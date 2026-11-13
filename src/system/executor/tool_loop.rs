@@ -43,8 +43,6 @@ pub(crate) struct ToolExecution {
     pub(crate) decider: bool,
     pub(crate) offer: ToolOffer,
     pub(crate) limits: ToolLoopLimits,
-    #[cfg(unix)]
-    pub(crate) workspace: Option<super::workspace_read::Workspace>,
     pub(crate) stops: crate::system::native_scheduler::NativeStops,
 }
 

@@ -15,14 +15,15 @@ pub(crate) enum ModelListError {
 pub(crate) async fn list_models(
     endpoint: &str,
     credential: Option<&str>,
-    protocol: crate::db::entities::LlmTransport,
+    protocol: Option<crate::db::entities::LlmTransport>,
     headers: &crate::system::http::RequestHeaders,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
     if !crate::system::http::discovery_permitted(endpoint) {
         return Err(ModelListError::NotAuthorized);
     }
     let base = super::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;
-    let anthropic = protocol == crate::db::entities::LlmTransport::AnthropicMessages;
+    let anthropic = protocol == Some(crate::db::entities::LlmTransport::AnthropicMessages);
+    let decision = protocol.is_none();
     let authorization = credential
         .map(if anthropic {
             anthropic::api_key
@@ -85,12 +86,15 @@ pub(crate) async fn list_models(
                 };
                 (status, body)
             };
-            for model in parse_models(status, &body, credential, headers)? {
+            for model in parse_models(status, &body, credential, headers, decision)? {
                 models.insert(model.id.clone(), model);
+            }
+            if !anthropic {
+                return Ok(models.into_values().collect());
             }
             let value =
                 serde_json::from_slice::<Value>(&body).map_err(|_| ModelListError::NotListed)?;
-            if !anthropic || value["has_more"] == false {
+            if value["has_more"] == false {
                 return Ok(models.into_values().collect());
             }
             if value["has_more"] != true {
@@ -126,6 +130,7 @@ fn parse_models(
     body: &[u8],
     credential: Option<&str>,
     headers: &crate::system::http::RequestHeaders,
+    decision: bool,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
     if status == 404 {
         return Err(ModelListError::NotListed);
@@ -136,12 +141,17 @@ fn parse_models(
     if !(200..300).contains(&status) {
         let message = value
             .as_ref()
-            .and_then(|value| value.get("error"))
-            .and_then(|error| {
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .or_else(|| error.as_str())
+            .and_then(|value| {
+                if decision {
+                    value.get("detail").and_then(Value::as_str)
+                } else {
+                    value.get("error").and_then(|error| {
+                        error
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .or_else(|| error.as_str())
+                    })
+                }
             })
             .or_else(|| value.as_ref()?.get("message")?.as_str())
             .map(str::to_owned)
@@ -164,15 +174,15 @@ fn parse_models(
     }
     let entries = value
         .as_ref()
-        .and_then(|value| value.get("data"))
+        .and_then(|value| value.get(if decision { "models" } else { "data" }))
         .and_then(Value::as_array)
         .ok_or(ModelListError::NotListed)?;
     let mut models = BTreeMap::<String, ProviderModel>::new();
     for entry in entries {
         let Some(id) = entry
-            .get("id")
+            .get(if decision { "name" } else { "id" })
             .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
+            .filter(|id| !id.is_empty() && (!decision || id.len() <= 512))
         else {
             continue;
         };

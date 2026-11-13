@@ -235,7 +235,6 @@ impl DatabaseWorker {
                     database_directory: directory.to_path_buf(),
                     log_directory,
                     log_files: Arc::new(crate::system::logger::LogFiles::default()),
-                    cleanup_worker: Arc::new(AtomicBool::new(false)),
                     admission: RwLock::new(Admission::Open),
                     update_paused: AtomicBool::new(false),
                     database: RwLock::new(Some(Opened { database, epoch })),
@@ -484,20 +483,6 @@ impl WriteWorker {
 
     pub(super) fn handle(&mut self, control: Control) {
         match control {
-            Control::FilesystemFailure { reason, reply } => {
-                let active = matches!(
-                    self.shared.admission(),
-                    Admission::Open | Admission::Protected(_)
-                );
-                if active {
-                    self.activate(vec![reason]);
-                }
-                send_reply(&reply, active);
-            }
-            Control::Recover => {
-                let result = self.recover();
-                self.shared.recovery.complete(result);
-            }
             Control::CompactStorage(reply) => {
                 let result = self.compact_storage();
                 send_reply(&reply, result);

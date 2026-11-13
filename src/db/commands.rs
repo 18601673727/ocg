@@ -8,11 +8,6 @@ pub(super) enum Message {
 }
 
 pub(super) enum Control {
-    FilesystemFailure {
-        reason: ProtectionReason,
-        reply: flume::Sender<bool>,
-    },
-    Recover,
     CompactStorage(flume::Sender<Result<CompactionOutcome, MaintenanceError>>),
 }
 
@@ -27,10 +22,6 @@ impl Control {
                         MaintenanceError::ShuttingDown
                     }))
                     .ok();
-            }
-            Self::Recover => {}
-            Self::FilesystemFailure { reply, .. } => {
-                reply.send(false).ok();
             }
         }
     }
@@ -76,7 +67,7 @@ trait PendingCommand: Send {
 struct CommandData<P, T, F> {
     payload: P,
     reply: Reply<T>,
-    estimate: fn(&P) -> u64,
+    expected_bytes: u64,
     execute: F,
 }
 
@@ -87,9 +78,7 @@ impl<
 > PendingCommand for CommandData<P, T, F>
 {
     fn expected_write_bytes(&self) -> u64 {
-        (self.estimate)(&self.payload)
-            .saturating_mul(2)
-            .saturating_add(TRANSACTION_ALLOWANCE_BYTES)
+        self.expected_bytes
     }
     fn execute(
         self: Box<Self>,
@@ -108,9 +97,9 @@ impl Command {
     pub(super) fn new<P: Send + 'static, T: Send + 'static>(
         payload: P,
         reply: Reply<T>,
-        estimate: fn(&P) -> u64,
+        estimate: impl FnOnce(&P) -> u64,
         kind: OperationKind,
-        body: fn(P, &mut redb::Batch) -> Result<T, BatchError>,
+        body: impl FnOnce(P, &mut redb::Batch) -> Result<T, BatchError> + Send + 'static,
     ) -> Self {
         Self::custom(
             payload,
@@ -126,14 +115,17 @@ impl Command {
     pub(super) fn custom<P: Send + 'static, T: Send + 'static>(
         payload: P,
         reply: Reply<T>,
-        estimate: fn(&P) -> u64,
+        estimate: impl FnOnce(&P) -> u64,
         execute: impl FnOnce(P, Reply<T>, &Database, OperationId, Commit) -> Executed + Send + 'static,
     ) -> Self {
+        let expected_bytes = estimate(&payload)
+            .saturating_mul(2)
+            .saturating_add(TRANSACTION_ALLOWANCE_BYTES);
         Self {
             action: Box::new(CommandData {
                 payload,
                 reply,
-                estimate,
+                expected_bytes,
                 execute,
             }),
         }

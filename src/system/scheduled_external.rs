@@ -176,7 +176,7 @@ impl ScheduledExternalGrant {
         &self,
         frozen: &FrozenExecutionConfig,
     ) -> Result<(), ScheduledExternalRefusal> {
-        if let Some(reason) = frozen.single_request_refusal() {
+        if let Some(reason) = frozen.native_execution_refusal() {
             return Err(ScheduledExternalRefusal::new(
                 "scheduled_external_not_single_request",
                 reason,
@@ -265,6 +265,10 @@ impl ScheduledExternalGrant {
 
     pub(crate) fn permits_endpoint(&self, endpoint: &str) -> bool {
         self.approval.permits_endpoint(endpoint)
+    }
+
+    pub(crate) fn limits(&self) -> ApprovalLimits {
+        self.approval.limits()
     }
 }
 

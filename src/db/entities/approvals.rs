@@ -247,13 +247,4 @@ impl ToolEvidenceRecord {
             | ToolDecision::AwaitingAnswer(_) => None,
         }
     }
-
-    pub fn is_unresolved(&self) -> bool {
-        self.admission().is_some()
-            && self.reconciliation.is_none()
-            && !self
-                .outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome.fact.is_definite())
-    }
 }

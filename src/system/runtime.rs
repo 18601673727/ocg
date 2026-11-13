@@ -145,7 +145,6 @@ where
         signals,
         None,
         crate::system::scheduler::ClaimScope::Process,
-        None,
         until_stopped,
     )
 }
@@ -164,39 +163,9 @@ where
         signals,
         control,
         crate::system::scheduler::ClaimScope::Stored,
-        None,
         until_stopped,
     )
     .into_result()
-}
-
-pub(crate) fn run_activated<F>(
-    data_directory: &DataDirectory,
-    control: Option<ControlPlaneConfig>,
-    activation: crate::system::loopback_activation::ActivationRequest,
-    report: impl FnOnce(&serde_json::Value) + 'static,
-    until_stopped: impl FnOnce(HostContext) -> F + 'static,
-) -> Result<(), HostError>
-where
-    F: Future<Output = ()> + 'static,
-{
-    run_scoped_reporting(
-        data_directory,
-        true,
-        control,
-        crate::system::scheduler::ClaimScope::Stored,
-        Some(Activation {
-            request: activation,
-            report: Box::new(report),
-        }),
-        until_stopped,
-    )
-    .into_result()
-}
-
-struct Activation {
-    request: crate::system::loopback_activation::ActivationRequest,
-    report: Box<dyn FnOnce(&serde_json::Value)>,
 }
 
 fn run_scoped_reporting<F>(
@@ -204,7 +173,6 @@ fn run_scoped_reporting<F>(
     signals: bool,
     control: Option<ControlPlaneConfig>,
     scope: crate::system::scheduler::ClaimScope,
-    activation: Option<Activation>,
     until_stopped: impl FnOnce(HostContext) -> F + 'static,
 ) -> HostReport
 where
@@ -240,7 +208,6 @@ where
             data_directory.clone(),
             scope,
             control,
-            activation,
             workspace_tools,
             until_stopped,
         ));
@@ -253,10 +220,9 @@ where
 #[allow(clippy::too_many_arguments)]
 async fn serve<F>(
     handle: DatabaseHandle,
-    data_directory: DataDirectory,
+    _data_directory: DataDirectory,
     scope: crate::system::scheduler::ClaimScope,
     control: Option<ControlPlaneConfig>,
-    activation: Option<Activation>,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     until_stopped: impl FnOnce(HostContext) -> F,
 ) -> HostReport
@@ -264,31 +230,17 @@ where
     F: Future<Output = ()>,
 {
     let mut report = HostReport::default();
-    let armed = match activation {
-        None => None,
-        Some(activation) => {
-            let (preflight, armed) = crate::system::loopback_activation::arm(
-                &handle,
-                &data_directory,
-                &activation.request,
-            )
-            .await;
-            (activation.report)(&preflight);
-            match armed {
-                Ok(armed) => Some(armed),
-                Err(refusal) => {
-                    report.fail(Phase::Startup, refusal);
-                    return report;
-                }
-            }
-        }
-    };
-    let armed_run = armed.is_some();
-    let started = match armed {
-        None => ExecutionRuntime::start(handle.clone(), scope),
-        Some(armed) => {
-            ExecutionRuntime::start_armed(handle.clone(), scope, armed, workspace_tools.clone())
-        }
+    let armed_run =
+        crate::system::execution_controls::ExecutionControl::AutonomousScheduling.is_enabled();
+    let started = if armed_run {
+        ExecutionRuntime::start_armed(
+            handle.clone(),
+            scope,
+            crate::system::loopback_activation::ArmedActivation::new(),
+            workspace_tools.clone(),
+        )
+    } else {
+        ExecutionRuntime::start(handle.clone(), scope)
     };
     let execution = match started {
         Ok(execution) => execution,

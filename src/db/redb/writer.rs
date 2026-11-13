@@ -5,7 +5,6 @@ use crate::db::entities::{
     ModelConfig, OutputKind, ProjectId, ProjectRecord, RequestEventRecord, RequestNumber,
     RequestPayload, SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidenceRecord, Violation,
 };
-use crate::system::execution_controls::ExecutionControl;
 use std::time::Instant;
 
 #[derive(Clone, Debug)]
@@ -26,7 +25,6 @@ pub(crate) enum BatchFailure {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Probe {
-    Job(JobId),
     Submission(SubmissionKey),
     PoolAllocation(crate::db::entities::AllocationToken),
     MutableJobStarted(crate::db::entities::AllocationToken, u64),
@@ -64,7 +62,6 @@ impl<T> BatchOutcome<T> {
 }
 
 pub(crate) struct Batch {
-    pub(crate) event_append: bool,
     pub(super) tx: WriteTransaction,
     pub(super) now: Timestamp,
     pub(super) epoch: u64,
@@ -253,7 +250,6 @@ pub(super) fn finish_abort<T>(tx: WriteTransaction, failure: Failure) -> BatchOu
 impl Batch {
     pub(super) fn new(tx: WriteTransaction, epoch: u64) -> Self {
         Self {
-            event_append: false,
             tx,
             now: Timestamp::now(),
             epoch,
@@ -343,13 +339,6 @@ impl Batch {
         })
     }
 
-    pub(super) fn decoded<T>(&mut self, decoded: DecodeResult<T>) -> Result<T, BatchError> {
-        match decoded {
-            Ok(value) => Ok(value),
-            Err(error) => self.fail(Failure::Storage(error)),
-        }
-    }
-
     pub(crate) fn next_id(&mut self) -> Result<u128, BatchError> {
         self.step(allocate)
     }
@@ -378,8 +367,7 @@ impl Batch {
             tx.open_table(META)?
                 .insert("compaction_settings", e.0.as_slice())?;
             Ok(())
-        })?;
-        self.cancel_stale_context_work()
+        })
     }
 
     fn provision_decision_executor(&mut self, model: ConfigId) -> Result<(), BatchError> {
@@ -462,11 +450,73 @@ impl Batch {
         Ok(row)
     }
 
+    fn resolve_and_write_credential(
+        &mut self,
+        change: crate::db::mutations::ProfileCredentialRef,
+        prior: Option<String>,
+        credential: Option<&crate::db::mutations::CredentialPayload>,
+    ) -> Result<Option<String>, BatchError> {
+        use crate::db::mutations::ProfileCredentialRef;
+        let base = match change {
+            ProfileCredentialRef::Preserve => prior,
+            ProfileCredentialRef::Clear => None,
+            ProfileCredentialRef::Explicit(reference) => Some(reference),
+            ProfileCredentialRef::PreserveOrGenerate(base) => match prior {
+                Some(reference) => Some(reference),
+                None => Some(self.allocate_credential_ref(&base)?),
+            },
+        };
+        let resolved = match (credential, base) {
+            (Some(_), Some(reference)) => Some(self.credential_generation(&reference)?),
+            (Some(_), None) => {
+                return self.reject(Violation::InvalidValue(
+                    "credential_ref",
+                    "credential secret requires a reference",
+                ));
+            }
+            (None, reference) => reference,
+        };
+        if let (Some(secret), Some(reference)) = (credential, resolved.as_deref()) {
+            self.write_credential(reference, secret)?;
+        }
+        Ok(resolved)
+    }
+
+    fn find_or_create_connection(
+        &mut self,
+        name: String,
+        body: ConnectionConfig,
+        require_unarchived: bool,
+    ) -> Result<ConfigId, BatchError> {
+        let existing = self.step(|tx| {
+            let mut found = None;
+            for entry in tx.open_table(CONFIGS)?.iter()? {
+                let (key, value) = entry?;
+                let Some(row) = ConfigRow::scan_at(key.value(), value.value())? else {
+                    continue;
+                };
+                if (!require_unarchived || row.archived_at.is_none())
+                    && matches!(&row.body, ConfigBody::Connection(c) if c == &body)
+                {
+                    found = Some(row.id);
+                    if require_unarchived {
+                        break;
+                    }
+                }
+            }
+            Ok(found)
+        })?;
+        match existing {
+            Some(id) => Ok(id),
+            None => self.create_config(name, ConfigBody::Connection(body)),
+        }
+    }
+
     pub(crate) fn save_model_profile(
         &mut self,
         save: crate::db::mutations::ModelProfileSave,
     ) -> Result<(ConfigId, Option<String>), BatchError> {
-        use crate::db::mutations::{ModelProfileDefinition, ProfileCredentialRef};
+        use crate::db::mutations::ModelProfileDefinition;
 
         let profile_kind = match &save.definition {
             ModelProfileDefinition::Llm { .. } => ConfigKind::Model,
@@ -525,28 +575,11 @@ impl Batch {
         let prior_credential_ref = previous_connection
             .as_ref()
             .and_then(|(_, connection)| connection.credential_ref.clone());
-        let credential_ref = match save.credential_ref {
-            ProfileCredentialRef::Preserve => prior_credential_ref,
-            ProfileCredentialRef::Clear => None,
-            ProfileCredentialRef::Explicit(reference) => Some(reference),
-            ProfileCredentialRef::PreserveOrGenerate(base) => match prior_credential_ref {
-                Some(reference) => Some(reference),
-                None => Some(self.allocate_credential_ref(&base)?),
-            },
-        };
-        let credential_ref = match (&save.credential, credential_ref) {
-            (Some(_), Some(reference)) => Some(self.credential_generation(&reference)?),
-            (Some(_), None) => {
-                return self.reject(Violation::InvalidValue(
-                    "credential_ref",
-                    "credential secret requires a reference",
-                ));
-            }
-            (None, reference) => reference,
-        };
-        if let (Some(credential), Some(reference)) = (&save.credential, credential_ref.as_deref()) {
-            self.write_credential(reference, credential)?;
-        }
+        let credential_ref = self.resolve_and_write_credential(
+            save.credential_ref,
+            prior_credential_ref,
+            save.credential.as_ref(),
+        )?;
 
         let previous_headers = previous_connection
             .as_ref()
@@ -558,42 +591,17 @@ impl Batch {
             self.ensure_llm_executor(protocol)?;
         }
 
-        let matching_connection = self.step(|tx| {
-            let mut found = None;
-            let table = tx.open_table(CONFIGS)?;
-            for entry in table.iter()? {
-                let (key, bytes) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), bytes.value())? else {
-                    continue;
-                };
-                if let ConfigBody::Connection(connection) = &row.body
-                    && connection.protocol == protocol
-                    && connection.endpoint == save.endpoint
-                    && connection.credential_ref == credential_ref
-                    && connection.headers == headers
-                {
-                    found = Some(row.id);
-                }
-            }
-            Ok(found)
-        })?;
-        let connection_id = match matching_connection {
-            Some(id) => {
-                if profile_kind == ConfigKind::Model {
-                    self.set_config_enabled(id, ConfigKind::Connection, true)?;
-                }
-                id
-            }
-            None => self.create_config(
-                save.connection_name,
-                ConfigBody::Connection(ConnectionConfig {
-                    protocol,
-                    endpoint: save.endpoint,
-                    credential_ref: credential_ref.clone(),
-                    headers,
-                }),
-            )?,
+        let connection_body = ConnectionConfig {
+            protocol,
+            endpoint: save.endpoint,
+            credential_ref: credential_ref.clone(),
+            headers,
         };
+        let connection_id =
+            self.find_or_create_connection(save.connection_name, connection_body, false)?;
+        if profile_kind == ConfigKind::Model {
+            self.set_config_enabled(connection_id, ConfigKind::Connection, true)?;
+        }
 
         let body = match save.definition {
             ModelProfileDefinition::Llm {
@@ -854,45 +862,16 @@ impl Batch {
         match body {
             ConfigBody::Connection(_) => {}
             ConfigBody::Model(model) => {
-                if model.reasoning_efforts.as_ref().is_some_and(|values| {
-                    values.len() > 7
-                        || values.iter().any(|value| {
-                            crate::db::entities::ReasoningEffort::parse(value).is_none()
-                        })
-                }) {
-                    return self.reject(Violation::InvalidValue(
-                        "reasoning_efforts",
-                        "must contain supported effort values",
-                    ));
-                }
                 self.require_config_kind(model.connection_id, ConfigKind::Connection)?;
-                for (field, value) in [
-                    ("temperature", model.parameters.temperature),
-                    ("top_p", model.parameters.top_p),
-                    ("presence_penalty", model.parameters.presence_penalty),
-                    ("frequency_penalty", model.parameters.frequency_penalty),
-                ] {
-                    if value.is_some_and(|value| !value.is_finite()) {
-                        return self.reject(Violation::InvalidValue(field, "must be finite"));
-                    }
-                }
             }
             ConfigBody::Agent(agent) => {
                 if let Some(policy) = &agent.compaction_policy {
                     self.check_compaction_policy(policy)?;
                 }
-
-                if agent.capabilities.is_empty()
-                    || agent
-                        .models
-                        .iter()
-                        .collect::<std::collections::BTreeSet<_>>()
-                        .len()
-                        != agent.models.len()
-                {
+                if agent.capabilities.is_empty() {
                     return self.reject(Violation::InvalidValue(
                         "capabilities",
-                        "select Agent capabilities and unique ordered models",
+                        "select Agent capabilities",
                     ));
                 }
                 for model in &agent.models {
@@ -915,97 +894,8 @@ impl Batch {
             }
             ConfigBody::DecisionModel(dm) => {
                 self.require_config_kind(dm.connection_id, ConfigKind::Connection)?;
-                for (question, request) in [
-                    (
-                        dm.limits.max_input_tokens_per_question,
-                        dm.limits.max_input_tokens_per_request,
-                    ),
-                    (
-                        dm.limits.max_output_tokens_per_question,
-                        dm.limits.max_output_tokens_per_request,
-                    ),
-                ] {
-                    if question.zip(request).is_some_and(|(q, r)| q > r) {
-                        return self.reject(Violation::InvalidValue(
-                            "limits",
-                            "per-question limit cannot exceed per-request limit",
-                        ));
-                    }
-                }
-                if dm.declared_capabilities.is_empty() {
-                    return self.reject(Violation::InvalidValue(
-                        "declared_capabilities",
-                        "decision models require at least one supported primitive",
-                    ));
-                }
-                if dm.model.trim().is_empty() || dm.model.len() > 512 {
-                    return self.reject(Violation::InvalidValue("model", "must be 1 to 512 bytes"));
-                }
-                if dm
-                    .limits
-                    .max_input_tokens_per_request
-                    .is_some_and(|v| v == 0 || v > 1_000_000)
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "max_input_tokens_per_request",
-                        "must be between 1 and 1000000",
-                    ));
-                }
-                if dm
-                    .limits
-                    .max_output_tokens_per_request
-                    .is_some_and(|v| v == 0 || v > 1_000_000)
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "max_output_tokens_per_request",
-                        "must be between 1 and 1000000",
-                    ));
-                }
-                if dm
-                    .limits
-                    .max_input_tokens_per_question
-                    .is_some_and(|v| v == 0 || v > 1_000_000)
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "max_input_tokens_per_question",
-                        "must be between 1 and 1000000",
-                    ));
-                }
-                if dm
-                    .limits
-                    .max_output_tokens_per_question
-                    .is_some_and(|v| v == 0 || v > 1_000_000)
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "max_output_tokens_per_question",
-                        "must be between 1 and 1000000",
-                    ));
-                }
             }
             ConfigBody::DecisionAgent(da) => {
-                if da
-                    .instructions
-                    .as_ref()
-                    .is_some_and(|text| text.len() > 64 * 1024)
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "instructions",
-                        "decision instructions exceed 64 KiB",
-                    ));
-                }
-                if da.models.len() > 256 {
-                    return self.reject(Violation::InvalidValue(
-                        "models",
-                        "at most 256 decision targets",
-                    ));
-                }
-
-                if da.models.windows(2).any(|pair| pair[0] >= pair[1]) {
-                    return self.reject(Violation::InvalidValue(
-                        "models",
-                        "must be sorted and unique",
-                    ));
-                }
                 for model in &da.models {
                     let row = self.require_config(*model)?;
                     if row.archived_at.is_some()
@@ -1016,15 +906,6 @@ impl Batch {
                             "decision targets must be configured models",
                         ));
                     }
-                }
-                if da
-                    .default_model
-                    .is_some_and(|default| !da.models.contains(&default))
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "default_model",
-                        "must be one of the Agent's models",
-                    ));
                 }
             }
         }
@@ -1195,7 +1076,6 @@ impl Batch {
         save: crate::db::mutations::ImportModelsSave,
     ) -> Result<(Vec<ConfigId>, usize), BatchError> {
         use crate::db::entities::{LlmParameters, ModelConfig};
-        use crate::db::mutations::ProfileCredentialRef;
         let crate::db::mutations::ImportModelsSave {
             headers,
             mut connection,
@@ -1205,21 +1085,18 @@ impl Batch {
             models,
             capabilities,
         } = save;
-        let resolved_ref = match credential_ref {
-            ProfileCredentialRef::Preserve => match &connection.body {
-                ConfigBody::Connection(wanted) => wanted.credential_ref.clone(),
-                ConfigBody::Model(_)
-                | ConfigBody::Agent(_)
-                | ConfigBody::Pool(_)
-                | ConfigBody::DecisionModel(_)
-                | ConfigBody::DecisionAgent(_) => None,
-            },
-            ProfileCredentialRef::Clear => None,
-            ProfileCredentialRef::Explicit(reference) => Some(reference),
-            ProfileCredentialRef::PreserveOrGenerate(base) => {
-                Some(self.allocate_credential_ref(&base)?)
-            }
+        if models.is_empty() || models.len() > 200 || capabilities.is_empty() {
+            return self.reject(Violation::InvalidValue(
+                "models",
+                "select 1 to 200 models with capabilities",
+            ));
+        }
+        let prior_ref = match &connection.body {
+            ConfigBody::Connection(wanted) => wanted.credential_ref.clone(),
+            _ => None,
         };
+        let resolved_ref =
+            self.resolve_and_write_credential(credential_ref, prior_ref, credential.as_ref())?;
         let ConfigBody::Connection(wanted) = &mut connection.body else {
             return self.reject(Violation::InvalidValue(
                 "connection",
@@ -1227,48 +1104,11 @@ impl Batch {
             ));
         };
         let own_headers = wanted.headers.clone();
-        let resolved_headers = self.apply_header_change(&own_headers, headers)?;
-        let resolved_ref = match (&credential, resolved_ref) {
-            (Some(_), Some(reference)) => Some(self.credential_generation(&reference)?),
-            (_, reference) => reference,
-        };
+        wanted.headers = self.apply_header_change(&own_headers, headers)?;
         wanted.credential_ref = resolved_ref;
-        wanted.headers = resolved_headers;
         let wanted = wanted.clone();
         let wanted_protocol = wanted.protocol;
-        if models.is_empty() || models.len() > 200 || capabilities.is_empty() {
-            return self.reject(Violation::InvalidValue(
-                "models",
-                "select 1 to 200 models with capabilities",
-            ));
-        }
-        if let Some(credential) = &credential {
-            let Some(reference) = wanted.credential_ref.as_deref() else {
-                return self.reject(Violation::InvalidValue(
-                    "credential_ref",
-                    "credential secret requires a reference",
-                ));
-            };
-            self.write_credential(reference, credential)?;
-        }
-        let existing = self.step(|tx| {
-            for entry in tx.open_table(CONFIGS)?.iter()? {
-                let (key, value) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), value.value())? else {
-                    continue;
-                };
-                if row.archived_at.is_none()
-                    && matches!(&row.body, ConfigBody::Connection(body) if body == &wanted)
-                {
-                    return Ok(Some(row.id));
-                }
-            }
-            Ok(None)
-        })?;
-        let connection_id = match existing {
-            Some(id) => id,
-            None => self.create_config(connection.name, connection.body)?,
-        };
+        let connection_id = self.find_or_create_connection(connection.name, wanted, true)?;
         self.set_config_enabled(connection_id, ConfigKind::Connection, true)?;
         self.ensure_llm_executor(wanted_protocol)?;
         let mut known = self.step(|tx| {
@@ -1618,22 +1458,6 @@ impl Batch {
         }
     }
 
-    pub(crate) fn require_legacy_evidence_job(&mut self, id: JobId) -> Result<(), BatchError> {
-        let native = self.step(|tx| {
-            Ok(tx.open_table(JOBS)?.get(id.get())?.is_some_and(|row| {
-                row.value().first() == Some(&TAG_JOB)
-                    && row.value().get(1) == Some(&codec::RECORD_VERSION)
-            }))
-        })?;
-        if native {
-            return self.reject(Violation::InvalidValue(
-                "execution",
-                "native evidence requires checked execution authority",
-            ));
-        }
-        Ok(())
-    }
-
     pub(crate) fn job_state(&mut self, id: JobId) -> Result<Option<JobState>, BatchError> {
         self.get(JOB_STATES, id.get(), |bytes| {
             JobState::decode_at(id.get(), bytes)
@@ -1647,71 +1471,9 @@ impl Batch {
         }
     }
 
-    pub(super) fn insert_job(&mut self, row: &JobSpec) -> Result<(), BatchError> {
-        if !ExecutionControl::LegacyProviderExecution.is_enabled() {
-            return self.reject(Violation::InvalidValue(
-                "job",
-                "legacy Job creation is unavailable; Jobs are native mutable Jobs",
-            ));
-        }
-        self.catalog_changed = true;
-        let duplicate = self.step(|tx| {
-            let mut jobs = tx.open_table(JOBS)?;
-            if jobs.get(row.id.get())?.is_some() {
-                return Ok(true);
-            }
-            jobs.insert(row.id.get(), row.encode().as_slice())?;
-            if let Some(allocation) = &row.allocation {
-                tx.open_table(JOB_ALLOCATIONS)?
-                    .insert((allocation.owner.get(), row.id.get()), ())?;
-            }
-            if row.kind.is_group() {
-                tx.open_table(CONVERSATIONS)?.insert(row.id.get(), ())?;
-            } else if row.kind.is_persistent()
-                && let Some(group) = row.parent_id
-            {
-                tx.open_table(TURNS)?
-                    .insert((group.get(), row.id.get()), ())?;
-            }
-            Ok(false)
-        })?;
-        if duplicate {
-            return self.reject(Violation::DuplicateId(RecordRef::Job(row.id)));
-        }
-        Ok(())
-    }
-
     pub(crate) fn put_job_state(&mut self, job: JobId, state: &JobState) -> Result<(), BatchError> {
         self.catalog_changed = true;
         self.insert(JOB_STATES, job.get(), state.encode().as_slice())
-    }
-
-    pub(crate) fn is_subtree_settled(&mut self, id: JobId) -> Result<bool, BatchError> {
-        let unsettled = self.step(|tx| Ok(tx.open_table(UNSETTLED)?.get(id.get())?.is_some()))?;
-        Ok(!unsettled)
-    }
-
-    pub(crate) fn append_output(
-        &mut self,
-        job: JobId,
-        kind: OutputKind,
-        summary: Option<String>,
-        code: Option<String>,
-        goal_reached: Option<bool>,
-        value: Option<serde_json::Value>,
-    ) -> Result<(u32, JobOutputId), BatchError> {
-        if self.step(|tx| {
-            Ok(tx
-                .open_table(JOBS)?
-                .get(job.get())?
-                .is_some_and(|row| row.value().first() == Some(&TAG_JOB)))
-        })? {
-            return self.reject(Violation::InvalidValue(
-                "output",
-                "native output requires checked execution authority",
-            ));
-        }
-        self.write_output(job, kind, summary, code, goal_reached, value)
     }
 
     pub(crate) fn append_development_output(
@@ -1786,70 +1548,12 @@ impl Batch {
             ));
         }
         for expected in attachments {
-            let actual = self.require_attachment(expected.id)?;
-            if actual != *expected || !actual.is_available() {
+            if !self.require_attachment(expected.id)?.is_available() {
                 return self.reject(Violation::InvalidValue(
                     "attachments",
                     "prepared Attachment changed or was cleaned up",
                 ));
             }
-        }
-        let first_request = sent.request == crate::db::entities::RequestNumber::FIRST;
-        let mut recorded_images = Vec::new();
-        for digest in &sent.messages {
-            let Some(body) = sent.bodies.iter().find(|body| body.digest() == *digest) else {
-                if !first_request {
-                    continue;
-                }
-                return self.reject(Violation::InvalidValue(
-                    "attachments",
-                    "prepared request message is missing",
-                ));
-            };
-            let Ok(message) = serde_json::from_slice::<serde_json::Value>(&body.bytes) else {
-                return self.reject(Violation::InvalidValue(
-                    "request",
-                    "invalid request message",
-                ));
-            };
-            if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
-                for part in parts {
-                    let reference = match part.get("type").and_then(serde_json::Value::as_str) {
-                        Some("image_url") => {
-                            part.get("image_url").and_then(|value| value.get("url"))
-                        }
-                        Some("input_image") => part.get("image_url"),
-                        Some("image") => part.get("source"),
-                        _ => continue,
-                    };
-                    let Some(id) = reference
-                        .and_then(|value| value.get("attachment"))
-                        .and_then(serde_json::Value::as_str)
-                    else {
-                        return self.reject(Violation::InvalidValue(
-                            "attachments",
-                            "request image has no Attachment reference",
-                        ));
-                    };
-                    recorded_images.push(id.to_owned());
-                }
-            }
-        }
-        let images_match = if first_request {
-            recorded_images.iter().map(String::as_str).eq(attachments
-                .iter()
-                .map(|attachment| attachment.id.to_string())
-                .collect::<Vec<_>>()
-                .iter()
-                .map(String::as_str))
-        } else {
-            recorded_images.is_empty()
-        };
-        if !images_match {
-            return self.reject(Violation::InvalidValue(
-                "attachments",
-                "request Attachment references differ from the checked snapshot",
-            ));
         }
         if !self.development_request_slot_is_next(sent.job, sent.request)? {
             return self.reject(Violation::InvalidValue(
@@ -1971,40 +1675,59 @@ impl Batch {
         ];
         let mut ids = [0u128; 3];
         for (offset, (seq, payload)) in [2u32, 3, 4].into_iter().zip(payloads).enumerate() {
-            let id = self.next_id()?;
-            ids[offset] = id;
-            let event = RequestEventRecord {
-                id: crate::db::entities::RequestEventId::new(id),
-                job_id: job,
-                request: stat.request,
+            ids[offset] = self.insert_development_request_event(
+                &identity,
+                job,
+                stat.request,
                 seq,
                 observed_at,
-                recorded_at: self.now,
                 payload,
-            };
-            let timeline = indexes::request_timeline_key(Some(&identity), &event);
-            let model = indexes::usage_model_key(Some(&identity), &event);
-            self.step(|tx| {
-                tx.open_table(REQUEST_EVENTS)?.insert(
-                    (job.get(), stat.request.get(), seq),
-                    encode_request_event(&event).as_slice(),
-                )?;
-                if let Some(kind) =
-                    observations::observation_kind(&tx.open_table(REQUEST_EVENTS)?, &event)?
-                {
-                    tx.open_table(JOB_OBSERVATIONS)?
-                        .insert((job.get(), kind, id), (stat.request.get(), seq))?;
-                }
-                if let Some(key) = timeline {
-                    tx.open_table(REQUEST_TIMELINE)?.insert(key, ())?;
-                }
-                if let Some(key) = model {
-                    indexes::record_usage_model(tx, key, job)?;
-                }
-                Ok(())
-            })?;
+            )?;
         }
         Ok((MetricsId::new(ids[0]), AvailabilityStatId::new(ids[2])))
+    }
+
+    fn insert_development_request_event(
+        &mut self,
+        identity: &crate::db::redb::reader::UsageIdentity,
+        job: JobId,
+        request: RequestNumber,
+        seq: u32,
+        observed_at: Timestamp,
+        payload: RequestPayload,
+    ) -> Result<u128, BatchError> {
+        let id = self.next_id()?;
+        let event = RequestEventRecord {
+            id: crate::db::entities::RequestEventId::new(id),
+            job_id: job,
+            request,
+            seq,
+            observed_at,
+            recorded_at: self.now,
+            payload,
+        };
+        let timeline = indexes::request_timeline_key(Some(identity), &event);
+        let model = indexes::usage_model_key(Some(identity), &event);
+        self.step(|tx| {
+            tx.open_table(REQUEST_EVENTS)?.insert(
+                (job.get(), request.get(), seq),
+                encode_request_event(&event).as_slice(),
+            )?;
+            if let Some(kind) =
+                observations::observation_kind(&tx.open_table(REQUEST_EVENTS)?, &event)?
+            {
+                tx.open_table(JOB_OBSERVATIONS)?
+                    .insert((job.get(), kind, id), (request.get(), seq))?;
+            }
+            if let Some(key) = timeline {
+                tx.open_table(REQUEST_TIMELINE)?.insert(key, ())?;
+            }
+            if let Some(key) = model {
+                indexes::record_usage_model(tx, key, job)?;
+            }
+            Ok(())
+        })?;
+        Ok(id)
     }
 
     fn development_only_sent(
@@ -2092,42 +1815,19 @@ impl Batch {
             ));
         }
         let identity = self.development_usage_identity(job)?;
-        let id = self.next_id()?;
-        let event = RequestEventRecord {
-            id: crate::db::entities::RequestEventId::new(id),
-            job_id: job,
-            request: stat.request,
-            seq: 2,
-            observed_at: stat.observed_at,
-            recorded_at: self.now,
-            payload: RequestPayload::Availability {
+        let id = self.insert_development_request_event(
+            &identity,
+            job,
+            stat.request,
+            2,
+            stat.observed_at,
+            RequestPayload::Availability {
                 status_code: observation.status_code,
                 finish_reason: observation.finish_reason,
                 raw_finish_reason: observation.raw_finish_reason,
                 failure: observation.failure,
             },
-        };
-        let timeline = indexes::request_timeline_key(Some(&identity), &event);
-        let model = indexes::usage_model_key(Some(&identity), &event);
-        self.step(|tx| {
-            tx.open_table(REQUEST_EVENTS)?.insert(
-                (job.get(), stat.request.get(), event.seq),
-                encode_request_event(&event).as_slice(),
-            )?;
-            if let Some(kind) =
-                observations::observation_kind(&tx.open_table(REQUEST_EVENTS)?, &event)?
-            {
-                tx.open_table(JOB_OBSERVATIONS)?
-                    .insert((job.get(), kind, id), (stat.request.get(), event.seq))?;
-            }
-            if let Some(key) = timeline {
-                tx.open_table(REQUEST_TIMELINE)?.insert(key, ())?;
-            }
-            if let Some(key) = model {
-                indexes::record_usage_model(tx, key, job)?;
-            }
-            Ok(())
-        })?;
+        )?;
         Ok(AvailabilityStatId::new(id))
     }
 
@@ -2178,14 +1878,24 @@ impl Batch {
         };
         let ok = self.step(|tx| {
             let mut totals = tx.open_table(USAGE_TOTALS)?;
-            if let Some(old) = &old {
-                let k = key(old);
-                let Some(v) = totals.get(k)?.map(|v| v.value()) else {
-                    return Err(StorageError::corrupted("native usage aggregate missing"));
+            for (remove, sample) in [(true, old.as_ref()), (false, new.as_ref())] {
+                let Some(sample) = sample else {
+                    continue;
                 };
-                let mut values = [v.0, v.1, v.2, v.3, v.4, v.5, v.6];
-                for (value, remove) in values.iter_mut().zip(numbers(old)) {
-                    let Some(next) = value.checked_sub(remove) else {
+                let k = key(sample);
+                let mut values = match totals.get(k)?.map(|v| v.value()) {
+                    Some(v) => [v.0, v.1, v.2, v.3, v.4, v.5, v.6],
+                    None if remove => {
+                        return Err(StorageError::corrupted("native usage aggregate missing"));
+                    }
+                    None => [0; 7],
+                };
+                for (value, delta) in values.iter_mut().zip(numbers(sample)) {
+                    let Some(next) = (if remove {
+                        value.checked_sub(delta)
+                    } else {
+                        value.checked_add(delta)
+                    }) else {
                         return Ok(false);
                     };
                     *value = next;
@@ -2205,23 +1915,6 @@ impl Batch {
                     )?;
                 }
             }
-            if let Some(new) = &new {
-                let k = key(new);
-                let v = totals.get(k)?.map_or((0, 0, 0, 0, 0, 0, 0), |v| v.value());
-                let mut values = [v.0, v.1, v.2, v.3, v.4, v.5, v.6];
-                for (value, add) in values.iter_mut().zip(numbers(new)) {
-                    let Some(next) = value.checked_add(add) else {
-                        return Ok(false);
-                    };
-                    *value = next;
-                }
-                totals.insert(
-                    k,
-                    (
-                        values[0], values[1], values[2], values[3], values[4], values[5], values[6],
-                    ),
-                )?;
-            }
             Ok(true)
         })?;
         if !ok {
@@ -2237,13 +1930,9 @@ impl Batch {
         metrics: crate::db::entities::Metrics,
         checkpoint: crate::db::handle::DevelopmentUsageCheckpoint,
     ) -> Result<(MetricsId, crate::db::handle::DevelopmentUsageCheckpoint), BatchError> {
-        use crate::db::entities::{RequestEligibility, TokenCount, UsageFinality};
         self.require_development_write_any(proof)?;
         let job = proof.token().job;
-        if metrics.job != job
-            || !(5..=3 + 2 * indexes::MAX_NATIVE_USAGE_OBSERVATIONS).contains(&expected_seq)
-            || expected_seq.is_multiple_of(2)
-        {
+        if metrics.job != job || expected_seq < 5 || expected_seq.is_multiple_of(2) {
             return self.reject(Violation::InvalidValue(
                 "usage",
                 "wrong Job, request or event sequence",
@@ -2255,118 +1944,12 @@ impl Batch {
                 "Token annotation required",
             ));
         };
-        if token.eligibility != RequestEligibility::Eligible {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "request was not reported eligible",
-            ));
-        }
-        let usage = &metrics.measurements.usage;
-        let fields = [
-            usage.input_tokens,
-            usage.output_tokens,
-            usage.cache_read_tokens,
-            usage.cache_write_tokens,
-            usage.reasoning_tokens,
-        ];
-        if fields.iter().all(Option::is_none) {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "Token counters are missing",
-            ));
-        }
-        if let (Some(input), Some(output)) = (usage.input_tokens, usage.output_tokens)
-            && input.checked_add(output).is_none()
-        {
-            return self.reject(Violation::ValueOutOfRange("usage"));
-        }
         let Some(token_seq) = expected_seq.checked_add(1) else {
             return self.reject(Violation::ValueOutOfRange("seq"));
         };
         let request = metrics.request;
-        let state = self.step(|tx| {
-            let table = tx.open_table(REQUEST_EVENTS)?;
-            let mut prefix = Vec::new();
-            for seq in 1..=4 {
-                let Some(value) = table.get((job.get(), request.get(), seq))? else {
-                    return Ok((false, None, None, 0u32));
-                };
-                prefix.push(decode_request_event(job, request, seq, value.value())?);
-            }
-            let valid = matches!(prefix[0].payload, RequestPayload::Sent { .. })
-                && matches!(prefix[1].payload, RequestPayload::Measurement { .. })
-                && matches!(prefix[2].payload, RequestPayload::Received { .. })
-                && matches!(prefix[3].payload, RequestPayload::Availability { .. });
-            let prior = table
-                .get((job.get(), request.get(), expected_seq))?
-                .map(|v| decode_request_event(job, request, expected_seq, v.value()))
-                .transpose()?;
-            let annotation = table
-                .get((job.get(), request.get(), token_seq))?
-                .map(|v| decode_request_event(job, request, token_seq, v.value()))
-                .transpose()?;
-            let last = table
-                .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
-                .next_back()
-                .transpose()?
-                .map_or(0, |(k, _)| k.value().2);
-            Ok((valid, prior, annotation, last))
-        })?;
-        if !state.0 {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "request and answer evidence required",
-            ));
-        }
-        if let (Some(prior), Some(annotation)) = (&state.1, &state.2) {
-            if prior.observed_at == metrics.observed_at
-                && annotation.observed_at == metrics.observed_at
-                && prior.recorded_at == annotation.recorded_at
-                && matches!(&prior.payload, RequestPayload::Measurement { measurements } if *measurements == metrics.measurements)
-                && matches!(annotation.payload, RequestPayload::Token { eligibility, finality } if eligibility == token.eligibility && finality == token.finality)
-            {
-                return self.reject(Violation::InvalidValue(
-                    "usage",
-                    "event identity was already recorded",
-                ));
-            }
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "event identity has different evidence",
-            ));
-        }
-        if state.1.is_some() || state.2.is_some() || state.3.checked_add(1) != Some(expected_seq) {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "event sequence is not next",
-            ));
-        }
-        let checkpoint_sequence = match checkpoint.last_sequence() {
-            0 => 4,
-            sequence => sequence,
-        };
-        if checkpoint_sequence != state.3 {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "confirmed usage checkpoint does not match durable sequence",
-            ));
-        }
         let mut evidence = checkpoint.evidence();
         let old = evidence.sample();
-        if token.finality == UsageFinality::Final
-            && let Some(sample) = &old
-        {
-            let previous = [
-                sample.input,
-                sample.output,
-                sample.cache_read,
-                sample.cache_write,
-                sample.reasoning,
-            ];
-            if previous.into_iter().zip(fields).any(|(prior, value)| matches!((prior, value), (TokenCount::Final(a), Some(b)) if a != b)) {
-                return self.reject(Violation::InvalidValue("usage", "conflicting final Token evidence"));
-            }
-        }
         let identity = self.development_usage_identity(job)?;
         let first_id = self.next_id()?;
         let second_id = self.next_id()?;
@@ -2375,6 +1958,7 @@ impl Batch {
             job,
             request,
             target: None,
+            decision_target: None,
             observed_at: metrics.observed_at,
             measurements: metrics.measurements.clone(),
             token: Some(token),
@@ -2669,14 +2253,23 @@ impl Batch {
         row: &JobControl,
     ) -> Result<(), BatchError> {
         self.catalog_changed = true;
-        self.insert(JOB_CONTROLS, root.get(), row.encode().as_slice())
-    }
-
-    pub(crate) fn job_tool_evidence(
-        &mut self,
-        job: JobId,
-    ) -> Result<Vec<ToolEvidenceRecord>, BatchError> {
-        self.step(|tx| job_tool_evidence(&tx.open_table(TOOL_CALLS)?, job))
+        self.insert(JOB_CONTROLS, root.get(), row.encode().as_slice())?;
+        if (row.closing.is_some() || row.hidden_at.is_some())
+            && let Some(mut rec) = self.get(RECURRENCES, root.get(), Recurrence::decode)?
+            && !matches!(rec.phase, RecurrencePhase::Halted { .. })
+        {
+            if let RecurrencePhase::WaitingDue { due } = rec.phase {
+                self.step(|tx| {
+                    tx.open_table(RECURRENCE_DUE)?.remove((due, root.get()))?;
+                    Ok(())
+                })?;
+            }
+            rec.phase = RecurrencePhase::Halted {
+                reason: RecurrenceHalt::Closed,
+            };
+            self.insert(RECURRENCES, root.get(), rec.encode().as_slice())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn tool_evidence(
@@ -2756,26 +2349,6 @@ impl Batch {
         })
     }
 
-    pub(crate) fn request_token_eligibility(
-        &mut self,
-        job: JobId,
-        request: RequestNumber,
-    ) -> Result<Option<RequestEligibility>, BatchError> {
-        self.step(|tx| {
-            let events = tx.open_table(REQUEST_EVENTS)?;
-            for entry in events
-                .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
-            {
-                let (key, bytes) = entry?;
-                let event = decode_request_event(job, request, key.value().2, bytes.value())?;
-                if let RequestPayload::Token { eligibility, .. } = event.payload {
-                    return Ok(Some(eligibility));
-                }
-            }
-            Ok(None)
-        })
-    }
-
     pub(crate) fn insert_request_event(
         &mut self,
         job: JobId,
@@ -2830,215 +2403,6 @@ impl Batch {
         })?;
         Ok(event)
     }
-
-    pub(crate) fn usage_sample(
-        &mut self,
-        job: JobId,
-        request: RequestNumber,
-    ) -> Result<
-        (
-            Option<crate::db::entities::TokenRequestSample>,
-            Vec<RequestEventRecord>,
-        ),
-        BatchError,
-    > {
-        let row = self.require_job(job)?;
-        if row.kind.is_group() {
-            return Ok((None, Vec::new()));
-        }
-        let target = self.step(|tx| reader::turn_target(tx, &row))?;
-        let events = self.step(|tx| {
-            let table = tx.open_table(REQUEST_EVENTS)?;
-            let mut events = Vec::new();
-            for entry in
-                table.range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
-            {
-                let (key, bytes) = entry?;
-                let (_, req, seq) = key.value();
-                if let Some(r) = RequestNumber::new(req) {
-                    events.push(decode_request_event(job, r, seq, bytes.value())?);
-                }
-            }
-            Ok(events)
-        })?;
-        if events.is_empty() {
-            return Ok((None, events));
-        }
-        let sample = observations::usage_sample_of(job, request, target.as_ref(), &events);
-        Ok((sample, events))
-    }
-
-    pub(crate) fn update_usage_total(
-        &mut self,
-        job: JobId,
-        request: RequestNumber,
-        old_sample: Option<crate::db::entities::TokenRequestSample>,
-        mut events: Vec<RequestEventRecord>,
-        inserted: Vec<RequestEventRecord>,
-    ) -> Result<(), BatchError> {
-        events.extend(inserted);
-        let row = self.require_job(job)?;
-        if row.kind.is_group() {
-            return Ok(());
-        }
-        let Some(identity) =
-            self.step(|tx| reader::turn_usage_identity_of(&tx.open_table(JOBS)?, &row))?
-        else {
-            return Ok(());
-        };
-        let target = self.step(|tx| reader::turn_target(tx, &row))?;
-        let parent = match row.parent_id {
-            Some(parent) => self.job(parent)?,
-            None => None,
-        };
-        let agent = usage_agent(&row, parent.as_ref());
-        let provider = identity.provider;
-        let model_hash = *ContentDigest::of(identity.model.as_bytes()).as_bytes();
-        if events.is_empty() {
-            return Ok(());
-        }
-        let new_sample = observations::usage_sample_of(job, request, target.as_ref(), &events);
-
-        if old_sample == new_sample {
-            return Ok(());
-        }
-
-        self.step(|tx| {
-            let mut table = tx.open_table(USAGE_TOTALS)?;
-            if let Some(old) = old_sample {
-                let hour = old
-                    .observed_at
-                    .as_unix_micros()
-                    .div_euclid(crate::db::entities::USAGE_SUMMARY_HOUR_MICROS);
-                let key = (hour, agent, provider, model_hash);
-                let current_val = table.get(key)?.map(|c| c.value()).ok_or_else(|| {
-                    StorageError::corrupted(format!("missing usage bucket for {key:?}"))
-                })?;
-                let old_complete = if old.usage == crate::db::entities::TokenUsageState::Complete {
-                    1
-                } else {
-                    0
-                };
-                let reqs = current_val
-                    .0
-                    .checked_sub(1)
-                    .ok_or_else(|| StorageError::corrupted("usage total requests underflow"))?;
-                if reqs == 0 {
-                    let comp = current_val.1.checked_sub(old_complete).ok_or_else(|| {
-                        StorageError::corrupted("usage total complete_requests underflow")
-                    })?;
-                    let inp = current_val
-                        .2
-                        .checked_sub(old.input.value().unwrap_or(0) as u64)
-                        .ok_or_else(|| StorageError::corrupted("usage total input underflow"))?;
-                    let out = current_val
-                        .3
-                        .checked_sub(old.output.value().unwrap_or(0) as u64)
-                        .ok_or_else(|| StorageError::corrupted("usage total output underflow"))?;
-                    let cr = current_val
-                        .4
-                        .checked_sub(old.cache_read.value().unwrap_or(0) as u64)
-                        .ok_or_else(|| {
-                            StorageError::corrupted("usage total cache_read underflow")
-                        })?;
-                    let cw = current_val
-                        .5
-                        .checked_sub(old.cache_write.value().unwrap_or(0) as u64)
-                        .ok_or_else(|| {
-                            StorageError::corrupted("usage total cache_write underflow")
-                        })?;
-                    let reas = current_val
-                        .6
-                        .checked_sub(old.reasoning.value().unwrap_or(0) as u64)
-                        .ok_or_else(|| {
-                            StorageError::corrupted("usage total reasoning underflow")
-                        })?;
-                    if comp != 0 || inp != 0 || out != 0 || cr != 0 || cw != 0 || reas != 0 {
-                        return Err(StorageError::corrupted(
-                            "usage total non-zero counters when requests reached 0",
-                        ));
-                    }
-                    table.remove(key)?;
-                } else {
-                    let updated = (
-                        reqs,
-                        current_val.1.checked_sub(old_complete).ok_or_else(|| {
-                            StorageError::corrupted("usage total complete_requests underflow")
-                        })?,
-                        current_val
-                            .2
-                            .checked_sub(old.input.value().unwrap_or(0) as u64)
-                            .ok_or_else(|| {
-                                StorageError::corrupted("usage total input underflow")
-                            })?,
-                        current_val
-                            .3
-                            .checked_sub(old.output.value().unwrap_or(0) as u64)
-                            .ok_or_else(|| {
-                                StorageError::corrupted("usage total output underflow")
-                            })?,
-                        current_val
-                            .4
-                            .checked_sub(old.cache_read.value().unwrap_or(0) as u64)
-                            .ok_or_else(|| {
-                                StorageError::corrupted("usage total cache_read underflow")
-                            })?,
-                        current_val
-                            .5
-                            .checked_sub(old.cache_write.value().unwrap_or(0) as u64)
-                            .ok_or_else(|| {
-                                StorageError::corrupted("usage total cache_write underflow")
-                            })?,
-                        current_val
-                            .6
-                            .checked_sub(old.reasoning.value().unwrap_or(0) as u64)
-                            .ok_or_else(|| {
-                                StorageError::corrupted("usage total reasoning underflow")
-                            })?,
-                    );
-                    table.insert(key, updated)?;
-                }
-            }
-            if let Some(new) = new_sample {
-                let hour = new
-                    .observed_at
-                    .as_unix_micros()
-                    .div_euclid(crate::db::entities::USAGE_SUMMARY_HOUR_MICROS);
-                let key = (hour, agent, provider, model_hash);
-                let current_val = table
-                    .get(key)?
-                    .map(|v| v.value())
-                    .unwrap_or((0, 0, 0, 0, 0, 0, 0));
-                let new_complete = if new.usage == crate::db::entities::TokenUsageState::Complete {
-                    1
-                } else {
-                    0
-                };
-                let updated = (
-                    current_val.0.saturating_add(1),
-                    current_val.1.saturating_add(new_complete),
-                    current_val
-                        .2
-                        .saturating_add(new.input.value().unwrap_or(0) as u64),
-                    current_val
-                        .3
-                        .saturating_add(new.output.value().unwrap_or(0) as u64),
-                    current_val
-                        .4
-                        .saturating_add(new.cache_read.value().unwrap_or(0) as u64),
-                    current_val
-                        .5
-                        .saturating_add(new.cache_write.value().unwrap_or(0) as u64),
-                    current_val
-                        .6
-                        .saturating_add(new.reasoning.value().unwrap_or(0) as u64),
-                );
-                table.insert(key, updated)?;
-            }
-            Ok(())
-        })?;
-        Ok(())
-    }
 }
 
 impl Batch {
@@ -3068,21 +2432,7 @@ impl Batch {
             Ok(())
         })
     }
-    pub(crate) fn record_submission(
-        &mut self,
-        record: &SubmissionRecord,
-    ) -> Result<(), BatchError> {
-        self.insert(
-            SUBMISSIONS,
-            record.key.as_bytes().as_slice(),
-            encode_submission(record).as_slice(),
-        )?;
-        self.probe = Some(Probe::Submission(record.key));
-        Ok(())
-    }
 }
-
-impl Batch {}
 
 impl Batch {
     pub(crate) fn wake_scheduler(&mut self) {

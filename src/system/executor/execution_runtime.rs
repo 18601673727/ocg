@@ -31,7 +31,6 @@ impl<'a> DevelopmentExecutionReturn<'a> {
 #[derive(Clone, Copy)]
 pub(crate) enum EndpointPolicy<'a> {
     Loopback,
-    ApprovedExternal(&'a crate::system::external_approval::ExternalApproval),
     ScheduledExternal(&'a crate::system::scheduled_external::ScheduledExternalGrant),
 }
 
@@ -39,9 +38,6 @@ impl EndpointPolicy<'_> {
     fn permits(self, endpoint: &str, config: &ProviderExecutionConfig) -> bool {
         match self {
             EndpointPolicy::Loopback => crate::system::http::direct_diagnostic_loopback(endpoint),
-            EndpointPolicy::ApprovedExternal(approval) => {
-                approval.permits_endpoint(endpoint) && config.destination == approval.destination()
-            }
             EndpointPolicy::ScheduledExternal(grant) => {
                 grant.permits_endpoint(endpoint) && config.destination == grant.destination()
             }
@@ -51,7 +47,6 @@ impl EndpointPolicy<'_> {
     fn refusal(self) -> &'static str {
         match self {
             EndpointPolicy::Loopback => "direct loopback endpoint required",
-            EndpointPolicy::ApprovedExternal(_) => "the approved external endpoint is required",
             EndpointPolicy::ScheduledExternal(_) => {
                 "the durable scheduled external endpoint is required"
             }
@@ -162,11 +157,7 @@ pub(crate) async fn supervise_development_generative(
         )
         .await?;
         let Some(tools) = tools.as_ref().filter(|_| result.requests_tools()) else {
-            let mut value = providers::result_value(&result);
-            #[cfg(unix)]
-            if let Some(workspace) = tools.as_ref().and_then(|tools| tools.workspace.as_ref()) {
-                attach_file_snapshots(&mut value, workspace, &result.text).await;
-            }
+            let value = providers::result_value(&result);
             let finalization = JobFinalization::Completed(FinalResult {
                 summary: Some(result.text.clone()),
                 code: None,
@@ -253,141 +244,43 @@ pub(crate) async fn supervise_development_generative(
                 return settle_tool_stop(database, &handoff, output_seq, Some(&result), stop).await;
             }
         };
+        if matches!(policy, EndpointPolicy::ScheduledExternal(_)) {
+            let recheck = match database.scheduled_external_grant(token.job).await {
+                Ok(Some(live_grant)) => {
+                    let body_bytes =
+                        serde_json::to_vec(&body).map_or(usize::MAX, |bytes| bytes.len());
+                    let ep_ok = frozen
+                        .llm
+                        .provider
+                        .endpoint
+                        .as_deref()
+                        .is_some_and(|ep| live_grant.permits_endpoint(ep))
+                        && config.destination == live_grant.destination();
+                    if !ep_ok {
+                        Err("the scheduled external endpoint or route is no longer authorized")
+                    } else if body_bytes > live_grant.limits().max_request_bytes {
+                        Err("the multi-turn request exceeds the scheduled external byte limit")
+                    } else {
+                        Ok(())
+                    }
+                }
+                Ok(None) | Err(_) => {
+                    Err("the scheduled external policy was revoked or changed mid-execution")
+                }
+            };
+            if let Err(reason) = recheck {
+                let stop = ToolLoopStop::AdmissionRefused {
+                    index: 0,
+                    violation: Violation::InvalidValue("scheduled_external_policy", reason),
+                };
+                return settle_tool_stop(database, &handoff, output_seq, Some(&result), stop).await;
+            }
+        }
         request = next;
     }
 }
 
 #[cfg(unix)]
-async fn capture_file_snapshots(
-    workspace: super::workspace_read::Workspace,
-    text: String,
-) -> Vec<serde_json::Value> {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
-    static ACTIVE: AtomicUsize = AtomicUsize::new(0);
-    static LINKS: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"\]\(\s*<?([^\s)>]+)"));
-    static LINES: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?::(\d+)(?:-\d+)?|#L(\d+)(?:-L?\d+)?)$"));
-    if ACTIVE
-        .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-            (count < 4).then_some(count + 1)
-        })
-        .is_err()
-    {
-        return Vec::new();
-    }
-    struct Slot;
-    impl Drop for Slot {
-        fn drop(&mut self) {
-            ACTIVE.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
-    let slot = Slot;
-    let work = super::blocking::run(super::blocking::Kind::File, move || {
-        let _slot = slot;
-        let Ok(links) = LINKS.as_ref() else {
-            return Vec::new();
-        };
-        let Ok(lines) = LINES.as_ref() else {
-            return Vec::new();
-        };
-        let stamp = super::workspace_read::mutation_stamp();
-        let mut seen = std::collections::HashSet::new();
-        let mut snapshots = Vec::new();
-        for link in links.captures_iter(&text).take(32) {
-            let Some(target) = link.get(1).map(|value| value.as_str()) else {
-                continue;
-            };
-            if target.contains("://") || target.starts_with('#') || target.starts_with("//") {
-                continue;
-            }
-            let (path, line) = if let Some(location) = lines.captures(target) {
-                let Some(matched) = location.get(0) else {
-                    continue;
-                };
-                let line = location
-                    .get(1)
-                    .or_else(|| location.get(2))
-                    .and_then(|value| value.as_str().parse::<u64>().ok())
-                    .unwrap_or(1);
-                (&target[..matched.start()], line.max(1))
-            } else {
-                (target, 1)
-            };
-            let reference_path = path.to_owned();
-            let path = std::path::Path::new(path);
-            let path = if path.is_absolute() {
-                let Ok(relative) = path.strip_prefix(workspace.root()) else {
-                    continue;
-                };
-                relative
-            } else {
-                path
-            };
-            let Some(path) = path.to_str() else { continue };
-            let path = path.strip_prefix("./").unwrap_or(path);
-            if !seen.insert(path.to_owned()) {
-                continue;
-            }
-            if let Ok(mut snapshot) = workspace.snapshot_range(path, line) {
-                let unchanged = snapshot
-                    .get("content")
-                    .and_then(|value| value.as_str())
-                    .is_some_and(|content| {
-                        matches!(
-                            crate::db::entities::output_filter::text(content),
-                            std::borrow::Cow::Borrowed(_)
-                        )
-                    });
-                if !unchanged {
-                    continue;
-                }
-                if let Some(object) = snapshot.as_object_mut() {
-                    object.insert("path".into(), serde_json::Value::String(reference_path));
-                }
-                snapshots.push(snapshot);
-                if snapshots.len() == 4 {
-                    break;
-                }
-            }
-        }
-        if stamp.is_dirty() {
-            Vec::new()
-        } else {
-            snapshots
-        }
-    });
-    match ntex::util::select(work, ntex::time::sleep(std::time::Duration::from_secs(1))).await {
-        ntex::util::Either::Left(Ok(snapshots)) => snapshots,
-        ntex::util::Either::Left(Err(_)) | ntex::util::Either::Right(_) => Vec::new(),
-    }
-}
-
-#[cfg(unix)]
-async fn attach_file_snapshots(
-    value: &mut serde_json::Value,
-    workspace: &super::workspace_read::Workspace,
-    text: &str,
-) {
-    if text.len() > 256 * 1024 || !text.contains("](") {
-        return;
-    }
-    let snapshots = capture_file_snapshots(workspace.clone(), text.to_owned()).await;
-    if snapshots.is_empty() {
-        return;
-    }
-    let Some(object) = value.as_object_mut() else {
-        return;
-    };
-    object.insert("file_snapshots".into(), serde_json::Value::Array(snapshots));
-    if crate::db::serialized_len(&*value).map_or(true, |bytes| bytes > 512 * 1024)
-        && let Some(object) = value.as_object_mut()
-    {
-        object.remove("file_snapshots");
-    }
-}
-
 fn awaiting_summary(result: &ProviderExecutionResult, awaiting: &[u32]) -> String {
     let mut summary = String::new();
     for call in result
@@ -561,28 +454,36 @@ pub(crate) async fn supervise_development_decision(
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
 ) -> Result<AppendedOutput, DatabaseError> {
-    let (native, request, body, token) =
+    let (frozen, request, body, token) =
         handoff
             .decision_inputs()
             .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
                 "handoff",
                 "Decision handoff required",
             )))?;
-    let frozen = crate::db::entities::FrozenDecisionConfig::Native(native.clone());
-    let local_rejection = match native.endpoint.as_deref() {
-        None => Some((NOT_SENT, "explicit loopback endpoint required")),
-        Some(endpoint) if !policy.permits(endpoint, config) => Some((NOT_SENT, policy.refusal())),
-        Some(_) => {
-            if crate::service::ai::decisive_model::request_body(&frozen, request)
-                .ok()
-                .as_ref()
-                == Some(body)
-            {
-                None
-            } else {
-                Some((BUILD_FAILED, "prepared Decision request mismatch"))
-            }
+    let frozen = frozen.clone();
+    let effective_config = match &frozen {
+        crate::db::entities::FrozenDecisionConfig::Native(_) => config.clone(),
+        crate::db::entities::FrozenDecisionConfig::Generative(generative, _) => {
+            config.for_profile(generative)
         }
+    };
+    let endpoint = match &frozen {
+        crate::db::entities::FrozenDecisionConfig::Native(native) => native.endpoint.as_deref(),
+        crate::db::entities::FrozenDecisionConfig::Generative(generative, _) => {
+            generative.llm.provider.endpoint.as_deref()
+        }
+    };
+    let local_rejection = match endpoint {
+        None => Some((NOT_SENT, "explicit loopback endpoint required")),
+        Some(endpoint) if !policy.permits(endpoint, &effective_config) => {
+            Some((NOT_SENT, policy.refusal()))
+        }
+        Some(_) if effective_config.cancellation.is_cancelled() => Some((
+            NOT_SENT,
+            "Execution was cancelled before the provider request.",
+        )),
+        Some(_) => None,
     };
     if let Some((code, message)) = local_rejection {
         return settle_development_unsent(
@@ -590,21 +491,9 @@ pub(crate) async fn supervise_development_decision(
             &handoff,
             RequestNumber::FIRST,
             1,
-            config,
+            &effective_config,
             code,
             message,
-        )
-        .await;
-    }
-    if config.cancellation.is_cancelled() {
-        return settle_development_unsent(
-            database,
-            &handoff,
-            RequestNumber::FIRST,
-            1,
-            config,
-            NOT_SENT,
-            "Execution was cancelled before the provider request.",
         )
         .await;
     }
@@ -613,7 +502,7 @@ pub(crate) async fn supervise_development_decision(
         handoff: &handoff,
         request: RequestNumber::FIRST,
         prepared: body,
-        cancellation: &config.cancellation,
+        cancellation: &effective_config.cancellation,
         output_seq: 1,
         sent: false,
         observations: Vec::new(),
@@ -625,7 +514,7 @@ pub(crate) async fn supervise_development_decision(
         request,
         body,
         &handoff,
-        config,
+        &effective_config,
         crate::db::entities::RequestRef {
             job: token.job,
             request: RequestNumber::FIRST,
@@ -640,8 +529,8 @@ pub(crate) async fn supervise_development_decision(
                 database,
                 &handoff,
                 RequestNumber::FIRST,
-                1,
-                config,
+                sink.output_seq,
+                &effective_config,
                 sink.sent,
                 error,
             )
@@ -716,7 +605,7 @@ pub(crate) async fn supervise_development_decision(
     }
     let returned = DevelopmentExecutionReturn { handoff: &handoff };
     database
-        .finalize_development_decision(returned, 1, result.result)
+        .finalize_development_decision(returned, sink.output_seq, result.result)
         .await
 }
 
@@ -985,89 +874,6 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                 self.observations.push(observation);
             }
         })
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) enum DevelopmentSyntheticExecution {
-    Generative {
-        observed_at: Timestamp,
-        sent: bool,
-        answer: Option<crate::db::entities::ProviderAnswer>,
-        usage: Option<Metrics>,
-        finalization: JobFinalization,
-    },
-    Decision {
-        observed_at: Timestamp,
-        answer: crate::db::entities::ProviderAnswer,
-        result: crate::db::entities::DecisionResult,
-    },
-}
-
-#[allow(dead_code)]
-pub(crate) async fn supervise_development_synthetic(
-    database: &DatabaseHandle,
-    handoff: crate::db::DevelopmentHandoff,
-    execution: DevelopmentSyntheticExecution,
-) -> Result<AppendedOutput, DatabaseError> {
-    enum Returned {
-        Generative(JobFinalization),
-        Decision(Box<crate::db::entities::DecisionResult>),
-    }
-    let result = async {
-        match execution {
-            DevelopmentSyntheticExecution::Generative {
-                observed_at,
-                sent,
-                answer,
-                usage,
-                finalization,
-            } => {
-                if sent {
-                    database
-                        .record_development_sent_request(&handoff, observed_at)
-                        .await?;
-                }
-                if let Some(answer) = answer {
-                    database
-                        .record_development_provider_answer(&handoff, answer)
-                        .await?;
-                }
-                if let Some(usage) = usage {
-                    database
-                        .record_development_usage(&handoff, 5, usage)
-                        .await?;
-                }
-                Ok::<_, DatabaseError>(Returned::Generative(finalization))
-            }
-            DevelopmentSyntheticExecution::Decision {
-                observed_at,
-                answer,
-                result,
-            } => {
-                database
-                    .record_development_sent_request(&handoff, observed_at)
-                    .await?;
-                database
-                    .record_development_provider_answer(&handoff, answer)
-                    .await?;
-                Ok(Returned::Decision(Box::new(result)))
-            }
-        }
-    }
-    .await?;
-    let returned = DevelopmentExecutionReturn { handoff: &handoff };
-    match result {
-        Returned::Generative(finalization) => {
-            database
-                .finalize_development_job(returned, 1, finalization)
-                .await
-        }
-        Returned::Decision(result) => {
-            database
-                .finalize_development_decision(returned, 1, *result)
-                .await
-        }
     }
 }
 

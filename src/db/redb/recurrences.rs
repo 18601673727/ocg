@@ -24,4 +24,26 @@ impl Recurrence {
         d.end()?;
         Ok(row)
     }
+
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new(TAG_RECURRENCE);
+        match self.phase {
+            RecurrencePhase::Active => {
+                e.u8(0);
+            }
+            RecurrencePhase::WaitingDue { due } => {
+                e.u8(1);
+                e.i64(due);
+            }
+            RecurrencePhase::Halted { reason } => {
+                e.u8(2);
+                e.u8(reason.code());
+            }
+        }
+        e.u64(self.n);
+        e.u128(self.current_turn.get());
+        e.ou128(self.previous_turn.map(JobId::get));
+        e.u32(self.interval_s);
+        e.0
+    }
 }

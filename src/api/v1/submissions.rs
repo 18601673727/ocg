@@ -10,11 +10,10 @@ use serde_json::Value;
 
 use super::{DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN, Shared};
 use crate::db::entities::{
-    ConfigBody, ConfigId, ConfigRecord, ExecutionConfiguration, ExecutorId, JobExecution, JobId,
-    JobKind, ProfileId, RecordRef, RequestFingerprint, Submission, SubmissionKey, SubmissionRecord,
-    Violation,
+    ConfigId, ExecutionConfiguration, ExecutorId, JobExecution, JobId, JobKind, ProfileId,
+    RecordRef, RequestFingerprint, Submission, SubmissionKey, SubmissionRecord, Violation,
 };
-use crate::db::{AdmissionCandidate, DatabaseError, DatabaseHandle};
+use crate::db::{AdmissionCandidate, DatabaseError};
 
 pub(super) const IDEMPOTENCY_KEY: &str = "idempotency-key";
 pub(super) const MIN_KEY_CHARS: usize = 16;
@@ -622,21 +621,6 @@ async fn admit(
     admit_decision(&shared, key, generation, fingerprint, request, finish).await
 }
 
-const DECISION_PROFILE_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "decision_profile_not_found",
-    "no such Decision Profile; nothing was submitted",
-);
-const DECISION_MODEL_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "decision_model_not_found",
-    "no such Decision Model Profile; nothing was submitted",
-);
-const DECISION_MODEL_NOT_TARGETED: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
-    "decision_model_not_targeted",
-    "the Decision Profile does not select that Decision Model Profile; nothing was submitted",
-);
 const DECISION_EXECUTOR_NOT_FOUND: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "executor_not_found",
@@ -825,9 +809,6 @@ async fn admit_decision(
     request: DecisionJobRequest,
     finish: impl Fn(Outcome),
 ) {
-    if let Err(refusal) = check_decision_configuration(&shared.database, &request).await {
-        return finish(Outcome::Refused(refusal));
-    }
     let submission = Some(Submission { key, fingerprint });
     let configuration = ExecutionConfiguration {
         reasoning_effort: request.reasoning_effort,
@@ -888,104 +869,6 @@ async fn admit_decision(
         }
         Err(error) => finish(Outcome::Refused(not_admitted(&error))),
     }
-}
-
-async fn check_decision_configuration(
-    database: &DatabaseHandle,
-    request: &DecisionJobRequest,
-) -> Result<(), Refusal> {
-    let agent = match database.config(request.decision_agent.into()).await? {
-        Some(ConfigRecord {
-            body: ConfigBody::DecisionAgent(agent),
-            archived_at: None,
-            ..
-        }) => agent.models,
-        Some(ConfigRecord {
-            body: ConfigBody::Agent(agent),
-            archived_at: None,
-            ..
-        }) if agent
-            .capabilities
-            .contains(&crate::db::entities::AgentCapability::Decision) =>
-        {
-            agent.models
-        }
-        _ => return Err(DECISION_PROFILE_NOT_FOUND),
-    };
-    let (capabilities, executors) = match database.config(request.decision_model.into()).await? {
-        Some(ConfigRecord {
-            body: ConfigBody::DecisionModel(model),
-            archived_at: None,
-            ..
-        }) => {
-            if request.reasoning_effort.is_some() {
-                return Err(Refusal::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "reasoning_effort_unsupported",
-                    "native decision models do not accept generative reasoning effort",
-                ));
-            }
-            (
-                model.declared_capabilities,
-                database.decision_executors().await?,
-            )
-        }
-        Some(ConfigRecord {
-            body: ConfigBody::Model(model),
-            archived_at: None,
-            model_enabled: true,
-            ..
-        }) if model
-            .declared_capabilities
-            .contains(&crate::db::entities::ModelCapability::Chat) =>
-        {
-            if request.reasoning_effort.is_some_and(|effort| {
-                model
-                    .reasoning_efforts
-                    .as_ref()
-                    .is_some_and(|values| !values.iter().any(|value| value == effort.as_str()))
-            }) {
-                return Err(Refusal::new(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "reasoning_effort_unsupported",
-                    "the selected model does not support the requested reasoning effort",
-                ));
-            }
-            (
-                std::collections::BTreeSet::from([
-                    crate::db::entities::DecisionCapability::Choice,
-                    crate::db::entities::DecisionCapability::BinaryProbability,
-                    crate::db::entities::DecisionCapability::OrdinalScore,
-                ]),
-                database
-                    .compatible_executors(request.decision_model)
-                    .await?,
-            )
-        }
-        _ => return Err(DECISION_MODEL_NOT_FOUND),
-    };
-    if !agent.contains(&request.decision_model.into()) {
-        return Err(DECISION_MODEL_NOT_TARGETED);
-    }
-    request
-        .request
-        .validate(&capabilities)
-        .map_err(|_| INVALID_DECISION_REQUEST)?;
-    if database.executor(request.executor).await?.is_none() {
-        return Err(DECISION_EXECUTOR_NOT_FOUND);
-    }
-    if !executors.contains(&request.executor)
-        && (executors.len() < crate::db::redb::MAX_PAGE
-            || !database
-                .candidate_compatible(AdmissionCandidate::Decision(
-                    request.executor,
-                    request.decision_model,
-                ))
-                .await?)
-    {
-        return Err(DECISION_EXECUTOR_INCOMPATIBLE);
-    }
-    Ok(())
 }
 
 fn not_admitted(error: &DatabaseError) -> Refusal {
@@ -1073,7 +956,6 @@ pub(super) async fn compact(
         .and_then(Value::as_str)
         .ok_or(INVALID_ROUTE_BODY)?;
     let model = identity(model, "profile:").ok_or(INVALID_ROUTE_BODY)?;
-    refuse_native(&shared.database, conversation).await?;
     let fingerprint = RequestFingerprint::from_digest({
         let mut context = Context::new(&SHA256);
         context.update(conversation.to_string().as_bytes());
@@ -1117,22 +999,6 @@ pub(super) async fn compact(
         },
     };
     Ok(Reply::ok(envelope(serde_json::json!(wire))))
-}
-
-pub(super) async fn refuse_native(database: &DatabaseHandle, id: JobId) -> Result<(), Refusal> {
-    let turn = !matches!(
-        database.mutable_job_details(id, None).await?,
-        crate::db::redb::MutableJobDetailsLookup::NotMutable
-    );
-    if turn
-        || database
-            .mutable_conversation_turn_page(id, None, 1)
-            .await?
-            .is_some()
-    {
-        return Err(NATIVE_ACTION_UNSUPPORTED);
-    }
-    Ok(())
 }
 
 pub(super) async fn action(

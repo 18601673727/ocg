@@ -665,10 +665,7 @@ pub(super) async fn conversation_turns(
                     crate::db::entities::MutableJobContent::Generative { .. } => None,
                     crate::db::entities::MutableJobContent::Decision { request, .. } => {
                         let result = item.details.result.as_ref().and_then(|output| output.value.as_ref()).and_then(|value| value.get("decision")).cloned().map(|value| {
-                            let result: crate::db::entities::DecisionResult = serde_json::from_value(value).map_err(|_| INCONSISTENT_RECORD)?;
-                            let Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)) = &turn.job.frozen else { return Err(INCONSISTENT_RECORD) };
-                            result.validate(request, &crate::db::entities::FrozenDecisionConfig::Native(frozen.clone()), crate::db::entities::RequestRef { job: turn.job.id, request: crate::db::entities::RequestNumber::FIRST }).map_err(|_| INCONSISTENT_RECORD)?;
-                            Ok::<_, Refusal>(result)
+                            serde_json::from_value::<crate::db::entities::DecisionResult>(value).map_err(|_| INCONSISTENT_RECORD)
                         }).transpose()?;
                         if turn.outcome.as_ref().is_some_and(|outcome| outcome.kind == crate::db::entities::OutcomeKind::Completed) && result.is_none() { return Err(INCONSISTENT_RECORD); }
                         let failure = turn.outcome.as_ref().filter(|outcome| outcome.kind == crate::db::entities::OutcomeKind::Failed).and(item.details.result.as_ref()).and_then(|output| output.summary.as_deref());
@@ -1106,6 +1103,7 @@ pub(crate) enum ContextWorkView {
         reserved_requests: u32,
         source: ContextSourceView,
     },
+    #[allow(dead_code)]
     Prediction {
         job: String,
         conversation: String,
@@ -1271,25 +1269,6 @@ pub(super) async fn conversation_context(
                         through: boundary(through),
                         turn_count,
                     },
-                },
-                crate::db::redb::ContextWorkDetails::Prediction {
-                    predictor,
-                    model,
-                    binding,
-                    forecast_tokens,
-                    result,
-                } => ContextWorkView::Prediction {
-                    job: work.job.to_string(),
-                    conversation: work.conversation.to_string(),
-                    state: work.state.to_owned(),
-                    predictor: predictor.to_string(),
-                    model: model.to_string(),
-                    activity_turn: binding.activity_turn.to_string(),
-                    policy_revision: binding.policy_revision,
-                    policy: compaction_policy_view(binding.policy),
-                    max_tokens: binding.max_tokens,
-                    forecast_tokens,
-                    result: result.and_then(|result| serde_json::to_value(result).ok()),
                 },
             })
             .collect(),

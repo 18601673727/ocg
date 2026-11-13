@@ -73,10 +73,23 @@ pub(super) async fn jobs(
 
 type CursorParts = (i64, u128, u32, u32);
 
-fn cursor(text: &str) -> Result<ObservationCursor, Refusal> {
+fn decode_cursor<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, Refusal> {
     let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| INVALID_REQUEST)?;
-    let (observed, job, request, seq): CursorParts =
-        serde_json::from_slice(&bytes).map_err(|_| INVALID_REQUEST)?;
+    serde_json::from_slice(&bytes).map_err(|_| INVALID_REQUEST)
+}
+
+fn encode_cursor<T: serde::Serialize>(parts: Option<T>) -> Result<Option<String>, Refusal> {
+    parts
+        .map(|parts| {
+            serde_json::to_vec(&parts)
+                .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
+                .map_err(|_| INTERNAL)
+        })
+        .transpose()
+}
+
+fn cursor(text: &str) -> Result<ObservationCursor, Refusal> {
+    let (observed, job, request, seq): CursorParts = decode_cursor(text)?;
     Ok(ObservationCursor {
         observed_at: Timestamp::from_unix_micros(observed),
         job: JobId::new(job),
@@ -86,19 +99,14 @@ fn cursor(text: &str) -> Result<ObservationCursor, Refusal> {
 }
 
 fn next_cursor(cursor: Option<ObservationCursor>) -> Result<Option<String>, Refusal> {
-    cursor
-        .map(|cursor| {
-            let parts: CursorParts = (
-                cursor.observed_at.as_unix_micros(),
-                cursor.job.get(),
-                cursor.request.get(),
-                cursor.seq,
-            );
-            serde_json::to_vec(&parts)
-                .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-                .map_err(|_| INTERNAL)
-        })
-        .transpose()
+    encode_cursor(cursor.map(|c| {
+        (
+            c.observed_at.as_unix_micros(),
+            c.job.get(),
+            c.request.get(),
+            c.seq,
+        )
+    }))
 }
 
 #[derive(Clone)]
@@ -200,11 +208,21 @@ pub(super) async fn usage(shared: &Shared, query: ObservationQuery) -> Result<Re
 fn usage_record(record: &MetricsRecord) -> UsageObservationView {
     let measurements = &record.measurements;
     let usage = &measurements.usage;
+    let (model, provider, llm_profile) = match (&record.target, &record.decision_target) {
+        (Some(target), _) => (
+            Some(target.frozen.config.model.clone()),
+            Some(target.frozen.provider.name.clone()),
+            Some(target.llm_profile.to_string()),
+        ),
+        (None, Some(decision)) => (
+            Some(decision.model_name.clone()),
+            Some(decision.provider_name.clone()),
+            Some(decision.model.id.to_string()),
+        ),
+        (None, None) => (None, None, None),
+    };
     UsageObservationView {
-        llm_profile: record
-            .target
-            .as_ref()
-            .map(|target| target.llm_profile.to_string()),
+        llm_profile,
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_read_tokens: usage.cache_read_tokens,
@@ -230,14 +248,8 @@ fn usage_record(record: &MetricsRecord) -> UsageObservationView {
         job: record.job.to_string(),
         request: record.request.get(),
         observed_at_us: record.observed_at.as_unix_micros(),
-        model: record
-            .target
-            .as_ref()
-            .map(|target| target.frozen.config.model.clone()),
-        provider: record
-            .target
-            .as_ref()
-            .map(|target| target.frozen.provider.name.clone()),
+        model,
+        provider,
     }
 }
 
@@ -419,9 +431,7 @@ pub(super) fn usage_summary_query(
 }
 
 fn usage_cursor(text: &str) -> Result<UsageCursor, Refusal> {
-    let bytes = URL_SAFE_NO_PAD.decode(text).map_err(|_| INVALID_REQUEST)?;
-    let (hour, agent, provider, model_hash): (i64, u128, u128, [u8; 32]) =
-        serde_json::from_slice(&bytes).map_err(|_| INVALID_REQUEST)?;
+    let (hour, agent, provider, model_hash) = decode_cursor(text)?;
     Ok(UsageCursor {
         hour,
         agent,
@@ -431,18 +441,7 @@ fn usage_cursor(text: &str) -> Result<UsageCursor, Refusal> {
 }
 
 fn usage_next_cursor(cursor: Option<UsageCursor>) -> Result<Option<String>, Refusal> {
-    cursor
-        .map(|cursor| {
-            serde_json::to_vec(&(
-                cursor.hour,
-                cursor.agent,
-                cursor.provider,
-                cursor.model_hash,
-            ))
-            .map(|bytes| URL_SAFE_NO_PAD.encode(bytes))
-            .map_err(|_| INVALID_REQUEST)
-        })
-        .transpose()
+    encode_cursor(cursor.map(|c| (c.hour, c.agent, c.provider, c.model_hash)))
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -753,10 +752,11 @@ pub(super) async fn changed_observation(
             let Some(record) = records.first().filter(|record| record.id == id) else {
                 return Ok(None);
             };
-            Ok(record
-                .target
-                .as_ref()
-                .map(|_| serde_json::json!(usage_record(record))))
+            if record.target.is_some() || record.decision_target.is_some() {
+                Ok(Some(serde_json::json!(usage_record(record))))
+            } else {
+                Ok(None)
+            }
         }
         ObservationChange::Availability(job, id) => {
             let Some(previous) = id.get().checked_sub(1) else {

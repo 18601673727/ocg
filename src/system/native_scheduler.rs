@@ -22,9 +22,8 @@ use crate::system::executor::execution_runtime::{
     supervise_development_generative,
 };
 use crate::system::executor::native_tools::NativeTooling;
+use crate::system::external_approval::MAX_TIMEOUT_CEILING;
 use crate::system::loopback_activation::ArmedActivation;
-use crate::system::manual_execution::within_deadline;
-use crate::system::manual_loopback::{MAX_TIMEOUT_CEILING, check_prepared_native};
 use crate::system::scheduler::{DispatchBatch, Scheduler};
 
 const EXECUTOR_PAGE: usize = 100;
@@ -289,7 +288,6 @@ pub(crate) async fn run_with(
 pub(crate) enum ExecutorPass {
     Reserved(Box<PoolAllocation>),
     Nothing,
-    GlobalLimit,
     BudgetSpent,
     IndexExhausted,
     Halted,
@@ -395,6 +393,7 @@ impl NativeScheduler {
                 next_due: None,
             });
         }
+        let recurrence_due = self.database.claim_due_recurrences(16).await?;
         let discovery = self.discovery.get();
         let mut executors = Vec::new();
         let mut before = discovery.next;
@@ -432,7 +431,6 @@ impl NativeScheduler {
             executors.rotate_left(start);
         }
         let mut rotating = false;
-        let mut global_limit = false;
         for (pool, executor) in executors {
             if self.halted.get() || self.shutdown.is_cancelled() {
                 break;
@@ -441,26 +439,21 @@ impl NativeScheduler {
                 ExecutorPass::Reserved(allocation) => grants.push(*allocation),
                 ExecutorPass::Nothing => {}
                 ExecutorPass::BudgetSpent => rotating = true,
-                ExecutorPass::GlobalLimit => {
-                    global_limit = true;
-                    break;
-                }
                 ExecutorPass::IndexExhausted | ExecutorPass::Halted => break,
             }
         }
-        let discovery = if global_limit && grants.is_empty() {
-            discovery
-        } else {
-            discovery.advanced(reached)
-        };
+        let discovery = discovery.advanced(reached);
         self.discovery.set(discovery);
-        if reached.is_none() || (global_limit && grants.is_empty()) {
+        if reached.is_none() {
             self.turns.set(turn.wrapping_add(1));
         }
-        let next_due = ((rotating && self.resume.get().is_some() || discovery.sweep.is_some())
-            && !global_limit
+        let dispatch_due = ((rotating && self.resume.get().is_some() || discovery.sweep.is_some())
             && !self.halted.get())
         .then_some(Duration::ZERO);
+        let next_due = match (dispatch_due, recurrence_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         Ok(DispatchBatch { grants, next_due })
     }
 
@@ -479,15 +472,11 @@ impl NativeScheduler {
                 after = Some(resume);
             }
             let fresh = DevelopmentFreshReservation::new(pool, executor, after);
-            let passed = match self
+            let passed = self
                 .database
                 .reserve_scheduled_job(fresh, scheduled_policy, scheduled_decision_policy)
                 .await
-            {
-                Ok(ScheduledReservation::GlobalLimitReached) => return ExecutorPass::GlobalLimit,
-                Ok(ScheduledReservation::Pass(passed)) => Ok(*passed),
-                Err(error) => Err(error),
-            };
+                .map(|ScheduledReservation::Pass(passed)| *passed);
             match passed {
                 Ok(DevelopmentReservation::Reserved(allocation)) => {
                     if allocation.token.executor != executor || allocation.token.pool != pool {
@@ -589,10 +578,20 @@ impl Dispatched {
     }
 
     fn log(&self) {
-        let phase = self
-            .allocation_phase
-            .map_or("unknown", crate::system::manual_execution::phase_name);
-        let outcome = crate::system::manual_execution::outcome_name(self.outcome);
+        let phase = self.allocation_phase.map_or("unknown", |p| match p {
+            AllocationPhase::Reserved => "reserved",
+            AllocationPhase::Running => "running",
+            AllocationPhase::StopRequested => "stop_requested",
+            AllocationPhase::Uncertain => "uncertain",
+            AllocationPhase::Released => "released",
+        });
+        let outcome = match self.outcome {
+            None => "none",
+            Some(OutcomeKind::Completed) => "completed",
+            Some(OutcomeKind::Failed) => "failed",
+            Some(OutcomeKind::Cancelled) => "cancelled",
+            Some(OutcomeKind::Unknown) => "unknown",
+        };
         let started = if self.started {
             "started"
         } else {
@@ -611,6 +610,72 @@ impl Dispatched {
             ),
         }
     }
+}
+
+fn check_prepared_native(
+    prepared: &crate::db::PreparedDevelopmentHandoff,
+) -> Result<(), &'static str> {
+    if let Some(decision) = prepared.decision_configuration() {
+        let endpoint = match decision {
+            crate::db::entities::FrozenDecisionConfig::Native(native) => native.endpoint.as_deref(),
+            crate::db::entities::FrozenDecisionConfig::Generative(generative, _) => {
+                generative.llm.provider.endpoint.as_deref()
+            }
+        };
+        if !endpoint.is_some_and(crate::system::http::direct_diagnostic_loopback) {
+            return Err("endpoint_not_loopback");
+        }
+        return Ok(());
+    }
+    let Some(frozen) = prepared.generative_configuration() else {
+        return Err("generative_required");
+    };
+    let refusal = if prepared.is_summary_producer() {
+        frozen.provider_refusal()
+    } else {
+        frozen.native_execution_refusal()
+    };
+    if refusal.is_some() {
+        return Err("not_single_request_generative");
+    }
+    if !frozen
+        .llm
+        .provider
+        .endpoint
+        .as_deref()
+        .is_some_and(crate::system::http::direct_diagnostic_loopback)
+    {
+        return Err("endpoint_not_loopback");
+    }
+    let request = prepared.request();
+    if request.get("tool_choice").is_some()
+        || request.get("stream") != Some(&serde_json::Value::Bool(true))
+    {
+        return Err("request_not_tool_free_stream");
+    }
+    Ok(())
+}
+
+async fn within_deadline<F: std::future::Future>(
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    exchange: F,
+) -> F::Output {
+    let done = CancellationToken::default();
+    let timer = ntex::rt::spawn({
+        let cancellation = cancellation.clone();
+        let done = done.clone();
+        async move {
+            use ntex::util::{Either, select};
+            if let Either::Right(()) = select(done.cancelled(), ntex::time::sleep(timeout)).await {
+                cancellation.cancel();
+            }
+        }
+    });
+    let output = exchange.await;
+    done.cancel();
+    drop(timer);
+    output
 }
 
 pub(crate) async fn dispatch(
@@ -689,7 +754,9 @@ pub(crate) async fn dispatch(
                     cancellation,
                     &config,
                     EndpointPolicy::ScheduledExternal(&grant),
-                    None,
+                    workspace_tools
+                        .filter(|_| allocation.operation == ExecutionOperation::LlmRequest)
+                        .map(WorkspaceTools::data_directory),
                     stops,
                     guard,
                 )
@@ -743,13 +810,19 @@ async fn start_and_exchange(
         Ok(handoff) => {
             let tools = tooling.into_execution();
             let exchange = within_deadline(cancellation, DISPATCH_TIMEOUT, async {
-                match operation {
-                    ExecutionOperation::LlmRequest => {
-                        supervise_development_generative(database, handoff, config, policy, tools)
+                if handoff.decision_inputs().is_some() {
+                    supervise_development_decision(database, handoff, config, policy).await
+                } else {
+                    match operation {
+                        ExecutionOperation::LlmRequest => {
+                            supervise_development_generative(
+                                database, handoff, config, policy, tools,
+                            )
                             .await
-                    }
-                    ExecutionOperation::Decision => {
-                        supervise_development_decision(database, handoff, config, policy).await
+                        }
+                        ExecutionOperation::Decision => {
+                            supervise_development_decision(database, handoff, config, policy).await
+                        }
                     }
                 }
             })

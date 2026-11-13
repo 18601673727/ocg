@@ -1,15 +1,9 @@
 use std::time::Duration;
 
-use crate::db::entities::{FrozenExecutionConfig, LlmTransport, MutableFrozenConfiguration};
-use crate::db::{DatabaseHandle, DevelopmentPreviewError};
+use crate::db::entities::{FrozenExecutionConfig, LlmTransport};
 use crate::service::ai::providers::{
     ApprovedRoute, CancellationToken, DestinationPolicy, ExternalAuthority, LoopbackProxy,
     ProviderExecutionConfig,
-};
-use crate::system::execution_controls::ExecutionControl;
-use crate::system::manual_execution::{
-    ExecutionReport, Stop, Target, checked_start, read_submitted_job, report,
-    require_free_executor, reserve_named_job, within_deadline,
 };
 
 pub(crate) const MAX_REQUEST_BYTES_CEILING: usize = 1 << 20;
@@ -28,15 +22,6 @@ pub(crate) fn refuse(code: &'static str, detail: impl Into<String>) -> ApprovalR
     ApprovalRefusal {
         code,
         detail: detail.into(),
-    }
-}
-
-impl From<ApprovalRefusal> for Stop {
-    fn from(refusal: ApprovalRefusal) -> Self {
-        Stop::Refused {
-            code: refusal.code,
-            detail: refusal.detail,
-        }
     }
 }
 
@@ -260,41 +245,6 @@ fn approved_credential_ref(credential_ref: &str) -> Result<String, ApprovalRefus
 }
 
 impl ExternalApproval {
-    pub(crate) fn trial(
-        endpoint: &str,
-        credential_ref: &str,
-        limits: ApprovalLimits,
-    ) -> Result<Self, ApprovalRefusal> {
-        let credential_ref = approved_credential_ref(credential_ref)?;
-        Ok(Self {
-            authority: ExternalAuthority::ManualExternalTrial,
-            endpoint: ApprovedEndpoint::parse(endpoint)?,
-            credential_ref,
-            limits,
-            route: ApprovedRoute::Direct,
-            model: None,
-        })
-    }
-
-    pub(crate) fn manual_execution(
-        endpoint: &str,
-        credential_ref: &str,
-        model: &str,
-        proxy: LoopbackProxy,
-        limits: ApprovalLimits,
-    ) -> Result<Self, ApprovalRefusal> {
-        let credential_ref = approved_credential_ref(credential_ref)?;
-        valid_model_id(model)?;
-        Ok(Self {
-            authority: ExternalAuthority::ManualExternalExecution,
-            endpoint: ApprovedEndpoint::parse(endpoint)?,
-            credential_ref,
-            limits,
-            route: ApprovedRoute::TrustedProxy(proxy),
-            model: Some(model.to_owned()),
-        })
-    }
-
     pub(crate) fn scheduled_external(
         endpoint: &str,
         credential_ref: &str,
@@ -312,33 +262,6 @@ impl ExternalApproval {
             route: ApprovedRoute::TrustedProxy(proxy),
             model: Some(model.to_owned()),
         })
-    }
-
-    pub(crate) fn with_trusted_proxy(mut self, proxy: LoopbackProxy) -> Self {
-        self.route = ApprovedRoute::TrustedProxy(proxy);
-        self
-    }
-
-    pub(crate) fn with_model(mut self, model: &str) -> Result<Self, ApprovalRefusal> {
-        valid_model_id(model)?;
-        self.model = Some(model.to_owned());
-        Ok(self)
-    }
-
-    pub(crate) fn authority(&self) -> ExternalAuthority {
-        self.authority
-    }
-
-    pub(crate) fn route(&self) -> &ApprovedRoute {
-        &self.route
-    }
-
-    pub(crate) fn destination_text(&self) -> String {
-        if self.endpoint.host().contains(':') {
-            format!("[{}]:{}", self.endpoint.host(), self.endpoint.port())
-        } else {
-            format!("{}:{}", self.endpoint.host(), self.endpoint.port())
-        }
     }
 
     pub(crate) fn limits(&self) -> ApprovalLimits {
@@ -397,41 +320,6 @@ impl ExternalApproval {
         }
     }
 
-    pub(crate) async fn check_destination(&self) -> Result<(), ApprovalRefusal> {
-        use crate::system::http::{DestinationFault, check_direct_destination};
-        match &self.route {
-            ApprovedRoute::TrustedProxy(proxy) => probe_proxy(*proxy).await,
-            ApprovedRoute::Direct => {
-                match check_direct_destination(self.endpoint.host(), self.endpoint.port()).await {
-                    Ok(_) => Ok(()),
-                    Err(DestinationFault::Unresolvable) => Err(refuse(
-                        "destination_unresolvable",
-                        "the approved host does not resolve from this machine; nothing was reserved or sent",
-                    )),
-                    Err(DestinationFault::NonPublic) => Err(refuse(
-                        "destination_not_public",
-                        "the approved host resolves to an address that is not public; nothing was reserved or sent",
-                    )),
-                }
-            }
-        }
-    }
-
-    pub(crate) fn check_frozen(
-        &self,
-        frozen: &MutableFrozenConfiguration,
-    ) -> Result<(), ApprovalRefusal> {
-        match frozen {
-            MutableFrozenConfiguration::Generative(configuration) => {
-                self.check_generative(configuration)
-            }
-            MutableFrozenConfiguration::Decision(_) => Err(refuse(
-                "decision_not_supported",
-                "one Generative request is run here; a Decision has no bound on its output",
-            )),
-        }
-    }
-
     fn check_generative(&self, frozen: &FrozenExecutionConfig) -> Result<(), ApprovalRefusal> {
         let provider = &frozen.llm.provider;
         if provider.transport != LlmTransport::OpenAiChatCompletions {
@@ -472,7 +360,12 @@ impl ExternalApproval {
                 "the Job's frozen model is not the model approved for this invocation",
             ));
         }
-        if let Some(reason) = frozen.single_request_refusal() {
+        let refusal = if self.authority == ExternalAuthority::ScheduledExternalTransport {
+            frozen.native_execution_refusal()
+        } else {
+            frozen.single_request_refusal()
+        };
+        if let Some(reason) = refusal {
             return Err(refuse("not_single_request_generative", reason));
         }
         let parameters = &frozen.llm.config.parameters;
@@ -507,7 +400,15 @@ impl ExternalApproval {
                 "a Generative Job is required",
             ));
         };
-        self.check_generative(frozen)?;
+        if prepared.is_summary_producer()
+            && self.authority == ExternalAuthority::ScheduledExternalTransport
+        {
+            if let Some(reason) = frozen.provider_refusal() {
+                return Err(refuse("not_single_request_generative", reason));
+            }
+        } else {
+            self.check_generative(frozen)?;
+        }
         if prepared.credential_references() != [self.credential_ref.as_str()] {
             return Err(refuse(
                 "credential_not_approved",
@@ -559,114 +460,4 @@ impl ExternalApproval {
         }
         Ok(())
     }
-}
-
-pub(crate) async fn run_approved_external(
-    database: &DatabaseHandle,
-    target: Target,
-    approval: &ExternalApproval,
-    cancellation: CancellationToken,
-) -> Result<ExecutionReport, Stop> {
-    use crate::system::executor::execution_runtime::{
-        EndpointPolicy, supervise_development_generative,
-    };
-    approval.authorized()?;
-
-    let record = read_submitted_job(database, target.job).await?;
-    if let Some(frozen) = record.job.frozen.as_ref() {
-        approval.check_frozen(frozen)?;
-    }
-    require_free_executor(database, target.executor).await?;
-
-    approval.check_destination().await?;
-    let refusal = std::cell::RefCell::new(None);
-    match database
-        .preview_development_handoff(target.job, target.pool, target.executor, |prepared| {
-            approval.check_prepared(prepared).map_err(|refusal_found| {
-                let code = refusal_found.code;
-                *refusal.borrow_mut() = Some(refusal_found);
-                code
-            })
-        })
-        .await
-    {
-        Ok(()) => {}
-        Err(DevelopmentPreviewError::Refused(code)) => {
-            return Err(refusal
-                .into_inner()
-                .unwrap_or_else(|| {
-                    refuse(code, "the prepared request is not covered by the approval")
-                })
-                .into());
-        }
-        Err(DevelopmentPreviewError::Unavailable(error)) => {
-            return Err(refuse(
-                "preflight_unavailable",
-                format!(
-                    "the request could not be prepared; nothing was reserved or sent, and the Job is unchanged ({error})"
-                ),
-            )
-            .into());
-        }
-    }
-
-    let allocation = reserve_named_job(database, target).await?;
-
-    let handoff = checked_start(database, allocation.token, |prepared| {
-        approval
-            .check_prepared(prepared)
-            .map_err(|refusal| refusal.code)
-    })
-    .await?;
-    let config = approval.provider_config(cancellation.clone());
-    let exchange = within_deadline(
-        &cancellation,
-        approval.limits().timeout,
-        supervise_development_generative(
-            database,
-            handoff,
-            &config,
-            EndpointPolicy::ApprovedExternal(approval),
-            None,
-        ),
-    )
-    .await;
-
-    report(database, target.job, &exchange).await
-}
-
-async fn probe_proxy(proxy: LoopbackProxy) -> Result<(), ApprovalRefusal> {
-    let address = proxy.address();
-    let reachable = ntex::rt::spawn_blocking(move || {
-        std::net::TcpStream::connect_timeout(&address, Duration::from_secs(2)).is_ok()
-    })
-    .await
-    .unwrap_or(false);
-    if reachable {
-        Ok(())
-    } else {
-        Err(refuse(
-            "proxy_unreachable",
-            format!(
-                "nothing accepts connections at the trusted proxy {address}; nothing was reserved or sent"
-            ),
-        ))
-    }
-}
-
-pub(crate) fn require_authority(
-    approval: &ExternalApproval,
-    control: ExecutionControl,
-) -> Result<(), ApprovalRefusal> {
-    if approval.authority().control() != control {
-        return Err(refuse(
-            "authority_mismatch",
-            format!(
-                "the approval was formed under {}, not {}",
-                approval.authority().name(),
-                control.name()
-            ),
-        ));
-    }
-    Ok(())
 }

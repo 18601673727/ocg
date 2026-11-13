@@ -10,93 +10,6 @@ use crate::db::entities::{
     TokenAnnotation,
 };
 
-#[derive(Clone, Debug)]
-#[allow(dead_code)]
-pub(crate) struct DecisionAvailabilityRecord {
-    pub id: AvailabilityStatId,
-    pub job: JobId,
-    pub executor: ExecutorId,
-    pub pool: ExecutionPoolId,
-    pub provider: ConfigRef,
-    pub model: ConfigRef,
-    pub model_name: String,
-    pub request: RequestNumber,
-    pub observed_at: Timestamp,
-    pub recorded_at: Timestamp,
-    pub observation: AvailabilityObservation,
-}
-
-pub(crate) fn read_decision_availability(
-    database: &Database,
-    job: JobId,
-    after: Option<AvailabilityStatId>,
-    limit: usize,
-) -> Result<Vec<DecisionAvailabilityRecord>, StorageError> {
-    let rx = read(database)?;
-    let jobs = rx.open_table(JOBS)?;
-    let bytes = jobs
-        .get(job.get())?
-        .ok_or_else(|| StorageError::corrupted("Decision Job missing"))?;
-    let row = transactions::decode_mutable_job(job.get(), bytes.value())?;
-    let Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)) = row.frozen else {
-        return Err(StorageError::corrupted(
-            "native Decision configuration required",
-        ));
-    };
-    let allocations = rx.open_table(POOL_ALLOCATIONS)?;
-    let allocation = allocations
-        .get(job.get())?
-        .ok_or_else(|| StorageError::corrupted("Decision Allocation missing"))?;
-    let allocation = transactions::decode_pool_allocation(job.get(), allocation.value())?;
-    let events = rx.open_table(REQUEST_EVENTS)?;
-    let index = rx.open_table(JOB_OBSERVATIONS)?;
-    let mut records = Vec::new();
-    for entry in index
-        .range((
-            Bound::Excluded((job.get(), 2, after.map_or(0, AvailabilityStatId::get))),
-            Bound::Included((job.get(), 2, u128::MAX)),
-        ))?
-        .take(limit.min(MAX_PAGE))
-    {
-        let (_, position) = entry?;
-        let (request, seq) = position.value();
-        let request = RequestNumber::new(request)
-            .ok_or_else(|| StorageError::corrupted("invalid observation request"))?;
-        let event = event_at_key(&events, job, request, seq)?
-            .ok_or_else(|| StorageError::corrupted("observation event missing"))?;
-        let RequestPayload::Availability {
-            status_code,
-            finish_reason,
-            raw_finish_reason,
-            failure,
-        } = event.payload
-        else {
-            return Err(StorageError::corrupted(
-                "invalid Decision availability index",
-            ));
-        };
-        records.push(DecisionAvailabilityRecord {
-            id: AvailabilityStatId::new(event.id.get()),
-            job,
-            executor: allocation.token.executor,
-            pool: allocation.token.pool,
-            provider: frozen.connection_ref,
-            model: frozen.model_ref,
-            model_name: frozen.model.model.clone(),
-            request,
-            observed_at: event.observed_at,
-            recorded_at: event.recorded_at,
-            observation: AvailabilityObservation {
-                status_code,
-                finish_reason,
-                raw_finish_reason,
-                failure,
-            },
-        });
-    }
-    Ok(records)
-}
-
 #[derive(Clone)]
 enum ObservationTarget {
     Llm(Box<LlmTarget>),
@@ -115,23 +28,38 @@ fn frozen_decision_target(
         return Ok(None);
     }
     let row = transactions::decode_mutable_job(job.get(), bytes.value())?;
-    let Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)) = row.frozen else {
-        return Ok(None);
+    let (provider, model, model_name) = match (row.frozen, &row.input.content) {
+        (
+            Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)),
+            crate::db::entities::MutableJobContent::Decision { .. },
+        ) => (frozen.connection_ref, frozen.model_ref, frozen.model.model),
+        (
+            Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)),
+            crate::db::entities::MutableJobContent::Decision { .. },
+        ) => (
+            ConfigRef {
+                id: frozen.llm.provider.id.into(),
+                edit_seq: frozen.llm.provider.edit_seq,
+            },
+            frozen.llm.model,
+            frozen.llm.config.model,
+        ),
+        _ => return Ok(None),
     };
     let configs = rx.open_table(CONFIGS)?;
     let provider_name = configs
-        .get(frozen.connection_ref.id.get())?
+        .get(provider.id.get())?
         .and_then(|bytes| {
-            ConfigRow::scan_at(frozen.connection_ref.id.get(), bytes.value())
+            ConfigRow::scan_at(provider.id.get(), bytes.value())
                 .ok()
                 .flatten()
         })
         .map(|row| row.name)
-        .unwrap_or_else(|| frozen.connection_ref.id.to_string());
+        .unwrap_or_else(|| provider.id.to_string());
     Ok(Some(DecisionTarget {
-        provider: frozen.connection_ref,
-        model: frozen.model_ref,
-        model_name: frozen.model.model,
+        provider,
+        model,
+        model_name,
         provider_name,
     }))
 }
@@ -226,6 +154,23 @@ pub(super) fn observation_kind(
     }
 }
 
+fn metric_record_with_target(
+    table: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
+    target: Option<&ObservationTarget>,
+    event: &RequestEventRecord,
+) -> Result<Option<MetricsRecord>, StorageError> {
+    let (llm_target, decision_target) = match target {
+        Some(ObservationTarget::Llm(llm)) => (Some(llm.as_ref()), None),
+        Some(ObservationTarget::Decision(decision)) => (None, Some(decision)),
+        None => (None, None),
+    };
+    let mut record = metric_record(table, llm_target, event)?;
+    if let Some(record) = &mut record {
+        record.decision_target = decision_target.cloned();
+    }
+    Ok(record)
+}
+
 pub(super) fn metric_record(
     table: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
     target: Option<&LlmTarget>,
@@ -282,6 +227,7 @@ pub(super) fn metric_record(
         job: event.job_id,
         request: event.request,
         target: target.cloned(),
+        decision_target: None,
         observed_at: event.observed_at,
         measurements,
         token,
@@ -326,21 +272,27 @@ fn availability_of(
     })
 }
 
-pub(crate) fn read_job_metrics(
+fn read_job_observations<T>(
     database: &Database,
     job: JobId,
-    after: Option<MetricsId>,
+    kind: u8,
+    after: u128,
     limit: usize,
-) -> Result<Vec<MetricsRecord>, StorageError> {
+    mut build: impl FnMut(
+        &redb::ReadOnlyTable<(u128, u32, u32), &'static [u8]>,
+        Option<&ObservationTarget>,
+        RequestEventRecord,
+    ) -> Result<T, StorageError>,
+) -> Result<Vec<T>, StorageError> {
     let rx = read(database)?;
-    let target = frozen_llm_target(&rx, job)?;
+    let target = frozen_observation_target(&rx, job)?;
     let events = rx.open_table(REQUEST_EVENTS)?;
     let index = rx.open_table(JOB_OBSERVATIONS)?;
     let mut records = Vec::new();
     for entry in index
         .range((
-            Bound::Excluded((job.get(), 1, after.map_or(0, MetricsId::get))),
-            Bound::Included((job.get(), 1, u128::MAX)),
+            Bound::Excluded((job.get(), kind, after)),
+            Bound::Included((job.get(), kind, u128::MAX)),
         ))?
         .take(limit.min(MAX_PAGE))
     {
@@ -350,12 +302,28 @@ pub(crate) fn read_job_metrics(
             .ok_or_else(|| StorageError::corrupted("invalid observation request"))?;
         let event = event_at_key(&events, job, request, seq)?
             .ok_or_else(|| StorageError::corrupted("observation event missing"))?;
-        records.push(
-            metric_record(&events, target.as_ref(), &event)?
-                .ok_or_else(|| StorageError::corrupted("invalid metrics index"))?,
-        );
+        records.push(build(&events, target.as_ref(), event)?);
     }
     Ok(records)
+}
+
+pub(crate) fn read_job_metrics(
+    database: &Database,
+    job: JobId,
+    after: Option<MetricsId>,
+    limit: usize,
+) -> Result<Vec<MetricsRecord>, StorageError> {
+    read_job_observations(
+        database,
+        job,
+        1,
+        after.map_or(0, MetricsId::get),
+        limit,
+        |events, target, event| {
+            metric_record_with_target(events, target, &event)?
+                .ok_or_else(|| StorageError::corrupted("invalid metrics index"))
+        },
+    )
 }
 
 pub(crate) fn read_job_availability(
@@ -364,32 +332,20 @@ pub(crate) fn read_job_availability(
     after: Option<AvailabilityStatId>,
     limit: usize,
 ) -> Result<Vec<AvailabilityStatRecord>, StorageError> {
-    let rx = read(database)?;
-    let Some(target) = frozen_observation_target(&rx, job)? else {
-        return Ok(Vec::new());
-    };
-    let events = rx.open_table(REQUEST_EVENTS)?;
-    let index = rx.open_table(JOB_OBSERVATIONS)?;
-    let mut records = Vec::new();
-    for entry in index
-        .range((
-            Bound::Excluded((job.get(), 2, after.map_or(0, AvailabilityStatId::get))),
-            Bound::Included((job.get(), 2, u128::MAX)),
-        ))?
-        .take(limit.min(MAX_PAGE))
-    {
-        let (_, position) = entry?;
-        let (request, seq) = position.value();
-        let request = RequestNumber::new(request)
-            .ok_or_else(|| StorageError::corrupted("invalid observation request"))?;
-        let event = event_at_key(&events, job, request, seq)?
-            .ok_or_else(|| StorageError::corrupted("observation event missing"))?;
-        records.push(
-            availability_of(job, target.clone(), event)
-                .ok_or_else(|| StorageError::corrupted("invalid availability index"))?,
-        );
-    }
-    Ok(records)
+    read_job_observations(
+        database,
+        job,
+        2,
+        after.map_or(0, AvailabilityStatId::get),
+        limit,
+        |_, target, event| {
+            let target = target
+                .cloned()
+                .ok_or_else(|| StorageError::corrupted("invalid availability index"))?;
+            availability_of(job, target, event)
+                .ok_or_else(|| StorageError::corrupted("invalid availability index"))
+        },
+    )
 }
 
 fn cursor_key(cursor: &ObservationCursor) -> RequestTimelineKey {
@@ -445,27 +401,39 @@ fn target_matches(
     rx: &ReadTransaction,
     filter: &ObservationFilter,
     job: JobId,
-    cache: &mut HashMap<JobId, Option<LlmTarget>>,
-) -> Result<Option<LlmTarget>, StorageError> {
+    cache: &mut HashMap<JobId, Option<ObservationTarget>>,
+) -> Result<Option<ObservationTarget>, StorageError> {
     let target = match cache.get(&job) {
         Some(target) => target.clone(),
         None => {
-            let target = frozen_llm_target(rx, job)?;
+            let target = frozen_observation_target(rx, job)?;
             cache.insert(job, target.clone());
             target
         }
     };
-    Ok(target.filter(|target| {
-        filter
-            .llm_profile
-            .is_none_or(|profile| profile == target.llm_profile)
-            && filter
-                .provider
-                .is_none_or(|provider| provider == target.frozen.provider.id)
-            && filter
-                .model
-                .as_deref()
-                .is_none_or(|model| model == target.frozen.config.model)
+    Ok(target.filter(|target| match target {
+        ObservationTarget::Llm(target) => {
+            filter
+                .llm_profile
+                .is_none_or(|profile| profile == target.llm_profile)
+                && filter
+                    .provider
+                    .is_none_or(|provider| provider == target.frozen.provider.id)
+                && filter
+                    .model
+                    .as_deref()
+                    .is_none_or(|model| model == target.frozen.config.model)
+        }
+        ObservationTarget::Decision(decision) => {
+            filter.llm_profile.is_none()
+                && filter
+                    .provider
+                    .is_none_or(|provider| provider == decision.provider.id.into())
+                && filter
+                    .model
+                    .as_deref()
+                    .is_none_or(|model| model == decision.model_name)
+        }
     }))
 }
 
@@ -505,7 +473,7 @@ fn read_observation_page<T>(
     mut project: impl FnMut(
         &ReadTransaction,
         JobId,
-        LlmTarget,
+        ObservationTarget,
         RequestEventRecord,
     ) -> Result<Option<T>, StorageError>,
 ) -> Result<ObservationPage<T>, StorageError> {
@@ -545,6 +513,9 @@ pub(crate) fn read_metrics(
         limit,
         max_scan,
         |rx, _, target, event| {
+            let ObservationTarget::Llm(target) = target else {
+                return Ok(None);
+            };
             if !matches!(
                 event.payload,
                 RequestPayload::Measurement { .. } | RequestPayload::Token { .. }
@@ -556,46 +527,6 @@ pub(crate) fn read_metrics(
     )
 }
 
-fn availability_target_matches(
-    rx: &ReadTransaction,
-    filter: &ObservationFilter,
-    job: JobId,
-    cache: &mut HashMap<JobId, Option<ObservationTarget>>,
-) -> Result<Option<ObservationTarget>, StorageError> {
-    let target = match cache.get(&job) {
-        Some(target) => target.clone(),
-        None => {
-            let target = frozen_observation_target(rx, job)?;
-            cache.insert(job, target.clone());
-            target
-        }
-    };
-    Ok(target.filter(|target| match target {
-        ObservationTarget::Llm(target) => {
-            filter
-                .llm_profile
-                .is_none_or(|profile| profile == target.llm_profile)
-                && filter
-                    .provider
-                    .is_none_or(|provider| provider == target.frozen.provider.id)
-                && filter
-                    .model
-                    .as_deref()
-                    .is_none_or(|model| model == target.frozen.config.model)
-        }
-        ObservationTarget::Decision(decision) => {
-            filter.llm_profile.is_none()
-                && filter
-                    .provider
-                    .is_none_or(|provider| provider == decision.provider.id.into())
-                && filter
-                    .model
-                    .as_deref()
-                    .is_none_or(|model| model == decision.model_name)
-        }
-    }))
-}
-
 pub(crate) fn read_availability_stats(
     database: &Database,
     filter: &ObservationFilter,
@@ -603,26 +534,14 @@ pub(crate) fn read_availability_stats(
     limit: usize,
     max_scan: usize,
 ) -> Result<ObservationPage<AvailabilityStatRecord>, StorageError> {
-    let rx = read(database)?;
-    let limit = limit.clamp(1, MAX_PAGE);
-    let mut cache = HashMap::new();
-    let mut records = Vec::new();
-    let stopped = walk_timeline(&rx, filter, cursor.as_ref(), max_scan, |key| {
-        let job = JobId::new(key.1);
-        let Some(target) = availability_target_matches(&rx, filter, job, &mut cache)? else {
-            return Ok(true);
-        };
-        if let Some(event) = event_at_timeline(&rx, key)?
-            && let Some(record) = availability_of(job, target, event)
-        {
-            records.push(record);
-        }
-        Ok(records.len() < limit)
-    })?;
-    Ok(ObservationPage {
-        records,
-        next: stopped.map(key_cursor),
-    })
+    read_observation_page(
+        database,
+        filter,
+        cursor,
+        limit,
+        max_scan,
+        |_, job, target, event| Ok(availability_of(job, target, event)),
+    )
 }
 
 pub(crate) struct ProviderResponse {

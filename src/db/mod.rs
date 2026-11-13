@@ -20,13 +20,12 @@ pub use crate::db::attachments::{
 };
 use crate::db::entities::{Actor, Appended, Entry, ExecutionConfiguration, JobAction, JobGroup};
 use crate::db::entities::{
-    AppendedOutput, Attachment, AttachmentId, AttachmentOrigin, AttachmentRecord, AvailabilityStat,
-    AvailabilityStatId, AvailabilityStatRecord, CleanupKind, Config, ConfigBody, ConfigId,
-    ConfigKind, ConfigRecord, ContentDigest, ExecutionPool, ExecutionPoolConfig, ExecutionPoolId,
-    ExecutionPoolRecord, Executor, ExecutorId, Job, JobEdit, JobFinalization, JobId, JobInputId,
-    JobOutput, JobOutputRecord, JobRecord, Metrics, MetricsId, MetricsRecord, ObservationCursor,
-    ObservationFilter, ObservationPage, OperationId, OperationKind, Project, ProjectCommand,
-    ProjectId, ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber, SentRequest,
+    AppendedOutput, Attachment, AttachmentId, AttachmentOrigin, AttachmentRecord,
+    AvailabilityStatId, AvailabilityStatRecord, Config, ConfigBody, ConfigId, ConfigKind,
+    ConfigRecord, ContentDigest, ExecutionPoolId, ExecutorId, JobEdit, JobFinalization, JobId,
+    JobInputId, JobOutput, JobOutputRecord, JobRecord, Metrics, MetricsId, MetricsRecord,
+    ObservationCursor, ObservationFilter, ObservationPage, OperationId, OperationKind, Project,
+    ProjectCommand, ProjectId, ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber,
     Submission, SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord,
     ToolOutcome, Violation,
 };
@@ -36,9 +35,9 @@ use crate::db::redb::{BatchFailure, Commit, CompactFailure, OpenedFile, Probe};
 pub use crate::db::redb::{StorageError, StorageErrorKind};
 use crate::system::data_directory::DataDirectory;
 use crate::system::monitor::{
-    self, DiskProtectionStatus, FilesystemConfig, FilesystemConfigError, ProtectedArea,
-    ProtectionCell, ProtectionLock, ProtectionReason, ProtectionWatch, RecoveryError,
-    RecoveryReport, ReopenFailure, SharedRequest, SpaceMeasurement, SpaceShortage,
+    self, FilesystemConfig, FilesystemConfigError, ProtectedArea, ProtectionCell, ProtectionLock,
+    ProtectionReason, ProtectionWatch, RecoveryError, RecoveryReport, ReopenFailure, SharedRequest,
+    SpaceMeasurement, SpaceShortage,
 };
 use crate::system::policy::{SystemPolicy, SystemPolicyError};
 
@@ -64,31 +63,6 @@ pub(crate) enum DevelopmentReservationError {
 #[derive(Debug)]
 pub(crate) enum ScheduledReservation {
     Pass(Box<entities::DevelopmentReservation>),
-    GlobalLimitReached,
-}
-
-#[allow(dead_code)]
-pub(crate) async fn reconcile_development_reservation_offline(
-    directory: PathBuf,
-    request: entities::DevelopmentReservationRequest,
-) -> Result<entities::DevelopmentReservationReconciliation, DatabaseError> {
-    if !redb::valid_reservation_request_id(request.id) {
-        return Err(DatabaseError::Rejected(entities::Violation::InvalidValue(
-            "reservation_request",
-            "expected a UUIDv7 request identity",
-        )));
-    }
-    ntex::rt::spawn_blocking(move || {
-        redb::reconcile_development_reservation_offline(&redb::database_file(&directory), request)
-    })
-    .await
-    .map_err(|_| DatabaseError::ReadInterrupted)?
-    .map_err(DatabaseError::Read)
-}
-pub(crate) fn inspect_held_allocations_offline(
-    directory: &std::path::Path,
-) -> Result<serde_json::Value, DatabaseError> {
-    redb::inspect_held_allocations_offline(directory).map_err(DatabaseError::Read)
 }
 
 pub(crate) fn verify_offline(
@@ -96,99 +70,6 @@ pub(crate) fn verify_offline(
     pages: bool,
 ) -> Result<serde_json::Value, DatabaseError> {
     redb::verify_offline(directory, pages).map_err(DatabaseError::Read)
-}
-
-#[cfg(unix)]
-pub(crate) fn verify_reserved_publication(
-    directory: &std::path::Path,
-    database: &std::fs::File,
-    exclusive_lock: &std::fs::File,
-    expected_device: u64,
-    expected_inode: u64,
-) -> Result<serde_json::Value, DatabaseError> {
-    redb::verify_reserved_publication(
-        directory,
-        database,
-        exclusive_lock,
-        expected_device,
-        expected_inode,
-    )
-    .map_err(DatabaseError::Read)
-}
-
-#[cfg(unix)]
-pub(crate) fn verify_recovered_publication(
-    directory: &std::path::Path,
-    database: &std::fs::File,
-    exclusive_lock: &std::fs::File,
-    expected_device: u64,
-    expected_inode: u64,
-) -> Result<serde_json::Value, DatabaseError> {
-    redb::verify_recovered_publication(
-        directory,
-        database,
-        exclusive_lock,
-        expected_device,
-        expected_inode,
-    )
-    .map_err(DatabaseError::Read)
-}
-
-pub(crate) use redb::{
-    DATABASE_FILE_NAME, HeldRecoveryPlan, ReservedRefusal, storage_format_versions,
-};
-
-pub(crate) fn reconcile_reserved_preflight(
-    copy: std::fs::File,
-    job: entities::JobId,
-) -> Result<serde_json::Value, ReservedRefusal> {
-    redb::reconcile_reserved_preflight(copy, job)
-}
-
-pub(crate) fn reconcile_reserved_apply(
-    copy: std::fs::File,
-    job: entities::JobId,
-) -> Result<serde_json::Value, ReservedRefusal> {
-    redb::reconcile_reserved_apply(copy, job)
-}
-
-pub(crate) fn reconcile_held_preflight(
-    copy: std::fs::File,
-    source_sha256: &str,
-) -> Result<HeldRecoveryPlan, ReservedRefusal> {
-    redb::reconcile_held_preflight(copy, source_sha256)
-}
-
-pub(crate) fn reconcile_held_apply(
-    copy: std::fs::File,
-    source_sha256: &str,
-    expected_digest: &str,
-) -> Result<serde_json::Value, ReservedRefusal> {
-    redb::reconcile_held_apply(copy, source_sha256, expected_digest)
-}
-
-pub(crate) fn verify_reserved_publication_delta(
-    source: &std::fs::File,
-    published: &std::fs::File,
-    job: entities::JobId,
-) -> Result<serde_json::Value, ReservedRefusal> {
-    redb::verify_reserved_publication_delta(source, published, job)
-}
-
-pub(crate) fn verify_held_publication_delta(
-    source: &std::fs::File,
-    published: &std::fs::File,
-    source_sha256: &str,
-    expected_plan: &serde_json::Value,
-    expected_digest: &str,
-) -> Result<serde_json::Value, ReservedRefusal> {
-    redb::verify_held_publication_delta(
-        source,
-        published,
-        source_sha256,
-        expected_plan,
-        expected_digest,
-    )
 }
 
 const GROUP_LIMIT: usize = 32;
@@ -216,8 +97,8 @@ pub(crate) use commands::serialized_len;
 mod errors;
 mod handle;
 pub(crate) use handle::{
-    DevelopmentHandoff, DevelopmentHandoffError, DevelopmentPreviewError, DevelopmentToolContext,
-    DevelopmentToolOffer, DevelopmentTooling, NoTooling, PreparedDevelopmentHandoff,
+    DevelopmentHandoff, DevelopmentHandoffError, DevelopmentToolContext, DevelopmentToolOffer,
+    DevelopmentTooling, PreparedDevelopmentHandoff,
 };
 mod scheduler_wake;
 mod shared;

@@ -25,21 +25,17 @@ struct DevelopmentHandoffCredentials {
 
 struct DevelopmentHandoffCredential {
     reference: String,
-    encrypted_row: Vec<u8>,
     secret: redb::CredentialSecret,
 }
 
 impl DevelopmentHandoffCredentials {
-    fn push(&mut self, reference: String, encrypted_row: Vec<u8>, secret: redb::CredentialSecret) {
+    fn push(&mut self, reference: String, secret: redb::CredentialSecret) {
         match &mut self.spellings {
             Some(spellings) => spellings.extend(secret.as_str()),
             None => self.spellings = Some(crate::system::secrets::Spellings::new(secret.as_str())),
         }
-        self.items.push(DevelopmentHandoffCredential {
-            reference,
-            encrypted_row,
-            secret,
-        });
+        self.items
+            .push(DevelopmentHandoffCredential { reference, secret });
     }
 }
 
@@ -66,19 +62,6 @@ pub(crate) struct DevelopmentToolContext {
     pub(crate) plan_step: bool,
 }
 
-pub(crate) struct NoTooling;
-
-impl DevelopmentTooling for NoTooling {
-    async fn offer(
-        &self,
-        _frozen: &entities::FrozenExecutionConfig,
-        _project: Option<&entities::ProjectRecord>,
-        _context: DevelopmentToolContext,
-    ) -> Result<Option<DevelopmentToolOffer>, &'static str> {
-        Ok(None)
-    }
-}
-
 enum DevelopmentToolPolicy {
     ToolFree,
     Offered,
@@ -96,11 +79,18 @@ impl PreparedDevelopmentHandoff {
         }
     }
 
-    pub(crate) fn decision_configuration(&self) -> Option<&entities::NativeDecisionConfig> {
+    pub(crate) fn decision_configuration(&self) -> Option<&entities::FrozenDecisionConfig> {
         match &self.candidate {
             redb::DevelopmentCandidate::Generative(_) => None,
             redb::DevelopmentCandidate::Decision(context) => Some(&context.configuration),
         }
+    }
+
+    pub(crate) fn is_summary_producer(&self) -> bool {
+        matches!(
+            &self.candidate,
+            redb::DevelopmentCandidate::Generative(context) if context.job.summary_source.is_some()
+        )
     }
 
     pub(crate) fn credential_references(&self) -> Vec<&str> {
@@ -111,21 +101,17 @@ impl PreparedDevelopmentHandoff {
         &self.candidate
     }
 
-    pub(super) fn credential_evidence(&self) -> impl Iterator<Item = (&str, &[u8])> {
-        self.credentials
-            .items
-            .iter()
-            .map(|item| (item.reference.as_str(), item.encrypted_row.as_slice()))
-    }
-
     fn provider_credential_reference(&self) -> Option<&str> {
         match &self.candidate {
             redb::DevelopmentCandidate::Generative(context) => {
                 context.configuration.llm.provider.credential_ref.as_deref()
             }
-            redb::DevelopmentCandidate::Decision(context) => {
-                context.configuration.credential_ref.as_deref()
-            }
+            redb::DevelopmentCandidate::Decision(context) => match &context.configuration {
+                entities::FrozenDecisionConfig::Native(native) => native.credential_ref.as_deref(),
+                entities::FrozenDecisionConfig::Generative(generative, _) => {
+                    generative.llm.provider.credential_ref.as_deref()
+                }
+            },
         }
     }
 
@@ -134,7 +120,12 @@ impl PreparedDevelopmentHandoff {
             redb::DevelopmentCandidate::Generative(context) => {
                 &context.configuration.llm.provider.headers
             }
-            redb::DevelopmentCandidate::Decision(context) => &context.configuration.headers,
+            redb::DevelopmentCandidate::Decision(context) => match &context.configuration {
+                entities::FrozenDecisionConfig::Native(native) => &native.headers,
+                entities::FrozenDecisionConfig::Generative(generative, _) => {
+                    &generative.llm.provider.headers
+                }
+            },
         };
         headers.secret_refs().collect()
     }
@@ -221,7 +212,7 @@ impl DevelopmentHandoff {
     pub(crate) fn decision_inputs(
         &self,
     ) -> Option<(
-        &entities::NativeDecisionConfig,
+        &entities::FrozenDecisionConfig,
         &entities::DecisionRequest,
         &serde_json::Value,
         entities::AllocationToken,
@@ -281,23 +272,17 @@ impl crate::service::ai::providers::CredentialResolver for DevelopmentHandoff {
 #[derive(Clone, Default)]
 pub(super) struct DevelopmentUsageCheckpoint {
     request: Option<entities::RequestNumber>,
-    last_sequence: u32,
     evidence: entities::TokenEvidence,
 }
 
 impl DevelopmentUsageCheckpoint {
-    pub(super) fn last_sequence(&self) -> u32 {
-        self.last_sequence
-    }
-
     pub(super) fn evidence(&self) -> entities::TokenEvidence {
         self.evidence.clone()
     }
 
-    pub(super) fn advanced(last_sequence: u32, evidence: entities::TokenEvidence) -> Self {
+    pub(super) fn advanced(_last_sequence: u32, evidence: entities::TokenEvidence) -> Self {
         Self {
             request: None,
-            last_sequence,
             evidence,
         }
     }
@@ -376,12 +361,6 @@ pub(crate) enum DevelopmentHandoffError {
     },
 }
 
-#[derive(Debug)]
-pub(crate) enum DevelopmentPreviewError {
-    Refused(&'static str),
-    Unavailable(DatabaseError),
-}
-
 fn classify_unstarted(error: DatabaseError) -> DevelopmentHandoffError {
     let cause = match &error {
         DatabaseError::Rejected(Violation::InvalidValue(field, reason))
@@ -430,11 +409,9 @@ fn prepare_development_handoff(
             else {
                 return Err(unavailable());
             };
-            let request = crate::service::ai::decisive_model::request_body(
-                &entities::FrozenDecisionConfig::Native(context.configuration.clone()),
-                request,
-            )
-            .map_err(|_| unavailable())?;
+            let request =
+                crate::service::ai::decisive_model::request_body(&context.configuration, request)
+                    .map_err(|_| unavailable())?;
             Ok(PreparedDevelopmentHandoff {
                 candidate: redb::DevelopmentCandidate::Decision(context),
                 images: Vec::new(),
@@ -456,12 +433,60 @@ fn prepare_development_handoff(
                 .agent
                 .as_ref()
                 .is_some_and(|agent| agent.manages_jobs());
-            if frozen.native_execution_refusal().is_some()
+            let is_summary = snapshot.job.summary_source.is_some();
+            if is_summary {
+                if frozen.provider_refusal().is_some() || offer.is_some() {
+                    return Err(unavailable());
+                }
+            } else if frozen.native_execution_refusal().is_some()
                 || (granted && offer.is_none_or(|offer| offer.grant.is_none()))
                 || (!granted && offer.is_some() && !manages)
                 || offer.is_some_and(|offer| offer.wires.is_empty())
             {
                 return Err(unavailable());
+            }
+            if is_summary {
+                let mut messages = vec![
+                    crate::service::ai::providers::openai_compatible::ChatMessage::system(
+                        "You are a context summarizer. Return ONLY valid JSON matching {\"schema_version\":1,\"source\":\"...\",\"summary\":\"...\",\"omitted_details\":[...]}. Do not use tools, Markdown fences, or extra prose.",
+                    ),
+                ];
+                let mut combined = String::new();
+                for input in &snapshot.covered_inputs {
+                    combined.push_str(&input.text);
+                }
+                if !combined.is_empty() {
+                    messages.push(
+                        crate::service::ai::providers::openai_compatible::ChatMessage::user(
+                            combined,
+                        ),
+                    );
+                }
+                messages.push(
+                    crate::service::ai::providers::openai_compatible::ChatMessage::user(
+                        snapshot.job.input.text().to_owned(),
+                    ),
+                );
+                let conversation =
+                    crate::service::ai::providers::openai_compatible::ChatConversation {
+                        messages,
+                        ..Default::default()
+                    };
+                let request = crate::service::ai::generative_model::request_body(
+                    &frozen.llm.config.model,
+                    &frozen.llm.config.parameters,
+                    &conversation,
+                )
+                .map_err(|_| unavailable())?;
+                return Ok(PreparedDevelopmentHandoff {
+                    candidate: redb::DevelopmentCandidate::Generative(context.snapshot),
+                    images: Vec::new(),
+                    request,
+                    conversation: Some(conversation),
+                    system_policy,
+                    tool_policy: DevelopmentToolPolicy::ToolFree,
+                    credentials: DevelopmentHandoffCredentials::default(),
+                });
             }
             let mut image_cursor = context.images.iter();
             let mut images_for =
@@ -547,7 +572,6 @@ fn prepare_development_handoff(
             {
                 return Err(unavailable());
             }
-            conversation.validate().map_err(|_| unavailable())?;
             let request = crate::service::ai::generative_model::request_body(
                 &frozen.llm.config.model,
                 &frozen.llm.config.parameters,
@@ -748,16 +772,6 @@ fn process_memory() -> (Option<u64>, Option<u64>) {
 }
 
 impl DatabaseHandle {
-    #[allow(dead_code)]
-    pub(crate) async fn decision_availability(
-        &self,
-        job: JobId,
-        after: Option<AvailabilityStatId>,
-        limit: usize,
-    ) -> Result<Vec<redb::DecisionAvailabilityRecord>, DatabaseError> {
-        self.read(move |database| redb::read_decision_availability(database, job, after, limit))
-            .await
-    }
     async fn attachment_permit(&self) -> Result<AttachmentPermit, DatabaseError> {
         self.shared
             .attachment_slots
@@ -854,14 +868,6 @@ impl DatabaseHandle {
         .await
     }
 
-    pub(crate) async fn activation_snapshot(
-        &self,
-        limit: usize,
-    ) -> Result<redb::ActivationSnapshot, DatabaseError> {
-        self.read(move |database| redb::activation_snapshot(database, limit))
-            .await
-    }
-
     pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
         self.shared
             .scheduler_subscription
@@ -914,10 +920,6 @@ impl DatabaseHandle {
         self.shared.log_files.clone()
     }
 
-    pub(crate) fn cleanup_worker(&self) -> Arc<AtomicBool> {
-        self.shared.cleanup_worker.clone()
-    }
-
     pub(crate) fn data_directory(&self) -> DataDirectory {
         self.shared.data_directory.clone()
     }
@@ -928,18 +930,6 @@ impl DatabaseHandle {
 
     pub(crate) fn logging_protection_state(&self) -> (bool, u64) {
         self.shared.protection.logging_state()
-    }
-
-    pub(crate) fn activate_filesystem_protection(&self, reason: ProtectionReason) -> bool {
-        let (reply, response) = flume::bounded(1);
-        if self
-            .control_sender
-            .send(Control::FilesystemFailure { reason, reply })
-            .is_err()
-        {
-            return false;
-        }
-        response.recv().unwrap_or(false)
     }
 
     pub fn active_system_policy(&self) -> SystemPolicy {
@@ -1032,6 +1022,48 @@ impl DatabaseHandle {
         })?
     }
 
+    async fn write<A: Send + 'static, T: Send + 'static>(
+        &self,
+        bytes: u64,
+        kind: OperationKind,
+        args: A,
+        f: impl FnOnce(&mut redb::Batch, A) -> Result<T, redb::BatchError> + Send + 'static,
+    ) -> Result<T, DatabaseError> {
+        self.submit(|reply| Command::new(args, reply, |_| bytes, kind, move |a, b| f(b, a)))
+            .await
+    }
+
+    async fn write_sized<A: Send + 'static, T: Send + 'static>(
+        &self,
+        args: A,
+        size: impl FnOnce(&A) -> u64,
+        kind: OperationKind,
+        f: impl FnOnce(&mut redb::Batch, A) -> Result<T, redb::BatchError> + Send + 'static,
+    ) -> Result<T, DatabaseError> {
+        self.submit(|reply| Command::new(args, reply, size, kind, move |a, b| f(b, a)))
+            .await
+    }
+
+    async fn write_output<A: Send + 'static, T: Send + 'static>(
+        &self,
+        job: JobId,
+        args: A,
+        size: impl FnOnce(&A) -> u64,
+        kind: OperationKind,
+        f: impl FnOnce(&mut redb::Batch, A) -> Result<T, redb::BatchError> + Send + 'static,
+    ) -> Result<T, DatabaseError> {
+        self.submit(|reply| {
+            Command::custom(args, reply, size, move |args, reply, db, op, commit| {
+                let mut outcome = run(db, op, commit, kind, reply, |batch| f(batch, args));
+                if outcome.committed {
+                    outcome.output_changed = Some(job);
+                }
+                outcome
+            })
+        })
+        .await
+    }
+
     pub(super) async fn read<T: Send + 'static>(
         &self,
         read: impl FnOnce(&Database) -> Result<T, StorageError> + Send + 'static,
@@ -1106,10 +1138,6 @@ impl DatabaseHandle {
         self.shared.epoch.load(Ordering::SeqCst)
     }
 
-    pub fn disk_protection(&self) -> DiskProtectionStatus {
-        self.shared.protection.status()
-    }
-
     pub fn watch_disk_protection(&self) -> ProtectionWatch {
         self.shared.protection.watch()
     }
@@ -1134,32 +1162,6 @@ impl DatabaseHandle {
             .recv_async()
             .await
             .unwrap_or(Err(MaintenanceError::WorkerStopped))
-    }
-
-    pub async fn recover_storage(&self) -> Result<RecoveryReport, RecoveryError> {
-        let response = self
-            .shared
-            .recovery
-            .join(|| self.request(Control::Recover))?;
-        response
-            .recv_async()
-            .await
-            .unwrap_or(Err(RecoveryError::WorkerStopped))
-    }
-
-    fn request(&self, control: Control) -> Result<(), RecoveryError> {
-        let admission = self
-            .shared
-            .admission
-            .read()
-            .unwrap_or_else(PoisonError::into_inner);
-        admission.check_recovery_enqueue()?;
-        self.control_sender
-            .try_send(control)
-            .map_err(|error| match error {
-                flume::TrySendError::Full(_) => RecoveryError::ControlQueueFull,
-                flume::TrySendError::Disconnected(_) => RecoveryError::WorkerStopped,
-            })
     }
 
     pub fn genesis(&self) -> JobId {
@@ -1217,15 +1219,6 @@ impl DatabaseHandle {
 
     pub async fn job(&self, job: JobId) -> Result<Option<JobRecord>, DatabaseError> {
         self.read(move |database| redb::read_job(database, job))
-            .await
-    }
-
-    pub async fn jobs(
-        &self,
-        before: Option<JobId>,
-        limit: usize,
-    ) -> Result<Vec<JobRecord>, DatabaseError> {
-        self.read(move |database| redb::read_jobs(database, before, limit))
             .await
     }
 
@@ -1309,26 +1302,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn compatible_executors(
-        &self,
-        llm_profile: crate::db::entities::ProfileId,
-    ) -> Result<Vec<ExecutorId>, DatabaseError> {
-        self.read(move |database| redb::read_compatible_executors(database, llm_profile))
-            .await
-    }
-
-    pub(crate) async fn candidate_compatible(
-        &self,
-        candidate: AdmissionCandidate,
-    ) -> Result<bool, DatabaseError> {
-        self.read(move |database| redb::read_candidate_compatible(database, candidate))
-            .await
-    }
-
-    pub async fn decision_executors(&self) -> Result<Vec<ExecutorId>, DatabaseError> {
-        self.read(redb::read_decision_executors).await
-    }
-
     pub async fn retries(
         &self,
         original: JobId,
@@ -1362,31 +1335,6 @@ impl DatabaseHandle {
         id: JobInputId,
     ) -> Result<Option<entities::JobInputRecord>, DatabaseError> {
         self.read(move |database| redb::read_job_input(database, id))
-            .await
-    }
-
-    pub async fn job_input_for_job(
-        &self,
-        job: JobId,
-    ) -> Result<Option<entities::JobInputRecord>, DatabaseError> {
-        self.read(move |database| redb::read_job_input_for_job(database, job))
-            .await
-    }
-
-    pub async fn executor(
-        &self,
-        id: ExecutorId,
-    ) -> Result<Option<entities::ExecutorRecord>, DatabaseError> {
-        self.read(move |database| redb::read_executor(database, id))
-            .await
-    }
-
-    pub async fn executors(
-        &self,
-        before: Option<ExecutorId>,
-        limit: usize,
-    ) -> Result<Vec<entities::ExecutorRecord>, DatabaseError> {
-        self.read(move |database| redb::read_executors(database, before, limit))
             .await
     }
 
@@ -1477,69 +1425,6 @@ impl DatabaseHandle {
         .await
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn reserve_next_development_job(
-        &self,
-        request: entities::DevelopmentReservationRequest,
-        attempt: entities::DevelopmentReservationAttempt,
-    ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
-        self.reserve_development_job(request, attempt, entities::ReadySelection::Any)
-            .await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn reserve_development_job(
-        &self,
-        request: entities::DevelopmentReservationRequest,
-        attempt: entities::DevelopmentReservationAttempt,
-        selection: entities::ReadySelection,
-    ) -> Result<entities::DevelopmentReservation, DevelopmentReservationError> {
-        let fresh = match attempt {
-            entities::DevelopmentReservationAttempt::New(fresh) => {
-                if !fresh.matches(request) {
-                    return Err(DevelopmentReservationError::DefinitelyNotCommitted {
-                        error: Box::new(DatabaseError::Rejected(Violation::InvalidValue(
-                            "reservation_request",
-                            "first-attempt permit has different parameters",
-                        ))),
-                        fresh,
-                    });
-                }
-                Some(fresh)
-            }
-            entities::DevelopmentReservationAttempt::Replay => None,
-        };
-        let is_new = fresh.is_some();
-        let result = self
-            .submit(|reply| {
-                Command::new(
-                    (request, is_new, selection),
-                    reply,
-                    |_| 4096,
-                    OperationKind::AssignJobExecutor,
-                    |(request, is_new, selection), batch| {
-                        batch.reserve_next_development_job(request, is_new, selection)
-                    },
-                )
-            })
-            .await;
-        match (result, fresh) {
-            (Ok(result), _) => Ok(result),
-            (Err(error), Some(fresh))
-                if matches!(
-                    error.command_outcome(),
-                    Some(CommandOutcome::NotAccepted | CommandOutcome::NotCommitted)
-                ) =>
-            {
-                Err(DevelopmentReservationError::DefinitelyNotCommitted {
-                    error: Box::new(error),
-                    fresh,
-                })
-            }
-            (Err(error), _) => Err(DevelopmentReservationError::Other(error)),
-        }
-    }
-
     pub(crate) async fn reserve_scheduled_job(
         &self,
         fresh: entities::DevelopmentFreshReservation,
@@ -1581,12 +1466,7 @@ impl DatabaseHandle {
                                     Ok(None)
                                 }
                                 Err(redb::BatchError(redb::Failure::Rejected(violation))) => {
-                                    if batch.global_execution_limit_reached()? {
-                                        passed = ScheduledReservation::GlobalLimitReached;
-                                        Ok(None)
-                                    } else {
-                                        batch.reject(violation)
-                                    }
+                                    batch.reject(violation)
                                 }
                                 Err(error) => Err(error),
                             },
@@ -1685,23 +1565,6 @@ impl DatabaseHandle {
     }
 
     #[allow(dead_code)]
-    pub(crate) async fn development_executor_allocation(
-        &self,
-        executor: entities::ExecutorId,
-    ) -> Result<Option<entities::PoolAllocation>, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (executor,),
-                reply,
-                |_| 0,
-                OperationKind::Open,
-                |(executor,), batch| batch.development_executor_allocation(executor),
-            )
-        })
-        .await
-    }
-
-    #[allow(dead_code)]
     pub(crate) async fn development_trial_job(
         &self,
         job: entities::JobId,
@@ -1748,12 +1611,12 @@ impl DatabaseHandle {
                     }
                     _ => classify_unstarted(error),
                 })?;
-            let Some((secret, encrypted_row)) = resolved else {
+            let Some((secret, _)) = resolved else {
                 return Err(classify_unstarted(DatabaseError::Rejected(
                     Violation::InvalidValue("credential", "stored credential is unavailable"),
                 )));
             };
-            prepared.credentials.push(reference, encrypted_row, secret);
+            prepared.credentials.push(reference, secret);
         }
         if prepared.system_policy != self.shared.active_policy {
             return Err(classify_unstarted(DatabaseError::Rejected(
@@ -1761,50 +1624,6 @@ impl DatabaseHandle {
             )));
         }
         Ok(prepared)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn preview_development_handoff(
-        &self,
-        job: entities::JobId,
-        pool: entities::ExecutionPoolId,
-        executor: entities::ExecutorId,
-        guard: impl FnOnce(&PreparedDevelopmentHandoff) -> Result<(), &'static str>,
-    ) -> Result<(), DevelopmentPreviewError> {
-        let snapshot = self
-            .read(move |database| {
-                redb::read_development_execution_preview(database, job, pool, executor)
-            })
-            .await
-            .map_err(DevelopmentPreviewError::Unavailable)?;
-        let resolved = self
-            .resolve_development_candidate(snapshot)
-            .await
-            .map_err(DevelopmentPreviewError::Unavailable)?;
-        let prepared = self
-            .prepare_with_credentials(resolved, None)
-            .await
-            .map_err(|error| match error {
-                DevelopmentHandoffError::NotStarted { error, .. } => {
-                    DevelopmentPreviewError::Unavailable(*error)
-                }
-                DevelopmentHandoffError::Database(error) => {
-                    DevelopmentPreviewError::Unavailable(*error)
-                }
-                DevelopmentHandoffError::OutcomeUnknown { error, .. } => {
-                    DevelopmentPreviewError::Unavailable(*error)
-                }
-            })?;
-        guard(&prepared).map_err(DevelopmentPreviewError::Refused)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn checked_development_handoff(
-        &self,
-        token: entities::AllocationToken,
-    ) -> Result<DevelopmentHandoff, DevelopmentHandoffError> {
-        self.checked_development_handoff_guarded(token, &NoTooling, |_| Ok(()))
-            .await
     }
 
     #[allow(dead_code)]
@@ -1819,24 +1638,29 @@ impl DatabaseHandle {
             .await
             .map_err(classify_unstarted)?;
         let offer = match &resolved {
-            redb::DevelopmentResolvedCandidate::Generative(context) => tooling
-                .offer(
-                    &context.snapshot.configuration,
-                    context.snapshot.project.as_ref(),
-                    DevelopmentToolContext {
-                        decider: context.snapshot.job.input.priority
-                            == entities::JobQueuePriority::Foreground,
-                        nested: context.snapshot.conversation.parent_id.is_some(),
-                        plan_step: context.snapshot.plan_step,
-                    },
-                )
-                .await
-                .map_err(|reason| {
-                    classify_unstarted(DatabaseError::Rejected(Violation::InvalidValue(
-                        "handoff", reason,
-                    )))
-                })?,
-            redb::DevelopmentResolvedCandidate::Decision(_) => None,
+            redb::DevelopmentResolvedCandidate::Generative(context)
+                if context.snapshot.job.summary_source.is_none() =>
+            {
+                tooling
+                    .offer(
+                        &context.snapshot.configuration,
+                        context.snapshot.project.as_ref(),
+                        DevelopmentToolContext {
+                            decider: context.snapshot.job.input.priority
+                                == entities::JobQueuePriority::Foreground,
+                            nested: context.snapshot.conversation.parent_id.is_some(),
+                            plan_step: context.snapshot.plan_step,
+                        },
+                    )
+                    .await
+                    .map_err(|reason| {
+                        classify_unstarted(DatabaseError::Rejected(Violation::InvalidValue(
+                            "handoff", reason,
+                        )))
+                    })?
+            }
+            redb::DevelopmentResolvedCandidate::Generative(_)
+            | redb::DevelopmentResolvedCandidate::Decision(_) => None,
         };
         let prepared = self
             .prepare_with_credentials(resolved, offer.as_ref())
@@ -1848,35 +1672,30 @@ impl DatabaseHandle {
         }
         let owner = self.shared.clone();
         let result = self
-            .submit(|reply| {
-                Command::new(
-                    (prepared, owner),
-                    reply,
-                    |(prepared, _)| {
-                        byte_count(
-                            crate::db::serialized_len(&prepared.request).unwrap_or(usize::MAX),
-                        )
+            .write_sized(
+                (prepared, owner),
+                |(prepared, _)| {
+                    byte_count(crate::db::serialized_len(&prepared.request).unwrap_or(usize::MAX))
                         .saturating_add(64 * 1024)
-                    },
-                    OperationKind::ClaimExecution,
-                    |(prepared, owner), batch| {
-                        let started = batch.start_mutable_job(&prepared)?;
-                        Ok(DevelopmentHandoff {
-                            prepared,
-                            started,
-                            owner,
-                            output_busy: AtomicBool::new(false),
-                            output_uncertain: AtomicBool::new(false),
-                            usage_checkpoint: std::sync::Mutex::new(
-                                DevelopmentUsageCheckpoint::default(),
-                            ),
-                            recorder: std::sync::Mutex::new(
-                                crate::service::ai::providers::RequestRecorder::default(),
-                            ),
-                        })
-                    },
-                )
-            })
+                },
+                OperationKind::ClaimExecution,
+                |batch, (prepared, owner)| {
+                    let started = batch.start_mutable_job(&prepared)?;
+                    Ok(DevelopmentHandoff {
+                        prepared,
+                        started,
+                        owner,
+                        output_busy: AtomicBool::new(false),
+                        output_uncertain: AtomicBool::new(false),
+                        usage_checkpoint: std::sync::Mutex::new(
+                            DevelopmentUsageCheckpoint::default(),
+                        ),
+                        recorder: std::sync::Mutex::new(
+                            crate::service::ai::providers::RequestRecorder::default(),
+                        ),
+                    })
+                },
+            )
             .await;
         match result {
             Ok(handoff) => Ok(handoff),
@@ -1901,41 +1720,7 @@ impl DatabaseHandle {
         expected_seq: u32,
         output: JobOutput,
     ) -> Result<AppendedOutput, DatabaseError> {
-        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "handoff",
-                "different database worker",
-            )));
-        }
-        if handoff.output_uncertain.load(Ordering::SeqCst)
-            || handoff
-                .output_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "output",
-                "output write is pending or requires reconciliation",
-            )));
-        }
-        let mut guard = DevelopmentOutputGuard {
-            handoff,
-            known: false,
-        };
-        if handoff.output_uncertain.load(Ordering::SeqCst) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "output",
-                "output write requires reconciliation",
-            )));
-        }
-        let token = match &handoff.prepared.candidate {
-            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
-        };
-        let proof = DevelopmentWriteProof {
-            token,
-            revision: handoff.started.revision,
-        };
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self
             .submit(|reply| {
                 Command::custom(
@@ -2064,31 +1849,7 @@ impl DatabaseHandle {
             sent
         };
         sent.observed_at = observed_at;
-        if handoff.output_uncertain.load(Ordering::SeqCst)
-            || handoff
-                .output_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write is pending or requires reconciliation",
-            )));
-        }
-        let mut guard = DevelopmentOutputGuard {
-            handoff,
-            known: false,
-        };
-        if handoff.output_uncertain.load(Ordering::SeqCst) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write requires reconciliation",
-            )));
-        }
-        let proof = DevelopmentWriteProof {
-            token,
-            revision: handoff.started.revision,
-        };
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
         let attachments = match &handoff.prepared.candidate {
             redb::DevelopmentCandidate::Generative(context) => context
                 .covered_inputs
@@ -2106,21 +1867,18 @@ impl DatabaseHandle {
             redb::DevelopmentCandidate::Decision(_) => Vec::new(),
         };
         let result = self
-            .submit(|reply| {
-                Command::new(
-                    (proof, sent, attachments),
-                    reply,
-                    |(_, sent, _)| {
-                        sent.bodies.iter().fold(0u64, |size, body| {
-                            size.saturating_add(byte_count(body.byte_length()))
-                        })
-                    },
-                    OperationKind::RecordSentRequest,
-                    |(proof, sent, attachments), batch| {
-                        batch.record_development_sent_request(&proof, sent, &attachments)
-                    },
-                )
-            })
+            .write_sized(
+                (proof, sent, attachments),
+                |(_, sent, _)| {
+                    sent.bodies.iter().fold(0u64, |size, body| {
+                        size.saturating_add(byte_count(body.byte_length()))
+                    })
+                },
+                OperationKind::RecordSentRequest,
+                |batch, (proof, sent, attachments)| {
+                    batch.record_development_sent_request(&proof, sent, &attachments)
+                },
+            )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         if result.is_ok()
@@ -2141,16 +1899,7 @@ impl DatabaseHandle {
         handoff: &DevelopmentHandoff,
         answer: ProviderAnswer,
     ) -> Result<(), DatabaseError> {
-        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "handoff",
-                "different database worker",
-            )));
-        }
-        let token = match &handoff.prepared.candidate {
-            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
-        };
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
         let response: serde_json::Value =
             serde_json::from_slice(&answer.response.bytes).map_err(|_| {
                 DatabaseError::Rejected(Violation::InvalidValue(
@@ -2160,20 +1909,16 @@ impl DatabaseHandle {
             })?;
         if let Some(secret) = &handoff.prepared.credentials.spellings {
             let observation = &answer.stat.observation;
-            let failure_contains_secret = observation.failure.as_ref().is_some_and(|failure| {
-                secret.found_in(&failure.message)
-                    || failure
-                        .provider_code
-                        .as_deref()
-                        .is_some_and(|s| secret.found_in(s))
-                    || failure
-                        .response_body
-                        .as_deref()
-                        .is_some_and(|s| secret.found_in(s))
-                    || failure
-                        .request_id
-                        .as_deref()
-                        .is_some_and(|s| secret.found_in(s))
+            let failure_has_secret = observation.failure.as_ref().is_some_and(|f| {
+                [
+                    Some(f.message.as_str()),
+                    f.provider_code.as_deref(),
+                    f.response_body.as_deref(),
+                    f.request_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|s| secret.found_in(s))
             });
             if development_contains_secret(&response, secret)
                 || answer
@@ -2181,12 +1926,12 @@ impl DatabaseHandle {
                     .usage
                     .raw
                     .as_ref()
-                    .is_some_and(|value| development_contains_secret(value, secret))
+                    .is_some_and(|v| development_contains_secret(v, secret))
                 || observation
                     .raw_finish_reason
                     .as_deref()
                     .is_some_and(|s| secret.found_in(s))
-                || failure_contains_secret
+                || failure_has_secret
             {
                 return Err(DatabaseError::Rejected(Violation::InvalidValue(
                     "answer",
@@ -2194,31 +1939,6 @@ impl DatabaseHandle {
                 )));
             }
         }
-        if handoff.output_uncertain.load(Ordering::SeqCst)
-            || handoff
-                .output_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write is pending or requires reconciliation",
-            )));
-        }
-        let mut guard = DevelopmentOutputGuard {
-            handoff,
-            known: false,
-        };
-        if handoff.output_uncertain.load(Ordering::SeqCst) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write requires reconciliation",
-            )));
-        }
-        let proof = DevelopmentWriteProof {
-            token,
-            revision: handoff.started.revision,
-        };
         let response_digest = answer.response.digest();
         let result = self
             .submit(|reply| {
@@ -2278,16 +1998,7 @@ impl DatabaseHandle {
         expected_seq: u32,
         metrics: Metrics,
     ) -> Result<MetricsId, DatabaseError> {
-        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "handoff",
-                "different database worker",
-            )));
-        }
-        let token = match &handoff.prepared.candidate {
-            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
-        };
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
         if handoff
             .prepared
             .credentials
@@ -2307,31 +2018,6 @@ impl DatabaseHandle {
                 "usage evidence contains credential material",
             )));
         }
-        if handoff.output_uncertain.load(Ordering::SeqCst)
-            || handoff
-                .output_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write is pending or requires reconciliation",
-            )));
-        }
-        let mut guard = DevelopmentOutputGuard {
-            handoff,
-            known: false,
-        };
-        if handoff.output_uncertain.load(Ordering::SeqCst) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write requires reconciliation",
-            )));
-        }
-        let proof = DevelopmentWriteProof {
-            token,
-            revision: handoff.started.revision,
-        };
         let request = metrics.request;
         let checkpoint = handoff
             .usage_checkpoint
@@ -2398,16 +2084,7 @@ impl DatabaseHandle {
         finalization: JobFinalization,
     ) -> Result<AppendedOutput, DatabaseError> {
         let handoff = returned.handoff();
-        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "handoff",
-                "different database worker",
-            )));
-        }
-        let token = match &handoff.prepared.candidate {
-            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
-        };
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
         if let Some(secret) = &handoff.prepared.credentials.spellings {
             let result = match &finalization {
                 JobFinalization::Completed(result)
@@ -2432,64 +2109,25 @@ impl DatabaseHandle {
                 )));
             }
         }
-        if handoff.output_uncertain.load(Ordering::SeqCst)
-            || handoff
-                .output_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write is pending or requires reconciliation",
-            )));
-        }
-        let mut guard = DevelopmentOutputGuard {
-            handoff,
-            known: false,
-        };
-        if handoff.output_uncertain.load(Ordering::SeqCst) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write requires reconciliation",
-            )));
-        }
-        let proof = DevelopmentWriteProof {
-            token,
-            revision: handoff.started.revision,
-        };
         let result = self
-            .submit(|reply| {
-                Command::custom(
-                    (proof, expected_seq, finalization),
-                    reply,
-                    |(_, _, value)| match value {
-                        JobFinalization::Completed(result)
-                        | JobFinalization::Failed(result)
-                        | JobFinalization::Cancelled(result) => output_bytes(
-                            result.summary.as_deref(),
-                            result.code.as_deref(),
-                            result.value.as_ref(),
-                        ),
-                        JobFinalization::Unknown => 0,
-                    },
-                    |(proof, expected_seq, finalization), reply, database, operation, commit| {
-                        let mut result = run(
-                            database,
-                            operation,
-                            commit,
-                            OperationKind::FinalizeJob,
-                            reply,
-                            |batch| {
-                                batch.finalize_development_job(&proof, expected_seq, finalization)
-                            },
-                        );
-                        if result.committed {
-                            result.output_changed = Some(proof.token.job);
-                        }
-                        result
-                    },
-                )
-            })
+            .write_output(
+                proof.token.job,
+                (proof, expected_seq, finalization),
+                |(_, _, value)| match value {
+                    JobFinalization::Completed(result)
+                    | JobFinalization::Failed(result)
+                    | JobFinalization::Cancelled(result) => output_bytes(
+                        result.summary.as_deref(),
+                        result.code.as_deref(),
+                        result.value.as_ref(),
+                    ),
+                    JobFinalization::Unknown => 0,
+                },
+                OperationKind::FinalizeJob,
+                |batch, (proof, expected_seq, finalization)| {
+                    batch.finalize_development_job(&proof, expected_seq, finalization)
+                },
+            )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         result
@@ -2503,21 +2141,16 @@ impl DatabaseHandle {
         result: entities::DecisionResult,
     ) -> Result<AppendedOutput, DatabaseError> {
         let handoff = returned.handoff();
-        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+        if !matches!(
+            &handoff.prepared.candidate,
+            redb::DevelopmentCandidate::Decision(_)
+        ) {
             return Err(DatabaseError::Rejected(Violation::InvalidValue(
                 "handoff",
-                "different database worker",
+                "Decision handoff required",
             )));
         }
-        let token = match &handoff.prepared.candidate {
-            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Generative(_) => {
-                return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                    "handoff",
-                    "Decision handoff required",
-                )));
-            }
-        };
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
         let value = serde_json::to_value(&result).map_err(|_| {
             DatabaseError::Rejected(Violation::InvalidValue(
                 "decision",
@@ -2536,55 +2169,16 @@ impl DatabaseHandle {
                 "result contains credential material",
             )));
         }
-        if handoff.output_uncertain.load(Ordering::SeqCst)
-            || handoff
-                .output_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write is pending or requires reconciliation",
-            )));
-        }
-        let mut guard = DevelopmentOutputGuard {
-            handoff,
-            known: false,
-        };
-        if handoff.output_uncertain.load(Ordering::SeqCst) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write requires reconciliation",
-            )));
-        }
-        let proof = DevelopmentWriteProof {
-            token,
-            revision: handoff.started.revision,
-        };
         let result = self
-            .submit(|reply| {
-                Command::custom(
-                    (proof, expected_seq, result),
-                    reply,
-                    |(_, _, result)| debug_bytes(result),
-                    |(proof, expected_seq, decision), reply, database, operation, commit| {
-                        let mut result = run(
-                            database,
-                            operation,
-                            commit,
-                            OperationKind::FinalizeJob,
-                            reply,
-                            |batch| {
-                                batch.finalize_development_decision(&proof, expected_seq, decision)
-                            },
-                        );
-                        if result.committed {
-                            result.output_changed = Some(proof.token.job);
-                        }
-                        result
-                    },
-                )
-            })
+            .write_output(
+                proof.token.job,
+                (proof, expected_seq, result),
+                |(_, _, result)| debug_bytes(result),
+                OperationKind::FinalizeJob,
+                |batch, (proof, expected_seq, decision)| {
+                    batch.finalize_development_decision(&proof, expected_seq, decision)
+                },
+            )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         result
@@ -2603,16 +2197,8 @@ impl DatabaseHandle {
         )>,
     ) -> Result<AppendedOutput, DatabaseError> {
         let handoff = returned.handoff();
-        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "handoff",
-                "different database worker",
-            )));
-        }
-        let token = match &handoff.prepared.candidate {
-            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
-        };
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let token = proof.token;
         if let Some(secret) = &handoff.prepared.credentials.spellings {
             let (JobFinalization::Completed(result)
             | JobFinalization::Failed(result)
@@ -2648,31 +2234,6 @@ impl DatabaseHandle {
                 )));
             }
         }
-        if handoff.output_uncertain.load(Ordering::SeqCst)
-            || handoff
-                .output_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write is pending or requires reconciliation",
-            )));
-        }
-        let mut guard = DevelopmentOutputGuard {
-            handoff,
-            known: false,
-        };
-        if handoff.output_uncertain.load(Ordering::SeqCst) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write requires reconciliation",
-            )));
-        }
-        let proof = DevelopmentWriteProof {
-            token,
-            revision: handoff.started.revision,
-        };
         let rejection =
             rejection.map(
                 |(request, observed_at, observation)| entities::AvailabilityStat {
@@ -2683,54 +2244,36 @@ impl DatabaseHandle {
                 },
             );
         let result = self
-            .submit(|reply| {
-                Command::custom(
-                    (proof, expected_seq, finalization, rejection),
-                    reply,
-                    |(_, _, finalization, rejection)| {
-                        let result = match finalization {
-                            JobFinalization::Completed(result)
-                            | JobFinalization::Failed(result)
-                            | JobFinalization::Cancelled(result) => output_bytes(
-                                result.summary.as_deref(),
-                                result.code.as_deref(),
-                                result.value.as_ref(),
-                            ),
-                            JobFinalization::Unknown => 0,
-                        };
-                        result.saturating_add(
-                            rejection
-                                .as_ref()
-                                .map_or(0, |stat| debug_bytes(&stat.observation)),
-                        )
-                    },
-                    |(proof, expected_seq, finalization, rejection),
-                     reply,
-                     database,
-                     operation,
-                     commit| {
-                        let mut outcome = run(
-                            database,
-                            operation,
-                            commit,
-                            OperationKind::FinalizeJob,
-                            reply,
-                            |batch| {
-                                batch.finalize_development_failure(
-                                    &proof,
-                                    expected_seq,
-                                    finalization,
-                                    rejection,
-                                )
-                            },
-                        );
-                        if outcome.committed {
-                            outcome.output_changed = Some(proof.token.job);
-                        }
-                        outcome
-                    },
-                )
-            })
+            .write_output(
+                proof.token.job,
+                (proof, expected_seq, finalization, rejection),
+                |(_, _, finalization, rejection)| {
+                    let result = match finalization {
+                        JobFinalization::Completed(result)
+                        | JobFinalization::Failed(result)
+                        | JobFinalization::Cancelled(result) => output_bytes(
+                            result.summary.as_deref(),
+                            result.code.as_deref(),
+                            result.value.as_ref(),
+                        ),
+                        JobFinalization::Unknown => 0,
+                    };
+                    result.saturating_add(
+                        rejection
+                            .as_ref()
+                            .map_or(0, |stat| debug_bytes(&stat.observation)),
+                    )
+                },
+                OperationKind::FinalizeJob,
+                |batch, (proof, expected_seq, finalization, rejection)| {
+                    batch.finalize_development_failure(
+                        &proof,
+                        expected_seq,
+                        finalization,
+                        rejection,
+                    )
+                },
+            )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         result
@@ -2742,27 +2285,13 @@ impl DatabaseHandle {
         token: entities::AllocationToken,
         cause: entities::UnstartedCause,
     ) -> Result<AppendedOutput, DatabaseError> {
-        self.submit(|reply| {
-            Command::custom(
-                (token, cause),
-                reply,
-                |(_, cause)| output_bytes(Some(cause.summary()), Some(cause.code()), None),
-                |(token, cause), reply, database, operation, commit| {
-                    let mut outcome = run(
-                        database,
-                        operation,
-                        commit,
-                        OperationKind::FinalizeJob,
-                        reply,
-                        |batch| batch.fail_unstarted_reservation(token, cause),
-                    );
-                    if outcome.committed {
-                        outcome.output_changed = Some(token.job);
-                    }
-                    outcome
-                },
-            )
-        })
+        self.write_output(
+            token.job,
+            (token, cause),
+            |(_, cause)| output_bytes(Some(cause.summary()), Some(cause.code()), None),
+            OperationKind::FinalizeJob,
+            |batch, (token, cause)| batch.fail_unstarted_reservation(token, cause),
+        )
         .await
     }
 
@@ -2773,53 +2302,14 @@ impl DatabaseHandle {
         reason: entities::UncertaintyReason,
     ) -> Result<(), DatabaseError> {
         let handoff = returned.handoff();
-        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "handoff",
-                "different database worker",
-            )));
-        }
-        let token = match &handoff.prepared.candidate {
-            redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
-        };
-        if handoff.output_uncertain.load(Ordering::SeqCst)
-            || handoff
-                .output_busy
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "execution",
-                "write is pending or requires reconciliation",
-            )));
-        }
-        let mut guard = DevelopmentOutputGuard {
-            handoff,
-            known: false,
-        };
-        let proof = DevelopmentWriteProof {
-            token,
-            revision: handoff.started.revision,
-        };
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self
-            .submit(|reply| {
-                Command::custom(
-                    (proof, reason),
-                    reply,
-                    |_| 0,
-                    |(proof, reason), reply, database, operation, commit| {
-                        run(
-                            database,
-                            operation,
-                            commit,
-                            OperationKind::FinalizeJob,
-                            reply,
-                            |batch| batch.record_development_uncertain(&proof, reason),
-                        )
-                    },
-                )
-            })
+            .write(
+                0,
+                OperationKind::FinalizeJob,
+                (proof, reason),
+                |batch, (proof, reason)| batch.record_development_uncertain(&proof, reason),
+            )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         result
@@ -2902,21 +2392,6 @@ impl DatabaseHandle {
         ))
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn verify_native_summary(
-        &self,
-        conversation: JobId,
-        consumer: JobId,
-        producer: JobId,
-        source: entities::ContentDigest,
-    ) -> Result<redb::VerifiedNativeSummary, DatabaseError> {
-        self.read(move |database| {
-            redb::verify_native_summary(database, conversation, consumer, producer, source)
-        })
-        .await
-    }
-
-    #[allow(dead_code)]
     pub(crate) async fn create_mutable_job(
         &self,
         context: entities::ComposerContextId,
@@ -2925,27 +2400,24 @@ impl DatabaseHandle {
         conversation: Option<JobId>,
         project: Option<entities::ProjectId>,
     ) -> Result<entities::MutableJobRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context, input, creation, conversation, project),
-                reply,
-                |(_, input, _, _, _)| byte_count(input.size_hint()).saturating_add(8192),
-                OperationKind::CreateJobWithInput,
-                |(context, input, creation, conversation, project), batch| {
-                    let id = batch.create_unsubmitted_job(
-                        context,
-                        input,
-                        creation,
-                        conversation,
-                        project,
-                    )?;
-                    match batch.read_mutable_job(id)? {
-                        Some(job) => Ok(job),
-                        None => batch.corrupted("created mutable Job is missing".to_owned()),
-                    }
-                },
-            )
-        })
+        self.write_sized(
+            (context, input, creation, conversation, project),
+            |(_, input, _, _, _)| byte_count(input.size_hint()).saturating_add(8192),
+            OperationKind::CreateJobWithInput,
+            |batch, (context, input, creation, conversation, project)| {
+                let id = batch.create_unsubmitted_job(
+                    context,
+                    input,
+                    creation,
+                    conversation,
+                    project,
+                )?;
+                match batch.read_mutable_job(id)? {
+                    Some(job) => Ok(job),
+                    None => batch.corrupted("created mutable Job is missing".to_owned()),
+                }
+            },
+        )
         .await
     }
 
@@ -2954,35 +2426,8 @@ impl DatabaseHandle {
         &self,
         context: entities::ComposerContextId,
     ) -> Result<Option<entities::MutableJobRecord>, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context,),
-                reply,
-                |_| 0,
-                OperationKind::Open,
-                |(context,), batch| batch.mutable_job_for_context(context),
-            )
-        })
-        .await
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn mutable_job_in_context(
-        &self,
-        context: entities::ComposerContextId,
-        id: JobId,
-    ) -> Result<Option<entities::MutableJobRecord>, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context, id),
-                reply,
-                |_| 0,
-                OperationKind::Open,
-                |(context, id), batch| {
-                    batch.require_mutable_job_context(context, id)?;
-                    batch.read_mutable_job(id)
-                },
-            )
+        self.write(0, OperationKind::Open, context, |batch, context| {
+            batch.mutable_job_for_context(context)
         })
         .await
     }
@@ -2992,22 +2437,19 @@ impl DatabaseHandle {
         context: entities::ComposerContextId,
         id: JobId,
     ) -> Result<(entities::MutableJobRecord, bool), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context, id),
-                reply,
-                |_| 0,
-                OperationKind::Open,
-                |(context, id), batch| {
-                    batch.require_mutable_job_context(context, id)?;
-                    let Some(record) = batch.read_mutable_job(id)? else {
-                        return batch.corrupted("mutable Job is missing".to_owned());
-                    };
-                    let blocked = batch.unsupported_queued_context(&record.job)?;
-                    Ok((record, blocked))
-                },
-            )
-        })
+        self.write(
+            0,
+            OperationKind::Open,
+            (context, id),
+            |batch, (context, id)| {
+                batch.require_mutable_job_context(context, id)?;
+                let Some(record) = batch.read_mutable_job(id)? else {
+                    return batch.corrupted("mutable Job is missing".to_owned());
+                };
+                let blocked = batch.unsupported_queued_context(&record.job)?;
+                Ok((record, blocked))
+            },
+        )
         .await
     }
 
@@ -3019,48 +2461,20 @@ impl DatabaseHandle {
         revision: u64,
         input: entities::MutableJobInput,
     ) -> Result<entities::MutableJobRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context, id, revision, input),
-                reply,
-                |(_, _, _, input)| byte_count(input.size_hint()).saturating_add(40 * 1024),
-                OperationKind::SaveJobInput,
-                |(context, id, revision, input), batch| {
-                    batch.require_mutable_job_context(context, id)?;
-                    batch.update_mutable_job(id, revision, input)?;
-                    match batch.read_mutable_job(id)? {
-                        Some(job) => Ok(job),
-                        None => batch.corrupted("updated mutable Job is missing".to_owned()),
-                    }
-                },
-            )
-        })
-        .await
-    }
-
-    pub async fn set_mutable_context_selection(
-        &self,
-        context: entities::ComposerContextId,
-        id: JobId,
-        revision: u64,
-        selection: entities::MutableContextSelection,
-    ) -> Result<entities::MutableJobRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context, id, revision, selection),
-                reply,
-                |_| 40 * 1024,
-                OperationKind::SaveJobInput,
-                |(context, id, revision, selection), batch| {
-                    batch.require_mutable_job_context(context, id)?;
-                    batch.set_mutable_context_selection(id, revision, selection)?;
-                    match batch.read_mutable_job(id)? {
-                        Some(job) => Ok(job),
-                        None => batch.corrupted("updated mutable Job is missing".to_owned()),
-                    }
-                },
-            )
-        })
+        self.write_sized(
+            (context, id, revision, input),
+            |(_, _, _, input)| byte_count(input.size_hint()).saturating_add(40 * 1024),
+            OperationKind::SaveJobInput,
+            |batch, (context, id, revision, input)| {
+                batch.require_mutable_job_context(context, id)?;
+                batch.update_mutable_job(id, revision, input)?;
+                batch.read_mutable_job(id)?.ok_or_else(|| {
+                    redb::BatchError(redb::Failure::Storage(redb::StorageError::corrupted(
+                        "updated mutable Job is missing",
+                    )))
+                })
+            },
+        )
         .await
     }
 
@@ -3073,31 +2487,29 @@ impl DatabaseHandle {
         input: Option<entities::MutableJobInput>,
         submission: Submission,
     ) -> Result<entities::MutableJobRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context, id, revision, input, submission),
-                reply,
-                |(_, _, _, input, _)| {
-                    input.as_ref().map_or(8192, |input| {
-                        byte_count(input.size_hint()).saturating_add(40 * 1024)
-                    })
-                },
-                OperationKind::Open,
-                |(context, id, revision, input, submission), batch| {
-                    batch.require_mutable_job_context(context, id)?;
-                    match input {
-                        Some(input) => {
-                            batch.submit_mutable_job_with_input(id, revision, input, submission)
-                        }
-                        None => batch.submit_mutable_job(id, revision, submission),
-                    }?;
-                    match batch.read_mutable_job(id)? {
-                        Some(job) => Ok(job),
-                        None => batch.corrupted("submitted mutable Job is missing".to_owned()),
+        self.write_sized(
+            (context, id, revision, input, submission),
+            |(_, _, _, input, _)| {
+                input.as_ref().map_or(8192, |input| {
+                    byte_count(input.size_hint()).saturating_add(40 * 1024)
+                })
+            },
+            OperationKind::Open,
+            |batch, (context, id, revision, input, submission)| {
+                batch.require_mutable_job_context(context, id)?;
+                match input {
+                    Some(input) => {
+                        batch.submit_mutable_job_with_input(id, revision, input, submission)
                     }
-                },
-            )
-        })
+                    None => batch.submit_mutable_job(id, revision, submission),
+                }?;
+                batch.read_mutable_job(id)?.ok_or_else(|| {
+                    redb::BatchError(redb::Failure::Storage(redb::StorageError::corrupted(
+                        "submitted mutable Job is missing",
+                    )))
+                })
+            },
+        )
         .await
     }
 
@@ -3108,18 +2520,15 @@ impl DatabaseHandle {
         id: JobId,
         revision: u64,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context, id, revision),
-                reply,
-                |_| 8192,
-                OperationKind::StopTurn,
-                |(context, id, revision), batch| {
-                    batch.require_mutable_job_context(context, id)?;
-                    batch.discard_unsubmitted_job(id, revision)
-                },
-            )
-        })
+        self.write(
+            8192,
+            OperationKind::StopTurn,
+            (context, id, revision),
+            |batch, (context, id, revision)| {
+                batch.require_mutable_job_context(context, id)?;
+                batch.discard_unsubmitted_job(id, revision)
+            },
+        )
         .await
     }
 
@@ -3129,75 +2538,20 @@ impl DatabaseHandle {
         id: JobId,
         revision: u64,
     ) -> Result<entities::MutableJobRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (context, id, revision),
-                reply,
-                |_| 8192,
-                OperationKind::StopTurn,
-                |(context, id, revision), batch| {
-                    batch.require_mutable_job_context(context, id)?;
-                    batch.cancel_unsupported_queued_job(id, revision)?;
-                    match batch.read_mutable_job(id)? {
-                        Some(job) => Ok(job),
-                        None => batch.corrupted("cancelled Job is missing".to_owned()),
-                    }
-                },
-            )
-        })
-        .await
-    }
-
-    pub async fn create_job(&self, job: Job) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (job,),
-                reply,
-                |(job,)| {
-                    text_bytes(job.name.as_deref())
-                        .saturating_add(text_bytes(job.input.objective.as_deref()))
-                },
-                OperationKind::CreateJobWithInput,
-                |(job,), batch| mutations::create_job(batch, job),
-            )
-        })
-        .await
-    }
-
-    #[doc(hidden)]
-    pub async fn bench_create_dependent_turn(&self, job: Job) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (job,),
-                reply,
-                |(job,)| {
-                    text_bytes(job.name.as_deref())
-                        .saturating_add(text_bytes(job.input.objective.as_deref()))
-                },
-                OperationKind::CreateJobWithInput,
-                |(job,), batch| mutations::bench_create_dependent_turn(batch, job),
-            )
-        })
-        .await
-    }
-
-    pub async fn create_submitted_job(
-        &self,
-        job: Job,
-        submission: Submission,
-    ) -> Result<JobId, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (job, submission),
-                reply,
-                |(job, _)| {
-                    text_bytes(job.name.as_deref())
-                        .saturating_add(text_bytes(job.input.objective.as_deref()))
-                },
-                OperationKind::CreateJobWithInput,
-                |(job, submission), batch| mutations::create_submitted_job(batch, job, submission),
-            )
-        })
+        self.write(
+            8192,
+            OperationKind::StopTurn,
+            (context, id, revision),
+            |batch, (context, id, revision)| {
+                batch.require_mutable_job_context(context, id)?;
+                batch.cancel_unsupported_queued_job(id, revision)?;
+                batch.read_mutable_job(id)?.ok_or_else(|| {
+                    redb::BatchError(redb::Failure::Storage(redb::StorageError::corrupted(
+                        "cancelled Job is missing",
+                    )))
+                })
+            },
+        )
         .await
     }
 
@@ -3257,14 +2611,8 @@ impl DatabaseHandle {
         &self,
         pool: entities::AllocationPool,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (pool,),
-                reply,
-                |_| 4096,
-                OperationKind::CreateExecutionPool,
-                |(pool,), batch| batch.register_allocation_pool(pool),
-            )
+        self.write(4096, OperationKind::CreateExecutionPool, pool, |b, p| {
+            b.register_allocation_pool(p)
         })
         .await
     }
@@ -3273,14 +2621,8 @@ impl DatabaseHandle {
         &self,
         executor: entities::AllocationExecutor,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (executor,),
-                reply,
-                |_| 4096,
-                OperationKind::CreateExecutor,
-                |(executor,), batch| batch.register_allocation_executor(executor),
-            )
+        self.write(4096, OperationKind::CreateExecutor, executor, |b, e| {
+            b.register_allocation_executor(e)
         })
         .await
     }
@@ -3291,17 +2633,12 @@ impl DatabaseHandle {
         expected_revision: u32,
         update: entities::ExecutorUpdate,
     ) -> Result<entities::AllocationExecutor, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, expected_revision, update),
-                reply,
-                |_| 4096,
-                OperationKind::UpdateExecutor,
-                |(id, expected_revision, update), batch| {
-                    batch.update_native_executor(id, expected_revision, update)
-                },
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::UpdateExecutor,
+            (id, expected_revision, update),
+            |b, (id, rev, upd)| b.update_native_executor(id, rev, upd),
+        )
         .await
     }
 
@@ -3310,17 +2647,12 @@ impl DatabaseHandle {
         id: ExecutorId,
         expected_revision: u32,
     ) -> Result<entities::AllocationExecutor, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, expected_revision),
-                reply,
-                |_| 4096,
-                OperationKind::ArchiveExecutor,
-                |(id, expected_revision), batch| {
-                    batch.archive_native_executor(id, expected_revision)
-                },
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::ArchiveExecutor,
+            (id, expected_revision),
+            |b, (id, rev)| b.archive_native_executor(id, rev),
+        )
         .await
     }
 
@@ -3329,15 +2661,12 @@ impl DatabaseHandle {
         id: ExecutionPoolId,
         expected_revision: u32,
     ) -> Result<entities::AllocationPool, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, expected_revision),
-                reply,
-                |_| 4096,
-                OperationKind::ArchivePool,
-                |(id, expected_revision), batch| batch.archive_native_pool(id, expected_revision),
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::ArchivePool,
+            (id, expected_revision),
+            |b, (id, rev)| b.archive_native_pool(id, rev),
+        )
         .await
     }
 
@@ -3348,17 +2677,12 @@ impl DatabaseHandle {
         capacity: Option<std::num::NonZeroU32>,
         enabled: Option<bool>,
     ) -> Result<entities::AllocationPool, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, expected_revision, capacity, enabled),
-                reply,
-                |_| 4096,
-                OperationKind::SetExecutionPoolProfile,
-                |(id, expected_revision, capacity, enabled), batch| {
-                    batch.update_native_pool(id, expected_revision, capacity, enabled)
-                },
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::SetExecutionPoolProfile,
+            (id, expected_revision, capacity, enabled),
+            |b, (id, rev, cap, en)| b.update_native_pool(id, rev, cap, en),
+        )
         .await
     }
 
@@ -3394,15 +2718,12 @@ impl DatabaseHandle {
     }
 
     pub async fn create_config(&self, config: Config) -> Result<ConfigId, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (config,),
-                reply,
-                |(config,)| config_bytes(config),
-                OperationKind::CreateProfile,
-                |(config,), batch| mutations::create_config(batch, config),
-            )
-        })
+        self.write_sized(
+            config,
+            config_bytes,
+            OperationKind::CreateProfile,
+            mutations::create_config,
+        )
         .await
     }
 
@@ -3412,27 +2733,18 @@ impl DatabaseHandle {
         kind: crate::db::entities::ConfigKind,
         enabled: bool,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, kind, enabled),
-                reply,
-                |(_, _, _)| 32,
-                OperationKind::UpdateProfile,
-                |(id, kind, enabled), batch| batch.set_config_enabled(id, kind, enabled),
-            )
-        })
+        self.write(
+            32,
+            OperationKind::UpdateProfile,
+            (id, kind, enabled),
+            |b, (id, k, en)| b.set_config_enabled(id, k, en),
+        )
         .await
     }
 
     pub(crate) async fn remove_provider(&self, id: ConfigId) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id,),
-                reply,
-                |(_,)| 16,
-                OperationKind::UpdateProfile,
-                |(id,), batch| batch.remove_provider(id),
-            )
+        self.write(16, OperationKind::UpdateProfile, id, |b, id| {
+            b.remove_provider(id)
         })
         .await
     }
@@ -3450,14 +2762,8 @@ impl DatabaseHandle {
         } else {
             OperationKind::CreateProfile
         };
-        self.submit(|reply| {
-            Command::new(
-                (save,),
-                reply,
-                |(save,)| model_profile_save_bytes(save),
-                kind,
-                |(save,), batch| mutations::save_model_profile(batch, save),
-            )
+        self.write_sized(save, model_profile_save_bytes, kind, |b, s| {
+            mutations::save_model_profile(b, s)
         })
         .await
     }
@@ -3467,24 +2773,20 @@ impl DatabaseHandle {
         connection: crate::db::entities::ConnectionConfig,
         models: Vec<crate::db::entities::DiscoveredModel>,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (connection, models),
-                reply,
-                |(connection, models)| {
-                    text_bytes(connection.endpoint.as_deref())
-                        .saturating_add(text_bytes(connection.credential_ref.as_deref()))
-                        .saturating_add(
-                            models
-                                .iter()
-                                .map(|model| byte_count(model.id.len()).saturating_add(512))
-                                .sum::<u64>(),
-                        )
-                },
-                OperationKind::UpdateProfile,
-                |(connection, models), batch| batch.refresh_model_metadata(connection, models),
-            )
-        })
+        self.write_sized(
+            (connection, models),
+            |(c, m)| {
+                text_bytes(c.endpoint.as_deref())
+                    .saturating_add(text_bytes(c.credential_ref.as_deref()))
+                    .saturating_add(
+                        m.iter()
+                            .map(|model| byte_count(model.id.len()).saturating_add(512))
+                            .sum::<u64>(),
+                    )
+            },
+            OperationKind::UpdateProfile,
+            |b, (c, m)| b.refresh_model_metadata(c, m),
+        )
         .await
     }
 
@@ -3496,58 +2798,40 @@ impl DatabaseHandle {
             let key = self.ensure_credential_key().await?;
             save.credential = Some(mutations::CredentialPayload { secret, key });
         }
-        self.submit(|reply| {
-            Command::new(
-                (save,),
-                reply,
-                |(save,)| {
-                    let ref_bytes = match &save.credential_ref {
-                        mutations::ProfileCredentialRef::Preserve => match &save.connection.body {
-                            ConfigBody::Connection(body) => {
-                                text_bytes(body.credential_ref.as_deref())
-                            }
-                            ConfigBody::Model(_)
-                            | ConfigBody::Agent(_)
-                            | ConfigBody::Pool(_)
-                            | ConfigBody::DecisionModel(_)
-                            | ConfigBody::DecisionAgent(_) => 0,
-                        },
-                        mutations::ProfileCredentialRef::Clear => 0,
-                        mutations::ProfileCredentialRef::Explicit(reference)
-                        | mutations::ProfileCredentialRef::PreserveOrGenerate(reference) => {
-                            byte_count(reference.len())
-                        }
-                    };
-                    let endpoint_bytes = match &save.connection.body {
-                        ConfigBody::Connection(body) => text_bytes(body.endpoint.as_deref()),
-                        ConfigBody::Model(_)
-                        | ConfigBody::Agent(_)
-                        | ConfigBody::Pool(_)
-                        | ConfigBody::DecisionModel(_)
-                        | ConfigBody::DecisionAgent(_) => 0,
-                    };
-                    let secret_bytes = save
-                        .secret
-                        .as_ref()
-                        .map_or(0, |secret| byte_count(secret.as_str().len()));
-                    let base = endpoint_bytes
-                        .saturating_add(ref_bytes)
-                        .saturating_add(header_change_bytes(&save.headers))
-                        .saturating_add(secret_bytes);
-                    save.models.iter().fold(
-                        base.saturating_add(byte_count(save.connection.name.len())),
-                        |bytes, model| {
-                            bytes
-                                .saturating_add(byte_count(model.id.len()))
-                                .saturating_add(512)
-                                .saturating_add(16)
-                        },
-                    )
-                },
-                OperationKind::CreateProfile,
-                |(save,), batch| mutations::import_models(batch, save),
-            )
-        })
+        self.write_sized(
+            save,
+            |save| {
+                let ref_bytes = match &save.credential_ref {
+                    mutations::ProfileCredentialRef::Preserve => match &save.connection.body {
+                        ConfigBody::Connection(body) => text_bytes(body.credential_ref.as_deref()),
+                        _ => 0,
+                    },
+                    mutations::ProfileCredentialRef::Clear => 0,
+                    mutations::ProfileCredentialRef::Explicit(r)
+                    | mutations::ProfileCredentialRef::PreserveOrGenerate(r) => byte_count(r.len()),
+                };
+                let endpoint_bytes = match &save.connection.body {
+                    ConfigBody::Connection(body) => text_bytes(body.endpoint.as_deref()),
+                    _ => 0,
+                };
+                let secret_bytes = save
+                    .secret
+                    .as_ref()
+                    .map_or(0, |s| byte_count(s.as_str().len()));
+                let base = endpoint_bytes
+                    .saturating_add(ref_bytes)
+                    .saturating_add(header_change_bytes(&save.headers))
+                    .saturating_add(secret_bytes)
+                    .saturating_add(byte_count(save.connection.name.len()));
+                save.models.iter().fold(base, |bytes, model| {
+                    bytes
+                        .saturating_add(byte_count(model.id.len()))
+                        .saturating_add(528)
+                })
+            },
+            OperationKind::CreateProfile,
+            mutations::import_models,
+        )
         .await
     }
 
@@ -3562,21 +2846,16 @@ impl DatabaseHandle {
         expected_revision: u32,
         fields: Vec<crate::db::entities::OutboundHeader>,
     ) -> Result<crate::db::entities::GlobalHeaders, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (expected_revision, fields),
-                reply,
-                |(_, fields)| {
-                    byte_count(fields.len())
-                        .saturating_mul(512)
-                        .saturating_add(4096)
-                },
-                OperationKind::UpdateProfile,
-                |(expected_revision, fields), batch| {
-                    batch.save_global_headers(expected_revision, fields)
-                },
-            )
-        })
+        self.write_sized(
+            (expected_revision, fields),
+            |(_, fields)| {
+                byte_count(fields.len())
+                    .saturating_mul(512)
+                    .saturating_add(4096)
+            },
+            OperationKind::UpdateProfile,
+            |b, (rev, fields)| b.save_global_headers(rev, fields),
+        )
         .await
     }
 
@@ -3598,27 +2877,18 @@ impl DatabaseHandle {
         &self,
         settings: crate::db::entities::GlobalCompactionSettings,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (settings,),
-                reply,
-                |(settings,)| compaction_bytes(Some(&settings.policy)).saturating_add(64),
-                OperationKind::UpdateProfile,
-                |(settings,), batch| batch.set_global_compaction_settings(settings),
-            )
-        })
+        self.write_sized(
+            settings,
+            |s| compaction_bytes(Some(&s.policy)).saturating_add(64),
+            OperationKind::UpdateProfile,
+            |b, s| b.set_global_compaction_settings(s),
+        )
         .await
     }
 
     pub async fn archive_model(&self, id: ConfigId) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id,),
-                reply,
-                |(_,)| 16,
-                OperationKind::UpdateProfile,
-                |(id,), batch| mutations::archive_model(batch, id),
-            )
+        self.write(16, OperationKind::UpdateProfile, id, |b, id| {
+            mutations::archive_model(b, id)
         })
         .await
     }
@@ -3629,17 +2899,12 @@ impl DatabaseHandle {
         config: Config,
         expected_edit_seq: u32,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, config, expected_edit_seq),
-                reply,
-                |(_, config, _)| config_bytes(config),
-                OperationKind::UpdateProfile,
-                |(id, config, expected), batch| {
-                    mutations::update_config(batch, id, config, expected)
-                },
-            )
-        })
+        self.write_sized(
+            (id, config, expected_edit_seq),
+            |(_, c, _)| config_bytes(c),
+            OperationKind::UpdateProfile,
+            |b, (id, c, exp)| mutations::update_config(b, id, c, exp),
+        )
         .await
     }
 
@@ -3648,32 +2913,16 @@ impl DatabaseHandle {
         approval: ToolCallRef,
         decision: entities::ApprovalDecision,
     ) -> Result<Appended, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (approval, decision),
-                reply,
-                |(_, decision)| match decision {
-                    entities::ApprovalDecision::Answered { text } => byte_count(text.len()),
-                    entities::ApprovalDecision::Approved
-                    | entities::ApprovalDecision::Rejected
-                    | entities::ApprovalDecision::Voided => 64,
-                },
-                OperationKind::DecideApproval,
-                |(approval, decision), batch| batch.decide(approval, decision),
-            )
-        })
+        self.write_sized(
+            (approval, decision),
+            |(_, d)| match d {
+                entities::ApprovalDecision::Answered { text } => byte_count(text.len()),
+                _ => 64,
+            },
+            OperationKind::DecideApproval,
+            |b, (a, d)| b.decide(a, d),
+        )
         .await
-    }
-    pub async fn has_decider(&self, conversation: Option<JobId>) -> Result<bool, DatabaseError> {
-        self.read(move |database| redb::read_has_decider(database, conversation))
-            .await
-    }
-    pub async fn approved_calls(
-        &self,
-        conversation: JobId,
-    ) -> Result<Vec<ToolEvidenceRecord>, DatabaseError> {
-        self.read(move |database| redb::read_approved_calls(database, conversation))
-            .await
     }
     pub async fn conversation_cards(
         &self,
@@ -3690,57 +2939,54 @@ impl DatabaseHandle {
     ) -> Result<redb::JobToolApplied, DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self
-            .submit(|reply| {
-                Command::new(
-                    (proof, call, tool),
-                    reply,
-                    |(_, _, tool)| {
-                        use entities::JobToolCall;
-                        let search = match tool {
-                            JobToolCall::JobPlan { steps, .. } => steps
-                                .iter()
-                                .map(|step| {
-                                    search_index_bytes(&step.objective).saturating_add(64 * 1024)
-                                })
-                                .sum(),
-                            JobToolCall::JobAssign { objective, .. }
-                            | JobToolCall::JobDispatch { objective, .. } => {
-                                search_index_bytes(objective)
-                            }
-                            JobToolCall::JobMessage { text, .. } => search_index_bytes(text),
-                            JobToolCall::JobLimits { .. }
-                            | JobToolCall::JobAgents { .. }
-                            | JobToolCall::JobWorkers { .. }
-                            | JobToolCall::JobStop { .. }
-                            | JobToolCall::JobClose { .. }
-                            | JobToolCall::JobHold { .. }
-                            | JobToolCall::JobUnhold { .. }
-                            | JobToolCall::JobRetry { .. } => 0,
-                        };
-                        debug_bytes(tool)
-                            .saturating_add(4096)
-                            .saturating_add(search)
-                            .saturating_add(match tool {
-                                JobToolCall::JobAssign { objective, .. }
-                                | JobToolCall::JobDispatch { objective, .. }
-                                    if objective.len() <= 64 * 1024 =>
-                                {
-                                    byte_count(objective.len())
-                                        .saturating_mul(6)
-                                        .saturating_add(64 * 1024)
-                                }
-                                JobToolCall::JobMessage { text, .. } if text.len() <= 64 * 1024 => {
-                                    byte_count(text.len())
-                                        .saturating_mul(6)
-                                        .saturating_add(64 * 1024)
-                                }
-                                _ => 0,
+            .write_sized(
+                (proof, call, tool),
+                |(_, _, tool)| {
+                    use entities::JobToolCall;
+                    let search = match tool {
+                        JobToolCall::JobPlan { steps, .. } => steps
+                            .iter()
+                            .map(|step| {
+                                search_index_bytes(&step.objective).saturating_add(64 * 1024)
                             })
-                    },
-                    OperationKind::ApplyJobTool,
-                    |(proof, call, tool), batch| batch.apply_job_tool(&proof, call, tool),
-                )
-            })
+                            .sum(),
+                        JobToolCall::JobAssign { objective, .. }
+                        | JobToolCall::JobDispatch { objective, .. } => {
+                            search_index_bytes(objective)
+                        }
+                        JobToolCall::JobMessage { text, .. } => search_index_bytes(text),
+                        JobToolCall::JobLimits { .. }
+                        | JobToolCall::JobAgents { .. }
+                        | JobToolCall::JobWorkers { .. }
+                        | JobToolCall::JobStop { .. }
+                        | JobToolCall::JobClose { .. }
+                        | JobToolCall::JobHold { .. }
+                        | JobToolCall::JobUnhold { .. }
+                        | JobToolCall::JobRetry { .. } => 0,
+                    };
+                    debug_bytes(tool)
+                        .saturating_add(4096)
+                        .saturating_add(search)
+                        .saturating_add(match tool {
+                            JobToolCall::JobAssign { objective, .. }
+                            | JobToolCall::JobDispatch { objective, .. }
+                                if objective.len() <= 64 * 1024 =>
+                            {
+                                byte_count(objective.len())
+                                    .saturating_mul(6)
+                                    .saturating_add(64 * 1024)
+                            }
+                            JobToolCall::JobMessage { text, .. } if text.len() <= 64 * 1024 => {
+                                byte_count(text.len())
+                                    .saturating_mul(6)
+                                    .saturating_add(64 * 1024)
+                            }
+                            _ => 0,
+                        })
+                },
+                OperationKind::ApplyJobTool,
+                |batch, (proof, call, tool)| batch.apply_job_tool(&proof, call, tool),
+            )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         result
@@ -3765,29 +3011,26 @@ impl DatabaseHandle {
         submission: Option<Submission>,
         candidate: AdmissionCandidate,
     ) -> Result<(JobId, Appended), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (
-                    parent,
-                    spec,
-                    first,
-                    configuration,
-                    request,
-                    submission,
-                    candidate,
-                ),
-                reply,
-                |(_, _, first, _, request, _, _)| {
-                    debug_bytes(first).saturating_add(debug_bytes(request))
-                },
-                OperationKind::Open,
-                |(parent, spec, first, configuration, request, submission, candidate), batch| {
-                    batch.with_admission_candidate(Some(candidate), submission, |batch| {
-                        batch.open_decision(parent, spec, first, configuration, request, submission)
-                    })
-                },
-            )
-        })
+        self.write_sized(
+            (
+                parent,
+                spec,
+                first,
+                configuration,
+                request,
+                submission,
+                candidate,
+            ),
+            |(_, _, first, _, request, _, _)| {
+                debug_bytes(first).saturating_add(debug_bytes(request))
+            },
+            OperationKind::Open,
+            |batch, (parent, spec, _first, configuration, request, submission, candidate)| {
+                batch.with_admission_candidate(Some(candidate), submission, |batch| {
+                    batch.submit_native_decision(parent, spec, configuration, request, submission)
+                })
+            },
+        )
         .await
     }
     pub async fn request_compaction(
@@ -3796,17 +3039,14 @@ impl DatabaseHandle {
         model: ConfigId,
         submission: Submission,
     ) -> Result<entities::CompactionRequest, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation, model, submission),
-                reply,
-                |(_, _, _)| 4096 * 512,
-                OperationKind::Open,
-                |(conversation, model, submission), batch| {
-                    batch.request_compaction(conversation, model, submission)
-                },
-            )
-        })
+        self.write(
+            4096 * 512,
+            OperationKind::Open,
+            (conversation, model, submission),
+            |batch, (conversation, model, submission)| {
+                batch.request_compaction(conversation, model, submission)
+            },
+        )
         .await
     }
 
@@ -3815,27 +3055,21 @@ impl DatabaseHandle {
         conversation: JobId,
         by: Actor,
     ) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation, by),
-                reply,
-                |(_, _)| 4096,
-                OperationKind::StopTurn,
-                |(conversation, by), batch| batch.stop_turn(conversation, by),
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::StopTurn,
+            (conversation, by),
+            |batch, (c, by)| batch.stop_turn(c, by),
+        )
         .await
     }
     pub async fn close(&self, conversation: JobId, by: Actor) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation, by),
-                reply,
-                |(_, _)| 4096,
-                OperationKind::Close,
-                |(conversation, by), batch| batch.close(conversation, by),
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::Close,
+            (conversation, by),
+            |batch, (c, by)| batch.close(c, by),
+        )
         .await
     }
     pub(crate) async fn settle_child_turns(
@@ -3845,30 +3079,24 @@ impl DatabaseHandle {
         if turns.is_empty() {
             return Ok(0);
         }
-        self.submit(|reply| {
-            Command::new(
-                (turns,),
-                reply,
-                |(turns,)| byte_count(turns.len()).saturating_mul(64 * 1024),
-                OperationKind::SettleChildTurns,
-                |(turns,), batch| batch.settle_child_turns(&turns),
-            )
-        })
+        self.write_sized(
+            turns,
+            |turns| byte_count(turns.len()).saturating_mul(64 * 1024),
+            OperationKind::SettleChildTurns,
+            |batch, turns| batch.settle_child_turns(&turns),
+        )
         .await
     }
     pub(crate) async fn settle_unreported_children(&self) -> Result<(), DatabaseError> {
         const BATCH: usize = 8;
         loop {
             let settled = self
-                .submit(|reply| {
-                    Command::new(
-                        (),
-                        reply,
-                        |()| byte_count(BATCH).saturating_mul(64 * 1024),
-                        OperationKind::SettleChildTurns,
-                        |(), batch| batch.settle_unreported_children(BATCH),
-                    )
-                })
+                .write(
+                    byte_count(BATCH).saturating_mul(64 * 1024),
+                    OperationKind::SettleChildTurns,
+                    (),
+                    |batch, ()| batch.settle_unreported_children(BATCH),
+                )
                 .await?;
             if settled < BATCH {
                 return Ok(());
@@ -3876,27 +3104,21 @@ impl DatabaseHandle {
         }
     }
     pub async fn hold(&self, conversation: JobId, by: Actor) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation, by),
-                reply,
-                |(_, _)| 4096,
-                OperationKind::Hold,
-                |(conversation, by), batch| batch.hold(conversation, by, false),
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::Hold,
+            (conversation, by),
+            |batch, (c, by)| batch.hold(c, by, false),
+        )
         .await
     }
     pub async fn unhold(&self, conversation: JobId, by: Actor) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation, by),
-                reply,
-                |(_, _)| 4096,
-                OperationKind::Unhold,
-                |(conversation, by), batch| batch.hold(conversation, by, true),
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::Unhold,
+            (conversation, by),
+            |batch, (c, by)| batch.hold(c, by, true),
+        )
         .await
     }
     pub async fn retry(
@@ -3905,84 +3127,27 @@ impl DatabaseHandle {
         turn: JobId,
         by: Actor,
     ) -> Result<Appended, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (conversation, turn, by),
-                reply,
-                |(_, _, _)| 4096,
-                OperationKind::Retry,
-                |(conversation, turn, by), batch| batch.retry(conversation, turn, by),
-            )
-        })
-        .await
-    }
-
-    pub async fn append_job_output(
-        &self,
-        job: JobId,
-        output: JobOutput,
-    ) -> Result<AppendedOutput, DatabaseError> {
-        self.submit(|reply| {
-            Command::custom(
-                (job, output),
-                reply,
-                |(_, output)| {
-                    output_bytes(
-                        output.summary.as_deref(),
-                        output.code.as_deref(),
-                        output.value.as_ref(),
-                    )
-                },
-                |(job, output), reply, database, operation, commit| {
-                    use OperationKind as Kind;
-                    {
-                        let mut result = run(
-                            database,
-                            operation,
-                            commit,
-                            Kind::AppendJobOutput,
-                            reply,
-                            |batch| mutations::append_job_output(batch, job, output),
-                        );
-                        if result.committed {
-                            result.output_changed = Some(job);
-                        }
-                        result
-                    }
-                },
-            )
-        })
-        .await
-    }
-
-    pub async fn create_executor(&self, executor: Executor) -> Result<ExecutorId, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (executor,),
-                reply,
-                |(executor,)| byte_count(executor.name.len()),
-                OperationKind::CreateExecutor,
-                |(executor,), batch| mutations::create_executor(batch, executor),
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::Retry,
+            (conversation, turn, by),
+            |batch, (c, t, by)| batch.retry(c, t, by),
+        )
         .await
     }
 
     pub async fn create_project(&self, project: Project) -> Result<ProjectId, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (project,),
-                reply,
-                |(project,)| {
-                    byte_count(project.name.len())
-                        .saturating_add(text_bytes(project.description.as_deref()))
-                        .saturating_add(byte_count(project.root.len()))
-                        .saturating_add(command_bytes(&project.commands))
-                },
-                OperationKind::CreateProject,
-                |(project,), batch| mutations::create_project(batch, project),
-            )
-        })
+        self.write_sized(
+            project,
+            |project| {
+                byte_count(project.name.len())
+                    .saturating_add(text_bytes(project.description.as_deref()))
+                    .saturating_add(byte_count(project.root.len()))
+                    .saturating_add(command_bytes(&project.commands))
+            },
+            OperationKind::CreateProject,
+            mutations::create_project,
+        )
         .await
     }
 
@@ -3992,17 +3157,14 @@ impl DatabaseHandle {
         expected: crate::db::entities::Timestamp,
         assignment: Option<entities::ProjectDecisionConfig>,
     ) -> Result<entities::ProjectRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, expected, assignment),
-                reply,
-                |(_, _, _)| 32 * 1024,
-                OperationKind::UpdateProject,
-                |(id, expected, assignment), batch| {
-                    mutations::configure_project_decision(batch, id, expected, assignment)
-                },
-            )
-        })
+        self.write(
+            32 * 1024,
+            OperationKind::UpdateProject,
+            (id, expected, assignment),
+            |batch, (id, expected, assignment)| {
+                mutations::configure_project_decision(batch, id, expected, assignment)
+            },
+        )
         .await
     }
 
@@ -4013,55 +3175,39 @@ impl DatabaseHandle {
         description: Option<String>,
         commands: Vec<ProjectCommand>,
     ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, name, description, commands),
-                reply,
-                |(_, name, description, commands)| {
-                    byte_count(name.len())
-                        .saturating_add(text_bytes(description.as_deref()))
-                        .saturating_add(command_bytes(commands))
-                },
-                OperationKind::UpdateProject,
-                |(id, name, description, commands), batch| {
-                    mutations::update_project(batch, id, name, description, commands)
-                },
-            )
-        })
+        self.write_sized(
+            (id, name, description, commands),
+            |(_, name, description, commands)| {
+                byte_count(name.len())
+                    .saturating_add(text_bytes(description.as_deref()))
+                    .saturating_add(command_bytes(commands))
+            },
+            OperationKind::UpdateProject,
+            |batch, (id, name, description, commands)| {
+                mutations::update_project(batch, id, name, description, commands)
+            },
+        )
         .await
     }
 
     pub async fn set_conversation(&self, root: JobId, edit: JobEdit) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (root, edit),
-                reply,
-                |(_, edit)| match edit {
-                    JobEdit::Title(title) | JobEdit::SuggestedTitle(title) => {
-                        byte_count(title.len())
-                    }
-                    JobEdit::Hide | JobEdit::Limits(_) => 16,
-                    JobEdit::CompactionPolicy(policy) => compaction_bytes(policy.as_ref()),
-                },
-                OperationKind::SetConversation,
-                |(root, edit), batch| mutations::set_conversation(batch, root, edit),
-            )
-        })
+        self.write_sized(
+            (root, edit),
+            |(_, edit)| match edit {
+                JobEdit::Title(title) | JobEdit::SuggestedTitle(title) => byte_count(title.len()),
+                JobEdit::Hide | JobEdit::Limits(_) => 16,
+                JobEdit::CompactionPolicy(policy) => compaction_bytes(policy.as_ref()),
+            },
+            OperationKind::SetConversation,
+            |batch, (root, edit)| mutations::set_conversation(batch, root, edit),
+        )
         .await
     }
 
     pub async fn hide_conversation(&self, root: JobId) -> Result<JobAction, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (root,),
-                reply,
-                |_| 4096,
-                OperationKind::Close,
-                |(root,), batch| {
-                    mutations::set_conversation(batch, root, JobEdit::Hide)?;
-                    batch.close(root, Actor::User)
-                },
-            )
+        self.write(4096, OperationKind::Close, root, |batch, root| {
+            mutations::set_conversation(batch, root, JobEdit::Hide)?;
+            batch.close(root, Actor::User)
         })
         .await
     }
@@ -4130,19 +3276,18 @@ impl DatabaseHandle {
             }
         };
         let created = self
-            .submit(|reply| {
-                submitted.store(true, Ordering::Release);
-                Command::new(
-                    (Box::new(published),),
-                    reply,
-                    |(attachment,)| {
-                        byte_count(attachment.mime.len())
-                            .saturating_add(text_bytes(attachment.display_name.as_deref()))
-                    },
-                    OperationKind::CreateAttachment,
-                    |(attachment,), batch| mutations::create_attachment(batch, *attachment),
-                )
-            })
+            .write_sized(
+                Box::new(published),
+                |attachment| {
+                    byte_count(attachment.mime.len())
+                        .saturating_add(text_bytes(attachment.display_name.as_deref()))
+                },
+                OperationKind::CreateAttachment,
+                move |batch, attachment| {
+                    submitted.store(true, Ordering::Release);
+                    mutations::create_attachment(batch, *attachment)
+                },
+            )
             .await;
         let settled = match &created {
             Ok(_) => true,
@@ -4211,163 +3356,6 @@ impl DatabaseHandle {
         Ok(AttachmentContent { record, bytes })
     }
 
-    pub async fn cleanup_attachment(
-        &self,
-        id: AttachmentId,
-    ) -> Result<AttachmentCleanupReport, AttachmentError> {
-        let record = self
-            .attachment(id)
-            .await?
-            .ok_or(AttachmentError::NotFound(id))?;
-        let (record, recorded) = if record.is_available() {
-            let kind = CleanupKind::Manual;
-            match self
-                .submit(|reply| {
-                    Command::new(
-                        (id, kind),
-                        reply,
-                        |(_, _)| 0,
-                        OperationKind::CleanupAttachment,
-                        |(id, kind), batch| mutations::cleanup_attachment(batch, id, kind),
-                    )
-                })
-                .await
-            {
-                Ok(record) => (record, true),
-                Err(DatabaseError::Rejected(Violation::AttachmentCleanedUp(_))) => (
-                    self.attachment(id)
-                        .await?
-                        .ok_or(AttachmentError::NotFound(id))?,
-                    false,
-                ),
-                Err(error) => return Err(error.into()),
-            }
-        } else {
-            (record, false)
-        };
-        let content = self.reclaim(record.sha256, record.byte_length).await;
-        Ok(AttachmentCleanupReport {
-            record,
-            recorded,
-            content,
-        })
-    }
-
-    async fn reclaim(
-        &self,
-        digest: ContentDigest,
-        length: u64,
-    ) -> Result<Reclamation, ReclamationError> {
-        let shared = self.shared.clone();
-        self.read(move |database| {
-            shared
-                .attachments
-                .reclaim(digest, length, || redb::content_available(database, digest))
-        })
-        .await
-        .map_err(ReclamationError::Database)?
-        .map_err(ReclamationError::Store)
-    }
-
-    pub async fn record_metrics(&self, metrics: Metrics) -> Result<MetricsId, DatabaseError> {
-        self.submit(|reply| {
-            Command::custom(
-                (Box::new(metrics),),
-                reply,
-                |(metrics,)| json_bytes(metrics.measurements.usage.raw.as_ref()),
-                |(metrics,), reply, database, operation, commit| {
-                    use OperationKind as Kind;
-                    {
-                        let job = metrics.job;
-                        let id = std::cell::Cell::new(None);
-                        let mut result = run(
-                            database,
-                            operation,
-                            commit,
-                            Kind::RecordMetrics,
-                            reply,
-                            |batch| {
-                                let value = mutations::record_metrics(batch, *metrics)?;
-                                id.set(Some(value));
-                                Ok(value)
-                            },
-                        );
-                        if let Some(id) = id.get() {
-                            result
-                                .observations
-                                .push(ObservationChange::Metrics(job, id));
-                        }
-                        result
-                    }
-                },
-            )
-        })
-        .await
-    }
-
-    pub async fn record_sent_request(&self, sent: SentRequest) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (Box::new(sent),),
-                reply,
-                |(sent,)| {
-                    sent.bodies.iter().fold(
-                        byte_count(sent.messages.len()).saturating_mul(32),
-                        |bytes, body| bytes.saturating_add(byte_count(body.byte_length())),
-                    )
-                },
-                OperationKind::RecordSentRequest,
-                |(sent,), batch| mutations::record_sent_request(batch, *sent),
-            )
-        })
-        .await
-    }
-
-    pub async fn record_provider_answer(
-        &self,
-        answer: ProviderAnswer,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::custom(
-                (Box::new(answer),),
-                reply,
-                |(answer,)| {
-                    byte_count(answer.response.byte_length())
-                        .saturating_add(json_bytes(answer.measurements.usage.raw.as_ref()))
-                },
-                |(answer,), reply, database, operation, commit| {
-                    use OperationKind as Kind;
-                    {
-                        let job = answer.stat.job;
-                        let ids = std::cell::Cell::new(None);
-                        let mut result = run(
-                            database,
-                            operation,
-                            commit,
-                            Kind::RecordProviderAnswer,
-                            reply,
-                            |batch| {
-                                let value = mutations::record_provider_answer(batch, *answer)?;
-                                ids.set(Some(value));
-                                Ok(())
-                            },
-                        );
-                        if let Some((metrics, availability)) = ids.get() {
-                            result
-                                .observations
-                                .push(ObservationChange::Metrics(job, metrics));
-                            result
-                                .observations
-                                .push(ObservationChange::Availability(job, availability));
-                        }
-                        result
-                    }
-                },
-            )
-        })
-        .await
-    }
-
     pub(crate) async fn provider_responses(
         &self,
         job: JobId,
@@ -4388,54 +3376,6 @@ impl DatabaseHandle {
     ) -> Result<Option<ProviderRequestRecord>, DatabaseError> {
         self.read(move |database| redb::read_provider_request(database, job, request))
             .await
-    }
-
-    pub async fn record_availability_stat(
-        &self,
-        stat: AvailabilityStat,
-    ) -> Result<AvailabilityStatId, DatabaseError> {
-        self.submit(|reply| {
-            Command::custom(
-                (Box::new(stat),),
-                reply,
-                |(stat,)| {
-                    let observation = &stat.observation;
-                    let failure = observation.failure.as_ref().map_or(0, |failure| {
-                        byte_count(failure.message.len())
-                            .saturating_add(text_bytes(failure.provider_code.as_deref()))
-                            .saturating_add(text_bytes(failure.response_body.as_deref()))
-                            .saturating_add(text_bytes(failure.request_id.as_deref()))
-                    });
-                    failure.saturating_add(text_bytes(observation.raw_finish_reason.as_deref()))
-                },
-                |(stat,), reply, database, operation, commit| {
-                    use OperationKind as Kind;
-                    {
-                        let job = stat.job;
-                        let id = std::cell::Cell::new(None);
-                        let mut result = run(
-                            database,
-                            operation,
-                            commit,
-                            Kind::RecordAvailabilityStat,
-                            reply,
-                            |batch| {
-                                let value = mutations::record_availability_stat(batch, *stat)?;
-                                id.set(Some(value));
-                                Ok(value)
-                            },
-                        );
-                        if let Some(id) = id.get() {
-                            result
-                                .observations
-                                .push(ObservationChange::Availability(job, id));
-                        }
-                        result
-                    }
-                },
-            )
-        })
-        .await
     }
 
     fn begin_development_write<'a>(
@@ -4481,27 +3421,24 @@ impl DatabaseHandle {
     ) -> Result<(), DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self
-            .submit(|reply| {
-                Command::new(
-                    (proof, Box::new(evidence)),
-                    reply,
-                    |(_, evidence)| {
-                        let identity = byte_count(evidence.tool_call_id.len())
-                            .saturating_add(byte_count(evidence.name.len()));
-                        match evidence.decision.stored_admission() {
-                            None => identity,
-                            Some(admission) => identity
-                                .saturating_add(byte_count(admission.handler_version.len()))
-                                .saturating_add(byte_count(admission.parameters.len()))
-                                .saturating_add(byte_count(admission.arguments.len())),
-                        }
-                    },
-                    OperationKind::RecordToolDecision,
-                    |(proof, evidence), batch| {
-                        mutations::record_tool_decision(batch, &proof, *evidence)
-                    },
-                )
-            })
+            .write_sized(
+                (proof, Box::new(evidence)),
+                |(_, evidence)| {
+                    let identity = byte_count(evidence.tool_call_id.len())
+                        .saturating_add(byte_count(evidence.name.len()));
+                    match evidence.decision.stored_admission() {
+                        None => identity,
+                        Some(admission) => identity
+                            .saturating_add(byte_count(admission.handler_version.len()))
+                            .saturating_add(byte_count(admission.parameters.len()))
+                            .saturating_add(byte_count(admission.arguments.len())),
+                    }
+                },
+                OperationKind::RecordToolDecision,
+                |batch, (proof, evidence)| {
+                    mutations::record_tool_decision(batch, &proof, *evidence)
+                },
+            )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         result
@@ -4515,24 +3452,21 @@ impl DatabaseHandle {
     ) -> Result<(), DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self
-            .submit(|reply| {
-                Command::new(
-                    (proof, call, Box::new(outcome)),
-                    reply,
-                    |(_, _, outcome)| match outcome.as_ref() {
-                        ToolOutcome::Completed { result } => byte_count(result.len()),
-                        ToolOutcome::NotApplied { message } => byte_count(message.len()),
-                        ToolOutcome::Uncertain { message, .. } => text_bytes(message.as_deref()),
-                        ToolOutcome::CompletedWithheld { .. }
-                        | ToolOutcome::CompletedElided { .. }
-                        | ToolOutcome::NotInvoked { .. } => 0,
-                    },
-                    OperationKind::RecordToolOutcome,
-                    |(proof, call, outcome), batch| {
-                        mutations::record_tool_outcome(batch, &proof, call, *outcome)
-                    },
-                )
-            })
+            .write_sized(
+                (proof, call, Box::new(outcome)),
+                |(_, _, outcome)| match outcome.as_ref() {
+                    ToolOutcome::Completed { result } => byte_count(result.len()),
+                    ToolOutcome::NotApplied { message } => byte_count(message.len()),
+                    ToolOutcome::Uncertain { message, .. } => text_bytes(message.as_deref()),
+                    ToolOutcome::CompletedWithheld { .. }
+                    | ToolOutcome::CompletedElided { .. }
+                    | ToolOutcome::NotInvoked { .. } => 0,
+                },
+                OperationKind::RecordToolOutcome,
+                |batch, (proof, call, outcome)| {
+                    mutations::record_tool_outcome(batch, &proof, call, *outcome)
+                },
+            )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         result
@@ -4550,73 +3484,6 @@ impl DatabaseHandle {
 }
 
 impl DatabaseHandle {
-    pub async fn create_execution_pool(
-        &self,
-        pool: ExecutionPool,
-    ) -> Result<ExecutionPoolId, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (pool,),
-                reply,
-                |(pool,)| byte_count(pool.name.len()),
-                OperationKind::CreateExecutionPool,
-                |(pool,), batch| mutations::create_execution_pool(batch, pool),
-            )
-        })
-        .await
-    }
-
-    pub async fn set_execution_pool_enabled(
-        &self,
-        id: ExecutionPoolId,
-        enabled: bool,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, enabled),
-                reply,
-                |(_, _)| 64,
-                OperationKind::SetExecutionPoolEnabled,
-                |(id, enabled), batch| mutations::set_execution_pool_enabled(batch, id, enabled),
-            )
-        })
-        .await
-    }
-
-    pub async fn update_execution_pool(
-        &self,
-        id: ExecutionPoolId,
-        config: ExecutionPoolConfig,
-    ) -> Result<(), DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, config),
-                reply,
-                |(_, _)| 64,
-                OperationKind::SetExecutionPoolProfile,
-                |(id, config), batch| mutations::update_execution_pool(batch, id, config),
-            )
-        })
-        .await
-    }
-
-    pub async fn execution_pool(
-        &self,
-        id: ExecutionPoolId,
-    ) -> Result<Option<ExecutionPoolRecord>, DatabaseError> {
-        self.read(move |database| redb::read_execution_pool(database, id))
-            .await
-    }
-
-    pub async fn execution_pools(
-        &self,
-        before: Option<ExecutionPoolId>,
-        limit: usize,
-    ) -> Result<Vec<ExecutionPoolRecord>, DatabaseError> {
-        self.read(move |database| redb::read_execution_pools(database, before, limit))
-            .await
-    }
-
     async fn ensure_credential_key(&self) -> Result<Arc<redb::CredentialKey>, DatabaseError> {
         if let Some(key) = self.shared.credential_key() {
             return Ok(key);
@@ -4711,15 +3578,12 @@ impl DatabaseHandle {
         &self,
         draft: crate::system::scheduled_external::ScheduledExternalPolicyDraft,
     ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (draft,),
-                reply,
-                |_| 8192,
-                OperationKind::SetScheduledExternalPolicy,
-                |(draft,), batch| batch.create_scheduled_external_policy(&draft),
-            )
-        })
+        self.write(
+            8192,
+            OperationKind::SetScheduledExternalPolicy,
+            draft,
+            |batch, draft| batch.create_scheduled_external_policy(&draft),
+        )
         .await
     }
 
@@ -4729,17 +3593,12 @@ impl DatabaseHandle {
         expected_revision: u32,
         draft: crate::system::scheduled_external::ScheduledExternalPolicyDraft,
     ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, expected_revision, draft),
-                reply,
-                |_| 8192,
-                OperationKind::SetScheduledExternalPolicy,
-                |(id, expected_revision, draft), batch| {
-                    batch.update_scheduled_external_policy(id, expected_revision, &draft)
-                },
-            )
-        })
+        self.write(
+            8192,
+            OperationKind::SetScheduledExternalPolicy,
+            (id, expected_revision, draft),
+            |batch, (id, rev, draft)| batch.update_scheduled_external_policy(id, rev, &draft),
+        )
         .await
     }
 
@@ -4749,17 +3608,14 @@ impl DatabaseHandle {
         expected_revision: u32,
         enabled: bool,
     ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, expected_revision, enabled),
-                reply,
-                |_| 4096,
-                OperationKind::SetScheduledExternalPolicy,
-                |(id, expected_revision, enabled), batch| {
-                    batch.set_scheduled_external_policy_enabled(id, expected_revision, enabled)
-                },
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::SetScheduledExternalPolicy,
+            (id, expected_revision, enabled),
+            |batch, (id, rev, enabled)| {
+                batch.set_scheduled_external_policy_enabled(id, rev, enabled)
+            },
+        )
         .await
     }
 
@@ -4768,17 +3624,12 @@ impl DatabaseHandle {
         id: entities::ScheduledExternalPolicyId,
         expected_revision: u32,
     ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
-        self.submit(|reply| {
-            Command::new(
-                (id, expected_revision),
-                reply,
-                |_| 4096,
-                OperationKind::SetScheduledExternalPolicy,
-                |(id, expected_revision), batch| {
-                    batch.revoke_scheduled_external_policy(id, expected_revision)
-                },
-            )
-        })
+        self.write(
+            4096,
+            OperationKind::SetScheduledExternalPolicy,
+            (id, expected_revision),
+            |batch, (id, rev)| batch.revoke_scheduled_external_policy(id, rev),
+        )
         .await
     }
 
@@ -4830,5 +3681,18 @@ impl DatabaseHandle {
                     refusal.code,
                 ))
             })
+    }
+
+    pub(crate) async fn claim_due_recurrences(
+        &self,
+        limit: usize,
+    ) -> Result<Option<std::time::Duration>, DatabaseError> {
+        self.write(
+            4096,
+            OperationKind::ClaimExecution,
+            limit,
+            |batch, limit| batch.claim_due_recurrences(limit),
+        )
+        .await
     }
 }

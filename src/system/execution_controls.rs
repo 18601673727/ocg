@@ -47,11 +47,11 @@ impl ExecutionControl {
         match self {
             ExecutionControl::ManualLoopbackExecution => ControlState::Enabled,
             ExecutionControl::AutonomousScheduling => ControlState::Enabled,
+            ExecutionControl::ScheduledExternalTransport => ControlState::Enabled,
             ExecutionControl::ToolsAndChildJobs => ControlState::Enabled,
             ExecutionControl::WorkspaceMutation => ControlState::Enabled,
             ExecutionControl::ManualExternalTrial
             | ExecutionControl::ManualExternalExecution
-            | ExecutionControl::ScheduledExternalTransport
             | ExecutionControl::ExternalProviderTransport
             | ExecutionControl::ProviderDiscovery
             | ExecutionControl::RecoveryAndRedispatch

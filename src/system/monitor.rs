@@ -380,9 +380,6 @@ pub struct ProtectionWatch {
 }
 
 impl ProtectionWatch {
-    pub(crate) fn notifications(&self) -> &flume::Receiver<()> {
-        &self.receiver
-    }
     pub fn status(&self) -> DiskProtectionStatus {
         self.cell.status()
     }
@@ -405,22 +402,6 @@ impl<T: Clone> SharedRequest<T> {
         Self {
             waiters: Mutex::new(None),
         }
-    }
-
-    pub(crate) fn join<E>(
-        &self,
-        start: impl FnOnce() -> Result<(), E>,
-    ) -> Result<flume::Receiver<T>, E> {
-        let mut waiters = self.waiters.lock().unwrap_or_else(PoisonError::into_inner);
-        let (sender, receiver) = flume::bounded(1);
-        match waiters.as_mut() {
-            Some(waiters) => waiters.push(sender),
-            None => {
-                start()?;
-                *waiters = Some(vec![sender]);
-            }
-        }
-        Ok(receiver)
     }
 
     pub(crate) fn complete(&self, result: T) {

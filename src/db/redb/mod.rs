@@ -15,12 +15,12 @@ use crate::db::entities::{
 use crate::db::entities::{
     AgentCapability, AgentConfig, AttachmentId, AttachmentOrigin, AttachmentRecord,
     AuthorizationBasis, CleanupKind, ConfigId, ConfigRef, ContentDigest, DependencyCondition,
-    EffectConclusion, ExecutionOperation, ExecutionPoolId, ExecutionPoolRecord, ExecutorId,
-    ExecutorRecord, FinalResult, FrozenExecutionConfig, FrozenLlmConfig, JobId, JobInputId,
-    JobOutputId, JobOutputRecord, JobRecord, LlmConfig, LlmParameters, LlmProviderId, LlmTarget,
-    LlmTransport, Measurements, MetricsId, ModelCapability, OutputKind, ProfileId, ProjectId,
-    ProjectRecord, ProviderSnapshot, RecordRef, RequestEligibility, RequestNumber, SubmissionKey,
-    SubmissionRecord, Timestamp, ToolEffect, ToolEvidenceRecord, UncertainCause, WithheldReason,
+    EffectConclusion, ExecutionOperation, ExecutionPoolId, ExecutorId, FrozenExecutionConfig,
+    FrozenLlmConfig, JobId, JobInputId, JobOutputId, JobOutputRecord, JobRecord, LlmConfig,
+    LlmParameters, LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsId,
+    ModelCapability, OutputKind, ProfileId, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef,
+    RequestEligibility, RequestNumber, SubmissionKey, SubmissionRecord, Timestamp, ToolEffect,
+    ToolEvidenceRecord, UncertainCause, WithheldReason,
 };
 use crate::service::ai::providers::openai_compatible::{
     ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
@@ -37,7 +37,6 @@ mod migrate;
 pub(crate) use migrate::{HeldSource, MigrationInspection, apply, inspect};
 mod notices;
 mod observations;
-pub(crate) use observations::{DecisionAvailabilityRecord, read_decision_availability};
 mod reader;
 mod recovery;
 pub(crate) use recovery::reclaim_pending;
@@ -46,7 +45,6 @@ mod rows;
 mod schema;
 mod transactions;
 mod writer;
-pub(crate) use transactions::valid_reservation_request_id;
 
 use crate::db::entities::AvailabilityStatId;
 use codec::{
@@ -62,26 +60,16 @@ pub(crate) use writer::{
     compact, persist_staged, run_batch_declinable, run_batch_with,
 };
 
+pub(crate) use reader::verify_offline;
 pub(crate) use reader::{
     DevelopmentCandidate, DevelopmentResolvedCandidate, DevelopmentResolvedContext,
-    read_development_execution_context, read_development_execution_preview,
+    read_development_execution_context,
 };
 pub(crate) use reader::{
     NativeResource, NativeResourceKind, PoolAllocationPage, read_native_resources,
     read_pool_allocations,
 };
 pub(crate) use reader::{ProfilePageRecord, read_global_compaction_settings};
-pub(crate) use reader::{VerifiedNativeSummary, verify_native_summary};
-pub(crate) use reader::{
-    inspect_held_allocations_offline, reconcile_development_reservation_offline, verify_offline,
-};
-#[cfg(unix)]
-pub(crate) use reader::{verify_recovered_publication, verify_reserved_publication};
-pub(crate) use recovery::{
-    HeldRecoveryPlan, ReservedRefusal, reconcile_held_apply, reconcile_held_preflight,
-    reconcile_reserved_apply, reconcile_reserved_preflight, verify_held_publication_delta,
-    verify_reserved_publication_delta,
-};
 pub(crate) fn escaped_json_char_cost(character: char) -> usize {
     match character {
         '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
@@ -102,22 +90,18 @@ pub(crate) use reader::read_global_outbound_headers;
 pub(crate) use reader::read_handoff_credential;
 pub(crate) use reader::read_trial_job;
 pub(crate) use reader::{
-    ActivationSnapshot, ContextState, ContextWorkDetails, GENESIS_JOB, JobTree, OfflineActivation,
-    RecurrenceAudit, TreeFacts, TreeNode, UncertainAllocation, UsageRetriesPage,
-    activation_snapshot, content_available, inspect_activation_offline, probe_committed,
-    queue_counts, read_agent_model_configs, read_attachment, read_attachments,
-    read_candidate_compatible, read_children, read_compatible_executors, read_config, read_configs,
-    read_context_state, read_conversation_search, read_conversations, read_credential_ref_in_use,
-    read_decision_executors, read_decision_work, read_execution_pool, read_execution_pools,
-    read_executor, read_executors, read_job, read_job_configuration, read_job_input,
-    read_job_input_for_job, read_job_search, read_job_tree, read_jobs, read_latest_output,
-    read_native_job, read_outputs, read_profile_page, read_project, read_projects, read_retries,
-    read_submission, read_tool_evidence, read_tool_stats, read_uncertain_allocations,
-    read_usage_buckets, read_usage_retries, read_usage_summary,
+    AgentModelConfig, ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage,
+    NativeJobItem, read_cards, read_conversation_children,
 };
 pub(crate) use reader::{
-    AgentModelConfig, ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage,
-    NativeJobItem, read_approved_calls, read_cards, read_conversation_children, read_has_decider,
+    ContextState, ContextWorkDetails, JobTree, TreeFacts, TreeNode, UncertainAllocation,
+    UsageRetriesPage, probe_committed, queue_counts, read_agent_model_configs, read_attachment,
+    read_attachments, read_children, read_config, read_configs, read_context_state,
+    read_conversation_search, read_conversations, read_credential_ref_in_use, read_decision_work,
+    read_job, read_job_configuration, read_job_input, read_job_search, read_job_tree,
+    read_latest_output, read_native_job, read_outputs, read_profile_page, read_project,
+    read_projects, read_retries, read_submission, read_tool_evidence, read_tool_stats,
+    read_uncertain_allocations, read_usage_buckets, read_usage_retries, read_usage_summary,
 };
 pub(crate) use reader::{
     MutableConversationPage, MutableJobDetails, MutableJobDetailsLookup, read_conversation_limits,
@@ -137,16 +121,12 @@ pub(crate) use rows::{
 use rows::{
     decode_attachment, decode_credential, decode_output, decode_project, decode_project_root,
     decode_submission, decode_tool_evidence, encode_attachment, encode_output, encode_project,
-    encode_submission, encode_tool_evidence, job_tool_evidence, tool_call_key, tool_call_ref,
+    encode_submission, encode_tool_evidence, tool_call_key, tool_call_ref,
 };
 use schema::*;
 pub(crate) use schema::{
     CACHE_BYTES, CREDENTIAL_KEY_FILE_NAME, DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN, MAX_PAGE,
 };
-
-pub(crate) const fn storage_format_versions() -> (u64, u8) {
-    (schema::DATABASE_FORMAT_VERSION, codec::RECORD_VERSION)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StorageErrorKind {

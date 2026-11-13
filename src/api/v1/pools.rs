@@ -277,7 +277,7 @@ pub(super) async fn update_executor(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct NativeExecutorArchiveInput {
+struct ArchiveInput {
     expected_revision: u32,
 }
 
@@ -286,8 +286,7 @@ pub(super) async fn archive_executor(
     id: crate::db::entities::ExecutorId,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
-    let input: NativeExecutorArchiveInput =
-        serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
+    let input: ArchiveInput = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
     let executor = database
         .archive_native_executor(id, input.expected_revision)
         .await
@@ -297,19 +296,12 @@ pub(super) async fn archive_executor(
     )))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativePoolArchiveInput {
-    expected_revision: u32,
-}
-
 pub(super) async fn archive_pool(
     database: &DatabaseHandle,
     id: ExecutionPoolId,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
-    let input: NativePoolArchiveInput =
-        serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
+    let input: ArchiveInput = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
     let pool = database
         .archive_native_pool(id, input.expected_revision)
         .await
@@ -474,30 +466,6 @@ fn refusal(error: DatabaseError) -> Refusal {
                 "an Executor of the Pool is not archived; archive each Executor first, nothing was archived",
             )
         }
-        DatabaseError::Rejected(Violation::InvalidValue(
-            "pool",
-            "child Executor verification exceeds the scan bound",
-        )) => Refusal::new(
-            StatusCode::CONFLICT,
-            "pool_child_scan_unavailable",
-            "the Pool's Executors could not all be examined within the safety bound; archival was safely refused",
-        ),
-        DatabaseError::Rejected(Violation::InvalidValue(
-            "pool",
-            "active Allocation index is inconsistent",
-        )) => Refusal::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "allocation_index_inconsistent",
-            "the Pool's active Allocation index disagrees with its stored Allocations; nothing was archived",
-        ),
-        DatabaseError::Rejected(Violation::InvalidValue(
-            "pool",
-            "configuration storage is inconsistent",
-        )) => Refusal::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "pool_storage_inconsistent",
-            "a stored Pool or Executor configuration is unreadable; nothing was archived",
-        ),
         DatabaseError::Rejected(Violation::InvalidValue("pool", _)) => Refusal::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_pool",
@@ -532,14 +500,6 @@ fn refusal(error: DatabaseError) -> Refusal {
             StatusCode::CONFLICT,
             "executor_holds_allocation",
             "the Executor still holds an Allocation; nothing was archived or released",
-        ),
-        DatabaseError::Rejected(Violation::InvalidValue(
-            "executor",
-            "active Allocation index is inconsistent",
-        )) => Refusal::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "allocation_index_inconsistent",
-            "the Executor's active Allocation index disagrees with its stored Allocations; nothing was archived",
         ),
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Executor(_))) => Refusal::new(
             StatusCode::NOT_FOUND,

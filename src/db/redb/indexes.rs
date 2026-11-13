@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::*;
-use crate::db::entities::{OutcomeKind, RequestEventRecord, RequestPayload};
+use crate::db::entities::{RequestEventRecord, RequestPayload};
 
 pub(super) fn search_gram(chars: &[char]) -> u64 {
     chars
@@ -82,45 +82,6 @@ fn searchable_turn_context(
     )
 }
 
-fn turn_search_grams(
-    tx: &WriteTransaction,
-    conversation: JobId,
-    turn: JobId,
-) -> Result<BTreeSet<u64>, StorageError> {
-    if !searchable_turn_context(tx, conversation, turn)? {
-        return Ok(BTreeSet::new());
-    }
-    let mut grams = BTreeSet::new();
-    for (_, entry) in
-        reader::effective_entries(reader::job_entries_of(&tx.open_table(JOB_INPUTS)?, turn)?)?
-    {
-        if let Some(text) = search_input_text(&tx.open_table(ATTACHMENTS)?, &entry.entry)? {
-            grams.extend(search_grams(&text));
-        }
-    }
-    let completed = tx
-        .open_table(JOB_STATES)?
-        .get(turn.get())?
-        .map(|bytes| JobState::decode_at(turn.get(), bytes.value()))
-        .transpose()?
-        .and_then(|state| state.outcome)
-        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
-    for entry in tx
-        .open_table(JOB_OUTPUTS)?
-        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
-    {
-        let (key, bytes) = entry?;
-        if rows::output_kind(bytes.value())? != OutputKind::Result {
-            continue;
-        }
-        let output = decode_output(key.value(), bytes.value())?;
-        if let Some(text) = search_output_text(&output, completed) {
-            grams.extend(search_grams(text));
-        }
-    }
-    Ok(grams)
-}
-
 fn insert_turn_search_grams(
     tx: &WriteTransaction,
     conversation: JobId,
@@ -130,25 +91,6 @@ fn insert_turn_search_grams(
     let mut table = tx.open_table(CONVERSATION_SEARCH)?;
     for gram in grams {
         table.insert((conversation.get(), *gram, turn.get()), ())?;
-    }
-    Ok(())
-}
-
-pub(super) fn append_input_search_index(
-    tx: &WriteTransaction,
-    conversation: JobId,
-    turn: JobId,
-    entry: &Entry,
-) -> Result<(), StorageError> {
-    if !matches!(
-        entry,
-        Entry::UserMessage { .. } | Entry::AgentMessage { .. }
-    ) || !searchable_turn_context(tx, conversation, turn)?
-    {
-        return Ok(());
-    }
-    if let Some(text) = search_input_text(&tx.open_table(ATTACHMENTS)?, entry)? {
-        insert_turn_search_grams(tx, conversation, turn, &search_grams(&text))?;
     }
     Ok(())
 }
@@ -167,48 +109,6 @@ pub(super) fn append_output_search_index(
         insert_turn_search_grams(tx, conversation, turn, &search_grams(text))?;
     }
     Ok(())
-}
-
-pub(super) fn amend_turn_search_index(
-    tx: &WriteTransaction,
-    conversation: JobId,
-    turn: JobId,
-    previous: &BTreeSet<u64>,
-) -> Result<(), StorageError> {
-    let grams = turn_search_grams(tx, conversation, turn)?;
-    let mut table = tx.open_table(CONVERSATION_SEARCH)?;
-    for gram in previous.difference(&grams) {
-        table.remove((conversation.get(), *gram, turn.get()))?;
-    }
-    for gram in &grams {
-        table.insert((conversation.get(), *gram, turn.get()), ())?;
-    }
-    Ok(())
-}
-
-pub(super) fn complete_turn_search_index(
-    tx: &WriteTransaction,
-    conversation: JobId,
-    turn: JobId,
-) -> Result<(), StorageError> {
-    if !searchable_turn_context(tx, conversation, turn)? {
-        return Ok(());
-    }
-    let mut grams = BTreeSet::new();
-    for entry in tx
-        .open_table(JOB_OUTPUTS)?
-        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
-    {
-        let (key, bytes) = entry?;
-        if rows::output_kind(bytes.value())? != OutputKind::Result {
-            continue;
-        }
-        let output = decode_output(key.value(), bytes.value())?;
-        if let Some(text) = search_output_text(&output, true) {
-            grams.extend(search_grams(text));
-        }
-    }
-    insert_turn_search_grams(tx, conversation, turn, &grams)
 }
 
 pub(super) fn searchable_conversation(row: &JobSpec) -> bool {
@@ -350,116 +250,6 @@ pub(super) fn validate_native_sample(
     Ok(())
 }
 
-pub(super) const MAX_NATIVE_USAGE_OBSERVATIONS: u32 = 1024;
-
-pub(super) fn native_usage_evidence(
-    tx: &WriteTransaction,
-    job: JobId,
-    request: RequestNumber,
-) -> Result<crate::db::entities::TokenEvidence, StorageError> {
-    let table = tx.open_table(REQUEST_EVENTS)?;
-    let mut evidence = crate::db::entities::TokenEvidence::default();
-    let mut expected = 5u32;
-    let mut entries =
-        table.range((job.get(), request.get(), 5)..=(job.get(), request.get(), u32::MAX))?;
-    while let Some(entry) = entries.next() {
-        let (key, bytes) = entry?;
-        let seq = key.value().2;
-        if seq > 4 + 2 * MAX_NATIVE_USAGE_OBSERVATIONS {
-            return Err(StorageError::corrupted(
-                "native Token observation limit exceeded",
-            ));
-        }
-        if seq != expected {
-            return Err(StorageError::corrupted("native Token sequence has a gap"));
-        }
-        let event = rows::decode_request_event(job, request, seq, bytes.value())?;
-        {
-            let RequestPayload::Measurement { ref measurements } = event.payload else {
-                return Err(StorageError::corrupted("native Token measurement missing"));
-            };
-            let usage = &measurements.usage;
-            if [
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cache_read_tokens,
-                usage.cache_write_tokens,
-                usage.reasoning_tokens,
-            ]
-            .iter()
-            .all(Option::is_none)
-                || matches!((usage.input_tokens, usage.output_tokens), (Some(a), Some(b)) if a.checked_add(b).is_none())
-            {
-                return Err(StorageError::corrupted("invalid native Token counters"));
-            }
-            let next = seq
-                .checked_add(1)
-                .ok_or_else(|| StorageError::corrupted("native Token sequence overflow"))?;
-            let (token_key, token) = entries
-                .next()
-                .transpose()?
-                .ok_or_else(|| StorageError::corrupted("native Token annotation missing"))?;
-            if token_key.value().2 != next {
-                return Err(StorageError::corrupted("native Token sequence has a gap"));
-            }
-            let token = rows::decode_request_event(job, request, next, token.value())?;
-            let RequestPayload::Token {
-                eligibility: RequestEligibility::Eligible,
-                finality,
-            } = token.payload
-            else {
-                return Err(StorageError::corrupted("invalid native Token annotation"));
-            };
-            if token.observed_at != event.observed_at || token.recorded_at != event.recorded_at {
-                return Err(StorageError::corrupted("invalid native Token annotation"));
-            }
-            let record = crate::db::entities::MetricsRecord {
-                id: crate::db::entities::MetricsId::new(event.id.get()),
-                job,
-                request: event.request,
-                target: None,
-                observed_at: event.observed_at,
-                measurements: measurements.clone(),
-                token: Some(crate::db::entities::TokenAnnotation {
-                    eligibility: RequestEligibility::Eligible,
-                    finality,
-                }),
-                recorded_at: event.recorded_at,
-            };
-            let observation = crate::db::entities::TokenObservation::from_record(&record)
-                .ok_or_else(|| StorageError::corrupted("native Token metric is unannotated"))?;
-            evidence
-                .add(observation)
-                .map_err(|_| StorageError::corrupted("inconsistent native Token evidence"))?;
-        }
-        expected = expected
-            .checked_add(2)
-            .ok_or_else(|| StorageError::corrupted("native Token sequence overflow"))?;
-    }
-    validate_native_sample(evidence.sample().as_ref())?;
-    Ok(evidence)
-}
-
-pub(super) fn native_usage_validate(tx: &WriteTransaction, job: JobId) -> Result<(), StorageError> {
-    let mut request = RequestNumber::FIRST;
-    loop {
-        let present = tx
-            .open_table(REQUEST_EVENTS)?
-            .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
-            .next()
-            .transpose()?
-            .is_some();
-        if !present {
-            return Ok(());
-        }
-        native_usage_evidence(tx, job, request)?;
-        let Some(next) = request.next() else {
-            return Ok(());
-        };
-        request = next;
-    }
-}
-
 pub(super) fn content_reference(
     tx: &WriteTransaction,
     record: &AttachmentRecord,
@@ -552,24 +342,6 @@ pub(super) fn compute_allocation_indexes(
     Ok(indexes)
 }
 
-pub(super) fn stored_allocation_indexes(
-    active: &impl ReadableTable<(u128, u128, u128), ()>,
-    requests: &impl ReadableTable<u128, u128>,
-) -> Result<AllocationIndexes, StorageError> {
-    let mut stored = AllocationIndexes {
-        active: BTreeSet::new(),
-        requests: std::collections::BTreeMap::new(),
-    };
-    for entry in active.iter()? {
-        stored.active.insert(entry?.0.value());
-    }
-    for entry in requests.iter()? {
-        let (request, job) = entry?;
-        stored.requests.insert(request.value(), job.value());
-    }
-    Ok(stored)
-}
-
 pub(super) fn rebuild_allocation_indexes(tx: &WriteTransaction) -> Result<(), StorageError> {
     let computed =
         compute_allocation_indexes(&tx.open_table(POOL_ALLOCATIONS)?, &tx.open_table(CONFIGS)?)?;
@@ -584,14 +356,4 @@ pub(super) fn rebuild_allocation_indexes(tx: &WriteTransaction) -> Result<(), St
         requests.insert(request, job)?;
     }
     Ok(())
-}
-
-pub(super) fn allocation_indexes_agree(
-    allocations: &impl ReadableTable<u128, &'static [u8]>,
-    configs: &impl ReadableTable<u128, &'static [u8]>,
-    active: &impl ReadableTable<(u128, u128, u128), ()>,
-    requests: &impl ReadableTable<u128, u128>,
-) -> Result<bool, StorageError> {
-    Ok(compute_allocation_indexes(allocations, configs)?
-        == stored_allocation_indexes(active, requests)?)
 }

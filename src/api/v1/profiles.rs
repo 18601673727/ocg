@@ -703,79 +703,6 @@ fn header_views(
         .collect()
 }
 
-async fn validate_decision_model(
-    database: &DatabaseHandle,
-    protocol: DecisionProtocol,
-    endpoint: Option<&str>,
-    model: &str,
-    credential_ref: Option<&str>,
-    credential: Option<&str>,
-    headers: &RequestHeaders,
-) -> Result<(), Refusal> {
-    if !crate::system::http::discovery_permitted(
-        endpoint.unwrap_or(crate::service::ai::decisive_model::DEFAULT_ENDPOINT),
-    ) {
-        return Err(PROVIDER_DISCOVERY_DISABLED);
-    }
-    let resolved_credential;
-    let credential = match credential {
-        Some(secret) => Some(secret),
-        None => {
-            resolved_credential = database
-                .credential_resolver()
-                .resolve(credential_ref)
-                .await
-                .map_err(|error| INVALID_CREDENTIAL_REF.with_reason(error.to_string()))?;
-            resolved_credential.as_deref()
-        }
-    };
-    use crate::service::ai::providers::ModelListError;
-    let listed = match protocol {
-        DecisionProtocol::TypeSafeSystemOne => {
-            crate::service::ai::decisive_model::list_models(
-                endpoint.unwrap_or(crate::service::ai::decisive_model::DEFAULT_ENDPOINT),
-                credential,
-                headers,
-            )
-            .await
-        }
-    }
-    .map_err(|error| {
-        let (code, message) = match error {
-            ModelListError::NotAuthorized => return PROVIDER_DISCOVERY_DISABLED,
-            ModelListError::Unreachable => (
-                "provider_unreachable",
-                "could not connect to the provider".to_owned(),
-            ),
-            ModelListError::NotListed => (
-                "models_not_listed",
-                "the provider does not list models".to_owned(),
-            ),
-            ModelListError::Rejected { message, .. } => {
-                ("provider_rejected", bounded_provider_message(message))
-            }
-        };
-        Refusal::new(
-            StatusCode::BAD_GATEWAY,
-            code,
-            "decision model validation failed",
-        )
-        .with_reason(message)
-    })?;
-    if listed.iter().any(|listed| listed.id == model) {
-        Ok(())
-    } else {
-        Err(Refusal::new(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "decision_model_unavailable",
-            "the provider does not list the configured decision model",
-        )
-        .with_reason(format!(
-            "the provider does not list decision model `{model}`"
-        )))
-    }
-}
-
 const DEFAULT_PROFILE_PAGE: usize = 50;
 const PROFILE_SCAN_FACTOR: usize = 4;
 const MAX_PROFILE_PAGE_BYTES: usize = 512 * 1024;
@@ -944,6 +871,65 @@ fn has_profile_credential(credentials: &BTreeSet<String>, reference: &str) -> bo
             || std::env::var_os(reference).is_some_and(|value| !value.is_empty()))
 }
 
+fn parse_capability_set<T: Ord>(
+    items: &[String],
+    parse: fn(&str) -> Option<T>,
+    err: Refusal,
+) -> Result<BTreeSet<T>, Refusal> {
+    let mut set = BTreeSet::new();
+    for item in items {
+        set.insert(parse(item.trim()).ok_or_else(|| err.clone())?);
+    }
+    if set.is_empty() {
+        return Err(err);
+    }
+    Ok(set)
+}
+
+fn valid_secret_header(secret: &str) -> bool {
+    !secret.is_empty()
+        && secret.len() <= 4096
+        && ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}")).is_ok()
+}
+
+fn connection_for_model<'a>(
+    connections: &'a BTreeMap<ConfigId, (String, ConnectionConfig, bool)>,
+    credentials: &BTreeSet<String>,
+    connection_id: ConfigId,
+) -> Result<(&'a str, &'a ConnectionConfig, bool, bool), Refusal> {
+    let Some((provider_name, connection, discovery_visible)) = connections.get(&connection_id)
+    else {
+        return Err(INCONSISTENT_RECORD);
+    };
+    let has_credential = connection
+        .credential_ref
+        .as_deref()
+        .is_some_and(|reference| has_profile_credential(credentials, reference));
+    Ok((
+        provider_name,
+        connection,
+        *discovery_visible,
+        has_credential,
+    ))
+}
+
+fn push_page_item<T: serde::Serialize>(
+    list: &mut Vec<T>,
+    item: T,
+    id: ConfigId,
+    page_bytes: &mut usize,
+    last_emitted: &mut Option<ConfigId>,
+    next_before: &mut Option<ConfigId>,
+) -> Result<bool, Refusal> {
+    if !fits_profile_page(&item, page_bytes)? {
+        *next_before = *last_emitted;
+        return Ok(false);
+    }
+    list.push(item);
+    *last_emitted = Some(id);
+    Ok(true)
+}
+
 fn build_profiles_page(
     page: crate::db::redb::ProfilePageRecords,
     saved_profile: Option<ProfileId>,
@@ -1006,21 +992,9 @@ fn build_profiles_page(
         let id = ProfileId::from(record.id);
         match record.body {
             ConfigBody::Model(model) => {
-                let Some((provider_name, connection, discovery_visible)) =
-                    connections.get(&model.connection_id).cloned()
-                else {
-                    return Err(INCONSISTENT_RECORD);
-                };
+                let (provider_name, connection, discovery_visible, has_credential) =
+                    connection_for_model(&connections, &credentials, model.connection_id)?;
                 let protocol = connection.protocol.as_str();
-                let has_credential = connection
-                    .credential_ref
-                    .as_deref()
-                    .is_some_and(|reference| has_profile_credential(&credentials, reference));
-                let capabilities = model
-                    .declared_capabilities
-                    .iter()
-                    .map(|cap| capability_str(*cap))
-                    .collect::<Vec<_>>();
                 let id_str = id.to_string();
                 let profile = LlmProfileView {
                     edit_seq: record.edit_seq,
@@ -1036,7 +1010,11 @@ fn build_profiles_page(
                     credential_ref: connection.credential_ref.clone(),
                     has_credential,
                     headers: header_views(&connection.headers, &credentials),
-                    declared_capabilities: capabilities.into_iter().map(str::to_owned).collect(),
+                    declared_capabilities: model
+                        .declared_capabilities
+                        .iter()
+                        .map(|cap| capability_str(*cap).to_owned())
+                        .collect(),
                     parameters: model.parameters,
                     editable: true,
                     blocking_jobs: Vec::new(),
@@ -1044,18 +1022,24 @@ fn build_profiles_page(
                     created_at_us: record.created_at.as_unix_micros(),
                     updated_at_us: record.updated_at.as_unix_micros(),
                 };
-                if !fits_profile_page(&profile, &mut page_bytes)? {
-                    next_before = last_emitted;
+                if !push_page_item(
+                    &mut llm_profiles,
+                    profile,
+                    record.id,
+                    &mut page_bytes,
+                    &mut last_emitted,
+                    &mut next_before,
+                )? {
                     break;
                 }
                 if discovery_visible {
                     let group = provider_groups
                         .entry(model.connection_id)
                         .or_insert_with(|| ProviderGroup {
-                            name: provider_name,
+                            name: provider_name.to_owned(),
                             protocol,
-                            endpoint: connection.endpoint,
-                            credential_ref: connection.credential_ref,
+                            endpoint: connection.endpoint.clone(),
+                            credential_ref: connection.credential_ref.clone(),
                             has_credential,
                             headers: header_views(&connection.headers, &credentials),
                             profile_ids: Vec::new(),
@@ -1064,8 +1048,6 @@ fn build_profiles_page(
                     group.profile_ids.push(id_str);
                     group.models.insert(model.model);
                 }
-                llm_profiles.push(profile);
-                last_emitted = Some(record.id);
             }
             ConfigBody::Agent(agent) => {
                 let profile = ManagedAgentView {
@@ -1087,24 +1069,22 @@ fn build_profiles_page(
                     created_at_us: record.created_at.as_unix_micros(),
                     updated_at_us: record.updated_at.as_unix_micros(),
                 };
-                if !fits_profile_page(&profile, &mut page_bytes)? {
-                    next_before = last_emitted;
+                if !push_page_item(
+                    &mut agent_profiles,
+                    profile,
+                    record.id,
+                    &mut page_bytes,
+                    &mut last_emitted,
+                    &mut next_before,
+                )? {
                     break;
                 }
-                agent_profiles.push(profile);
-                last_emitted = Some(record.id);
             }
             ConfigBody::Pool(_) => return Err(INCONSISTENT_RECORD),
             ConfigBody::Connection(_) => {}
             ConfigBody::DecisionModel(model) => {
-                let Some((_, connection, _)) = connections.get(&model.connection_id).cloned()
-                else {
-                    return Err(INCONSISTENT_RECORD);
-                };
-                let has_credential = connection
-                    .credential_ref
-                    .as_deref()
-                    .is_some_and(|reference| has_profile_credential(&credentials, reference));
+                let (_, connection, _, has_credential) =
+                    connection_for_model(&connections, &credentials, model.connection_id)?;
                 let profile = DecisionProfileView {
                     id: id.to_string(),
                     edit_seq: record.edit_seq,
@@ -1130,12 +1110,16 @@ fn build_profiles_page(
                     created_at_us: record.created_at.as_unix_micros(),
                     updated_at_us: record.updated_at.as_unix_micros(),
                 };
-                if !fits_profile_page(&profile, &mut page_bytes)? {
-                    next_before = last_emitted;
+                if !push_page_item(
+                    &mut decision_profiles,
+                    profile,
+                    record.id,
+                    &mut page_bytes,
+                    &mut last_emitted,
+                    &mut next_before,
+                )? {
                     break;
                 }
-                decision_profiles.push(profile);
-                last_emitted = Some(record.id);
             }
             ConfigBody::DecisionAgent(agent) => {
                 let profile = DecisionAgentProfileView {
@@ -1155,12 +1139,16 @@ fn build_profiles_page(
                     created_at_us: record.created_at.as_unix_micros(),
                     updated_at_us: record.updated_at.as_unix_micros(),
                 };
-                if !fits_profile_page(&profile, &mut page_bytes)? {
-                    next_before = last_emitted;
+                if !push_page_item(
+                    &mut decision_agent_profiles,
+                    profile,
+                    record.id,
+                    &mut page_bytes,
+                    &mut last_emitted,
+                    &mut next_before,
+                )? {
                     break;
                 }
-                decision_agent_profiles.push(profile);
-                last_emitted = Some(record.id);
             }
         }
     }
@@ -1222,6 +1210,61 @@ enum PreparedProfileSave {
     Model(ModelProfileSave),
 }
 
+struct CommonModelInput {
+    name: String,
+    model: String,
+    endpoint: Option<String>,
+    credential_ref: Option<String>,
+    credential: Option<String>,
+    clear_credential: bool,
+    headers: Option<Vec<OutboundHeaderInput>>,
+    expected_edit_seq: Option<u32>,
+}
+
+async fn prepare_model_save(
+    database: &DatabaseHandle,
+    existing_id: Option<ProfileId>,
+    kind: ConfigKind,
+    input: CommonModelInput,
+    connection_suffix: &str,
+    build_definition: impl FnOnce(String) -> ModelProfileDefinition,
+) -> Result<ModelProfileSave, Refusal> {
+    if !valid_single_line(&input.name, MAX_PROFILE_NAME_BYTES) {
+        return Err(INVALID_PROFILE_NAME);
+    }
+    if !valid_single_line(&input.model, MAX_MODEL_BYTES) {
+        return Err(INVALID_MODEL);
+    }
+    let name = input.name.trim().to_owned();
+    let model = input.model.trim().to_owned();
+    let endpoint = normalize_endpoint(input.endpoint.as_deref())?;
+    let (credential_ref, secret) = resolve_credential_input(
+        &name,
+        input.credential_ref.as_deref(),
+        input.credential.as_deref(),
+        input.clear_credential,
+    )?;
+    let previous = previous_model_connection(database, existing_id, kind).await?;
+    let previous_headers = previous
+        .as_ref()
+        .map(|(_, connection, _)| connection.headers.clone())
+        .unwrap_or_default();
+    let guard = revision_guard(previous.map(|(_, _, guard)| guard), input.expected_edit_seq)?;
+    let plan = plan_headers(database, input.headers, &previous_headers).await?;
+    Ok(ModelProfileSave {
+        headers: plan.change,
+        existing_id,
+        connection_name: format!("{name} {connection_suffix}"),
+        name,
+        endpoint,
+        credential_ref,
+        secret,
+        credential: None,
+        guard,
+        definition: build_definition(model),
+    })
+}
+
 pub(crate) async fn save_profile(
     database: &DatabaseHandle,
     existing_id: Option<ProfileId>,
@@ -1243,30 +1286,16 @@ pub(crate) async fn save_profile(
             headers,
             expected_edit_seq,
         } => {
-            if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
-                return Err(INVALID_PROFILE_NAME);
-            }
-            if !valid_single_line(&model, MAX_MODEL_BYTES) {
-                return Err(INVALID_MODEL);
-            }
             let protocol = protocol
                 .as_deref()
                 .map(str::trim)
                 .map(|value| LlmTransport::parse(value).ok_or(UNSUPPORTED_PROTOCOL))
                 .transpose()?;
-            let normalized_endpoint = normalize_endpoint(endpoint.as_deref())?;
-
-            let mut capabilities = BTreeSet::new();
-            for item in &declared_capabilities {
-                let Some(parsed) = parse_capability(item.trim()) else {
-                    return Err(INVALID_CAPABILITIES);
-                };
-                capabilities.insert(parsed);
-            }
-            if capabilities.is_empty() {
-                return Err(INVALID_CAPABILITIES);
-            }
-
+            let capabilities = parse_capability_set(
+                &declared_capabilities,
+                parse_capability,
+                INVALID_CAPABILITIES,
+            )?;
             if parameters
                 .temperature
                 .is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v))
@@ -1292,33 +1321,24 @@ pub(crate) async fn save_profile(
             {
                 return Err(INVALID_PARAMETERS);
             }
-
-            let (credential_ref, secret) = resolve_credential_input(
-                name.trim(),
-                credential_ref.as_deref(),
-                credential.as_deref(),
-                clear_credential,
-            )?;
-            let (previous_headers, guard) =
-                match previous_model_connection(database, existing_id, ConfigKind::Model).await? {
-                    Some((_, connection, guard)) => (connection.headers, Some(guard)),
-                    None => (Vec::new(), None),
-                };
-            let guard = revision_guard(guard, expected_edit_seq)?;
-            let plan = plan_headers(database, headers, &previous_headers).await?;
-            PreparedProfileSave::Model(ModelProfileSave {
-                headers: plan.change,
+            let save = prepare_model_save(
+                database,
                 existing_id,
-                name: name.trim().to_owned(),
-                connection_name: format!("{} provider", name.trim()),
-                endpoint: normalized_endpoint,
-                credential_ref,
-                secret,
-                credential: None,
-                guard,
-                definition: ModelProfileDefinition::Llm {
+                ConfigKind::Model,
+                CommonModelInput {
+                    name,
+                    model,
+                    endpoint,
+                    credential_ref,
+                    credential,
+                    clear_credential,
+                    headers,
+                    expected_edit_seq,
+                },
+                "provider",
+                |model| ModelProfileDefinition::Llm {
                     protocol,
-                    model: model.trim().to_owned(),
+                    model,
                     context_window,
                     parameters: LlmParameters {
                         temperature: parameters.temperature,
@@ -1331,7 +1351,9 @@ pub(crate) async fn save_profile(
                     },
                     declared_capabilities: capabilities,
                 },
-            })
+            )
+            .await?;
+            PreparedProfileSave::Model(save)
         }
         ProfileRequest::Agent {
             name,
@@ -1367,24 +1389,11 @@ pub(crate) async fn save_profile(
             if llm_targets.is_empty() {
                 return Err(MISSING_LLM_TARGETS);
             }
-            let mut parsed_targets: Vec<ConfigId> = Vec::with_capacity(llm_targets.len());
-            for raw_target in &llm_targets {
-                let target_id = crate::db::entities::parse_entity_id(raw_target.trim())
-                    .map(ConfigId::new)
-                    .ok_or(INVALID_LLM_TARGET)?;
-                if parsed_targets.contains(&target_id) {
-                    return Err(INVALID_LLM_TARGET);
-                }
-                match database.config(target_id).await? {
-                    Some(record)
-                        if record.archived_at.is_none()
-                            && selection.supports_model(&record.body) =>
-                    {
-                        parsed_targets.push(target_id)
-                    }
-                    _ => return Err(INVALID_LLM_TARGET),
-                }
-            }
+            let parsed_targets =
+                parse_profile_refs(database, &llm_targets, INVALID_LLM_TARGET, |record| {
+                    record.archived_at.is_none() && selection.supports_model(&record.body)
+                })
+                .await?;
             let (prior, expected) = if let Some(id) = existing_id {
                 let record = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
                 let expected = config_revision(record.edit_seq, expected_edit_seq)?;
@@ -1421,29 +1430,17 @@ pub(crate) async fn save_profile(
             headers,
             expected_edit_seq,
         } => {
-            if !valid_single_line(&name, MAX_PROFILE_NAME_BYTES) {
-                return Err(INVALID_PROFILE_NAME);
-            }
-            if !valid_single_line(&model, MAX_MODEL_BYTES) {
-                return Err(INVALID_MODEL);
-            }
             let decision_protocol = protocol
                 .as_deref()
                 .map(str::trim)
                 .map(DecisionProtocol::parse)
                 .unwrap_or(Some(DecisionProtocol::TypeSafeSystemOne))
                 .ok_or(UNSUPPORTED_DECISION_PROTOCOL)?;
-            let normalized_endpoint = normalize_endpoint(endpoint.as_deref())?;
-            let mut capabilities = BTreeSet::new();
-            for item in &declared_capabilities {
-                let Some(parsed) = parse_decision_capability(item.trim()) else {
-                    return Err(INVALID_DECISION_CAPABILITIES);
-                };
-                capabilities.insert(parsed);
-            }
-            if capabilities.is_empty() {
-                return Err(INVALID_DECISION_CAPABILITIES);
-            }
+            let capabilities = parse_capability_set(
+                &declared_capabilities,
+                parse_decision_capability,
+                INVALID_DECISION_CAPABILITIES,
+            )?;
             let decision_limits = DecisionLimits {
                 max_input_tokens_per_request: limits.max_input_tokens_per_request,
                 max_output_tokens_per_request: limits.max_output_tokens_per_request,
@@ -1477,57 +1474,30 @@ pub(crate) async fn save_profile(
                     return Err(INVALID_DECISION_LIMITS);
                 }
             }
-            let previous =
-                previous_model_connection(database, existing_id, ConfigKind::DecisionModel).await?;
-            let prior_credential_ref = previous
-                .as_ref()
-                .and_then(|(_, connection, _)| connection.credential_ref.clone());
-            let previous_headers = previous
-                .as_ref()
-                .map(|(_, connection, _)| connection.headers.clone())
-                .unwrap_or_default();
-            let guard = revision_guard(previous.map(|(_, _, guard)| guard), expected_edit_seq)?;
-            let plan = plan_headers(database, headers, &previous_headers).await?;
-            let (credential_ref, secret) = resolve_credential_input(
-                name.trim(),
-                credential_ref.as_deref(),
-                credential.as_deref(),
-                clear_credential,
-            )?;
-            let validation_ref = match &credential_ref {
-                ProfileCredentialRef::Preserve | ProfileCredentialRef::PreserveOrGenerate(_) => {
-                    prior_credential_ref
-                }
-                ProfileCredentialRef::Clear => None,
-                ProfileCredentialRef::Explicit(reference) => Some(reference.clone()),
-            };
-            validate_decision_model(
+            let save = prepare_model_save(
                 database,
-                decision_protocol,
-                normalized_endpoint.as_deref(),
-                model.trim(),
-                validation_ref.as_deref(),
-                secret.as_ref().map(CredentialSecret::as_str),
-                &plan.probe,
-            )
-            .await?;
-            PreparedProfileSave::Model(ModelProfileSave {
-                headers: plan.change,
                 existing_id,
-                name: name.trim().to_owned(),
-                connection_name: format!("{} decision provider", name.trim()),
-                endpoint: normalized_endpoint,
-                credential_ref,
-                secret,
-                credential: None,
-                guard,
-                definition: ModelProfileDefinition::Decision {
+                ConfigKind::DecisionModel,
+                CommonModelInput {
+                    name,
+                    model,
+                    endpoint,
+                    credential_ref,
+                    credential,
+                    clear_credential,
+                    headers,
+                    expected_edit_seq,
+                },
+                "decision provider",
+                |model| ModelProfileDefinition::Decision {
                     protocol: decision_protocol,
-                    model: model.trim().to_owned(),
+                    model,
                     limits: decision_limits,
                     declared_capabilities: capabilities,
                 },
-            })
+            )
+            .await?;
+            PreparedProfileSave::Model(save)
         }
         ProfileRequest::DecisionAgent {
             name,
@@ -1543,23 +1513,15 @@ pub(crate) async fn save_profile(
             if models.is_empty() {
                 return Err(MISSING_DECISION_MODELS);
             }
-            let mut parsed_models: Vec<ConfigId> = Vec::with_capacity(models.len());
-            for raw_model in &models {
-                let model_id = crate::db::entities::parse_entity_id(raw_model.trim())
-                    .map(ConfigId::new)
-                    .ok_or(INVALID_DECISION_MODELS)?;
-                if parsed_models.contains(&model_id) {
-                    return Err(INVALID_DECISION_MODELS);
-                }
-                match database.config(model_id).await? {
-                    Some(ConfigRecord {
-                        body: ConfigBody::DecisionModel(_) | ConfigBody::Model(_),
-                        archived_at: None,
-                        ..
-                    }) => parsed_models.push(model_id),
-                    _ => return Err(INVALID_DECISION_MODELS),
-                }
-            }
+            let mut parsed_models =
+                parse_profile_refs(database, &models, INVALID_DECISION_MODELS, |record| {
+                    record.archived_at.is_none()
+                        && matches!(
+                            record.body,
+                            ConfigBody::DecisionModel(_) | ConfigBody::Model(_)
+                        )
+                })
+                .await?;
             parsed_models.sort();
             let invalid_default = Refusal::new(
                 StatusCode::UNPROCESSABLE_ENTITY,
@@ -1603,49 +1565,63 @@ pub(crate) async fn save_profile(
         }
     };
 
-    let (status, profile_id) = match prepared {
-        PreparedProfileSave::Config(new_config, expected) => {
-            let profile_id = match existing_id {
-                None => ProfileId::from(
-                    database
-                        .create_config(new_config)
-                        .await
-                        .map_err(map_mutation_error)?,
-                ),
-                Some(id) => {
-                    database
-                        .update_config(
-                            id.into(),
-                            new_config,
-                            expected.ok_or(PROFILE_REVISION_REQUIRED)?,
-                        )
-                        .await
-                        .map_err(map_mutation_error)?;
-                    id
-                }
-            };
-            let status = if existing_id.is_some() {
-                StatusCode::OK
-            } else {
-                StatusCode::CREATED
-            };
-            (status, profile_id)
-        }
+    let status = if existing_id.is_some() {
+        StatusCode::OK
+    } else {
+        StatusCode::CREATED
+    };
+    let profile_id = match prepared {
+        PreparedProfileSave::Config(new_config, expected) => match existing_id {
+            None => ProfileId::from(
+                database
+                    .create_config(new_config)
+                    .await
+                    .map_err(map_mutation_error)?,
+            ),
+            Some(id) => {
+                database
+                    .update_config(
+                        id.into(),
+                        new_config,
+                        expected.ok_or(PROFILE_REVISION_REQUIRED)?,
+                    )
+                    .await
+                    .map_err(map_mutation_error)?;
+                id
+            }
+        },
         PreparedProfileSave::Model(save) => {
             let (saved_id, _) = database
                 .save_model_profile(save)
                 .await
                 .map_err(map_mutation_error)?;
-            let status = if existing_id.is_some() {
-                StatusCode::OK
-            } else {
-                StatusCode::CREATED
-            };
-            (status, ProfileId::from(saved_id))
+            ProfileId::from(saved_id)
         }
     };
     let snapshot = build_profiles_snapshot(database, Some(profile_id)).await?;
     Ok(Reply::new(status, snapshot))
+}
+
+async fn parse_profile_refs(
+    database: &crate::db::DatabaseHandle,
+    raw_ids: &[String],
+    invalid: Refusal,
+    accept: impl Fn(&ConfigRecord) -> bool,
+) -> Result<Vec<ConfigId>, Refusal> {
+    let mut parsed = Vec::with_capacity(raw_ids.len());
+    for raw in raw_ids {
+        let id = crate::db::entities::parse_entity_id(raw.trim())
+            .map(ConfigId::new)
+            .ok_or_else(|| invalid.clone())?;
+        if parsed.contains(&id) {
+            return Err(invalid);
+        }
+        match database.config(id).await? {
+            Some(record) if accept(&record) => parsed.push(id),
+            _ => return Err(invalid),
+        }
+    }
+    Ok(parsed)
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -1699,13 +1675,11 @@ pub(crate) async fn import_models(
         }
         models.entry(model.id.trim().to_owned()).or_insert(model);
     }
-    let mut capabilities = BTreeSet::new();
-    for value in request.declared_capabilities {
-        capabilities.insert(parse_capability(&value).ok_or(INVALID_CAPABILITIES)?);
-    }
-    if capabilities.is_empty() {
-        return Err(INVALID_CAPABILITIES);
-    }
+    let capabilities = parse_capability_set(
+        &request.declared_capabilities,
+        parse_capability,
+        INVALID_CAPABILITIES,
+    )?;
     let headers;
     let (connection, credential_ref, secret) = match (request.source_profile_id, request.provider) {
         (Some(id), None) => {
@@ -1756,11 +1730,10 @@ pub(crate) async fn import_models(
                 return Err(INVALID_CREDENTIAL_REF);
             }
             let credential = provider.credential.filter(|value| !value.is_empty());
-            if credential.as_ref().is_some_and(|secret| {
-                secret.len() > 4096
-                    || ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}"))
-                        .is_err()
-            }) {
+            if credential
+                .as_deref()
+                .is_some_and(|secret| !valid_secret_header(secret))
+            {
                 return Err(INVALID_CREDENTIAL);
             }
             headers = plan_headers(database, provider.headers, &[]).await?.change;
@@ -1942,11 +1915,10 @@ pub(crate) async fn provider_models(
             None => None,
         },
     };
-    if credential.as_ref().is_some_and(|secret| {
-        secret.is_empty()
-            || secret.len() > 4096
-            || ntex::http::header::HeaderValue::try_from(format!("Bearer {secret}")).is_err()
-    }) {
+    if credential
+        .as_deref()
+        .is_some_and(|secret| !valid_secret_header(secret))
+    {
         return Err(INVALID_CREDENTIAL);
     }
     use crate::service::ai::providers::ModelListError;
@@ -1964,26 +1936,19 @@ pub(crate) async fn provider_models(
         }
     };
     let plan = plan_headers(database, request.headers, &saved_headers).await?;
-    let listed = match protocol {
-        DiscoveryProtocol::Generative(protocol) => {
-            crate::service::ai::providers::list_models(
-                &request.endpoint,
-                credential.as_deref(),
-                protocol,
-                &plan.probe,
-            )
-            .await
-        }
-        DiscoveryProtocol::Decision(protocol) => {
-            debug_assert_eq!(protocol, DecisionProtocol::TypeSafeSystemOne);
-            crate::service::ai::decisive_model::list_models(
-                &request.endpoint,
-                credential.as_deref(),
-                &plan.probe,
-            )
-            .await
-        }
-    };
+    let listed = crate::service::ai::providers::list_models(
+        &request.endpoint,
+        credential.as_deref(),
+        match protocol {
+            DiscoveryProtocol::Generative(protocol) => Some(protocol),
+            DiscoveryProtocol::Decision(protocol) => {
+                debug_assert_eq!(protocol, DecisionProtocol::TypeSafeSystemOne);
+                None
+            }
+        },
+        &plan.probe,
+    )
+    .await;
     let (code, message, status_code) = match listed {
         Ok(models) => {
             if saved_connection && let DiscoveryProtocol::Generative(protocol) = protocol {

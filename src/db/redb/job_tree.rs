@@ -541,6 +541,16 @@ impl Batch {
         });
         control.loop_count = 0;
         self.put_job_control(conversation, &control)?;
+        if unhold
+            && matches!(by, Actor::User)
+            && let Some(rec) = self.get(RECURRENCES, conversation.get(), Recurrence::decode)?
+            && matches!(
+                rec.phase,
+                crate::db::entities::RecurrencePhase::Halted { .. }
+            )
+        {
+            self.resume_recurrence(conversation)?;
+        }
         self.wake_scheduler();
         Ok(JobAction {
             conversation,

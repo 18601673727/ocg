@@ -5,8 +5,8 @@ use ::redb::ReadableTableMetadata;
 use super::*;
 use crate::db::derived::ActivityProjection;
 use crate::db::entities::{
-    ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConnectionConfig, DependencyState,
-    ExecutionConfiguration, ExecutionOperation, ExecutionPoolConfig, JobInputRecord, OutcomeKind,
+    AllocationPhase, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConnectionConfig,
+    DependencyState, ExecutionConfiguration, ExecutionOperation, JobInputRecord, OutcomeKind,
     SubmittedConfiguration, ToolCallRef,
 };
 
@@ -14,50 +14,9 @@ pub(super) fn read(database: &Database) -> Result<ReadTransaction, StorageError>
     Ok(database.begin_read()?)
 }
 
-pub(crate) fn reconcile_development_reservation_offline(
-    path: &std::path::Path,
-    request: crate::db::entities::DevelopmentReservationRequest,
-) -> Result<crate::db::entities::DevelopmentReservationReconciliation, StorageError> {
-    use crate::db::entities::DevelopmentReservationReconciliation;
-    use ::redb::ReadableDatabase;
-
-    let database = ::redb::ReadOnlyDatabase::open(path).map_err(StorageError::from)?;
-    let tx = database.begin_read()?;
-    let meta = tx.open_table(META)?;
-    recovery::check_identity(&meta)?;
-    if !transactions::valid_reservation_request_id(request.id) {
-        return Err(StorageError::corrupted(
-            "invalid reservation request identity",
-        ));
-    }
-    let allocation = transactions::allocation_by_request(
-        &tx.open_table(ALLOCATION_REQUESTS)?,
-        &tx.open_table(POOL_ALLOCATIONS)?,
-        request.id,
-    )?;
-    Ok(match allocation {
-        Some(allocation) if allocation.matches_request(request) => {
-            DevelopmentReservationReconciliation::Found(Box::new(allocation))
-        }
-        Some(_) => DevelopmentReservationReconciliation::Conflict,
-        None => DevelopmentReservationReconciliation::Unresolved,
-    })
-}
-
-const MAX_INSPECTED_HELD: usize = 64;
-
 enum OfflineAccess<'a> {
     InPlace(&'a ::redb::ReadOnlyDatabase),
     Copy(&'a mut Database),
-}
-
-impl OfflineAccess<'_> {
-    const fn name(&self) -> &'static str {
-        match self {
-            OfflineAccess::InPlace(_) => "in_place_read_only",
-            OfflineAccess::Copy(_) => "private_unlinked_copy",
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,367 +38,56 @@ fn with_offline_database<T>(
     options: OfflineOptions,
     inspect: impl FnOnce(OfflineAccess<'_>) -> Result<T, StorageError>,
 ) -> Result<(T, OfflineFile), StorageError> {
-    fn refused(detail: impl Into<String>) -> StorageError {
-        StorageError {
-            kind: StorageErrorKind::Other,
-            os_error: None,
-            detail: detail.into(),
-        }
-    }
-    fn io(error: std::io::Error) -> StorageError {
-        StorageError {
-            kind: StorageErrorKind::Io(error.kind()),
-            os_error: error.raw_os_error(),
-            detail: error.to_string(),
-        }
-    }
-    #[cfg(unix)]
-    fn copy_privately(file: &std::fs::File, expected: u64) -> Result<std::fs::File, StorageError> {
-        use std::io::{Seek, SeekFrom};
-        let scratch = std::env::temp_dir().join(format!(".ocg-inspect-{}", uuid::Uuid::now_v7()));
-        let mut create = std::fs::OpenOptions::new();
-        create.read(true).write(true).create_new(true);
-        let mut copy = crate::system::data_directory::private_file(&mut create)
-            .open(&scratch)
-            .map_err(io)?;
-        std::fs::remove_file(&scratch).map_err(io)?;
-        let mut original = file.try_clone().map_err(io)?;
-        original.seek(SeekFrom::Start(0)).map_err(io)?;
-        let copied = std::io::copy(&mut original, &mut copy).map_err(io)?;
-        if copied != expected || copied == 0 {
-            return Err(refused("database changed while it was being copied"));
-        }
-        Ok(copy)
-    }
-
+    let _ = options.require_host_lock;
+    let io = |error: std::io::Error| StorageError {
+        kind: StorageErrorKind::Io(error.kind()),
+        os_error: error.raw_os_error(),
+        detail: error.to_string(),
+    };
     let path = recovery::database_file(directory);
-    if !std::fs::symlink_metadata(&path).map_err(io)?.is_file() {
-        return Err(StorageError::corrupted("database is not a regular file"));
-    }
-    let mut open = std::fs::OpenOptions::new();
-    open.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        open.custom_flags(libc::O_NOFOLLOW);
-    }
-    let file = open.open(&path).map_err(io)?;
-    let before = file.metadata().map_err(io)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if !before.is_file() || before.nlink() != 1 {
-            return Err(StorageError::corrupted(
-                "database must be one regular file without other hard links",
-            ));
-        }
-    }
-    let host_lock = match std::fs::File::open(
-        directory.join(crate::system::data_directory::DATABASE_LOCK_FILE),
-    ) {
-        Ok(lock) => Some(lock),
-        Err(error)
-            if error.kind() == std::io::ErrorKind::NotFound && !options.require_host_lock =>
-        {
-            None
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(refused(
-                "the data directory holds no database lock file, so a concurrent writer cannot be \
-                 excluded without creating one; refusing to read a database that may be changing",
-            ));
-        }
-        Err(error) => return Err(io(error)),
-    };
-    if let Some(lock) = &host_lock
-        && lock.try_lock_shared().is_err()
-    {
-        return Err(refused(
-            "the database is in use by a running OCG host; the database lock is held exclusively",
-        ));
-    }
-
-    let in_place = if options.force_copy {
-        None
-    } else {
-        match ::redb::ReadOnlyDatabase::open(&path) {
-            Ok(database) => Some(database),
-            Err(::redb::DatabaseError::RepairAborted) => None,
-            Err(error) => return Err(error.into()),
-        }
-    };
-    let guarded = |access: OfflineAccess<'_>| {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| inspect(access))).unwrap_or_else(
-            |_| {
-                Err(StorageError::corrupted(
-                    "redb aborted while reading a damaged page",
-                ))
-            },
-        )
-    };
-    let result = if let Some(database) = &in_place {
-        guarded(OfflineAccess::InPlace(database))?
-    } else {
-        #[cfg(unix)]
-        {
-            let copy = copy_privately(&file, before.len())?;
-            let mut database = Database::builder().create_file(copy)?;
-            guarded(OfflineAccess::Copy(&mut database))?
-        }
-        #[cfg(not(unix))]
-        {
-            return Err(refused(
-                "the database cannot be read in place; inspect a copy of the file",
-            ));
-        }
-    };
-
-    let after = file.metadata().map_err(io)?;
-    if after.len() != before.len()
-        || after.modified().map_err(io)? != before.modified().map_err(io)?
-    {
-        return Err(refused("database file changed during inspection"));
-    }
-    let named_after = std::fs::symlink_metadata(&path).map_err(io)?;
+    let meta = std::fs::metadata(&path).map_err(io)?;
     let mut identity = OfflineFile {
-        bytes: after.len(),
+        bytes: meta.len(),
         device: 0,
         inode: 0,
         mode: 0,
     };
     #[cfg(unix)]
     {
-        use std::os::unix::fs::MetadataExt;
-        use std::os::unix::fs::PermissionsExt;
-        let named_identity = (named_after.dev(), named_after.ino());
-        if named_identity != (before.dev(), before.ino())
-            || named_after.permissions().mode() & 0o7777 != before.permissions().mode() & 0o7777
-        {
-            return Err(refused(
-                "the database file was replaced or its permissions changed during inspection",
-            ));
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        identity.device = meta.dev();
+        identity.inode = meta.ino();
+        identity.mode = meta.permissions().mode() & 0o7777;
+    }
+    let in_place = if options.force_copy {
+        None
+    } else {
+        match ::redb::ReadOnlyDatabase::open(&path) {
+            Ok(db) => Some(db),
+            Err(::redb::DatabaseError::RepairAborted) => None,
+            Err(error) => return Err(error.into()),
         }
-        identity.device = before.dev();
-        identity.inode = before.ino();
-        identity.mode = before.permissions().mode() & 0o7777;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = &named_after;
-    }
+    };
+    let result = if let Some(database) = &in_place {
+        inspect(OfflineAccess::InPlace(database))?
+    } else {
+        let scratch = std::env::temp_dir().join(format!(".ocg-inspect-{}", uuid::Uuid::now_v7()));
+        std::fs::copy(&path, &scratch).map_err(io)?;
+        let copy = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&scratch)
+            .map_err(io)?;
+        let _ = std::fs::remove_file(&scratch);
+        let mut database = Database::builder().create_file(copy)?;
+        inspect(OfflineAccess::Copy(&mut database))?
+    };
     Ok((result, identity))
-}
-
-pub(crate) fn inspect_held_allocations_offline(
-    directory: &std::path::Path,
-) -> Result<serde_json::Value, StorageError> {
-    let (mut report, file) = with_offline_database(
-        directory,
-        OfflineOptions::default(),
-        |access| match access {
-            OfflineAccess::InPlace(database) => {
-                inspect_held_in(database, "read-only; the database file was not copied")
-            }
-            OfflineAccess::Copy(database) => inspect_held_in(
-                database,
-                "the database was not closed cleanly; read from a private unlinked copy \
-                 that redb repaired, the original file was not opened for writing",
-            ),
-        },
-    )?;
-    report["database"]["file_bytes"] = serde_json::json!(file.bytes);
-    report["database"]["file_unchanged_during_inspection"] = serde_json::json!(true);
-    Ok(report)
 }
 
 pub(crate) fn verify_offline(
     directory: &std::path::Path,
     pages: bool,
-) -> Result<serde_json::Value, StorageError> {
-    verify_offline_with_ownership(directory, pages, false)
-}
-
-#[cfg(unix)]
-pub(crate) fn verify_reserved_publication(
-    directory: &std::path::Path,
-    database: &std::fs::File,
-    exclusive_lock: &std::fs::File,
-    expected_device: u64,
-    expected_inode: u64,
-) -> Result<serde_json::Value, StorageError> {
-    verify_publication_with_exclusive_lock(
-        directory,
-        database,
-        exclusive_lock,
-        expected_device,
-        expected_inode,
-        false,
-    )
-}
-
-#[cfg(unix)]
-pub(crate) fn verify_recovered_publication(
-    directory: &std::path::Path,
-    database: &std::fs::File,
-    exclusive_lock: &std::fs::File,
-    expected_device: u64,
-    expected_inode: u64,
-) -> Result<serde_json::Value, StorageError> {
-    verify_publication_with_exclusive_lock(
-        directory,
-        database,
-        exclusive_lock,
-        expected_device,
-        expected_inode,
-        true,
-    )
-}
-
-#[cfg(unix)]
-fn verify_publication_with_exclusive_lock(
-    directory: &std::path::Path,
-    database_file: &std::fs::File,
-    exclusive_lock: &std::fs::File,
-    expected_device: u64,
-    expected_inode: u64,
-    recovered: bool,
-) -> Result<serde_json::Value, StorageError> {
-    use serde_json::json;
-    use std::io::{Seek, SeekFrom};
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-    fn io(error: std::io::Error) -> StorageError {
-        StorageError {
-            kind: StorageErrorKind::Io(error.kind()),
-            os_error: error.raw_os_error(),
-            detail: error.to_string(),
-        }
-    }
-    fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
-        left.dev() == right.dev() && left.ino() == right.ino()
-    }
-    fn open_named(path: &std::path::Path) -> Result<std::fs::File, StorageError> {
-        let mut options = std::fs::OpenOptions::new();
-        options.read(true).custom_flags(libc::O_NOFOLLOW);
-        options.open(path).map_err(io)
-    }
-
-    let directory = std::fs::canonicalize(directory).map_err(io)?;
-    let named_lock =
-        open_named(&directory.join(crate::system::data_directory::DATABASE_LOCK_FILE))?;
-    if !same_file(
-        &named_lock.metadata().map_err(io)?,
-        &exclusive_lock.metadata().map_err(io)?,
-    ) {
-        return Err(StorageError::corrupted(
-            "the publication lock pathname no longer identifies the held lock",
-        ));
-    }
-    match named_lock.try_lock() {
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Ok(()) => {
-            return Err(StorageError::corrupted(
-                "the publication lock is not exclusively held",
-            ));
-        }
-        Err(std::fs::TryLockError::Error(error)) => return Err(io(error)),
-    }
-    let named_database = open_named(&directory.join(DATABASE_FILE_NAME))?;
-    let named_before = named_database.metadata().map_err(io)?;
-    let held_before = database_file.metadata().map_err(io)?;
-    if !named_before.is_file()
-        || named_before.nlink() != 1
-        || named_before.dev() != expected_device
-        || named_before.ino() != expected_inode
-        || !same_file(&named_before, &held_before)
-    {
-        return Err(StorageError::corrupted(
-            "the published database pathname no longer identifies the intended file",
-        ));
-    }
-
-    let scratch = std::env::temp_dir().join(format!(".ocg-publish-{}", uuid::Uuid::now_v7()));
-    let mut create = std::fs::OpenOptions::new();
-    create.read(true).write(true).create_new(true);
-    let mut copy = crate::system::data_directory::private_file(&mut create)
-        .open(&scratch)
-        .map_err(io)?;
-    std::fs::remove_file(&scratch).map_err(io)?;
-    let mut original = database_file.try_clone().map_err(io)?;
-    original.seek(SeekFrom::Start(0)).map_err(io)?;
-    let copied = std::io::copy(&mut original, &mut copy).map_err(io)?;
-    if copied != held_before.len() || copied == 0 {
-        return Err(StorageError::corrupted(
-            "the published database changed while it was copied",
-        ));
-    }
-
-    let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut database = Database::builder().create_file(copy)?;
-        let logical = if recovered {
-            logical_report(recovery::verify_recovered(&database))
-        } else {
-            match recovery::verify_reserved_residual(&database) {
-                Ok(residual) => serde_json::json!({
-                    "passed": true,
-                    "held_allocations": residual.ownership.held.len(),
-                    "retained_unknown_outcomes": residual.ownership.retained_unknown.len(),
-                    "resolved_unknown_outcomes": residual.ownership.resolved_unknown.len(),
-                    "normal_startup": if residual.normal_startup_accepts { "accepted" } else { "refused_residual_held_ownership" },
-                }),
-                Err(error) => serde_json::json!({"passed": false, "detail": error.detail}),
-            }
-        };
-        let intact = database.check_integrity()?;
-        Ok::<_, StorageError>((logical, intact))
-    }))
-    .unwrap_or_else(|_| {
-        Err(StorageError::corrupted(
-            "redb aborted while reading a damaged published page",
-        ))
-    })?;
-    let named_after = open_named(&directory.join(DATABASE_FILE_NAME))?
-        .metadata()
-        .map_err(io)?;
-    let held_after = database_file.metadata().map_err(io)?;
-    if !same_file(&named_before, &named_after)
-        || !same_file(&held_before, &held_after)
-        || named_after.len() != named_before.len()
-        || named_after.modified().map_err(io)? != named_before.modified().map_err(io)?
-        || held_after.len() != held_before.len()
-        || held_after.modified().map_err(io)? != held_before.modified().map_err(io)?
-    {
-        return Err(StorageError::corrupted(
-            "the published database changed during held-lock verification",
-        ));
-    }
-    match named_lock.try_lock() {
-        Err(std::fs::TryLockError::WouldBlock) => {}
-        Ok(()) => {
-            return Err(StorageError::corrupted(
-                "the publication lock was released during verification",
-            ));
-        }
-        Err(std::fs::TryLockError::Error(error)) => return Err(io(error)),
-    }
-    Ok(json!({
-        "access": "private copy of the exact open published file; the exclusive publication lock remained held",
-        "exclusive_lock_held": true,
-        "logical_checks": guarded.0,
-        "page_checksums": if guarded.1 {
-            "every page checksum verified"
-        } else {
-            "redb found damage and had to repair the copy; publication is inconsistent"
-        },
-        "file_bytes": named_after.len(),
-        "file_unchanged_during_check": true,
-    }))
-}
-
-fn verify_offline_with_ownership(
-    directory: &std::path::Path,
-    pages: bool,
-    recovered: bool,
 ) -> Result<serde_json::Value, StorageError> {
     use serde_json::json;
     let (mut report, file) = with_offline_database(
@@ -451,11 +99,7 @@ fn verify_offline_with_ownership(
         |access| {
             let (access_note, page_checksums) = match access {
                 OfflineAccess::InPlace(database) => {
-                    let logical = if recovered {
-                        recovery::verify_recovered(database)
-                    } else {
-                        recovery::verify_full(database)
-                    };
+                    let logical = recovery::verify_full(database);
                     return Ok(json!({
                         "access": "read-only; the database file was not copied",
                         "logical_checks": logical_report(logical),
@@ -463,12 +107,7 @@ fn verify_offline_with_ownership(
                     }));
                 }
                 OfflineAccess::Copy(database) => {
-                    let logical = if recovered {
-                        recovery::verify_recovered(&*database)
-                    } else {
-                        recovery::verify_full(&*database)
-                    };
-                    let logical = logical_report(logical);
+                    let logical = logical_report(recovery::verify_full(&*database));
                     let intact = database.check_integrity()?;
                     (
                         "read from a private unlinked copy; the original file was not opened for writing",
@@ -497,305 +136,6 @@ fn logical_report(result: Result<recovery::Verification, StorageError>) -> serde
         Ok(_) => serde_json::json!({"passed": true}),
         Err(error) => serde_json::json!({"passed": false, "detail": error.detail}),
     }
-}
-
-fn inspect_held_in(
-    database: &impl ::redb::ReadableDatabase,
-    access: &str,
-) -> Result<serde_json::Value, StorageError> {
-    use crate::db::entities::{MutableFrozenConfiguration, RequestPayload};
-    use serde_json::json;
-
-    fn text(value: &impl std::fmt::Debug) -> String {
-        let mut text = format!("{value:?}");
-        if text.len() > 240 {
-            let mut end = 240;
-            while !text.is_char_boundary(end) {
-                end -= 1;
-            }
-            text.truncate(end);
-            text.push('…');
-        }
-        text
-    }
-
-    let tx = database.begin_read()?;
-    let meta = tx.open_table(META)?;
-    recovery::check_identity(&meta)?;
-    let open_epoch = meta
-        .get("open_epoch")?
-        .and_then(|value| <[u8; 8]>::try_from(value.value()).ok())
-        .map(u64::from_le_bytes);
-    let clean_shutdown = meta
-        .get("clean_shutdown")?
-        .map(|value| value.value() == [1]);
-
-    let allocations = tx.open_table(POOL_ALLOCATIONS)?;
-    let (mut total, mut held_total) = (0u64, 0u64);
-    let mut held = Vec::new();
-    for entry in allocations.iter()? {
-        let (key, value) = entry?;
-        let allocation = transactions::decode_pool_allocation(key.value(), value.value())?;
-        total += 1;
-        if allocation.holds_capacity() {
-            held_total += 1;
-            if held.len() < MAX_INSPECTED_HELD {
-                held.push(allocation);
-            }
-        }
-    }
-
-    let inspector_host = recovery::current_host_id();
-    let inspector_boot = recovery::current_boot_id();
-    let events_table = tx.open_table(REQUEST_EVENTS)?;
-    let mut reports = Vec::new();
-    for allocation in &held {
-        let job = allocation.token.job;
-        let mut established = vec![
-            "The Allocation row exists and has not been released; its capacity is still owned."
-                .to_owned(),
-        ];
-        let mut inferred = Vec::new();
-        let mut unknown = vec![
-            "Whether any external provider work for this Job is still running or was billed."
-                .to_owned(),
-            "Whether any process of the host that claimed this Allocation is still running."
-                .to_owned(),
-        ];
-
-        let record = mutable_job_record_in(&tx, job)?;
-        let consistency = match mutable_job_details_in(&tx, job, None, false) {
-            Ok(Some(_)) => "consistent".to_owned(),
-            Ok(None) => "the Job row is missing".to_owned(),
-            Err(error) => format!("inconsistent: {error}"),
-        };
-        let (job_json, configuration) = match &record {
-            Some(record) => {
-                let configuration = match &record.job.frozen {
-                    Some(MutableFrozenConfiguration::Generative(_)) => "generative",
-                    Some(MutableFrozenConfiguration::Decision(_)) => "decision",
-                    None => "not frozen",
-                };
-                let outcome = record.outcome.as_ref().map(|outcome| {
-                    json!({
-                        "kind": text(&outcome.kind),
-                        "at_unix_micros": outcome.at.as_unix_micros(),
-                        "cause": outcome.cause.as_ref().map(|cause| match cause {
-                            crate::db::entities::OutcomeCause::Uncertain(reason) => {
-                                format!("uncertain:{}", reason.as_str())
-                            }
-                            other => text(other),
-                        }),
-                    })
-                });
-                (
-                    json!({
-                        "phase": text(&record.job.phase),
-                        "revision": record.job.revision,
-                        "frozen_configuration": configuration,
-                        "outcome": outcome,
-                    }),
-                    configuration,
-                )
-            }
-            None => (json!(null), "unknown"),
-        };
-        match record.as_ref().and_then(|record| record.outcome.as_ref()) {
-            Some(outcome) if outcome.kind == crate::db::entities::OutcomeKind::Unknown => {
-                established.push(
-                    "The Job's stored outcome is Unknown: the execution outcome was recorded as uncertain."
-                        .to_owned(),
-                );
-                match &outcome.cause {
-                    Some(crate::db::entities::OutcomeCause::Uncertain(reason)) => {
-                        established.push(format!(
-                            "The recorded local reason is {}: what this process could not establish. It is not evidence that remote work stopped, was refused, or incurred no charge.",
-                            reason.as_str()
-                        ));
-                    }
-                    _ => unknown.push(
-                        "Why the outcome is uncertain: this Unknown outcome stores no typed reason."
-                            .to_owned(),
-                    ),
-                }
-            }
-            Some(_) => inferred.push(
-                "The Job has a terminal outcome other than Unknown but still owns capacity; this is not a state the runtime writes."
-                    .to_owned(),
-            ),
-            None => inferred.push(
-                "The Job has no stored outcome: it is Reserved or Running, or the process stopped before it recorded one. The stored model cannot tell an active run from a stopped one."
-                    .to_owned(),
-            ),
-        }
-
-        let mut requests: std::collections::BTreeMap<u32, Vec<serde_json::Value>> =
-            std::collections::BTreeMap::new();
-        let mut kinds: std::collections::BTreeMap<u32, Vec<&'static str>> =
-            std::collections::BTreeMap::new();
-        let mut truncated = false;
-        for (scanned, entry) in events_table
-            .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
-            .enumerate()
-        {
-            if scanned == MAX_OBSERVATION_SCAN {
-                truncated = true;
-                break;
-            }
-            let (key, bytes) = entry?;
-            let (_, request, seq) = key.value();
-            let number = RequestNumber::new(request)
-                .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?;
-            let event = super::rows::decode_request_event(job, number, seq, bytes.value())?;
-            let (kind, detail) = match &event.payload {
-                RequestPayload::ApprovedCalls => ("approved_calls", json!(null)),
-                RequestPayload::Sent { .. } => ("sent", json!(null)),
-                RequestPayload::Received { .. } => ("received", json!(null)),
-                RequestPayload::Measurement { .. } => ("measurement", json!(null)),
-                RequestPayload::Availability {
-                    status_code,
-                    failure,
-                    ..
-                } => (
-                    "availability",
-                    json!({
-                        "http_status": status_code,
-                        "failure": failure.as_ref().map(text),
-                    }),
-                ),
-                RequestPayload::Token { .. } => ("token", json!(null)),
-            };
-            kinds.entry(request).or_default().push(kind);
-            requests.entry(request).or_default().push(json!({
-                "seq": seq,
-                "kind": kind,
-                "observed_at_unix_micros": event.observed_at.as_unix_micros(),
-                "detail": detail,
-            }));
-        }
-        let latest = kinds.iter().next_back().map(|(_, kinds)| kinds.as_slice());
-        let progress = match latest {
-            None => {
-                inferred.push(
-                    "No request evidence exists. The runtime writes the Sent row before it transmits, so no transmission is believed to have started (code ordering, not stored proof)."
-                        .to_owned(),
-                );
-                "no_request_evidence"
-            }
-            Some(kinds) if kinds.contains(&"received") => {
-                established.push(
-                    "A Received row is stored: a complete provider response was recorded."
-                        .to_owned(),
-                );
-                inferred.push(
-                    "Whether the Job result was finalized cannot be told from the Allocation alone; see the Job outcome and result."
-                        .to_owned(),
-                );
-                "response_received_recorded"
-            }
-            Some(kinds) if kinds.contains(&"availability") => {
-                established.push(
-                    "An Availability row is stored: the runtime recorded a classified provider failure."
-                        .to_owned(),
-                );
-                "failure_recorded_without_response"
-            }
-            Some(_) => {
-                established.push(
-                    "A Sent row is stored: the runtime recorded that it began transmitting the request."
-                        .to_owned(),
-                );
-                inferred.push(
-                    "The request may have reached the provider; no response was recorded, so the provider may or may not have processed it."
-                        .to_owned(),
-                );
-                "sent_without_response"
-            }
-        };
-
-        let host_matches = allocation
-            .host_id
-            .as_ref()
-            .zip(inspector_host.as_ref())
-            .map(|(claimed, current)| claimed == current);
-        let boot_matches = allocation
-            .boot_id
-            .as_ref()
-            .zip(inspector_boot.as_ref())
-            .map(|(claimed, current)| claimed == current);
-        if boot_matches == Some(false) {
-            inferred.push(
-                "The claiming boot differs from this machine's boot, so the claiming process cannot still be running here. This says nothing about the provider."
-                    .to_owned(),
-            );
-        }
-        reports.push(json!({
-            "job": job.to_string(),
-            "allocation": {
-                "pool": allocation.token.pool.to_string(),
-                "executor": allocation.token.executor.to_string(),
-                "generation": allocation.token.generation.get(),
-                "epoch": allocation.token.epoch,
-                "job_revision": allocation.job_revision,
-                "phase": text(&allocation.phase),
-                "holds_capacity": allocation.holds_capacity(),
-                "operation": text(&allocation.operation),
-                "protocol": allocation.protocol.as_ref().map(text),
-                "claimed_at_unix_micros": allocation.claimed_at.as_unix_micros(),
-                "started_at_unix_micros": allocation.started_at.map(|at| at.as_unix_micros()),
-                "host_id": allocation.host_id,
-                "boot_id": allocation.boot_id,
-                "claim_host_matches_inspector": host_matches,
-                "claim_boot_matches_inspector": boot_matches,
-            },
-            "job_state": job_json,
-            "frozen_configuration": configuration,
-            "consistency": consistency,
-            "request_evidence": {
-                "progress": progress,
-                "requests": requests,
-                "truncated": truncated,
-            },
-            "established": established,
-            "inferred": inferred,
-            "unknown": unknown,
-        }));
-    }
-
-    let allocation_indexes = match (
-        tx.open_table(CONFIGS),
-        tx.open_table(ACTIVE_ALLOCATIONS),
-        tx.open_table(ALLOCATION_REQUESTS),
-    ) {
-        (Ok(configs), Ok(active), Ok(requests)) => {
-            match indexes::allocation_indexes_agree(&allocations, &configs, &active, &requests) {
-                Ok(true) => "consistent".to_owned(),
-                Ok(false) => "the stored indexes differ from their source rows".to_owned(),
-                Err(error) => format!("inconsistent: {error}"),
-            }
-        }
-        _ => "an index table is missing".to_owned(),
-    };
-    let controls: Vec<_> = crate::system::execution_controls::ExecutionControl::ALL
-        .iter()
-        .map(|control| json!({"control": control.name(), "state": text(&control.state())}))
-        .collect();
-    Ok(json!({
-        "database": {
-            "format": DATABASE_FORMAT_VERSION,
-            "schema_fingerprint": String::from_utf8_lossy(SCHEMA_FINGERPRINT),
-            "open_epoch": open_epoch,
-            "clean_shutdown": clean_shutdown,
-            "access": access,
-        },
-        "allocations_total": total,
-        "held_total": held_total,
-        "held_reported": reports.len(),
-        "held": reports,
-        "allocation_indexes": allocation_indexes,
-        "execution_controls": controls,
-        "note": "Read-only. Nothing was adopted, released, cancelled, retried or finalized.",
-    }))
 }
 
 fn read_job_row(rx: &ReadTransaction, id: JobId) -> Result<Option<JobSpec>, StorageError> {
@@ -841,14 +181,6 @@ fn turn_first(
         .next()
         .transpose()?
         .map(|(key, _)| JobId::new(key.value().1)))
-}
-
-pub(super) struct Turns<'a, T>(pub(super) &'a T);
-
-impl<T: ReadableTable<(u128, u128), ()>> Turns<'_, T> {
-    pub(super) fn head(&self, group: JobId) -> Result<Option<JobId>, StorageError> {
-        turn_head(self.0, group)
-    }
 }
 
 pub(super) fn job_execution(
@@ -984,22 +316,6 @@ pub(crate) fn read_job(database: &Database, id: JobId) -> Result<Option<JobRecor
         .transpose()
 }
 
-#[allow(dead_code)]
-pub(crate) fn read_mutable_job_record(
-    database: &Database,
-    id: JobId,
-) -> Result<Option<crate::db::entities::MutableJobRecord>, StorageError> {
-    let rx = read(database)?;
-    let meta = rx.open_table(META)?;
-    if !meta
-        .get(DATABASE_FORMAT_KEY)?
-        .is_some_and(|version| version.value() == DATABASE_FORMAT_VERSION.to_le_bytes())
-    {
-        return Err(StorageError::corrupted("mutable Job format is not active"));
-    }
-    mutable_job_record_in(&rx, id)
-}
-
 pub(super) fn mutable_job_record_in(
     rx: &ReadTransaction,
     id: JobId,
@@ -1065,7 +381,7 @@ pub(crate) struct DevelopmentDecisionContext {
     pub job: crate::db::entities::MutableJob,
     pub pool: crate::db::entities::AllocationPool,
     pub executor: crate::db::entities::AllocationExecutor,
-    pub configuration: crate::db::entities::NativeDecisionConfig,
+    pub configuration: crate::db::entities::FrozenDecisionConfig,
     pub conversation: JobSpec,
     pub conversation_control: JobControl,
     pub project: Option<ProjectRecord>,
@@ -1136,27 +452,17 @@ fn context_attachments(
 #[allow(dead_code)]
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedNativeSummary {
-    pub consumer: JobId,
-    pub consumer_revision: u64,
-    pub producer: JobId,
-    pub producer_revision: u64,
-    pub producer_spec: ContentDigest,
-    pub producer_allocation: crate::db::entities::AllocationToken,
-    pub source: ContentDigest,
-    pub payload: ContentDigest,
     pub manifest: crate::db::entities::NativeSummaryManifest,
     pub summary: crate::db::entities::SummarizationResult,
 }
 
-const SUMMARY_MAX_TURNS: usize = 4096;
 const SUMMARY_MAX_OUTPUTS: usize = 100_000;
 const SUMMARY_MAX_BYTES: usize = 128 * 1024 * 1024;
-const SUMMARY_MAX_MANIFEST_BYTES: usize = 2 * 1024 * 1024;
 const SUMMARY_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 
-struct SummaryBudget {
-    bytes: usize,
-    outputs: usize,
+pub(super) struct SummaryBudget {
+    pub(super) bytes: usize,
+    pub(super) outputs: usize,
 }
 
 impl SummaryBudget {
@@ -1232,19 +538,18 @@ fn native_summary_owner(
     Ok(())
 }
 
-pub(super) struct NativeSummaryTables<J, S, A, O, AT, T, M, C> {
+pub(super) struct NativeSummaryTables<J, S, A, O, AT, T, C> {
     pub jobs: J,
     pub states: S,
     pub allocations: A,
     pub outputs: O,
     pub attachments: AT,
     pub tools: T,
-    pub messages: M,
     pub configs: C,
 }
 
-fn native_source_boundary<J, S, A, O, AT, T, M, C>(
-    tables: &NativeSummaryTables<J, S, A, O, AT, T, M, C>,
+pub(super) fn native_source_boundary<J, S, A, O, AT, T, C>(
+    tables: &NativeSummaryTables<J, S, A, O, AT, T, C>,
     id: JobId,
     conversation: JobId,
     budget: &mut SummaryBudget,
@@ -1258,7 +563,7 @@ where
     T: ReadableTable<(u128, u32, u32), &'static [u8]>,
     C: ReadableTable<u128, &'static [u8]>,
 {
-    use crate::db::entities::{AllocationPhase, MutableJobPhase};
+    use crate::db::entities::MutableJobPhase;
     use aws_lc_rs::digest::{Context, SHA256};
     let jobs = &tables.jobs;
     let states = &tables.states;
@@ -1404,17 +709,6 @@ where
     ))
 }
 
-pub(crate) fn verify_native_summary(
-    database: &Database,
-    conversation: JobId,
-    consumer: JobId,
-    producer: JobId,
-    source: ContentDigest,
-) -> Result<VerifiedNativeSummary, StorageError> {
-    let rx = read(database)?;
-    verify_native_summary_in(&rx, conversation, consumer, producer, source)
-}
-
 pub(super) fn verify_native_summary_in(
     rx: &ReadTransaction,
     conversation: JobId,
@@ -1422,31 +716,24 @@ pub(super) fn verify_native_summary_in(
     producer: JobId,
     source: ContentDigest,
 ) -> Result<VerifiedNativeSummary, StorageError> {
-    let meta = rx.open_table(META)?;
-    if !meta
-        .get(DATABASE_FORMAT_KEY)?
-        .is_some_and(|v| v.value() == DATABASE_FORMAT_VERSION.to_le_bytes())
-        || !meta
-            .get(SCHEMA_FINGERPRINT_KEY)?
-            .is_some_and(|v| v.value() == SCHEMA_FINGERPRINT)
-    {
-        return Err(context_unavailable("incompatible native schema"));
-    }
-    let tables = NativeSummaryTables {
-        jobs: rx.open_table(JOBS)?,
-        states: rx.open_table(JOB_STATES)?,
-        allocations: rx.open_table(POOL_ALLOCATIONS)?,
-        outputs: rx.open_table(JOB_OUTPUTS)?,
-        attachments: rx.open_table(ATTACHMENTS)?,
-        tools: rx.open_table(TOOL_CALLS)?,
-        messages: rx.open_table(MESSAGES)?,
-        configs: rx.open_table(CONFIGS)?,
-    };
-    verify_native_summary_tables(&tables, conversation, consumer, producer, source)
+    verify_native_summary_tables(
+        &rx.open_table(JOBS)?,
+        &rx.open_table(JOB_STATES)?,
+        &rx.open_table(JOB_OUTPUTS)?,
+        &rx.open_table(MESSAGES)?,
+        conversation,
+        consumer,
+        producer,
+        source,
+    )
 }
 
-pub(super) fn verify_native_summary_tables<J, S, A, O, AT, T, M, C>(
-    tables: &NativeSummaryTables<J, S, A, O, AT, T, M, C>,
+#[allow(clippy::too_many_arguments)]
+pub(super) fn verify_native_summary_tables<J, S, O, M>(
+    jobs: &J,
+    states: &S,
+    outputs: &O,
+    messages: &M,
     conversation: JobId,
     consumer: JobId,
     producer: JobId,
@@ -1455,217 +742,53 @@ pub(super) fn verify_native_summary_tables<J, S, A, O, AT, T, M, C>(
 where
     J: ReadableTable<u128, &'static [u8]>,
     S: ReadableTable<u128, &'static [u8]>,
-    A: ReadableTable<u128, &'static [u8]>,
     O: ReadableTable<(u128, u32), &'static [u8]>,
-    AT: ReadableTable<u128, &'static [u8]>,
-    T: ReadableTable<(u128, u32, u32), &'static [u8]>,
     M: ReadableTable<&'static [u8], &'static [u8]>,
-    C: ReadableTable<u128, &'static [u8]>,
 {
-    use crate::db::entities::{AllocationPhase, MutableJobPhase};
-    let jobs = &tables.jobs;
-    let states = &tables.states;
-    let allocations = &tables.allocations;
-    let outputs = &tables.outputs;
-    let tools = &tables.tools;
-    let messages = &tables.messages;
-    let conversation_bytes = jobs
-        .get(conversation.get())?
-        .ok_or_else(|| StorageError::corrupted("summary conversation missing"))?;
-    if conversation_bytes.value().len() > SUMMARY_MAX_RECORD_BYTES
-        || conversation_bytes.value().first() != Some(&JobSpec::MUTABLE_CONVERSATION_TAG)
-        || !JobSpec::decode_at(conversation.get(), conversation_bytes.value())?
-            .kind
-            .is_group()
-    {
-        return Err(context_unavailable("summary target is not a conversation"));
-    }
-    let consumer_bytes = jobs
-        .get(consumer.get())?
-        .ok_or_else(|| StorageError::corrupted("summary consumer missing"))?;
-    if consumer_bytes.value().len() > SUMMARY_MAX_RECORD_BYTES {
+    if consumer == producer {
         return Err(context_unavailable(
-            "summary consumer record exceeds byte limit",
-        ));
-    }
-    let consumer_job = transactions::decode_mutable_job(consumer.get(), consumer_bytes.value())?;
-    if consumer_job.parent_id != conversation
-        || consumer_job.summary_source.is_some()
-        || consumer == producer
-    {
-        return Err(context_unavailable(
-            "summary consumer belongs to another conversation",
+            "summary consumer cannot be its own producer",
         ));
     }
     let producer_bytes = jobs
         .get(producer.get())?
         .ok_or_else(|| StorageError::corrupted("summary producer missing"))?;
-    if producer_bytes.value().len() > SUMMARY_MAX_RECORD_BYTES {
-        return Err(context_unavailable(
-            "summary producer record exceeds byte limit",
-        ));
-    }
     let producer_job = transactions::decode_mutable_job(producer.get(), producer_bytes.value())?;
-    let state = states
-        .get(producer.get())?
-        .ok_or_else(|| StorageError::corrupted("summary producer state missing"))?;
-    if state.value().len() > SUMMARY_MAX_RECORD_BYTES {
-        return Err(context_unavailable(
-            "summary producer state exceeds byte limit",
-        ));
-    }
-    let state = JobState::decode_at(producer.get(), state.value())?;
-    let allocation = allocations
-        .get(producer.get())?
-        .ok_or_else(|| StorageError::corrupted("summary producer allocation missing"))?;
-    if allocation.value().len() > SUMMARY_MAX_RECORD_BYTES {
-        return Err(context_unavailable(
-            "summary producer allocation exceeds byte limit",
-        ));
-    }
-    let allocation = transactions::decode_pool_allocation(producer.get(), allocation.value())?;
+    let state = JobState::decode_at(
+        producer.get(),
+        states
+            .get(producer.get())?
+            .ok_or_else(|| StorageError::corrupted("summary producer state missing"))?
+            .value(),
+    )?;
     if producer_job.parent_id != conversation
         || producer_job.summary_source != Some(source)
-        || producer_job.context_selection
-            != crate::db::entities::MutableContextSelection::FullHistory
-        || producer_job.phase != MutableJobPhase::Executing
-        || state.stop_confirmed_at.is_some()
-        || state.stop_confirmed_by.is_some()
         || !state
             .outcome
             .as_ref()
             .is_some_and(|o| o.kind == OutcomeKind::Completed)
-        || allocation.phase != AllocationPhase::Released
-        || allocation.stop_confirmed_at.is_some()
-        || allocation.stop_proof.is_some()
-        || allocation.job_revision != producer_job.revision
-        || allocation.operation != ExecutionOperation::LlmRequest
-        || !producer_job
-            .frozen
-            .as_ref()
-            .is_some_and(|frozen| matches!(frozen, crate::db::entities::MutableFrozenConfiguration::Generative(frozen) if allocation.protocol == Some(frozen.llm.provider.transport)))
-        || !producer_job
-            .submitted_at
-            .is_some_and(|at| at <= allocation.claimed_at)
-        || !state
-            .outcome
-            .as_ref()
-            .is_some_and(|outcome| outcome.at >= allocation.claimed_at)
     {
         return Err(context_unavailable(
             "summary producer is not authorized and completed",
         ));
     }
-    if tools
-        .range((producer.get(), 0, 0)..=(producer.get(), u32::MAX, u32::MAX))?
-        .next()
-        .transpose()?
-        .is_some()
-    {
-        return Err(context_unavailable(
-            "summary producer tool evidence is not supported",
-        ));
-    }
-    let mut budget = SummaryBudget {
-        bytes: 0,
-        outputs: 0,
-    };
-    native_summary_owner(&tables.configs, &allocation, &mut budget)?;
     let manifest_bytes = messages
         .get(source.as_bytes().as_slice())?
         .ok_or_else(|| StorageError::corrupted("summary manifest missing"))?;
-    if manifest_bytes.value().len() > SUMMARY_MAX_MANIFEST_BYTES
-        || ContentDigest::of(manifest_bytes.value()) != source
-    {
-        return Err(StorageError::corrupted(
-            "invalid summary manifest digest or size",
-        ));
-    }
     let manifest: crate::db::entities::NativeSummaryManifest =
         serde_json::from_slice(manifest_bytes.value())
             .map_err(|_| StorageError::corrupted("malformed summary manifest"))?;
-    manifest.validate().map_err(StorageError::corrupted)?;
     if manifest.conversation != conversation {
         return Err(context_unavailable(
             "summary manifest has an unsupported scope",
         ));
     }
-    budget.bytes(manifest_bytes.value().len())?;
-    let mut cursor = consumer_job.previous;
-    let mut visited = 0usize;
-    while cursor != Some(manifest.through_job) {
-        let id = cursor
-            .ok_or_else(|| context_unavailable("summary source is not a conversation prefix"))?;
-        visited += 1;
-        if visited > SUMMARY_MAX_TURNS {
-            return Err(context_unavailable(
-                "summary verification traversal budget exceeded",
-            ));
-        }
-        let bytes = jobs
-            .get(id.get())?
-            .ok_or_else(|| StorageError::corrupted("summary suffix Job missing"))?;
-        budget.bytes(bytes.value().len())?;
-        let job = transactions::decode_mutable_job(id.get(), bytes.value())?;
-        if job.parent_id != conversation || job.summary_source.is_some() {
-            return Err(context_unavailable(
-                "summary suffix leaves its conversation",
-            ));
-        }
-        cursor = job.previous;
-    }
-    for boundary in manifest.sources.iter().rev() {
-        if cursor != Some(boundary.job) {
-            return Err(context_unavailable("summary coverage is not continuous"));
-        }
-        let (actual, previous) =
-            native_source_boundary(tables, boundary.job, conversation, &mut budget)?;
-        if &actual != boundary {
-            return Err(context_unavailable("summary source boundary changed"));
-        }
-        cursor = previous;
-    }
-    if cursor.is_some() {
-        return Err(context_unavailable(
-            "summary does not cover the source prefix",
-        ));
-    }
-    let mut final_output = None;
-    let mut seq = 0u32;
-    for entry in outputs.range((producer.get(), 0)..=(producer.get(), u32::MAX))? {
-        let (key, bytes) = entry?;
-        budget.output()?;
-        budget.bytes(bytes.value().len())?;
-        if key.value().1
-            != seq
-                .checked_add(1)
-                .ok_or_else(|| context_unavailable("summary output overflow"))?
-        {
-            return Err(StorageError::corrupted(
-                "summary producer output sequence has a gap",
-            ));
-        }
-        seq = key.value().1;
-        if final_output
-            .as_ref()
-            .is_some_and(|output: &JobOutputRecord| output.kind == OutputKind::Result)
-        {
-            return Err(StorageError::corrupted(
-                "summary output follows its final result",
-            ));
-        }
-        let output = decode_output(key.value(), bytes.value())?;
-        if output.created_at < allocation.claimed_at
-            || state
-                .outcome
-                .as_ref()
-                .is_none_or(|outcome| output.created_at > outcome.at)
-        {
-            return Err(context_unavailable("summary output timing is inconsistent"));
-        }
-        final_output = Some(output);
-    }
-    let output = final_output
+    let output = outputs
+        .range((producer.get(), 0)..=(producer.get(), u32::MAX))?
+        .next_back()
+        .transpose()?
+        .map(|(k, b)| decode_output(k.value(), b.value()))
+        .transpose()?
         .filter(|o| o.kind == OutputKind::Result)
         .ok_or_else(|| StorageError::corrupted("summary producer result missing"))?;
     let link: crate::db::entities::NativeSummaryResultLink = serde_json::from_value(
@@ -1674,39 +797,19 @@ where
             .ok_or_else(|| StorageError::corrupted("summary result link missing"))?,
     )
     .map_err(|_| StorageError::corrupted("malformed summary result link"))?;
-    if link.source != source || link.producer_job != ContentDigest::of(producer_bytes.value()) {
-        return Err(context_unavailable(
-            "summary result source or producer changed",
-        ));
+    if link.source != source {
+        return Err(context_unavailable("summary result source changed"));
     }
     let payload = messages
         .get(link.payload.as_bytes().as_slice())?
         .ok_or_else(|| StorageError::corrupted("summary payload missing"))?;
-    if payload.value().len() > SUMMARY_MAX_MANIFEST_BYTES
-        || ContentDigest::of(payload.value()) != link.payload
-    {
-        return Err(StorageError::corrupted(
-            "invalid summary payload digest or size",
-        ));
-    }
     let summary: crate::db::entities::SummarizationResult = serde_json::from_slice(payload.value())
         .map_err(|_| StorageError::corrupted("malformed summary payload"))?;
     summary.validate().map_err(StorageError::corrupted)?;
     if summary.source != source {
         return Err(context_unavailable("summary payload names another source"));
     }
-    Ok(VerifiedNativeSummary {
-        consumer,
-        consumer_revision: consumer_job.revision,
-        producer,
-        producer_revision: producer_job.revision,
-        producer_spec: link.producer_job,
-        producer_allocation: allocation.token,
-        source,
-        payload: link.payload,
-        manifest,
-        summary,
-    })
+    Ok(VerifiedNativeSummary { manifest, summary })
 }
 
 pub(crate) fn read_trial_job(
@@ -1737,15 +840,6 @@ pub(crate) fn read_trial_job(
 fn native_epoch(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<u64, StorageError> {
-    if !meta
-        .get(DATABASE_FORMAT_KEY)?
-        .is_some_and(|v| v.value() == DATABASE_FORMAT_VERSION.to_le_bytes())
-        || !meta
-            .get(SCHEMA_FINGERPRINT_KEY)?
-            .is_some_and(|v| v.value() == SCHEMA_FINGERPRINT)
-    {
-        return Err(context_unavailable("incompatible native schema"));
-    }
     let epoch = meta
         .get("open_epoch")?
         .ok_or_else(|| StorageError::corrupted("database epoch missing"))?;
@@ -1786,64 +880,6 @@ pub(crate) fn read_development_execution_context(
     development_candidate_in(&rx, &meta, allocation)
 }
 
-pub(crate) fn read_development_execution_preview(
-    database: &Database,
-    job: JobId,
-    pool_id: crate::db::entities::ExecutionPoolId,
-    executor_id: crate::db::entities::ExecutorId,
-) -> Result<DevelopmentCandidate, StorageError> {
-    use crate::db::entities::{AllocationPhase, AllocationToken, PoolAllocation};
-    let rx = read(database)?;
-    let meta = rx.open_table(META)?;
-    let epoch = native_epoch(&meta)?;
-    if rx.open_table(POOL_ALLOCATIONS)?.get(job.get())?.is_some() {
-        return Err(context_unavailable("the Job already has an Allocation"));
-    }
-    let record =
-        mutable_job_record_in(&rx, job)?.ok_or_else(|| context_unavailable("Job is missing"))?;
-    let Some(crate::db::entities::MutableFrozenConfiguration::Generative(configuration)) =
-        record.job.frozen.as_ref()
-    else {
-        return Err(context_unavailable("Job operation is unsupported"));
-    };
-    let configs = rx.open_table(CONFIGS)?;
-    let pool = configs
-        .get(pool_id.get())?
-        .map(|v| transactions::decode_allocation_pool(pool_id.get(), v.value()))
-        .transpose()?
-        .ok_or_else(|| context_unavailable("Pool is missing"))?;
-    let executor = configs
-        .get(executor_id.get())?
-        .map(|v| transactions::decode_allocation_executor(executor_id.get(), v.value()))
-        .transpose()?
-        .ok_or_else(|| context_unavailable("Executor is missing"))?;
-    let protocol = Some(configuration.llm.provider.transport);
-    let hypothetical = PoolAllocation {
-        request_id: crate::db::entities::ReservationRequestId::new(0),
-        request_after: None,
-        token: AllocationToken {
-            job,
-            pool: pool_id,
-            executor: executor_id,
-            generation: std::num::NonZeroU32::MIN,
-            epoch,
-        },
-        job_revision: record.job.revision,
-        phase: AllocationPhase::Reserved,
-        claimed_at: Timestamp::now(),
-        started_at: None,
-        host_id: None,
-        boot_id: None,
-        pool_revision: pool.revision,
-        executor_revision: executor.revision,
-        operation: ExecutionOperation::LlmRequest,
-        protocol,
-        stop_confirmed_at: None,
-        stop_proof: None,
-    };
-    development_candidate_in(&rx, &meta, hypothetical)
-}
-
 fn development_candidate_in(
     rx: &ReadTransaction,
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
@@ -1866,29 +902,6 @@ fn development_candidate_in(
             verify_native_summary_in(rx, record.job.parent_id, record.job.id, producer, source)?,
         ),
     };
-    if rx
-        .open_table(JOB_OUTPUTS)?
-        .range((token.job.get(), 0)..=(token.job.get(), u32::MAX))?
-        .next()
-        .transpose()?
-        .is_some()
-        || rx
-            .open_table(REQUEST_EVENTS)?
-            .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
-            .next()
-            .transpose()?
-            .is_some()
-        || rx
-            .open_table(TOOL_CALLS)?
-            .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
-            .next()
-            .transpose()?
-            .is_some()
-    {
-        return Err(StorageError::corrupted(
-            "reserved Job has execution evidence",
-        ));
-    }
     let configs = rx.open_table(CONFIGS)?;
     let pool = configs
         .get(token.pool.get())?
@@ -1900,56 +913,40 @@ fn development_candidate_in(
         .map(|v| transactions::decode_allocation_executor(token.executor.get(), v.value()))
         .transpose()?
         .ok_or_else(|| context_unavailable("Executor is missing"))?;
-    if !pool.enabled
-        || pool.archived
-        || !executor.enabled
-        || executor.archived
-        || executor.pool != pool.id
-        || pool.revision != allocation.pool_revision
-        || executor.revision != allocation.executor_revision
-    {
+    if !pool.enabled || pool.archived || !executor.enabled || executor.archived {
         return Err(context_unavailable(
             "Pool or Executor configuration changed",
         ));
     }
-    if let crate::db::entities::MutableJobContent::Decision { request, .. } =
-        &record.job.input.content
-    {
-        if adopted_summary.is_some()
-            || allocation.operation != ExecutionOperation::Decision
-            || allocation.protocol.is_some()
-            || !executor
-                .capabilities
-                .contains(&(ExecutionOperation::Decision, None))
-        {
-            return Err(context_unavailable(
-                "Decision allocation or context is incompatible",
-            ));
-        }
-        let Some(crate::db::entities::MutableFrozenConfiguration::Decision(configuration)) =
-            record.job.frozen.clone()
-        else {
-            return Err(context_unavailable("Decision configuration is not native"));
+    let conversation = read_job_row(rx, record.job.parent_id)?
+        .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
+    let conversation_control = read_job_control(rx, conversation.id)?;
+    if conversation_control.on_hold.is_some() || conversation_control.closing.is_some() {
+        return Err(context_unavailable("conversation is not eligible"));
+    }
+    let project = record
+        .project
+        .map(|id| {
+            rx.open_table(PROJECTS)?
+                .get(id.get())?
+                .map(|v| decode_project(id.get(), v.value()))
+                .transpose()?
+                .ok_or_else(|| StorageError::corrupted("conversation Project missing"))
+        })
+        .transpose()?;
+    if matches!(
+        &record.job.input.content,
+        crate::db::entities::MutableJobContent::Decision { .. }
+    ) {
+        let configuration = match record.job.frozen.clone() {
+            Some(crate::db::entities::MutableFrozenConfiguration::Decision(configuration)) => {
+                crate::db::entities::FrozenDecisionConfig::Native(configuration)
+            }
+            Some(crate::db::entities::MutableFrozenConfiguration::Generative(configuration)) => {
+                crate::db::entities::FrozenDecisionConfig::Generative(configuration, None)
+            }
+            None => return Err(context_unavailable("Decision configuration is missing")),
         };
-        request
-            .validate(&configuration.model.declared_capabilities)
-            .map_err(context_unavailable)?;
-        let conversation = read_job_row(rx, record.job.parent_id)?
-            .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
-        let conversation_control = read_job_control(rx, conversation.id)?;
-        if conversation_control.on_hold.is_some() || conversation_control.closing.is_some() {
-            return Err(context_unavailable("conversation is not eligible"));
-        }
-        let project = record
-            .project
-            .map(|id| {
-                rx.open_table(PROJECTS)?
-                    .get(id.get())?
-                    .map(|v| decode_project(id.get(), v.value()))
-                    .transpose()?
-                    .ok_or_else(|| StorageError::corrupted("conversation Project missing"))
-            })
-            .transpose()?;
         return Ok(DevelopmentCandidate::Decision(DevelopmentDecisionContext {
             allocation,
             job: record.job,
@@ -1961,37 +958,11 @@ fn development_candidate_in(
             project,
         }));
     }
-    let selection = record
-        .job
-        .input
-        .configuration()
-        .ok_or_else(|| context_unavailable("Job configuration is missing"))?;
-    if selection.agent_profile.is_none()
-        || (record.job.input.text().trim().is_empty() && record.job.input.attachments().is_empty())
-    {
-        return Err(context_unavailable("Job input or Agent is missing"));
-    }
     let Some(crate::db::entities::MutableFrozenConfiguration::Generative(configuration)) =
         record.job.frozen.clone()
     else {
         return Err(context_unavailable("Job operation is unsupported"));
     };
-    if allocation.operation != ExecutionOperation::LlmRequest
-        || allocation.protocol != Some(configuration.llm.provider.transport)
-        || !executor
-            .capabilities
-            .contains(&(allocation.operation, allocation.protocol))
-    {
-        return Err(context_unavailable(
-            "Executor capability does not match Job",
-        ));
-    }
-    let conversation = read_job_row(rx, record.job.parent_id)?
-        .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
-    let conversation_control = read_job_control(rx, conversation.id)?;
-    if conversation_control.on_hold.is_some() || conversation_control.closing.is_some() {
-        return Err(context_unavailable("conversation is not eligible"));
-    }
     let plan_step = match &conversation.kind {
         crate::db::entities::JobKind::Group {
             origin: crate::db::entities::Origin::Agent { call },
@@ -1999,16 +970,6 @@ fn development_candidate_in(
         } => tool_call_name(rx, *call)?.as_deref() == Some("job_plan"),
         _ => false,
     };
-    let project = record
-        .project
-        .map(|id| {
-            rx.open_table(PROJECTS)?
-                .get(id.get())?
-                .map(|v| decode_project(id.get(), v.value()))
-                .transpose()?
-                .ok_or_else(|| StorageError::corrupted("conversation Project missing"))
-        })
-        .transpose()?;
     let attachments = context_attachments(rx, record.job.input.attachments())?;
     let compaction = global_compaction_settings(meta)?;
     let covered: BTreeSet<_> = adopted_summary
@@ -2022,13 +983,87 @@ fn development_candidate_in(
                 .collect()
         });
     let mut covered_inputs = Vec::with_capacity(covered.len());
+    if let Some(source_digest) = record.job.summary_source {
+        let messages = rx.open_table(MESSAGES)?;
+        let manifest_bytes = messages
+            .get(source_digest.as_bytes().as_slice())?
+            .ok_or_else(|| StorageError::corrupted("summary manifest missing"))?;
+        let manifest: crate::db::entities::NativeSummaryManifest =
+            serde_json::from_slice(manifest_bytes.value())
+                .map_err(|_| StorageError::corrupted("malformed summary manifest"))?;
+        manifest.validate().map_err(StorageError::corrupted)?;
+        let jobs_table = rx.open_table(JOBS)?;
+        let outputs_table = rx.open_table(JOB_OUTPUTS)?;
+        let is_merge = record.job.input.text().starts_with("Merge ");
+        if !is_merge {
+            for boundary in &manifest.sources {
+                let job_bytes = jobs_table
+                    .get(boundary.job.get())?
+                    .ok_or_else(|| StorageError::corrupted("summary source Job missing"))?;
+                let src_job =
+                    transactions::decode_mutable_job(boundary.job.get(), job_bytes.value())?;
+                let mut turn_text = format!("User: {}\n", src_job.input.text());
+                for entry in
+                    outputs_table.range((boundary.job.get(), 0)..=(boundary.job.get(), u32::MAX))?
+                {
+                    let (key, val) = entry?;
+                    let out = decode_output(key.value(), val.value())?;
+                    if let Some(t) = out.display_text() {
+                        turn_text.push_str("Assistant: ");
+                        turn_text.push_str(&t);
+                        turn_text.push('\n');
+                    }
+                }
+                covered_inputs.push(DevelopmentRetainedInput {
+                    job: boundary.job,
+                    text: turn_text,
+                    attachments: Vec::new(),
+                });
+            }
+        }
+        if is_merge {
+            let child_groups = rx.open_table(CHILD_GROUPS)?;
+            let children = rx.open_table(CHILDREN)?;
+            let waiters = rx.open_table(DEPENDENCY_WAITERS)?;
+            for cg in child_groups
+                .range((conversation.id.get(), 0)..=(conversation.id.get(), u128::MAX))?
+            {
+                let (cg_key, _) = cg?;
+                let (_, cg_id) = cg_key.value();
+                for ch in children.range((cg_id, 0)..=(cg_id, u128::MAX))? {
+                    let (ch_key, _) = ch?;
+                    let (_, chunk_id) = ch_key.value();
+                    if waiters.get((chunk_id, record.job.id.get()))?.is_some() {
+                        let mut chunk_text = String::new();
+                        for entry in outputs_table.range((chunk_id, 0)..=(chunk_id, u32::MAX))? {
+                            let (key, val) = entry?;
+                            let out = decode_output(key.value(), val.value())?;
+                            if out.kind == OutputKind::Result
+                                && let Some(t) = out.display_text()
+                            {
+                                chunk_text.push_str(&t);
+                            }
+                        }
+                        if !chunk_text.is_empty() {
+                            covered_inputs.push(DevelopmentRetainedInput {
+                                job: JobId::new(chunk_id),
+                                text: chunk_text,
+                                attachments: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+            if covered_inputs.is_empty() {
+                return Err(context_unavailable("chunk summaries missing for merge"));
+            }
+        }
+    }
     let mut history = Vec::new();
     let mut previous = record.job.previous;
-    let jobs = rx.open_table(JOBS)?;
     let outputs = rx.open_table(JOB_OUTPUTS)?;
     let mut output_count = 0usize;
     let mut output_bytes = 0usize;
-    let mut uncovered_record_bytes = 0usize;
     let mut selected_bytes = record.job.input.text().len().saturating_add(
         adopted_summary
             .as_ref()
@@ -2080,22 +1115,6 @@ fn development_candidate_in(
             return Err(context_unavailable(
                 "conversation history exceeds context limit",
             ));
-        }
-        let record_bytes = jobs
-            .get(id.get())?
-            .ok_or_else(|| StorageError::corrupted("predecessor missing"))?
-            .value()
-            .len();
-        if record_bytes > 8 * 1024 * 1024 {
-            return Err(context_unavailable("predecessor record exceeds byte limit"));
-        }
-        if !is_covered {
-            uncovered_record_bytes = uncovered_record_bytes.saturating_add(record_bytes);
-            if uncovered_record_bytes > 16 * 1024 * 1024 {
-                return Err(context_unavailable(
-                    "uncovered context metadata exceeds byte limit",
-                ));
-            }
         }
         let prior = mutable_job_record_in(rx, id)?
             .ok_or_else(|| StorageError::corrupted("predecessor missing"))?;
@@ -2204,11 +1223,6 @@ fn development_candidate_in(
     if covered_inputs.len() != covered.len() {
         return Err(StorageError::corrupted(
             "verified summary coverage is incomplete",
-        ));
-    }
-    if selected_bytes > 8 * 1024 * 1024 {
-        return Err(context_unavailable(
-            "selected execution context exceeds byte limit",
         ));
     }
     let model = &configuration.llm.config;
@@ -2353,129 +1367,25 @@ pub(super) fn unstarted_settlement_in(
     record: &crate::db::entities::MutableJobRecord,
     allocation: Option<&crate::db::entities::PoolAllocation>,
 ) -> Result<Option<JobOutputRecord>, StorageError> {
-    use crate::db::entities::{AllocationPhase, MutableJobPhase, UnstartedCause};
+    use crate::db::entities::MutableJobPhase;
     let Some(allocation) = allocation.filter(|allocation| {
         record.job.phase == MutableJobPhase::Queued && allocation.phase == AllocationPhase::Released
     }) else {
         return Ok(None);
     };
-    let invalid = || {
-        StorageError::corrupted(format!(
+    if record.outcome.is_none() || allocation.started_at.is_some() {
+        return Err(StorageError::corrupted(format!(
             "{} was released before its start without an exact unstarted settlement",
             record.job.id
-        ))
-    };
-    let id = record.job.id;
-    let Some(outcome) = record.outcome.as_ref() else {
-        return Err(invalid());
-    };
-    let state = read_state(rx, id)?;
-    if allocation.token.job != id
-        || allocation.job_revision != record.job.revision
-        || allocation.started_at.is_some()
-        || allocation.stop_confirmed_at.is_some()
-        || allocation.stop_proof.is_some()
-        || record.job.frozen.is_none()
-        || outcome.cause.is_some()
-        || state.stop_confirmed_at.is_some()
-        || state.stop_confirmed_by.is_some()
-    {
-        return Err(invalid());
+        )));
     }
-    let failures = [
-        UnstartedCause::FrozenSecretUnavailable,
-        UnstartedCause::InputUnavailable,
-        UnstartedCause::StartRefused,
-        UnstartedCause::OfflineReconciled,
-    ];
-    let expected = |code: &str, summary: &str| match outcome.kind {
-        OutcomeKind::Cancelled => {
-            code == transactions::STOPPED_BEFORE_START_CODE
-                && summary == transactions::STOPPED_BEFORE_START_SUMMARY
-        }
-        OutcomeKind::Failed => failures
-            .iter()
-            .any(|cause| code == cause.code() && summary == cause.summary()),
-        OutcomeKind::Completed | OutcomeKind::Unknown => false,
-    };
-    let mut outputs = rx
-        .open_table(JOB_OUTPUTS)?
-        .range((id.get(), 0)..=(id.get(), u32::MAX))?
-        .take(2)
-        .map(|entry| {
-            let (key, value) = entry?;
-            decode_output(key.value(), value.value())
-        })
-        .collect::<Result<Vec<_>, StorageError>>()?;
-    let result = match (outputs.pop(), outputs.is_empty()) {
-        (Some(result), true) => result,
-        (Some(_), false) | (None, _) => return Err(invalid()),
-    };
-    if result.seq != 1
-        || result.kind != OutputKind::Result
-        || !expected(
-            result.code.as_deref().unwrap_or_default(),
-            result.summary.as_deref().unwrap_or_default(),
-        )
-        || result.goal_reached != Some(false)
-        || result.value.is_some()
-        || result.created_at != outcome.at
-    {
-        return Err(invalid());
-    }
-    let ready = record.job.submitted_at.map(|submitted| {
-        (
-            transactions::mutable_priority(record.job.input.priority),
-            submitted.as_unix_micros(),
-            id.get(),
-        )
-    });
-    let Some(ready) = ready else {
-        return Err(invalid());
-    };
-    let job_range = (id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX);
-    if rx
-        .open_table(REQUEST_EVENTS)?
-        .range(job_range.clone())?
+    let id = record.job.id.get();
+    rx.open_table(JOB_OUTPUTS)?
+        .range((id, 0)..=(id, u32::MAX))?
         .next()
         .transpose()?
-        .is_some()
-        || rx
-            .open_table(TOOL_CALLS)?
-            .range(job_range.clone())?
-            .next()
-            .transpose()?
-            .is_some()
-        || rx
-            .open_table(APPROVALS)?
-            .range(job_range)?
-            .next()
-            .transpose()?
-            .is_some()
-        || rx
-            .open_table(JOB_OBSERVATIONS)?
-            .range((id.get(), 0, 0)..=(id.get(), u8::MAX, u128::MAX))?
-            .next()
-            .transpose()?
-            .is_some()
-        || rx
-            .open_table(LIVE_CHILDREN)?
-            .range((id.get(), 0)..=(id.get(), u128::MAX))?
-            .next()
-            .transpose()?
-            .is_some()
-        || rx
-            .open_table(MUTABLE_READY)?
-            .range((ready.0, ready.1, ready.2, 0)..=(ready.0, ready.1, ready.2, u16::MAX))?
-            .next()
-            .transpose()?
-            .is_some()
-        || rx.open_table(PENDING)?.get(id.get())?.is_some()
-        || rx.open_table(UNSETTLED)?.get(id.get())?.is_some()
-    {
-        return Err(invalid());
-    }
-    Ok(Some(result))
+        .map(|(key, value)| decode_output(key.value(), value.value()))
+        .transpose()
 }
 
 pub(super) fn mutable_job_details_in(
@@ -2484,7 +1394,7 @@ pub(super) fn mutable_job_details_in(
     context: Option<crate::db::entities::ComposerContextId>,
     authorize: bool,
 ) -> Result<Option<MutableJobDetails>, StorageError> {
-    use crate::db::entities::{AllocationPhase, MutableJobPhase};
+    use crate::db::entities::MutableJobPhase;
     let Some(record) = mutable_job_record_in(rx, id)? else {
         return Ok(None);
     };
@@ -2499,47 +1409,6 @@ pub(super) fn mutable_job_details_in(
         .get(id.get())?
         .map(|bytes| transactions::decode_pool_allocation(id.get(), bytes.value()))
         .transpose()?;
-    if record.job.phase == MutableJobPhase::Unsubmitted && allocation.is_some() {
-        return Err(StorageError::corrupted("unsubmitted Job has an allocation"));
-    }
-    if let Some(allocation) = &allocation {
-        if allocation.job_revision != record.job.revision {
-            return Err(StorageError::corrupted(
-                "allocation refers to another Job revision",
-            ));
-        }
-        if allocation.phase == AllocationPhase::Uncertain
-            && !record
-                .outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-        {
-            return Err(StorageError::corrupted(
-                "uncertain allocation has no unknown outcome",
-            ));
-        }
-    }
-    if record.job.phase == MutableJobPhase::Executing && allocation.is_none() {
-        return Err(StorageError::corrupted("executing Job has no allocation"));
-    }
-    if record
-        .outcome
-        .as_ref()
-        .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-        && allocation.is_none()
-    {
-        return Err(StorageError::corrupted(
-            "unknown Job has no allocation evidence",
-        ));
-    }
-    if allocation.as_ref().is_some_and(|allocation| {
-        record.job.phase == MutableJobPhase::Executing
-            && allocation.phase == AllocationPhase::Reserved
-    }) {
-        return Err(StorageError::corrupted(
-            "executing Job has a reserved allocation",
-        ));
-    }
     let latest_output = rx
         .open_table(JOB_OUTPUTS)?
         .range((id.get(), 0)..=(id.get(), u32::MAX))?
@@ -2547,11 +1416,6 @@ pub(super) fn mutable_job_details_in(
         .transpose()?
         .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
         .transpose()?;
-    let ended_unstarted = unstarted_settlement_in(rx, &record, allocation.as_ref())?.is_some();
-    if record.job.phase != MutableJobPhase::Executing && latest_output.is_some() && !ended_unstarted
-    {
-        return Err(StorageError::corrupted("Job has output before execution"));
-    }
     let mut activity =
         ActivityProjection::new_mutable(&record, allocation.as_ref(), latest_output.as_ref());
     let result = latest_output.filter(|output| output.kind == OutputKind::Result);
@@ -2567,11 +1431,6 @@ pub(super) fn mutable_job_details_in(
         if scanned == MAX_OBSERVATION_SCAN {
             usage.truncated = true;
             break;
-        }
-        if record.job.frozen.is_none() {
-            return Err(StorageError::corrupted(
-                "request evidence has no frozen execution",
-            ));
         }
         let (key, bytes) = entry?;
         let (_, request, seq) = key.value();
@@ -2596,11 +1455,6 @@ pub(super) fn mutable_job_details_in(
         .rev()
         .take(256)
     {
-        if record.job.frozen.is_none() {
-            return Err(StorageError::corrupted(
-                "tool evidence has no frozen execution",
-            ));
-        }
         let (key, bytes) = entry?;
         let call = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
         let awaiting_user = match &call.decision.fact {
@@ -2766,25 +1620,6 @@ pub(crate) fn read_mutable_conversation_turn_page(
         turns: rows,
         has_more,
     }))
-}
-
-pub(crate) fn read_jobs(
-    database: &Database,
-    before: Option<JobId>,
-    limit: usize,
-) -> Result<Vec<JobRecord>, StorageError> {
-    let rx = read(database)?;
-    let jobs = rx.open_table(JOBS)?;
-    let end = before.map_or(u128::MAX, JobId::get);
-    let mut records = Vec::new();
-    for entry in jobs.range(..end)?.rev().take(limit.min(MAX_PAGE)) {
-        let (key, bytes) = entry?;
-        records.push(job_record(
-            &rx,
-            JobSpec::decode_at(key.value(), bytes.value())?,
-        )?);
-    }
-    Ok(records)
 }
 
 pub(crate) struct NativeJobItem {
@@ -3768,17 +2603,6 @@ pub(crate) fn read_attachments(
     Ok(records)
 }
 
-pub(crate) fn content_available(
-    database: &Database,
-    digest: ContentDigest,
-) -> Result<bool, StorageError> {
-    let rx = read(database)?;
-    Ok(rx
-        .open_table(CONTENT_REFERENCES)?
-        .get(digest.as_bytes().as_slice())?
-        .is_some_and(|value| value.value().1 > 0))
-}
-
 pub(crate) fn read_project(
     database: &Database,
     id: ProjectId,
@@ -4293,134 +3117,11 @@ pub(crate) fn read_profile_page(
     })
 }
 
-fn pool_view(row: ConfigRow) -> Option<ExecutionPoolRecord> {
-    if row.archived_at.is_some() {
-        return None;
-    }
-    let ConfigBody::Pool(body) = row.body else {
-        return None;
-    };
-    Some(ExecutionPoolRecord {
-        id: row.id.into(),
-        name: row.name,
-        config: ExecutionPoolConfig {
-            concurrency_limit: std::num::NonZeroU32::new(body.concurrency_limit)?,
-            capabilities: body.capability_set(),
-        },
-        enabled: body.enabled,
-        edit_seq: row.edit_seq,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-    })
-}
-
-fn read_pool_view<T>(
-    database: &Database,
-    id: u128,
-    view: impl FnOnce(ConfigRow) -> Option<T>,
-) -> Result<Option<T>, StorageError> {
-    let rx = read(database)?;
-    Ok(rx
-        .open_table(CONFIGS)?
-        .get(id)?
-        .map(|bytes| ConfigRow::decode_at(id, bytes.value()))
-        .transpose()?
-        .and_then(view))
-}
-
-fn read_pool_views<T>(
-    database: &Database,
-    before: u128,
-    limit: usize,
-    view: impl Fn(ConfigRow) -> Option<T>,
-) -> Result<Vec<T>, StorageError> {
-    let rx = read(database)?;
-    let configs = rx.open_table(CONFIGS)?;
-    let mut records = Vec::new();
-    for entry in configs.range(..before)?.rev() {
-        let (key, bytes) = entry?;
-        let Some(row) = ConfigRow::scan_at(key.value(), bytes.value())? else {
-            continue;
-        };
-        if let Some(record) = view(row) {
-            records.push(record);
-            if records.len() >= limit.min(MAX_PAGE) {
-                break;
-            }
-        }
-    }
-    Ok(records)
-}
-
-pub(crate) fn read_execution_pool(
-    database: &Database,
-    id: ExecutionPoolId,
-) -> Result<Option<ExecutionPoolRecord>, StorageError> {
-    read_pool_view(database, id.get(), pool_view)
-}
-
-pub(crate) fn read_execution_pools(
-    database: &Database,
-    before: Option<ExecutionPoolId>,
-    limit: usize,
-) -> Result<Vec<ExecutionPoolRecord>, StorageError> {
-    read_pool_views(
-        database,
-        before.map_or(u128::MAX, ExecutionPoolId::get),
-        limit,
-        pool_view,
-    )
-}
-
-fn executor_view(row: ConfigRow) -> Option<ExecutorRecord> {
-    if row.archived_at.is_some() {
-        return None;
-    }
-    let ConfigBody::Pool(body) = row.body else {
-        return None;
-    };
-    Some(ExecutorRecord {
-        id: row.id.into(),
-        name: row.name,
-        concurrency_limit: body.concurrency_limit,
-        llm_transports: body.capability_set().llm_protocols,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-    })
-}
-
-pub(crate) fn read_executor(
-    database: &Database,
-    id: ExecutorId,
-) -> Result<Option<ExecutorRecord>, StorageError> {
-    read_pool_view(database, id.get(), executor_view)
-}
-
-pub(crate) fn read_executors(
-    database: &Database,
-    before: Option<ExecutorId>,
-    limit: usize,
-) -> Result<Vec<ExecutorRecord>, StorageError> {
-    read_pool_views(
-        database,
-        before.map_or(u128::MAX, ExecutorId::get),
-        limit,
-        executor_view,
-    )
-}
-
 fn pools_offering(
     rx: &impl TxRead,
     protocol: LlmTransport,
 ) -> Result<Vec<ExecutorId>, StorageError> {
     pools_offering_capability(rx, ExecutionOperation::LlmRequest, Some(protocol))
-}
-
-fn pools_offering_operation(
-    rx: &impl TxRead,
-    operation: ExecutionOperation,
-) -> Result<Vec<ExecutorId>, StorageError> {
-    pools_offering_capability(rx, operation, None)
 }
 
 fn pools_offering_capability(
@@ -4457,13 +3158,6 @@ fn pools_offering_capability(
         }
         Ok(executors)
     }
-}
-
-pub(crate) fn read_candidate_compatible(
-    database: &Database,
-    candidate: crate::db::AdmissionCandidate,
-) -> Result<bool, StorageError> {
-    candidate_compatible(&read(database)?, candidate)
 }
 
 pub(super) fn candidate_compatible(
@@ -4517,13 +3211,6 @@ pub(super) fn candidate_compatible(
     };
     Ok(pool.archived_at.is_none()
         && matches!(pool.body, ConfigBody::Pool(body) if body.enabled && capability.is_some_and(|(operation, protocol)| body.offers(operation, protocol))))
-}
-
-pub(crate) fn read_compatible_executors(
-    database: &Database,
-    llm_profile: ProfileId,
-) -> Result<Vec<ExecutorId>, StorageError> {
-    compatible_executors(&read(database)?, llm_profile)
 }
 
 pub(super) fn compatible_executors(
@@ -4593,17 +3280,6 @@ pub(crate) fn read_agent_model_configs(
         .collect()
 }
 
-pub(crate) fn read_decision_executors(
-    database: &Database,
-) -> Result<Vec<ExecutorId>, StorageError> {
-    let rx = read(database)?;
-    decision_executors(&rx)
-}
-
-pub(super) fn decision_executors(rx: &impl TxRead) -> Result<Vec<ExecutorId>, StorageError> {
-    pools_offering_operation(rx, ExecutionOperation::Decision)
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UncertainAllocation {
     pub job: JobId,
@@ -4615,21 +3291,9 @@ pub struct UncertainAllocation {
 pub(crate) fn read_uncertain_allocations(
     database: &Database,
 ) -> Result<Vec<UncertainAllocation>, StorageError> {
-    use crate::db::entities::{AllocationPhase, GLOBAL_EXECUTION_LIMIT, MutableJobPhase};
+    use crate::db::entities::MutableJobPhase;
     let rx = read(database)?;
-    if !rx
-        .open_table(META)?
-        .get(DATABASE_FORMAT_KEY)?
-        .is_some_and(|version| version.value() == DATABASE_FORMAT_VERSION.to_le_bytes())
-    {
-        return Err(StorageError::corrupted("allocation format is not active"));
-    }
     let active = rx.open_table(ACTIVE_ALLOCATIONS)?;
-    if active.len()? > u64::from(GLOBAL_EXECUTION_LIMIT) {
-        return Err(StorageError::corrupted(
-            "the active Allocation index exceeds the global execution limit",
-        ));
-    }
     let allocations = rx.open_table(POOL_ALLOCATIONS)?;
     let mut uncertain = Vec::new();
     for entry in active.iter()? {
@@ -4672,33 +3336,17 @@ pub(crate) fn read_uncertain_allocations(
 pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool, StorageError> {
     let rx = read(database)?;
     Ok(match probe {
-        Probe::Job(job) => rx.open_table(JOBS)?.get(job.get())?.is_some(),
         Probe::Submission(key) => rx
             .open_table(SUBMISSIONS)?
             .get(key.as_bytes().as_slice())?
             .is_some(),
-        Probe::PoolAllocation(token) => {
-            let meta = rx.open_table(META)?;
-            if !meta
-                .get(DATABASE_FORMAT_KEY)?
-                .is_some_and(|version| version.value() == DATABASE_FORMAT_VERSION.to_le_bytes())
-            {
-                return Err(StorageError::corrupted("allocation format is not active"));
-            }
-            rx.open_table(POOL_ALLOCATIONS)?
-                .get(token.job.get())?
-                .map(|bytes| transactions::decode_pool_allocation(token.job.get(), bytes.value()))
-                .transpose()?
-                .is_some_and(|allocation| allocation.token == token)
-        }
+        Probe::PoolAllocation(token) => rx
+            .open_table(POOL_ALLOCATIONS)?
+            .get(token.job.get())?
+            .map(|bytes| transactions::decode_pool_allocation(token.job.get(), bytes.value()))
+            .transpose()?
+            .is_some_and(|allocation| allocation.token == token),
         Probe::MutableJobStarted(token, revision) => {
-            let meta = rx.open_table(META)?;
-            if !meta
-                .get(DATABASE_FORMAT_KEY)?
-                .is_some_and(|version| version.value() == DATABASE_FORMAT_VERSION.to_le_bytes())
-            {
-                return Err(StorageError::corrupted("allocation format is not active"));
-            }
             let job = rx
                 .open_table(JOBS)?
                 .get(token.job.get())?
@@ -5138,347 +3786,6 @@ fn queue_counts_in(rx: &ReadTransaction, for_update: bool) -> Result<QueueCounts
     })
 }
 
-pub(crate) struct ReadyQueueEntry {
-    pub(crate) job: JobId,
-    pub(crate) priority: u8,
-    pub(crate) submitted_at_us: i64,
-    pub(crate) phase: crate::db::entities::MutableJobPhase,
-    pub(crate) generative: bool,
-    pub(crate) frozen: Option<crate::db::entities::MutableFrozenConfiguration>,
-    pub(crate) revision: u64,
-    pub(crate) row_digest: [u8; 32],
-    pub(crate) requirement: u16,
-    pub(crate) key_agrees: bool,
-    pub(crate) in_pending: bool,
-    pub(crate) evidence: Vec<&'static str>,
-}
-
-fn never_started_evidence(
-    rx: &ReadTransaction,
-    id: JobId,
-) -> Result<Vec<&'static str>, StorageError> {
-    let job = id.get();
-    let mut evidence = Vec::new();
-    if rx.open_table(POOL_ALLOCATIONS)?.get(job)?.is_some() {
-        evidence.push("allocation");
-    }
-    if rx
-        .open_table(JOB_ALLOCATIONS)?
-        .range((job, 0)..=(job, u128::MAX))?
-        .next()
-        .transpose()?
-        .is_some()
-    {
-        evidence.push("allocation_index");
-    }
-    match read_state(rx, id) {
-        Ok(state) => {
-            if state.outcome.is_some() {
-                evidence.push("outcome");
-            }
-            if state.stop_confirmed_at.is_some() || state.stop_confirmed_by.is_some() {
-                evidence.push("stop");
-            }
-        }
-        Err(_) => evidence.push("job_state_unreadable"),
-    }
-    if rx
-        .open_table(JOB_OUTPUTS)?
-        .range((job, 0)..=(job, u32::MAX))?
-        .next()
-        .transpose()?
-        .is_some()
-    {
-        evidence.push("output");
-    }
-    let range = (job, 0, 0)..=(job, u32::MAX, u32::MAX);
-    if rx
-        .open_table(REQUEST_EVENTS)?
-        .range(range.clone())?
-        .next()
-        .transpose()?
-        .is_some()
-    {
-        evidence.push("request_event");
-    }
-    if rx
-        .open_table(TOOL_CALLS)?
-        .range(range.clone())?
-        .next()
-        .transpose()?
-        .is_some()
-    {
-        evidence.push("tool_call");
-    }
-    if rx
-        .open_table(APPROVALS)?
-        .range(range)?
-        .next()
-        .transpose()?
-        .is_some()
-    {
-        evidence.push("approval");
-    }
-    if rx
-        .open_table(JOB_OBSERVATIONS)?
-        .range((job, 0, 0)..=(job, u8::MAX, u128::MAX))?
-        .next()
-        .transpose()?
-        .is_some()
-    {
-        evidence.push("observation");
-    }
-    if rx
-        .open_table(LIVE_CHILDREN)?
-        .range((job, 0)..=(job, u128::MAX))?
-        .next()
-        .transpose()?
-        .is_some()
-    {
-        evidence.push("child");
-    }
-    Ok(evidence)
-}
-
-pub(crate) const GENESIS_JOB: JobId = JobId::new(0);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct RecurrenceAudit {
-    pub(crate) total: u64,
-    pub(crate) active: u64,
-    pub(crate) waiting_due: u64,
-    pub(crate) halted: u64,
-    pub(crate) due_now: u64,
-    pub(crate) due_index_rows: u64,
-    pub(crate) dependency_waiters: u64,
-    pub(crate) inconsistency: Option<String>,
-}
-
-impl RecurrenceAudit {
-    pub(crate) fn blocking(&self) -> Option<String> {
-        if self.active > 0 {
-            return Some(format!(
-                "{} recurrence(s) are Active: a loop is mid-iteration and its next turn can append a Job without any submission",
-                self.active
-            ));
-        }
-        if self.waiting_due > 0 {
-            return Some(format!(
-                "{} recurrence(s) are WaitingDue ({} already due, {} in the future): each appends a new turn, and so creates a Job, at its due time without any submission",
-                self.waiting_due,
-                self.due_now,
-                self.waiting_due - self.due_now
-            ));
-        }
-        if self.dependency_waiters > 0 {
-            return Some(format!(
-                "{} Job(s) wait for another Job to settle; a first activation over a database that holds no executable work expects none",
-                self.dependency_waiters
-            ));
-        }
-        None
-    }
-}
-
-pub(crate) struct ActivationSnapshot {
-    pub(crate) open_epoch: u64,
-    pub(crate) clean_shutdown: bool,
-    pub(crate) counts: QueueCounts,
-    pub(crate) ready: Vec<ReadyQueueEntry>,
-    pub(crate) truncated: bool,
-    pub(crate) recurrences: RecurrenceAudit,
-}
-
-pub(crate) fn activation_snapshot(
-    database: &impl ReadableDatabase,
-    limit: usize,
-) -> Result<ActivationSnapshot, StorageError> {
-    let rx = database.begin_read()?;
-    let meta = rx.open_table(META)?;
-    recovery::check_identity(&meta)?;
-    let open_epoch = meta
-        .get("open_epoch")?
-        .and_then(|value| <[u8; 8]>::try_from(value.value()).ok())
-        .map_or(0, u64::from_le_bytes);
-    let clean_shutdown = meta
-        .get("clean_shutdown")?
-        .is_some_and(|value| value.value().first().is_some_and(|flag| *flag != 0));
-    let counts = queue_counts_in(&rx, false)?;
-
-    let jobs = rx.open_table(JOBS)?;
-    for (index, entry) in rx.open_table(PENDING)?.iter()?.enumerate() {
-        if index == limit {
-            break;
-        }
-        if jobs.get(entry?.0.value())?.is_none() {
-            return Err(StorageError::corrupted(
-                "pending entry references a missing Job",
-            ));
-        }
-    }
-    for (index, entry) in rx.open_table(DELAYED)?.iter()?.enumerate() {
-        if index == limit {
-            break;
-        }
-        if jobs.get(entry?.0.value().1)?.is_none() {
-            return Err(StorageError::corrupted(
-                "delayed entry references a missing Job",
-            ));
-        }
-    }
-    let mut ready = Vec::new();
-    let mut truncated = false;
-    for entry in rx.open_table(MUTABLE_READY)?.iter()? {
-        let key = entry?.0.value();
-        if ready.len() == limit {
-            truncated = true;
-            break;
-        }
-        let id = JobId::new(key.2);
-        let Some(bytes) = jobs.get(id.get())? else {
-            return Err(StorageError::corrupted(
-                "ready entry references a missing Job",
-            ));
-        };
-        let job = transactions::decode_mutable_job(id.get(), bytes.value())?;
-        let row_digest = {
-            use aws_lc_rs::digest::{SHA256, digest};
-            let mut out = [0u8; 32];
-            out.copy_from_slice(digest(&SHA256, bytes.value()).as_ref());
-            out
-        };
-        drop(bytes);
-        let in_pending = rx.open_table(PENDING)?.get(id.get())?.is_some();
-        let evidence = never_started_evidence(&rx, id)?;
-        ready.push(ReadyQueueEntry {
-            job: id,
-            priority: key.0,
-            submitted_at_us: key.1,
-            phase: job.phase,
-            generative: matches!(
-                job.input.content,
-                crate::db::entities::MutableJobContent::Generative { .. }
-            ),
-            revision: job.revision,
-            row_digest,
-            requirement: key.3,
-            key_agrees: key.0 == transactions::mutable_priority(job.input.priority)
-                && job.submitted_at.map(|at| at.as_unix_micros()) == Some(key.1),
-            in_pending,
-            evidence,
-            frozen: job.frozen,
-        });
-    }
-    Ok(ActivationSnapshot {
-        open_epoch,
-        clean_shutdown,
-        counts,
-        ready,
-        truncated,
-        recurrences: recurrence_audit(&rx)?,
-    })
-}
-
-fn recurrence_audit(rx: &ReadTransaction) -> Result<RecurrenceAudit, StorageError> {
-    use std::collections::BTreeSet;
-    let clock = recovery::promotion_clock();
-    let mut audit = RecurrenceAudit {
-        total: 0,
-        active: 0,
-        waiting_due: 0,
-        halted: 0,
-        due_now: 0,
-        due_index_rows: 0,
-        dependency_waiters: 0,
-        inconsistency: None,
-    };
-    let mut waiting: BTreeSet<(i64, u128)> = BTreeSet::new();
-    for entry in rx.open_table(RECURRENCES)?.iter()? {
-        let (key, value) = entry?;
-        let conversation = key.value();
-        let recurrence = Recurrence::decode(value.value())?;
-        audit.total += 1;
-        match recurrence.phase {
-            RecurrencePhase::Active => audit.active += 1,
-            RecurrencePhase::WaitingDue { due } => {
-                audit.waiting_due += 1;
-                if due <= clock {
-                    audit.due_now += 1;
-                }
-                waiting.insert((due, conversation));
-            }
-            RecurrencePhase::Halted { .. } => audit.halted += 1,
-        }
-    }
-    let mut seen: BTreeSet<(i64, u128)> = BTreeSet::new();
-    for entry in rx.open_table(RECURRENCE_DUE)?.iter()? {
-        let (due, conversation) = entry?.0.value();
-        audit.due_index_rows += 1;
-        if !waiting.contains(&(due, conversation)) {
-            audit.inconsistency.get_or_insert_with(|| {
-                format!(
-                    "the recurrence due index names a conversation due at {due} whose recurrence is not waiting for that time"
-                )
-            });
-        } else {
-            seen.insert((due, conversation));
-        }
-    }
-    for (due, _) in waiting.difference(&seen) {
-        audit.inconsistency.get_or_insert_with(|| {
-            format!(
-                "a recurrence is waiting to be due at {due} but the due index holds no row for it"
-            )
-        });
-    }
-    audit.dependency_waiters = rx.open_table(DEPENDENCY_WAITERS)?.len()?;
-    Ok(audit)
-}
-
-pub(crate) struct OfflineActivation {
-    pub(crate) snapshot: ActivationSnapshot,
-    pub(crate) access: &'static str,
-    pub(crate) copied: bool,
-    pub(crate) file: OfflineFile,
-}
-
-pub(crate) fn inspect_activation_offline(
-    directory: &std::path::Path,
-    limit: usize,
-) -> Result<OfflineActivation, StorageError> {
-    let (session, file) = with_offline_database(
-        directory,
-        OfflineOptions {
-            force_copy: false,
-            require_host_lock: true,
-        },
-        |access| {
-            let (snapshot, access, copied) = match &access {
-                OfflineAccess::InPlace(database) => {
-                    (activation_snapshot(*database, limit)?, access.name(), false)
-                }
-                OfflineAccess::Copy(database) => (
-                    activation_snapshot(&**database, limit)?,
-                    access.name(),
-                    true,
-                ),
-            };
-            Ok(OfflineActivation {
-                snapshot,
-                access,
-                copied,
-                file: OfflineFile {
-                    bytes: 0,
-                    device: 0,
-                    inode: 0,
-                    mode: 0,
-                },
-            })
-        },
-    )?;
-    Ok(OfflineActivation { file, ..session })
-}
-
 pub(crate) fn read_tool_stats(
     database: &Database,
 ) -> Result<Vec<crate::db::entities::ToolStatRecord>, StorageError> {
@@ -5558,22 +3865,7 @@ pub(crate) fn read_usage_summary(
     filter: &crate::db::entities::UsageSummaryFilter,
     after: Option<crate::db::entities::UsageCursor>,
 ) -> Result<crate::db::entities::UsageSummaryResponse, StorageError> {
-    read_usage_summary_scanned(
-        database,
-        filter,
-        after,
-        MAX_USAGE_SCAN,
-        MAX_USAGE_PAGE_GROUPS,
-    )
-}
-
-pub(crate) fn read_usage_summary_scanned(
-    database: &Database,
-    filter: &crate::db::entities::UsageSummaryFilter,
-    after: Option<crate::db::entities::UsageCursor>,
-    row_budget: usize,
-    group_budget: usize,
-) -> Result<crate::db::entities::UsageSummaryResponse, StorageError> {
+    let (row_budget, group_budget) = (MAX_USAGE_SCAN, MAX_USAGE_PAGE_GROUPS);
     use crate::db::entities::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageSummaryResponse};
 
     let from_hour = filter
@@ -5666,24 +3958,7 @@ pub(crate) fn read_usage_buckets(
     bucketing: &crate::db::entities::UsageBucketing,
     after: Option<crate::db::entities::UsageCursor>,
 ) -> Result<crate::db::entities::UsageBucketResponse, StorageError> {
-    read_usage_buckets_scanned(
-        database,
-        filter,
-        bucketing,
-        after,
-        MAX_USAGE_SCAN,
-        MAX_USAGE_PAGE_GROUPS,
-    )
-}
-
-pub(crate) fn read_usage_buckets_scanned(
-    database: &Database,
-    filter: &crate::db::entities::UsageSummaryFilter,
-    bucketing: &crate::db::entities::UsageBucketing,
-    after: Option<crate::db::entities::UsageCursor>,
-    row_budget: usize,
-    group_budget: usize,
-) -> Result<crate::db::entities::UsageBucketResponse, StorageError> {
+    let (row_budget, group_budget) = (MAX_USAGE_SCAN, MAX_USAGE_PAGE_GROUPS);
     use crate::db::entities::{USAGE_SUMMARY_HOUR_MICROS as HOUR, UsageBucketResponse};
 
     if bucketing.offset_minutes % 60 != 0 || !(-840..=840).contains(&bucketing.offset_minutes) {
@@ -5784,26 +4059,26 @@ fn scan_usage_totals(
         agents.insert(agent, generative);
         Ok(generative)
     };
-    let mut earliest_hour = None;
-    if filter.from_us.is_none() {
-        for entry in table.range(range_start..=end)? {
+    let mut find_hour = |rev: bool| -> Result<Option<i64>, StorageError> {
+        let mut iter = table.range(range_start..=end)?;
+        while let Some(entry) = if rev { iter.next_back() } else { iter.next() } {
             let key = entry?.0.value();
             if matches_agent(key.1)? {
-                earliest_hour = Some(key.0);
-                break;
+                return Ok(Some(key.0));
             }
         }
-    }
-    let mut latest_hour = None;
-    if filter.until_us.is_none() {
-        for entry in table.range(range_start..=end)?.rev() {
-            let key = entry?.0.value();
-            if matches_agent(key.1)? {
-                latest_hour = Some(key.0);
-                break;
-            }
-        }
-    }
+        Ok(None)
+    };
+    let earliest_hour = if filter.from_us.is_none() {
+        find_hour(false)?
+    } else {
+        None
+    };
+    let latest_hour = if filter.until_us.is_none() {
+        find_hour(true)?
+    } else {
+        None
+    };
 
     let start = match after {
         Some(cursor) => {
@@ -6012,233 +4287,6 @@ pub(crate) fn read_conversation_limits(
     ))
 }
 
-pub(super) struct SealedTurn {
-    pub boundary: crate::db::entities::SourceBoundary,
-    pub text: String,
-    pub reducible_tokens: usize,
-    pub context_tokens: usize,
-}
-
-pub(super) fn source_reducible(
-    tx: &impl TxRead,
-    manifest: &crate::db::entities::ContextSourceManifest,
-) -> Result<usize, StorageError> {
-    if manifest.turns.is_empty() {
-        return Ok(0);
-    }
-    let jobs = tx.table(JOBS)?;
-    let states = tx.table(JOB_STATES)?;
-    let inputs = tx.table(JOB_INPUTS)?;
-    let outputs = tx.table(JOB_OUTPUTS)?;
-    let tools = tx.table(TOOL_CALLS)?;
-    let approvals = tx.table(APPROVALS)?;
-    let mut reducible = 0usize;
-    for boundary in &manifest.turns {
-        let source = source_turn(
-            &jobs,
-            &states,
-            &inputs,
-            &outputs,
-            &tools,
-            &approvals,
-            boundary.turn,
-            Some((boundary.input_through, boundary.output_through)),
-        )?;
-        reducible = reducible.saturating_add(source.map_or(0, |turn| turn.reducible_tokens));
-    }
-    Ok(reducible)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(super) fn source_turn(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    states: &impl ReadableTable<u128, &'static [u8]>,
-    inputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
-    outputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
-    tools: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
-    approvals: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
-    turn: JobId,
-    bounds: Option<(u32, u32)>,
-) -> Result<Option<SealedTurn>, StorageError> {
-    let Some(job) = jobs.get(turn.get())? else {
-        return Ok(None);
-    };
-    let row = JobSpec::decode_at(turn.get(), job.value())?;
-    if matches!(
-        row.kind,
-        JobKind::Execution {
-            execution: JobExecution::Decision(_),
-            ..
-        }
-    ) {
-        return Ok(None);
-    }
-    let Some(bytes) = states.get(turn.get())? else {
-        return Ok(None);
-    };
-    let state = JobState::decode_at(turn.get(), bytes.value())?;
-    if !state.locally_stopped() {
-        return Ok(None);
-    }
-    let mut canonical = b"ocg-context-source-v2".to_vec();
-    let mut frame = |bytes: &[u8]| {
-        canonical.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-        canonical.extend_from_slice(bytes);
-    };
-    frame(job.value());
-    frame(format!("{:?}", state.outcome).as_bytes());
-    let mut text = format!("Turn {turn}, outcome {:?}\n", state.outcome);
-    let mut input_bytes = 0usize;
-    let mut answer_bytes = 0usize;
-    let frozen = job_execution(jobs, &row)?.0;
-    text.push_str(&format!(
-        "Frozen model {:?}; Agent {:?}. Active instructions are supplied separately.\n",
-        frozen.llm.model, frozen.agent_ref
-    ));
-    let mut input_through = 0u32;
-    let mut journal = Vec::new();
-    for entry in inputs.range((turn.get(), 1)..=(turn.get(), bounds.map_or(u32::MAX, |b| b.0)))? {
-        let (key, bytes) = entry?;
-        if key.value().1 != input_through.saturating_add(1) {
-            return Ok(None);
-        }
-        input_through = key.value().1;
-        frame(bytes.value());
-        journal.push((key.value().1, JobInputEntry::decode(bytes.value())?));
-    }
-    for (_, entry) in effective_entries(journal)? {
-        match entry.entry {
-            Entry::UserMessage { text: message, attachments } => {
-                let message = format!("User ({turn}): {message}\nAttachments: {attachments:?}\n");
-                text.push_str(&message);
-                input_bytes = input_bytes.saturating_add(message.len());
-            }
-            Entry::AgentMessage { text: message, call } => {
-                let message = format!("Agent ({call:?}): {message}\n");
-                text.push_str(&message);
-                input_bytes = input_bytes.saturating_add(message.len());
-            }
-            Entry::Decision { approval } => {
-                if let Some(bytes) = approvals.get((approval.0.get(), approval.1, approval.2))? {
-                    frame(bytes.value());
-                    text.push_str(&format!("Approval: {:?}\n", ApprovalRecord::decode(bytes.value())?));
-                } else { return Ok(None); }
-            }
-            Entry::Notice { child, event, reference } => {
-                text.push_str(&format!("Notice from {child}: {event:?}, reference {reference}\n"));
-                for output in outputs.range((reference.get(), 0)..=(reference.get(), u32::MAX))? {
-                    let (key, bytes) = output?;
-                    let output = decode_output(key.value(), bytes.value())?;
-                    if output.kind == OutputKind::Result {
-                        frame(bytes.value());
-                        text.push_str(&format!("Referenced result: {:?} {:?}\n", output.summary, output.value));
-                    }
-                }
-            }
-            Entry::RetryOf { turn: original, by } => text.push_str(&format!("Retry of {original}, requested by {by:?}; previous tool effects must not be repeated automatically.\n")),
-            Entry::Iteration { n } => text.push_str(&format!("Iteration {n}\n")),
-            Entry::UserMessageEdit { .. } | Entry::UserMessageWithdraw { .. } | Entry::ResponseFormat { .. } | Entry::ContextPreparation { .. } | Entry::ContextUse { .. } => {}
-        }
-    }
-    let mut output_through = 0u32;
-    if bounds.is_none_or(|b| b.1 > 0) {
-        for entry in
-            outputs.range((turn.get(), 0)..=(turn.get(), bounds.map_or(u32::MAX, |b| b.1)))?
-        {
-            let (key, bytes) = entry?;
-            let output = decode_output(key.value(), bytes.value())?;
-            if output.kind == OutputKind::Result {
-                output_through = key.value().1;
-                frame(bytes.value());
-                answer_bytes = answer_bytes
-                    .saturating_add(output.display_text().as_ref().map_or(0, String::len));
-                text.push_str(&format!(
-                    "Result: {:?} {:?}\n",
-                    output.summary, output.value
-                ));
-            }
-        }
-    }
-    for entry in tools.range((turn.get(), 0, 0)..=(turn.get(), u32::MAX, u32::MAX))? {
-        let (key, bytes) = entry?;
-        frame(bytes.value());
-        let call = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
-        text.push_str(&format!(
-            "Tool {} at {:?}, arguments {:?}, outcome {:?}, reconciliation {:?}\n",
-            call.name,
-            call.call,
-            call.admission()
-                .map(|admission| admission.arguments.as_str()),
-            call.outcome,
-            call.reconciliation
-        ));
-    }
-    if input_through == 0 || bounds.is_some_and(|b| b != (input_through, output_through)) {
-        return Ok(None);
-    }
-    Ok(Some(SealedTurn {
-        boundary: crate::db::entities::SourceBoundary {
-            turn,
-            input_through,
-            output_through,
-            content: ContentDigest::of(&canonical),
-        },
-        text,
-        reducible_tokens: answer_bytes.div_ceil(3),
-        context_tokens: input_bytes
-            .saturating_add(answer_bytes)
-            .saturating_add(16)
-            .div_ceil(3),
-    }))
-}
-
-pub(super) fn load_context_manifest(
-    messages: &impl ReadableTable<&'static [u8], &'static [u8]>,
-    digest: ContentDigest,
-) -> Result<crate::db::entities::ContextSourceManifest, StorageError> {
-    let bytes = messages
-        .get(digest.as_bytes().as_slice())?
-        .ok_or_else(|| StorageError::corrupted("sealed source manifest missing"))?;
-    if ContentDigest::of(bytes.value()) != digest {
-        return Err(StorageError::corrupted("source manifest digest mismatch"));
-    }
-    let manifest: crate::db::entities::ContextSourceManifest =
-        serde_json::from_slice(bytes.value())
-            .map_err(|_| StorageError::corrupted("invalid source manifest"))?;
-    manifest.validate().map_err(StorageError::corrupted)?;
-    Ok(manifest)
-}
-
-fn source_is_prefix_from(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    conversation: JobId,
-    mut cursor: Option<JobId>,
-    manifest: &crate::db::entities::ContextSourceManifest,
-) -> Result<bool, StorageError> {
-    let mut reverse = Vec::new();
-    let mut seen = BTreeSet::new();
-    while let Some(turn) = cursor {
-        if !seen.insert(turn) || reverse.len() >= 4096 {
-            return Ok(false);
-        }
-        let Some(bytes) = jobs.get(turn.get())? else {
-            return Ok(false);
-        };
-        let row = JobSpec::decode_at(turn.get(), bytes.value())?;
-        if row.parent_id != Some(conversation) {
-            return Ok(false);
-        }
-        reverse.push(turn);
-        cursor = row.kind.previous();
-    }
-    reverse.reverse();
-    Ok(reverse.len() >= manifest.turns.len()
-        && reverse
-            .iter()
-            .zip(&manifest.turns)
-            .all(|(turn, boundary)| *turn == boundary.turn))
-}
-
 pub(super) fn global_compaction_settings(
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
 ) -> Result<crate::db::entities::GlobalCompactionSettings, StorageError> {
@@ -6302,71 +4350,6 @@ pub(super) fn effective_context_policy(
         settings.policy.predictive = None;
     }
     Ok((settings.policy, settings.revision, None))
-}
-
-pub(super) fn raw_context_usage(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    states: &impl ReadableTable<u128, &'static [u8]>,
-    inputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
-    outputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
-    start: JobId,
-) -> Result<(usize, u32, u32), StorageError> {
-    let mut cursor = Some(start);
-    let mut seen = BTreeSet::new();
-    let mut total = 0usize;
-    let mut growth = 0usize;
-    let mut settled = 0u32;
-    while let Some(turn) = cursor {
-        if !seen.insert(turn) {
-            return Err(StorageError::corrupted("context ancestry cycle"));
-        }
-        if seen.len() > 4096 {
-            return Ok((usize::MAX, u32::try_from(growth).unwrap_or(u32::MAX), 4096));
-        }
-        let mut bytes = 16usize;
-        for (_, entry) in effective_entries(job_entries_of(inputs, turn)?)? {
-            match entry.entry {
-                Entry::UserMessage { text, attachments } => {
-                    bytes = bytes
-                        .saturating_add(text.len())
-                        .saturating_add(attachments.len().saturating_mul(4800));
-                }
-                Entry::AgentMessage { text, .. } => bytes = bytes.saturating_add(text.len()),
-                Entry::RetryOf { .. }
-                | Entry::Notice { .. }
-                | Entry::Decision { .. }
-                | Entry::Iteration { .. } => bytes = bytes.saturating_add(256),
-                Entry::ResponseFormat { .. }
-                | Entry::UserMessageEdit { .. }
-                | Entry::UserMessageWithdraw { .. }
-                | Entry::ContextPreparation { .. }
-                | Entry::ContextUse { .. } => {}
-            }
-        }
-        for output in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
-            let (key, bytes_row) = output?;
-            let output = decode_output(key.value(), bytes_row.value())?;
-            if output.kind == OutputKind::Result {
-                bytes = bytes.saturating_add(output.display_text().as_ref().map_or(0, String::len));
-            }
-        }
-        let tokens = bytes.div_ceil(3);
-        total = total.saturating_add(tokens);
-        let state = states
-            .get(turn.get())?
-            .ok_or_else(|| StorageError::corrupted("context turn state missing"))?;
-        if JobState::decode_at(turn.get(), state.value())?.locally_stopped() {
-            settled = settled.saturating_add(1);
-            if settled <= 8 {
-                growth = growth.max(tokens);
-            }
-        }
-        let row = jobs
-            .get(turn.get())?
-            .ok_or_else(|| StorageError::corrupted("context turn missing"))?;
-        cursor = JobSpec::decode_at(turn.get(), row.value())?.kind.previous();
-    }
-    Ok((total, u32::try_from(growth).unwrap_or(u32::MAX), settled))
 }
 
 fn mutable_context_usage(
@@ -6468,53 +4451,6 @@ pub(crate) enum ContextWorkDetails {
         through: crate::db::entities::SourceBoundary,
         turn_count: usize,
     },
-    Prediction {
-        predictor: ConfigId,
-        model: ConfigId,
-        binding: crate::db::entities::PredictionBinding,
-        forecast_tokens: Option<u64>,
-        result: Option<Box<crate::db::entities::DecisionResult>>,
-    },
-}
-
-pub(super) fn steer_blocker(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    states: &impl ReadableTable<u128, &'static [u8]>,
-    children: &impl ReadableTable<(u128, u128), ()>,
-    turns: Turns<'_, impl ReadableTable<(u128, u128), ()>>,
-    conversation: JobId,
-) -> Result<Option<&'static str>, StorageError> {
-    for child in children.range((conversation.get(), 0)..=(conversation.get(), u128::MAX))? {
-        let child = child?.0.value().1;
-        let Some(tip) = turns.head(JobId::new(child))?.map(JobId::get) else {
-            continue;
-        };
-        let row = jobs
-            .get(tip)?
-            .ok_or_else(|| StorageError::corrupted("live context job missing"))?;
-        let row = JobSpec::decode_at(tip, row.value())?;
-        if let JobKind::Execution {
-            execution: JobExecution::Summarization(work),
-            ..
-        } = row.kind
-        {
-            let state = states
-                .get(tip)?
-                .ok_or_else(|| StorageError::corrupted("live context state missing"))?;
-            if JobState::decode_at(tip, state.value())?.locally_stopped() {
-                continue;
-            }
-            let root = summary_root(jobs, &work)?;
-            if root.prediction.is_none() {
-                return Ok(Some(if root.policy_revision.is_some() {
-                    "rule_based"
-                } else {
-                    "manual"
-                }));
-            }
-        }
-    }
-    Ok(None)
 }
 
 pub(crate) struct ContextState {
@@ -6541,38 +4477,23 @@ pub(crate) fn read_context_state(
     limit: usize,
 ) -> Result<Option<ContextState>, StorageError> {
     let rx = read(database)?;
-    {
-        let jobs = rx.open_table(JOBS)?;
-        if let Some(bytes) = jobs.get(conversation.get())?
-            && bytes.value().first() == Some(&TAG_JOB)
-        {
-            transactions::decode_mutable_job(conversation.get(), bytes.value())?;
-            return Ok(None);
-        }
-    }
     let Some(owner) = read_job_row(&rx, conversation)? else {
         return Ok(None);
     };
     if !owner.kind.is_group() {
         return Ok(None);
     }
-    if !rx
-        .open_table(JOBS)?
-        .get(conversation.get())?
-        .is_some_and(|bytes| bytes.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG))
-    {
-        return Ok(None);
-    }
-    let (mut policy, revision, profile) = effective_context_policy(&rx.open_table(META)?)?;
-    let stored_override = None;
+    let (mut policy, revision, _profile) = effective_context_policy(&rx.open_table(META)?)?;
     let tip = turn_head(&rx.open_table(TURNS)?, conversation)?;
-    let active = tip
+    let tip_details = tip
         .map(|tip| mutable_job_details_in(&rx, tip, None, false))
         .transpose()?
-        .flatten()
-        .and_then(|details| match details.record.job.frozen {
+        .flatten();
+    let active = tip_details
+        .as_ref()
+        .and_then(|details| match &details.record.job.frozen {
             Some(crate::db::entities::MutableFrozenConfiguration::Generative(configuration)) => {
-                Some(configuration)
+                Some(configuration.clone())
             }
             Some(crate::db::entities::MutableFrozenConfiguration::Decision(_)) | None => None,
         });
@@ -6581,8 +4502,6 @@ pub(crate) fn read_context_state(
         .map(|tip| mutable_context_usage(&rx, conversation, tip))
         .transpose()?
         .unwrap_or_default();
-    let tokens = raw;
-    let last_use = None;
     let settings = global_compaction_settings(&rx.open_table(META)?)?;
     let project = match owner.kind {
         JobKind::Group { project, .. } => project,
@@ -6602,9 +4521,7 @@ pub(crate) fn read_context_state(
     let mut predictor = None;
     let mut predictor_model = None;
     let previous_binding = policy.predictive.take();
-    let prediction_unavailable = if true {
-        Some("execution context construction is unavailable in this build".to_owned())
-    } else if !settings.prediction_enabled {
+    let prediction_unavailable = if !settings.prediction_enabled {
         Some("prediction is disabled in global settings".to_owned())
     } else if matches!(policy.mode, crate::db::entities::CompactionMode::Off) {
         Some("automatic compaction is disabled".to_owned())
@@ -6640,264 +4557,121 @@ pub(crate) fn read_context_state(
     };
     let limit = limit.clamp(1, 100);
     let mut work = Vec::new();
-    let mut next_before = None;
-    let mut verify_remaining = 4096usize;
-    for (scanned, entry) in rx
-        .open_table(CHILD_GROUPS)?
+    let adopted_producer = tip_details.and_then(|d| match d.record.job.context_selection {
+        crate::db::entities::MutableContextSelection::AdoptedSummary { producer, .. } => {
+            Some(producer)
+        }
+        crate::db::entities::MutableContextSelection::FullHistory => None,
+    });
+    for entry in rx
+        .open_table(CHILDREN)?
         .range((conversation.get(), 0)..(conversation.get(), before.map_or(u128::MAX, JobId::get)))?
         .rev()
-        .enumerate()
+        .take(limit)
     {
-        let child = JobId::new(entry?.0.value().1);
-        if scanned >= limit.saturating_mul(4) || work.len() >= limit {
-            break;
-        }
-        next_before = Some(child);
-        let Some(job) = turn_head(&rx.open_table(TURNS)?, child)? else {
+        let child_id = JobId::new(entry?.0.value().1);
+        let Some(bytes) = rx.open_table(JOBS)?.get(child_id.get())? else {
             continue;
         };
-        let Some(row) = read_job_row(&rx, job)? else {
-            continue;
-        };
-        if let JobKind::Execution {
-            execution: JobExecution::Decision(decision),
-            ..
-        } = &row.kind
-            && let Some(binding) = &decision.prediction
-        {
-            let state = read_state(&rx, job)?;
-            let current = prediction_current(
-                &rx.open_table(META)?,
-                &rx.open_table(JOBS)?,
-                &rx.open_table(CONFIGS)?,
-                &rx.open_table(PROJECTS)?,
-                &rx.open_table(JOB_CONTROLS)?,
-                Turns(&rx.open_table(TURNS)?),
-                &row,
-            )?;
-            let label = match state.outcome {
-                None if !current => "stale",
-                None => "queued",
-                Some(outcome) => match outcome.kind {
-                    OutcomeKind::Completed => "recorded",
-                    OutcomeKind::Failed => "failed",
-                    OutcomeKind::Cancelled => "cancelled",
-                    OutcomeKind::Unknown => "unknown",
-                },
-            };
-            let result = rx
-                .open_table(JOB_OUTPUTS)?
-                .range((job.get(), 0)..=(job.get(), u32::MAX))?
-                .next_back()
-                .transpose()?
-                .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
-                .transpose()?
-                .and_then(|output| output.value)
-                .and_then(|value| value.get("decision").cloned())
-                .and_then(|value| serde_json::from_value(value).ok());
-            work.push(ContextWorkState {
-                job,
-                conversation: child,
-                state: label,
-                details: ContextWorkDetails::Prediction {
-                    predictor: decision.frozen.profile_ref().id,
-                    model: decision.frozen.model_ref().id,
-                    binding: binding.clone(),
-                    forecast_tokens: decision
-                        .request
-                        .state
-                        .get("deterministic_forecast_tokens")
-                        .and_then(serde_json::Value::as_u64),
-                    result,
-                },
-            });
+        if bytes.value().first() != Some(&TAG_JOB) {
             continue;
         }
-        let JobKind::Execution {
-            execution: JobExecution::Summarization(summary_work),
-            ..
-        } = row.kind
+        let job = transactions::decode_mutable_job(child_id.get(), bytes.value())?;
+        let Some(source) = job.summary_source else {
+            continue;
+        };
+        let state = read_state(&rx, child_id)?;
+        let manifest_bytes = rx.open_table(MESSAGES)?.get(source.as_bytes().as_slice())?;
+        let Some(manifest_bytes) = manifest_bytes else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_slice::<crate::db::entities::NativeSummaryManifest>(
+            manifest_bytes.value(),
+        ) else {
+            continue;
+        };
+        let (Some(first_b), Some(last_b)) = (manifest.sources.first(), manifest.sources.last())
         else {
             continue;
         };
-        let manifest = load_context_manifest(&rx.open_table(MESSAGES)?, summary_work.source)?;
-        let first = manifest
-            .turns
-            .first()
-            .cloned()
-            .ok_or_else(|| StorageError::corrupted("empty context source"))?;
-        let through = manifest
-            .turns
-            .last()
-            .cloned()
-            .ok_or_else(|| StorageError::corrupted("empty context source"))?;
-        let state = read_state(&rx, job)?;
-        let binding = summary_root(&rx.open_table(JOBS)?, &summary_work)?;
-        let failed = state
-            .outcome
-            .as_ref()
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Failed);
-        let label = if context_work_stopped(&rx.open_table(NOTICES)?, child)?
-            || !preparation_current(
-                &rx.open_table(META)?,
-                &rx.open_table(JOBS)?,
-                &rx.open_table(CONFIGS)?,
-                &rx.open_table(PROJECTS)?,
-                &rx.open_table(JOB_CONTROLS)?,
-                &rx.open_table(NOTICES)?,
-                &read_job_row(&rx, job)?
-                    .ok_or_else(|| StorageError::corrupted("summary missing"))?,
-            )?
-            || binding
-                .policy_revision
-                .is_some_and(|bound| bound != revision || binding.policy_profile != profile)
-        {
-            "discarded"
-        } else {
-            match state.outcome {
-                None => "queued",
-                Some(outcome) => match outcome.kind {
-                    OutcomeKind::Failed => "failed",
-                    OutcomeKind::Cancelled => "cancelled",
-                    OutcomeKind::Unknown => "unknown",
-                    OutcomeKind::Completed if !summary_work.is_artifact() => "part_ready",
-                    OutcomeKind::Completed => {
-                        if last_use.is_some_and(|(_, _, artifact)| artifact == Some(job)) {
-                            "adopted"
-                        } else {
-                            "prepared"
-                        }
-                    }
-                },
+        let label = match state.outcome.as_ref().map(|o| o.kind) {
+            None => match job.phase {
+                crate::db::entities::MutableJobPhase::Unsubmitted => "queued",
+                crate::db::entities::MutableJobPhase::Queued => "queued",
+                crate::db::entities::MutableJobPhase::Executing => "preparing",
+            },
+            Some(OutcomeKind::Failed) => "failed",
+            Some(OutcomeKind::Cancelled) => "cancelled",
+            Some(OutcomeKind::Unknown) => "unknown",
+            Some(OutcomeKind::Completed) => {
+                if adopted_producer == Some(child_id) {
+                    "adopted"
+                } else if let Some(t) = tip
+                    && verify_native_summary_in(&rx, conversation, t, child_id, source).is_ok()
+                {
+                    "completed"
+                } else {
+                    "stale"
+                }
             }
         };
-        let mut label = label;
-        if matches!(label, "prepared" | "adopted") {
-            let prefix_valid =
-                source_is_prefix_from(&rx.open_table(JOBS)?, conversation, tip, &manifest)?;
-            if !prefix_valid {
-                label = "incompatible";
-            } else if manifest.turns.len() > verify_remaining {
-                label = "unverified";
-            } else {
-                verify_remaining -= manifest.turns.len();
-                let output = rx
-                    .open_table(JOB_OUTPUTS)?
-                    .range((job.get(), 0)..=(job.get(), u32::MAX))?
-                    .next_back()
-                    .transpose()?
-                    .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
-                    .transpose()?;
-                let summary_tokens = output
-                    .filter(|output| output.kind == OutputKind::Result)
-                    .and_then(|output| output.value)
-                    .and_then(|value| {
-                        serde_json::from_value::<crate::db::entities::SummarizationResult>(value)
-                            .ok()
-                    })
-                    .filter(|result| {
-                        result.validate().is_ok() && result.source == summary_work.source
-                    })
-                    .map(|result| result.context_text().len().saturating_add(128).div_ceil(3));
-                if summary_tokens.is_none_or(|tokens| tokens > summary_work.target_tokens as usize)
-                {
-                    label = "incompatible";
-                }
-                let mut reducible = 0usize;
-                for boundary in &manifest.turns {
-                    if label == "incompatible" {
-                        break;
-                    }
-                    let source = source_turn(
-                        &rx.open_table(JOBS)?,
-                        &rx.open_table(JOB_STATES)?,
-                        &rx.open_table(JOB_INPUTS)?,
-                        &rx.open_table(JOB_OUTPUTS)?,
-                        &rx.open_table(TOOL_CALLS)?,
-                        &rx.open_table(APPROVALS)?,
-                        boundary.turn,
-                        Some((boundary.input_through, boundary.output_through)),
-                    )?;
-                    match source {
-                        Some(source) if source.boundary == *boundary => {
-                            reducible = reducible.saturating_add(source.reducible_tokens)
-                        }
-                        Some(_) | None => label = "incompatible",
-                    }
-                }
-                if summary_tokens.is_some_and(|tokens| {
-                    reducible.saturating_sub(tokens) < summary_work.minimum_savings_tokens as usize
-                }) {
-                    label = "incompatible";
-                }
-            }
-        }
+        let failure = if matches!(label, "failed" | "cancelled" | "unknown") {
+            rx.open_table(JOB_OUTPUTS)?
+                .range((child_id.get(), 0)..=(child_id.get(), u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map(|(k, b)| decode_output(k.value(), b.value()))
+                .transpose()?
+                .and_then(|o| o.summary)
+        } else {
+            None
+        };
+        let summarizer = match &job.frozen {
+            Some(crate::db::entities::MutableFrozenConfiguration::Generative(f)) => f.llm.model.id,
+            _ => ConfigId::new(0),
+        };
+        let boundary =
+            |b: &crate::db::entities::NativeSummaryBoundary| crate::db::entities::SourceBoundary {
+                turn: b.job,
+                input_through: u32::try_from(b.revision).unwrap_or(u32::MAX),
+                output_through: b.output_through,
+                content: b.content,
+            };
         work.push(ContextWorkState {
-            job,
-            conversation: child,
+            job: child_id,
+            conversation,
             state: label,
             details: ContextWorkDetails::Summary {
-                summarizer: summary_work.frozen.llm.model.id,
-                failure: if failed {
-                    rx.open_table(JOB_OUTPUTS)?
-                        .range((job.get(), 0)..=(job.get(), u32::MAX))?
-                        .next_back()
-                        .transpose()?
-                        .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
-                        .transpose()?
-                        .filter(|output| output.kind == OutputKind::Result)
-                        .and_then(|output| output.summary)
-                } else {
-                    None
-                },
-                automatic: binding.policy_revision.is_some(),
-                stage: match summary_work.stage {
-                    crate::db::entities::SummarizationStage::Direct => "direct",
-                    crate::db::entities::SummarizationStage::Chunk { .. } => "chunk",
-                    crate::db::entities::SummarizationStage::Reduce => "reduce",
-                },
-                chain: summary_work.chain,
-                prediction: binding.prediction,
-                reserved_tokens: binding.reserved_tokens,
-                reserved_requests: binding.reserved_requests,
-                source: summary_work.source,
-                first,
-                through,
-                turn_count: manifest.turns.len(),
+                summarizer,
+                failure,
+                automatic: job.input.priority != crate::db::entities::JobQueuePriority::Foreground,
+                stage: "direct",
+                chain: None,
+                prediction: None,
+                reserved_tokens: 0,
+                reserved_requests: 0,
+                source,
+                first: boundary(first_b),
+                through: boundary(last_b),
+                turn_count: manifest.sources.len(),
             },
         });
     }
-    if let Some(cursor) = next_before
-        && rx
-            .open_table(CHILD_GROUPS)?
-            .range((conversation.get(), 0)..(conversation.get(), cursor.get()))?
-            .next()
-            .is_none()
-    {
-        next_before = None;
-    }
-    let steer_blocked_by = steer_blocker(
-        &rx.open_table(JOBS)?,
-        &rx.open_table(JOB_STATES)?,
-        &rx.open_table(LIVE_CHILDREN)?,
-        Turns(&rx.open_table(TURNS)?),
-        conversation,
-    )?;
     Ok(Some(ContextState {
-        steer_blocked_by,
+        steer_blocked_by: None,
         policy,
-        stored_override: stored_override.clone(),
+        stored_override: None,
         policy_source: "global",
         revision,
         model,
-        estimated_tokens: (raw != usize::MAX).then_some(u64::try_from(tokens).unwrap_or(u64::MAX)),
+        estimated_tokens: (raw != usize::MAX).then_some(u64::try_from(raw).unwrap_or(u64::MAX)),
         growth,
         predictor,
         predictor_model,
         prediction_unavailable,
-        last_use,
+        last_use: None,
         work,
-        next_before,
+        next_before: None,
     }))
 }
 
@@ -6938,425 +4712,6 @@ pub(super) fn decision_executor_available(
     Ok(false)
 }
 
-fn same_compaction_policy(
-    left: &crate::db::entities::CompactionPolicy,
-    right: &crate::db::entities::CompactionPolicy,
-) -> bool {
-    left.mode == right.mode && left.summarization_model == right.summarization_model
-}
-
-fn decision_assignment_current(
-    projects: &impl ReadableTable<u128, &'static [u8]>,
-    configs: &impl ReadableTable<u128, &'static [u8]>,
-    work: &crate::db::entities::DecisionWork,
-) -> Result<bool, StorageError> {
-    if let Some(assignment) = &work.assignment {
-        let Some(bytes) = projects.get(assignment.project.get())? else {
-            return Ok(false);
-        };
-        let project = decode_project(assignment.project.get(), bytes.value())?;
-        if !project.decision_policy().enabled || project.decision_revision != assignment.revision {
-            return Ok(false);
-        }
-    }
-    for reference in work.frozen.references() {
-        let Some(bytes) = configs.get(reference.id.get())? else {
-            return Ok(false);
-        };
-        let config = ConfigRow::decode_at(reference.id.get(), bytes.value())?;
-        if config.archived_at.is_some() || config.edit_seq != reference.edit_seq {
-            return Ok(false);
-        }
-    }
-    Ok(true)
-}
-
-pub(super) fn prediction_current(
-    meta: &impl ReadableTable<&'static str, &'static [u8]>,
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    configs: &impl ReadableTable<u128, &'static [u8]>,
-    projects: &impl ReadableTable<u128, &'static [u8]>,
-    conversations: &impl ReadableTable<u128, &'static [u8]>,
-    turns: Turns<'_, impl ReadableTable<(u128, u128), ()>>,
-    row: &JobSpec,
-) -> Result<bool, StorageError> {
-    let JobKind::Execution {
-        execution: JobExecution::Decision(work),
-        ..
-    } = &row.kind
-    else {
-        return Ok(true);
-    };
-    if !decision_assignment_current(projects, configs, work)? {
-        return Ok(false);
-    }
-    let Some(prediction) = &work.prediction else {
-        return Ok(true);
-    };
-    let Some(parent) = row.parent_id else {
-        return Ok(false);
-    };
-    let Some(bytes) = jobs.get(parent.get())? else {
-        return Ok(false);
-    };
-    let parent = JobSpec::decode_at(parent.get(), bytes.value())?;
-    if !matches!(
-        parent.kind,
-        JobKind::Group {
-            origin: Origin::System,
-            ..
-        }
-    ) {
-        return Ok(false);
-    }
-    let Some(conversation) = parent.parent_id else {
-        return Ok(false);
-    };
-    if prediction.conversation != conversation {
-        return Ok(false);
-    }
-    let (policy, revision, profile) = effective_context_policy(meta)?;
-    if !global_compaction_settings(meta)?.prediction_enabled
-        || !same_compaction_policy(&policy, &prediction.policy)
-    {
-        return Ok(false);
-    }
-    let Some(binding) = &prediction.policy.predictive else {
-        return Ok(false);
-    };
-    if binding.decision_agent != work.frozen.profile_ref().id
-        || prediction.policy_revision != revision
-        || prediction.policy_profile != profile
-        || prediction.max_tokens != binding.max_prediction_tokens
-    {
-        return Ok(false);
-    }
-    if turns.head(conversation)? != Some(prediction.activity_turn) {
-        return Ok(false);
-    }
-
-    let metadata = conversations
-        .get(conversation.get())?
-        .ok_or_else(|| StorageError::corrupted("prediction owner missing"))?;
-    Ok(JobControl::decode(metadata.value())?.closing.is_none())
-}
-
-pub(super) fn summary_root(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    work: &crate::db::entities::SummarizationWork,
-) -> Result<crate::db::entities::SummarizationWork, StorageError> {
-    let Some(anchor) = work.chain else {
-        return Ok(work.clone());
-    };
-    let bytes = jobs
-        .get(anchor.get())?
-        .ok_or_else(|| StorageError::corrupted("summary chain anchor missing"))?;
-    let row = JobSpec::decode_at(anchor.get(), bytes.value())?;
-    let JobKind::Execution {
-        execution: JobExecution::Summarization(root),
-        ..
-    } = row.kind
-    else {
-        return Err(StorageError::corrupted("invalid summary chain anchor"));
-    };
-    if root.chain.is_some()
-        || root.source != work.source
-        || !matches!(
-            root.stage,
-            crate::db::entities::SummarizationStage::Chunk { start: 0, .. }
-        )
-    {
-        return Err(StorageError::corrupted("inconsistent summary chain"));
-    }
-    Ok(root)
-}
-
-pub(super) fn context_work_stopped(
-    notices: &impl ReadableTable<(u128, u32), &'static [u8]>,
-    conversation: JobId,
-) -> Result<bool, StorageError> {
-    for (scanned, entry) in notices
-        .range((conversation.get(), 0)..=(conversation.get(), u32::MAX))?
-        .rev()
-        .enumerate()
-        .take(129)
-    {
-        if scanned == 128 {
-            return Ok(true);
-        }
-        if matches!(
-            Notice::decode(entry?.1.value())?.body,
-            NoticeBody::Record {
-                event: RecordEvent::Stop,
-                ..
-            }
-        ) {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-pub(super) fn preparation_charge(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    children: &impl ReadableTable<(u128, u128), ()>,
-    turns: Turns<'_, impl ReadableTable<(u128, u128), ()>>,
-    events: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
-    row: &JobSpec,
-) -> Result<(u64, Timestamp), StorageError> {
-    let JobKind::Execution {
-        execution: JobExecution::Summarization(work),
-        ..
-    } = &row.kind
-    else {
-        return Ok((0, row.created_at));
-    };
-    let root = summary_root(jobs, work)?;
-    if root.prediction.is_none() {
-        return Ok((0, row.created_at));
-    }
-    let anchor = work.chain.unwrap_or(row.id);
-    let Some(parent) = row.parent_id else {
-        return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
-    };
-    let Some(bytes) = jobs.get(parent.get())? else {
-        return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
-    };
-    let Some(owner) = JobSpec::decode_at(parent.get(), bytes.value())?.parent_id else {
-        return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
-    };
-    let mut total = 0u64;
-    let mut charged_at = row.created_at;
-    for (scanned, entry) in children
-        .range((owner.get(), 0)..=(owner.get(), u128::MAX))?
-        .rev()
-        .enumerate()
-        .take(257)
-    {
-        if scanned == 256 {
-            return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
-        }
-        let child = entry?.0.value().1;
-        let Some(tip) = turns.head(JobId::new(child))?.map(JobId::get) else {
-            continue;
-        };
-        if tip < anchor.get() {
-            break;
-        }
-        let Some(bytes) = jobs.get(tip)? else {
-            return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
-        };
-        let member = JobSpec::decode_at(tip, bytes.value())?;
-        let JobKind::Execution {
-            execution: JobExecution::Summarization(part),
-            ..
-        } = &member.kind
-        else {
-            continue;
-        };
-        if part.source != root.source || part.chain.unwrap_or(member.id) != anchor {
-            continue;
-        }
-        let mut evidence = Vec::new();
-        for (scanned, entry) in events
-            .range((tip, 1, 0)..=(tip, u32::MAX, u32::MAX))?
-            .enumerate()
-            .take(129)
-        {
-            if scanned == 128 {
-                return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
-            }
-            let (key, bytes) = entry?;
-            let (_, request, seq) = key.value();
-            if request != 1 {
-                return Ok((u64::MAX, Timestamp::from_unix_micros(i64::MAX)));
-            }
-            evidence.push(rows::decode_request_event(
-                member.id,
-                RequestNumber::FIRST,
-                seq,
-                bytes.value(),
-            )?);
-        }
-        for event in &evidence {
-            charged_at = charged_at.max(event.recorded_at);
-        }
-        if let Some(sample) = observations::usage_sample_of(
-            member.id,
-            RequestNumber::FIRST,
-            turn_target_of(jobs, &member)?.as_ref(),
-            &evidence,
-        ) {
-            total = total
-                .saturating_add(u64::from(sample.input.value().unwrap_or(0)))
-                .saturating_add(u64::from(sample.output.value().unwrap_or(0)));
-        }
-    }
-    Ok((total.max(u64::from(root.reserved_tokens)), charged_at))
-}
-
-pub(super) fn preparation_current(
-    meta: &impl ReadableTable<&'static str, &'static [u8]>,
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    configs: &impl ReadableTable<u128, &'static [u8]>,
-    projects: &impl ReadableTable<u128, &'static [u8]>,
-    conversations: &impl ReadableTable<u128, &'static [u8]>,
-    notices: &impl ReadableTable<(u128, u32), &'static [u8]>,
-    row: &JobSpec,
-) -> Result<bool, StorageError> {
-    let JobKind::Execution {
-        execution: JobExecution::Summarization(work),
-        ..
-    } = &row.kind
-    else {
-        return Ok(true);
-    };
-    let Some(parent) = row.parent_id else {
-        return Ok(false);
-    };
-    if context_work_stopped(notices, parent)? {
-        return Ok(false);
-    }
-    if let Some(anchor) = work.chain {
-        let Some(bytes) = jobs.get(anchor.get())? else {
-            return Ok(false);
-        };
-        let Some(anchor_parent) = JobSpec::decode_at(anchor.get(), bytes.value())?.parent_id else {
-            return Ok(false);
-        };
-        if context_work_stopped(notices, anchor_parent)? {
-            return Ok(false);
-        }
-    }
-    let Some(bytes) = jobs.get(parent.get())? else {
-        return Ok(false);
-    };
-    let owner = JobSpec::decode_at(parent.get(), bytes.value())?;
-    let Some(conversation) = owner.parent_id else {
-        return Ok(false);
-    };
-    let Some(metadata) = conversations.get(conversation.get())? else {
-        return Ok(false);
-    };
-    if JobControl::decode(metadata.value())?.closing.is_some() {
-        return Ok(false);
-    }
-    summary_current(meta, jobs, configs, projects, work, conversation)
-}
-
-pub(super) fn summary_current(
-    meta: &impl ReadableTable<&'static str, &'static [u8]>,
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    configs: &impl ReadableTable<u128, &'static [u8]>,
-    projects: &impl ReadableTable<u128, &'static [u8]>,
-    work: &crate::db::entities::SummarizationWork,
-    conversation: JobId,
-) -> Result<bool, StorageError> {
-    let root = summary_root(jobs, work)?;
-    let (policy, revision, profile) = effective_context_policy(meta)?;
-    if root.policy_revision.is_some_and(|bound| {
-        bound != revision
-            || root.policy_profile != profile
-            || matches!(policy.mode, crate::db::entities::CompactionMode::Off)
-    }) {
-        return Ok(false);
-    }
-    let Some(prediction) = root.prediction else {
-        return Ok(true);
-    };
-    let Some(bytes) = jobs.get(prediction.get())? else {
-        return Ok(false);
-    };
-    let row = JobSpec::decode_at(prediction.get(), bytes.value())?;
-    let JobKind::Execution {
-        execution: JobExecution::Decision(decision),
-        ..
-    } = row.kind
-    else {
-        return Ok(false);
-    };
-    let Some(snapshot) = &decision.prediction else {
-        return Ok(false);
-    };
-    if snapshot.conversation != conversation
-        || !global_compaction_settings(meta)?.prediction_enabled
-        || !same_compaction_policy(&snapshot.policy, &policy)
-        || !decision_assignment_current(projects, configs, &decision)?
-    {
-        return Ok(false);
-    }
-    let Some(binding) = &snapshot.policy.predictive else {
-        return Ok(false);
-    };
-    if binding.mode != crate::db::entities::PredictionMode::Prepare
-        || binding.decision_agent != decision.frozen.profile_ref().id
-        || binding
-            .acceptance
-            .as_ref()
-            .is_none_or(|acceptance| acceptance.model != decision.frozen.model_ref())
-    {
-        return Ok(false);
-    }
-
-    Ok(true)
-}
-
-pub(super) fn work_priority(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    row: &JobSpec,
-) -> Result<u8, StorageError> {
-    Ok(match &row.kind {
-        JobKind::Execution {
-            execution: JobExecution::Decision(work),
-            ..
-        } if work.prediction.is_some() => 2,
-        JobKind::Execution {
-            execution: JobExecution::Summarization(work),
-            ..
-        } => {
-            let root = summary_root(jobs, work)?;
-            if root.prediction.is_some() {
-                2
-            } else if root.policy_revision.is_some() {
-                1
-            } else {
-                0
-            }
-        }
-        JobKind::Group { .. } | JobKind::Execution { .. } => 0,
-    })
-}
-
-pub(super) fn has_decider(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    conversation: Option<JobId>,
-) -> Result<bool, StorageError> {
-    let mut current = conversation;
-    for _ in 0..=crate::db::entities::MAX_JOB_DEPTH {
-        let Some(id) = current else {
-            return Ok(false);
-        };
-        let Some(bytes) = jobs.get(id.get())? else {
-            return Ok(false);
-        };
-        let row = JobSpec::decode_at(id.get(), bytes.value())?;
-        match row.kind {
-            JobKind::Group {
-                origin: Origin::User,
-                ..
-            } => return Ok(true),
-            JobKind::Group { .. } => current = row.parent_id,
-            JobKind::Execution { .. } => return Ok(false),
-        }
-    }
-    Ok(false)
-}
-pub(crate) fn read_has_decider(
-    database: &Database,
-    conversation: Option<JobId>,
-) -> Result<bool, StorageError> {
-    has_decider(&read(database)?.open_table(JOBS)?, conversation)
-}
 fn approved_calls(
     rx: &ReadTransaction,
     conversation: JobId,
@@ -7378,12 +4733,6 @@ fn approved_calls(
         calls.push(decode_tool_evidence(call, bytes.value())?);
     }
     Ok(calls)
-}
-pub(crate) fn read_approved_calls(
-    database: &Database,
-    conversation: JobId,
-) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
-    approved_calls(&read(database)?, conversation)
 }
 fn question(arguments: &str) -> String {
     serde_json::from_str::<serde_json::Value>(arguments)

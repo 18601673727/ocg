@@ -210,30 +210,6 @@ impl Workspace {
         read_lines(&file, start_line, line_count)
     }
 
-    pub(super) fn snapshot_range(&self, path: &str, line: u64) -> Result<Value, Refusal> {
-        match self.read(path) {
-            Ok(content) => {
-                let count = content.matches('\n').count() as u64
-                    + u64::from(!content.is_empty() && !content.ends_with('\n'));
-                if count > MAX_RANGE_LINES {
-                    return self
-                        .read_range(path, line.saturating_sub(8).max(1), 80)
-                        .map(|range| range.to_json(path));
-                }
-                Ok(json!({
-                    "path": path, "start_line": 1,
-                    "end_line": (count > 0).then_some(count), "total_lines": count,
-                    "content": content, "line_truncated": false,
-                }))
-            }
-            Err(Refusal::TooLargeToReadWhole { .. }) => {
-                let range = self.read_range(path, line.saturating_sub(8).max(1), 80)?;
-                Ok(range.to_json(path))
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     pub fn read_binary(&self, path: &str, limit: usize) -> Result<Vec<u8>, Refusal> {
         let (directory, name) = self.parent(path)?;
         let file = open_within(&directory, name, Step::File, limit)?;

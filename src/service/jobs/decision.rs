@@ -12,27 +12,6 @@ impl Batch {
             .with_global_headers(global)
             .freeze_decision_profile(profile)
     }
-
-    pub(crate) fn decision_assignment_current(
-        &mut self,
-        work: &DecisionWork,
-    ) -> Result<bool, BatchError> {
-        if let Some(assignment) = &work.assignment {
-            let row = self.require_project_record(assignment.project)?;
-            if !row.decision_policy().enabled || row.decision_revision != assignment.revision {
-                return Ok(false);
-            }
-        }
-        for reference in work.frozen.references() {
-            if self
-                .config(reference.id)?
-                .is_none_or(|row| row.archived_at.is_some() || row.edit_seq != reference.edit_seq)
-            {
-                return Ok(false);
-            }
-        }
-        Ok(true)
-    }
 }
 
 pub(crate) fn bind_prediction(

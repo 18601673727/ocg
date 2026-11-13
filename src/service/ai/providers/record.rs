@@ -177,18 +177,6 @@ impl RequestRecorder {
         MessageBody::new(&value).map_err(|error| record_error(error.to_string()))
     }
 
-    pub fn response_with_items(
-        &mut self,
-        message: &ChatMessage,
-        items: &[Value],
-    ) -> Result<MessageBody, OutputSinkError> {
-        self.pending_response_items = items.len();
-        if items.is_empty() {
-            return self.response(message);
-        }
-        MessageBody::new(&json!({"output": items})).map_err(|error| record_error(error.to_string()))
-    }
-
     pub fn remember_response(&mut self, digest: ContentDigest) {
         if self.responses && self.pending_response_items > 0 {
             self.response_groups

@@ -248,42 +248,31 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         .split('/')
         .collect::<Vec<_>>();
     if request.method() == Method::POST {
-        return match segments.as_slice() {
-            ["jobs", job, "cancel-unsupported"] => no_query(query).and_then(|()| {
-                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::CancelQueued(id)))
-            }),
-            ["jobs", job, "stop"] => no_query(query).and_then(|()| {
-                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Stop(id)))
-            }),
-            ["update"] => no_query(query).map(|()| Route::StartUpdate),
-            ["jobs"] => no_query(query).map(|()| Route::MutableJob(mutable_jobs::Action::Create)),
-            ["jobs", job] => no_query(query).and_then(|()| {
-                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Edit(id)))
-            }),
-            ["jobs", job, "submit"] => no_query(query).and_then(|()| {
-                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Submit(id)))
-            }),
-            ["decisions"] => no_query(query).map(|()| Route::DecisionSubmit),
+        let route = match segments.as_slice() {
+            ["jobs", job, "cancel-unsupported"] => {
+                Route::MutableJob(mutable_jobs::Action::CancelQueued(job_id(job)?))
+            }
+            ["jobs", job, "stop"] => Route::MutableJob(mutable_jobs::Action::Stop(job_id(job)?)),
+            ["update"] => Route::StartUpdate,
+            ["jobs"] => Route::MutableJob(mutable_jobs::Action::Create),
+            ["jobs", job] => Route::MutableJob(mutable_jobs::Action::Edit(job_id(job)?)),
+            ["jobs", job, "submit"] => {
+                Route::MutableJob(mutable_jobs::Action::Submit(job_id(job)?))
+            }
+            ["decisions"] => Route::DecisionSubmit,
             ["approvals", job, request, index] => {
-                let approval = crate::db::entities::ToolCallRef {
+                Route::DecideApproval(crate::db::entities::ToolCallRef {
                     job: job_id(job)?,
                     request: decimal::<u32>(request)
                         .and_then(RequestNumber::new)
                         .ok_or(INVALID_REQUEST)?,
                     index: decimal::<u32>(index).ok_or(INVALID_REQUEST)?,
-                };
-                no_query(query).map(|()| Route::DecideApproval(approval))
+                })
             }
             ["conversations", conversation, "compact"] => {
-                no_query(query).and_then(|()| job_id(conversation).map(Route::ConversationCompact))
+                Route::ConversationCompact(job_id(conversation)?)
             }
-            ["conversations", conversation, action]
-                if matches!(
-                    *action,
-                    "stop" | "close" | "hold" | "unhold" | "retry" | "queue"
-                ) =>
-            {
-                let conversation = job_id(conversation)?;
+            ["conversations", conversation, action] => {
                 let action = match *action {
                     "stop" => "stop",
                     "close" => "close",
@@ -293,77 +282,48 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                     "queue" => "queue",
                     _ => return Err(NOT_FOUND),
                 };
-                no_query(query).map(|()| Route::JobAction(conversation, action))
+                Route::JobAction(job_id(conversation)?, action)
             }
-            ["settings", "compaction"] => {
-                no_query(query).map(|()| Route::SaveGlobalCompactionSettings)
-            }
-            ["settings", "outbound-headers"] => {
-                no_query(query).map(|()| Route::SaveGlobalOutboundHeaders)
-            }
-            ["profiles"] => no_query(query).map(|()| Route::ProfileCreate),
-            ["pools"] => no_query(query).map(|()| Route::NativePoolCreate),
-            ["executors"] => no_query(query).map(|()| Route::NativeExecutorCreate),
-            ["profiles", "import"] => no_query(query).map(|()| Route::ProfileImport),
+            ["settings", "compaction"] => Route::SaveGlobalCompactionSettings,
+            ["settings", "outbound-headers"] => Route::SaveGlobalOutboundHeaders,
+            ["profiles"] => Route::ProfileCreate,
+            ["pools"] => Route::NativePoolCreate,
+            ["executors"] => Route::NativeExecutorCreate,
+            ["profiles", "import"] => Route::ProfileImport,
             ["profiles", profile, "availability"] => {
-                let id = profiles::profile_id(profile)?;
-                no_query(query).map(|()| Route::ProfileAvailability(id))
+                Route::ProfileAvailability(profiles::profile_id(profile)?)
             }
-            ["provider-models"] => no_query(query).map(|()| Route::ProviderModels),
-            ["profiles", profile] => {
-                let profile = profiles::profile_id(profile)?;
-                no_query(query).map(|()| Route::ProfileUpdate(profile))
-            }
-            ["projects"] => no_query(query).map(|()| Route::ProjectCreate),
+            ["provider-models"] => Route::ProviderModels,
+            ["profiles", profile] => Route::ProfileUpdate(profiles::profile_id(profile)?),
+            ["projects"] => Route::ProjectCreate,
             ["projects", project, "decision"] => {
-                let project = projects::project_id(project)?;
-                no_query(query).map(|()| Route::ProjectDecision(project))
+                Route::ProjectDecision(projects::project_id(project)?)
             }
-            ["projects", project] => {
-                let project = projects::project_id(project)?;
-                no_query(query).map(|()| Route::ProjectUpdate(project))
-            }
-            ["pools", pool, "archive"] => {
-                let pool = pools::pool_id(pool)?;
-                no_query(query).map(|()| Route::NativePoolArchive(pool))
-            }
-            ["pools", pool] => {
-                let pool = pools::pool_id(pool)?;
-                no_query(query).map(|()| Route::PoolUpdate(pool))
-            }
-            ["executors", executor] => {
-                let executor = pools::executor_id(executor)?;
-                no_query(query).map(|()| Route::NativeExecutorUpdate(executor))
-            }
+            ["projects", project] => Route::ProjectUpdate(projects::project_id(project)?),
+            ["pools", pool, "archive"] => Route::NativePoolArchive(pools::pool_id(pool)?),
+            ["pools", pool] => Route::PoolUpdate(pools::pool_id(pool)?),
+            ["executors", executor] => Route::NativeExecutorUpdate(pools::executor_id(executor)?),
             ["executors", executor, "archive"] => {
-                let executor = pools::executor_id(executor)?;
-                no_query(query).map(|()| Route::NativeExecutorArchive(executor))
+                Route::NativeExecutorArchive(pools::executor_id(executor)?)
             }
-            ["conversations", job] => {
-                let job = job_id(job)?;
-                no_query(query).map(|()| Route::JobEdit(job))
-            }
-            ["attachments"] => no_query(query).map(|()| Route::AttachmentUpload),
-            ["session"] => no_query(query).map(|()| Route::SessionCreate),
-            _ => Err(NOT_FOUND),
+            ["conversations", job] => Route::JobEdit(job_id(job)?),
+            ["attachments"] => Route::AttachmentUpload,
+            ["session"] => Route::SessionCreate,
+            _ => return Err(NOT_FOUND),
         };
+        no_query(query)?;
+        return Ok(route);
     }
     if request.method() == Method::DELETE {
-        return match segments.as_slice() {
-            ["jobs", job] => no_query(query).and_then(|()| {
-                job_id(job).map(|id| Route::MutableJob(mutable_jobs::Action::Discard(id)))
-            }),
-            ["providers", id] => {
-                let id = profiles::profile_id(id)?;
-                no_query(query).map(|()| Route::ProviderDelete(id))
-            }
-            ["session"] => no_query(query).map(|()| Route::SessionRevoke),
-            ["profiles", id] => {
-                let id = profiles::profile_id(id)?;
-                no_query(query).map(|()| Route::ProfileDelete(id))
-            }
-            _ => Err(NOT_FOUND),
+        let route = match segments.as_slice() {
+            ["jobs", job] => Route::MutableJob(mutable_jobs::Action::Discard(job_id(job)?)),
+            ["providers", id] => Route::ProviderDelete(profiles::profile_id(id)?),
+            ["session"] => Route::SessionRevoke,
+            ["profiles", id] => Route::ProfileDelete(profiles::profile_id(id)?),
+            _ => return Err(NOT_FOUND),
         };
+        no_query(query)?;
+        return Ok(route);
     }
     match segments.as_slice() {
         ["jobs", "current"] => {

@@ -904,21 +904,6 @@ pub(super) fn decode_tool_evidence(
     })
 }
 
-pub(super) fn job_tool_evidence(
-    table: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
-    job: JobId,
-) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
-    let mut records = Vec::new();
-    for entry in table.range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))? {
-        let (key, bytes) = entry?;
-        records.push(decode_tool_evidence(
-            tool_call_ref(key.value())?,
-            bytes.value(),
-        )?);
-    }
-    Ok(records)
-}
-
 pub(super) fn tool_call_ref((job, request, index): (u128, u32, u32)) -> DecodeResult<ToolCallRef> {
     Ok(ToolCallRef {
         job: JobId::new(job),
@@ -1085,12 +1070,6 @@ pub(super) fn decode_request_event(
 }
 
 impl JobInputEntry {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_JOB_INPUT);
-        e.entry(&self.entry);
-        e.ts(self.at);
-        e.0
-    }
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_JOB_INPUT)?;
         let row = Self {

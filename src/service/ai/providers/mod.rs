@@ -42,7 +42,7 @@ pub(crate) use observe::{announce, rejected_failure};
 pub(crate) fn model_endpoint(endpoint: &str) -> Result<String, ProviderExecutionError> {
     self::endpoint(endpoint, "models")
 }
-pub(crate) use models::{ModelListError, ProviderModel, list_models};
+pub(crate) use models::{ModelListError, list_models};
 pub use observe::{error_observations, metrics, result_value, success_observation};
 pub use types::{
     ApprovedRoute, CredentialResolver, DestinationPolicy, EnvironmentCredentialResolver,

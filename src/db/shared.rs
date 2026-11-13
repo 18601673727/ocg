@@ -40,14 +40,6 @@ impl Admission {
             Self::WorkerStopped => Err(MaintenanceError::WorkerStopped),
         }
     }
-
-    pub(super) fn check_recovery_enqueue(&self) -> Result<(), RecoveryError> {
-        match self {
-            Self::Open | Self::Protected(_) => Ok(()),
-            Self::ShuttingDown => Err(RecoveryError::ShuttingDown),
-            Self::WorkerStopped => Err(RecoveryError::WorkerStopped),
-        }
-    }
 }
 
 pub(super) fn admitted(admission: &Admission) -> Result<(), DatabaseError> {
@@ -70,7 +62,6 @@ pub(super) struct Shared {
     pub(super) database_directory: PathBuf,
     pub(super) log_directory: PathBuf,
     pub(super) log_files: Arc<crate::system::logger::LogFiles>,
-    pub(super) cleanup_worker: Arc<AtomicBool>,
     pub(super) admission: RwLock<Admission>,
     pub(super) update_paused: AtomicBool,
     pub(super) database: RwLock<Option<Opened>>,

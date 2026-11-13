@@ -477,10 +477,12 @@ impl Batch {
         if objective.trim().is_empty() {
             return self.reject(Violation::InvalidValue("objective", "must not be empty"));
         }
-        if every_seconds.is_some() {
+        if let Some(interval_s) = every_seconds
+            && !(60..=2_592_000).contains(&interval_s)
+        {
             return self.reject(Violation::InvalidValue(
                 "every_seconds",
-                "scheduled recurrence is not available for native conversations",
+                "interval must be between 60 and 2592000 seconds",
             ));
         }
         let agent = selection
@@ -550,7 +552,7 @@ impl Batch {
                 approval,
                 agent,
                 project,
-                keep_open,
+                keep_open || every_seconds.is_some(),
                 after.clone(),
             )?;
             let n = u32::try_from(index).unwrap_or(u32::MAX);
@@ -562,6 +564,16 @@ impl Batch {
                 job_tree::tool_submission(approval, b"dispatch create", n),
                 job_tree::tool_submission(approval, b"dispatch submit", n),
             )?;
+            if let Some(interval_s) = every_seconds {
+                let rec = crate::db::entities::Recurrence {
+                    phase: crate::db::entities::RecurrencePhase::Active,
+                    n: 1,
+                    current_turn: turn,
+                    previous_turn: None,
+                    interval_s,
+                };
+                self.insert(RECURRENCES, child.get(), rec.encode().as_slice())?;
+            }
             lines.push(format!("conversation {child}, turn {turn}"));
         }
         Ok(format!(

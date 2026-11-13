@@ -695,10 +695,6 @@ impl JobRecord {
         self.confirmed_terminal() || self.unknown_at.is_some()
     }
 
-    pub fn awaits_start(&self) -> bool {
-        self.started_at.is_none() && !self.any_terminal()
-    }
-
     pub fn locally_stopped(&self) -> bool {
         self.confirmed_terminal() || (self.unknown_at.is_some() && self.stop_confirmed_at.is_some())
     }
@@ -1124,12 +1120,6 @@ impl JobKind {
             Self::Execution { name, .. } => name.as_deref(),
             Self::Group { .. } => None,
         }
-    }
-    pub(crate) fn waits_on(&self) -> impl Iterator<Item = (JobId, DependencyCondition)> + '_ {
-        self.dependencies().iter().copied().chain(
-            self.previous()
-                .map(|previous| (previous, DependencyCondition::Settled)),
-        )
     }
 }
 

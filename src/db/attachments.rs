@@ -312,26 +312,6 @@ mod supported {
             Ok(bytes)
         }
 
-        pub(crate) fn reclaim<E>(
-            &self,
-            digest: ContentDigest,
-            length: u64,
-            needed: impl FnOnce() -> Result<bool, E>,
-        ) -> Result<Result<Reclamation, StoreError>, E> {
-            let pins = self.pins.lock();
-            if pins.contains_key(&digest) || needed()? {
-                return Ok(Ok(Reclamation::Retained));
-            }
-            let removed = self.remove(digest, length).and_then(|reclaimed| {
-                if reclaimed == Reclamation::Absent {
-                    self.directory.sync_all().map_err(failed)?;
-                }
-                Ok(reclaimed)
-            });
-            drop(pins);
-            Ok(removed)
-        }
-
         pub(crate) fn reclaim_unneeded(
             &self,
             unneeded: &[(ContentDigest, u64)],

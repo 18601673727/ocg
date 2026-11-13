@@ -188,11 +188,6 @@ async fn exchange(
     sink: &mut Option<&mut dyn ProviderOutputSink>,
     announced: &mut bool,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-    conversation
-        .validate()
-        .map_err(|error| ProviderExecutionError::Build {
-            message: error.to_string(),
-        })?;
     let provider = &frozen.llm.provider;
     let anthropic = config.transport == crate::db::entities::LlmTransport::AnthropicMessages;
     let endpoint = endpoint(

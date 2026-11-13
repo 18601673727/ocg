@@ -1,15 +1,5 @@
 use super::*;
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct ExecutorRecord {
-    pub id: ExecutorId,
-    pub name: String,
-    pub concurrency_limit: u32,
-    pub llm_transports: BTreeSet<LlmTransport>,
-    pub created_at: Timestamp,
-    pub updated_at: Timestamp,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LlmTransport {
     OpenAiChatCompletions,
@@ -474,7 +464,7 @@ impl FrozenExecutionConfig {
         self.provider_refusal()
     }
 
-    fn provider_refusal(&self) -> Option<&'static str> {
+    pub fn provider_refusal(&self) -> Option<&'static str> {
         if self.llm.provider.transport != LlmTransport::OpenAiChatCompletions {
             return Some("native execution requires the OpenAI Chat Completions protocol");
         }
@@ -560,17 +550,6 @@ pub struct ExecutionPool {
     pub name: String,
     pub config: ExecutionPoolConfig,
     pub enabled: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutionPoolRecord {
-    pub id: ExecutionPoolId,
-    pub name: String,
-    pub config: ExecutionPoolConfig,
-    pub enabled: bool,
-    pub edit_seq: u32,
-    pub created_at: Timestamp,
-    pub updated_at: Timestamp,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

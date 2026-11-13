@@ -39,7 +39,6 @@ pub use identity::{
     RequestEventId, RequestNumber, RequestRef, ReservationRequestId, ScheduledExternalPolicyId,
     Timestamp, parse_entity_id,
 };
-pub(crate) use job_context::parse_suggested_title;
 pub use job_context::{
     Actor, Appended, COMPACTION_JOB_NAME, CompactionMode, CompactionPolicy, CompactionPreset,
     CompactionRequest, ContextSourceManifest, CustomPolicy, Entry, EntryKind,

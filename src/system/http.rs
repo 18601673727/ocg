@@ -519,10 +519,6 @@ pub(crate) fn initialize() -> Result<(), String> {
     }
 }
 
-pub(crate) fn ambient_proxy_configured() -> bool {
-    !matches!(PROXY.get_or_init(load), Ok(None))
-}
-
 pub(crate) fn log_configuration() {
     if let Some(Ok(Some(proxy))) = PROXY.get() {
         log::info!(
@@ -531,6 +527,48 @@ pub(crate) fn log_configuration() {
             proxy.uri.port_u16().unwrap_or(80)
         );
     }
+}
+
+async fn wrap_tls(
+    io: Io,
+    host: &str,
+    tls: Arc<rustls::ClientConfig>,
+) -> Result<IoBoxed, ConnectError> {
+    let name = rustls::pki_types::ServerName::try_from(host.trim_matches(['[', ']']).to_owned())
+        .map_err(|_| ConnectError::InvalidInput)?;
+    ntex::connect::rustls::TlsClientFilter::create(io, tls, name)
+        .await
+        .map(IoBoxed::from)
+        .map_err(ConnectError::from)
+}
+
+async fn open_proxy_io(
+    proxy: &Proxy,
+    request: Connect<Uri>,
+    default_port: u16,
+    call: impl AsyncFnOnce(Connect<Uri>) -> Result<Io, ConnectError>,
+) -> Result<(Io, String), ConnectError> {
+    let target = request.get_ref().clone();
+    let host = target.host().ok_or(ConnectError::InvalidInput)?.to_owned();
+    let port = target.port_u16().unwrap_or(default_port);
+    let tunnel = !proxy.bypasses(&host, port);
+    let io = call(if tunnel {
+        Connect::new(proxy.uri.clone())
+    } else {
+        request
+    })
+    .await?;
+    if tunnel {
+        connect_tunnel_with_timeout(
+            &io,
+            &host,
+            port,
+            proxy.authorization.as_ref(),
+            TUNNEL_TIMEOUT,
+        )
+        .await?;
+    }
+    Ok((io, host))
 }
 
 fn connector() -> Result<Connector, ProviderExecutionError> {
@@ -549,62 +587,17 @@ fn connector() -> Result<Connector, ProviderExecutionError> {
         .connector(apply_fn_factory(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                let target = request.get_ref().clone();
-                let host = target.host().ok_or(ConnectError::InvalidInput)?;
-                let port = target.port_u16().unwrap_or(80);
-                let tunnel = !proxy.bypasses(host, port);
-                let io = service
-                    .call(if tunnel {
-                        Connect::new(proxy.uri.clone())
-                    } else {
-                        request
-                    })
-                    .await?;
-                if tunnel {
-                    connect_tunnel_with_timeout(
-                        &io,
-                        host,
-                        port,
-                        proxy.authorization.as_ref(),
-                        TUNNEL_TIMEOUT,
-                    )
-                    .await?;
-                }
-                Ok::<_, ConnectError>(io)
+                open_proxy_io(proxy, request, 80, |req| service.call(req))
+                    .await
+                    .map(|(io, _)| io)
             },
         ))
         .secure_connector(apply_fn_factory(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                let target = request.get_ref().clone();
-                let host = target.host().ok_or(ConnectError::InvalidInput)?;
-                let port = target.port_u16().unwrap_or(443);
-                let tunnel = !proxy.bypasses(host, port);
-                let io = service
-                    .call(if tunnel {
-                        Connect::new(proxy.uri.clone())
-                    } else {
-                        request
-                    })
-                    .await?;
-                if tunnel {
-                    connect_tunnel_with_timeout(
-                        &io,
-                        host,
-                        port,
-                        proxy.authorization.as_ref(),
-                        TUNNEL_TIMEOUT,
-                    )
-                    .await?;
-                }
-                let name = rustls::pki_types::ServerName::try_from(
-                    host.trim_matches(['[', ']']).to_owned(),
-                )
-                .map_err(|_| ConnectError::InvalidInput)?;
-                ntex::connect::rustls::TlsClientFilter::create(io, tls.clone(), name)
-                    .await
-                    .map(IoBoxed::from)
-                    .map_err(ConnectError::from)
+                let (io, host) =
+                    open_proxy_io(proxy, request, 443, |req| service.call(req)).await?;
+                wrap_tls(io, &host, tls.clone()).await
             },
         )))
 }
@@ -615,25 +608,21 @@ fn approved_connector(
     route: &crate::service::ai::providers::ApprovedRoute,
 ) -> Result<Connector, ProviderExecutionError> {
     use crate::service::ai::providers::ApprovedRoute;
-    match route {
-        ApprovedRoute::Direct => direct_approved_connector(host, port),
-        ApprovedRoute::TrustedProxy(proxy) => trusted_proxy_connector(host, port, proxy.address()),
-    }
-}
-
-fn trusted_proxy_connector(
-    host: &str,
-    port: u16,
-    proxy: SocketAddr,
-) -> Result<Connector, ProviderExecutionError> {
     let tls = tunnel_tls();
     let approved = Arc::new((bare_host(host), port));
-    let proxy_uri: Uri =
-        format!("http://{proxy}")
-            .parse()
-            .map_err(|_| ProviderExecutionError::Build {
-                message: "the trusted proxy address is not usable".to_owned(),
-            })?;
+    let proxy = match route {
+        ApprovedRoute::Direct => None,
+        ApprovedRoute::TrustedProxy(proxy) => {
+            let addr = proxy.address();
+            let uri: Uri =
+                format!("http://{addr}")
+                    .parse()
+                    .map_err(|_| ProviderExecutionError::Build {
+                        message: "the trusted proxy address is not usable".to_owned(),
+                    })?;
+            Some((addr, uri))
+        }
+    };
     Ok(Connector::default()
         .connector(apply_fn_factory(
             TcpConnector::<Uri>::new(),
@@ -650,72 +639,50 @@ fn trusted_proxy_connector(
                 if bare_host(host) != approved.0 || port != approved.1 {
                     return Err(ConnectError::InvalidInput);
                 }
-                let io = service
-                    .call(Connect::new(proxy_uri.clone()).set_addrs(vec![proxy]))
-                    .await?;
-                connect_tunnel_with_timeout(&io, host, port, None, TUNNEL_TIMEOUT).await?;
-                let name = rustls::pki_types::ServerName::try_from(
-                    host.trim_matches(['[', ']']).to_owned(),
-                )
-                .map_err(|_| ConnectError::InvalidInput)?;
-                ntex::connect::rustls::TlsClientFilter::create(io, tls.clone(), name)
-                    .await
-                    .map(IoBoxed::from)
-                    .map_err(ConnectError::from)
+                let io = if let Some((addr, uri)) = &proxy {
+                    let io = service
+                        .call(Connect::new(uri.clone()).set_addrs(vec![*addr]))
+                        .await?;
+                    connect_tunnel_with_timeout(&io, host, port, None, TUNNEL_TIMEOUT).await?;
+                    io
+                } else {
+                    let refused = Arc::new(AtomicBool::new(false));
+                    let addrs = resolve_approved_target(host, port, &refused).await?;
+                    service.call(request.set_addrs(addrs)).await?
+                };
+                wrap_tls(io, host, tls.clone()).await
             },
         )))
 }
 
-fn direct_approved_connector(host: &str, port: u16) -> Result<Connector, ProviderExecutionError> {
-    let tls = tunnel_tls();
-    let approved = Arc::new((bare_host(host), port));
-    Ok(Connector::default()
-        .connector(apply_fn_factory(
-            TcpConnector::<Uri>::new(),
-            async move |_request: Connect<Uri>, _service| {
-                Err::<Io, ConnectError>(ConnectError::InvalidInput)
-            },
-        ))
-        .secure_connector(apply_fn_factory(
-            TcpConnector::<Uri>::new(),
-            async move |request: Connect<Uri>, service| {
-                let target = request.get_ref().clone();
-                let host = target.host().ok_or(ConnectError::InvalidInput)?;
-                let port = target.port_u16().unwrap_or(443);
-                if bare_host(host) != approved.0 || port != approved.1 {
-                    return Err(ConnectError::InvalidInput);
-                }
-                let refused = Arc::new(AtomicBool::new(false));
-                let addrs = resolve_approved_target(host, port, &refused).await?;
-                let io = service.call(request.set_addrs(addrs)).await?;
-                let name = rustls::pki_types::ServerName::try_from(
-                    host.trim_matches(['[', ']']).to_owned(),
-                )
-                .map_err(|_| ConnectError::InvalidInput)?;
-                ntex::connect::rustls::TlsClientFilter::create(io, tls.clone(), name)
-                    .await
-                    .map(IoBoxed::from)
-                    .map_err(ConnectError::from)
-            },
-        )))
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) enum DestinationFault {
-    Unresolvable,
-    NonPublic,
-}
-
-pub(crate) async fn check_direct_destination(
-    host: &str,
-    port: u16,
-) -> Result<usize, DestinationFault> {
-    let refused = Arc::new(AtomicBool::new(false));
-    match resolve_approved_target(host, port, &refused).await {
-        Ok(addrs) => Ok(addrs.len()),
-        Err(_) if refused.load(Ordering::SeqCst) => Err(DestinationFault::NonPublic),
-        Err(_) => Err(DestinationFault::Unresolvable),
-    }
+async fn open_web_io(
+    proxy: Option<&Proxy>,
+    request: Connect<Uri>,
+    default_port: u16,
+    non_public: &Arc<AtomicBool>,
+    call: impl AsyncFnOnce(Connect<Uri>) -> Result<Io, ConnectError>,
+) -> Result<(Io, String), ConnectError> {
+    let target = request.get_ref().clone();
+    let host = target.host().ok_or(ConnectError::InvalidInput)?.to_owned();
+    let port = target.port_u16().unwrap_or(default_port);
+    let tunnel = proxy.is_some_and(|proxy| !proxy.bypasses(&host, port));
+    let io = if let (true, Some(proxy)) = (tunnel, proxy) {
+        check_proxied_web_target(&host, port, non_public).await?;
+        let io = call(Connect::new(proxy.uri.clone())).await?;
+        connect_tunnel_with_timeout(
+            &io,
+            &host,
+            port,
+            proxy.authorization.as_ref(),
+            TUNNEL_TIMEOUT,
+        )
+        .await?;
+        io
+    } else {
+        let addrs = resolve_direct_web_target(&host, port, non_public).await?;
+        call(request.set_addrs(addrs)).await?
+    };
+    Ok((io, host))
 }
 
 fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, ProviderExecutionError> {
@@ -732,63 +699,21 @@ fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, ProviderExecu
         .connector(apply_fn_factory(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                let target = request.get_ref().clone();
-                let host = target.host().ok_or(ConnectError::InvalidInput)?;
-                let port = target.port_u16().unwrap_or(80);
-                let tunnel = proxy
-                    .as_ref()
-                    .is_some_and(|proxy| !proxy.bypasses(host, port));
-                if let (true, Some(proxy)) = (tunnel, proxy.as_ref()) {
-                    check_proxied_web_target(host, port, &http_non_public).await?;
-                    let io = service.call(Connect::new(proxy.uri.clone())).await?;
-                    connect_tunnel_with_timeout(
-                        &io,
-                        host,
-                        port,
-                        proxy.authorization.as_ref(),
-                        TUNNEL_TIMEOUT,
-                    )
-                    .await?;
-                    Ok::<_, ConnectError>(io)
-                } else {
-                    let addrs = resolve_direct_web_target(host, port, &http_non_public).await?;
-                    service.call(request.set_addrs(addrs)).await
-                }
+                open_web_io(proxy.as_ref(), request, 80, &http_non_public, |req| {
+                    service.call(req)
+                })
+                .await
+                .map(|(io, _)| io)
             },
         ))
         .secure_connector(apply_fn_factory(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                let target = request.get_ref().clone();
-                let host = target.host().ok_or(ConnectError::InvalidInput)?;
-                let port = target.port_u16().unwrap_or(443);
-                let tunnel = proxy
-                    .as_ref()
-                    .is_some_and(|proxy| !proxy.bypasses(host, port));
-                let io = if let (true, Some(proxy)) = (tunnel, proxy.as_ref()) {
-                    check_proxied_web_target(host, port, &non_public).await?;
-                    let io = service.call(Connect::new(proxy.uri.clone())).await?;
-                    connect_tunnel_with_timeout(
-                        &io,
-                        host,
-                        port,
-                        proxy.authorization.as_ref(),
-                        TUNNEL_TIMEOUT,
-                    )
-                    .await?;
-                    io
-                } else {
-                    let addrs = resolve_direct_web_target(host, port, &non_public).await?;
-                    service.call(request.set_addrs(addrs)).await?
-                };
-                let name = rustls::pki_types::ServerName::try_from(
-                    host.trim_matches(['[', ']']).to_owned(),
-                )
-                .map_err(|_| ConnectError::InvalidInput)?;
-                ntex::connect::rustls::TlsClientFilter::create(io, tls.clone(), name)
-                    .await
-                    .map(IoBoxed::from)
-                    .map_err(ConnectError::from)
+                let (io, host) = open_web_io(proxy.as_ref(), request, 443, &non_public, |req| {
+                    service.call(req)
+                })
+                .await?;
+                wrap_tls(io, &host, tls.clone()).await
             },
         )))
 }

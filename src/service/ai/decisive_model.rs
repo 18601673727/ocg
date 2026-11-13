@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use ntex::http::StatusCode;
@@ -9,12 +8,10 @@ use serde_json::{Value, json};
 use super::providers::observe::{self, Redactor};
 use super::providers::openai_compatible::NormalizedUsage;
 use super::providers::{
-    CredentialResolver, MAX_PROVIDER_ERROR_BYTES, ModelListError, ProviderExecutionConfig,
-    ProviderExecutionError, ProviderModel, ResponseFacts,
+    CredentialResolver, MAX_PROVIDER_ERROR_BYTES, ProviderExecutionConfig, ProviderExecutionError,
+    ResponseFacts,
 };
-use crate::system::http::{
-    DiscoveryClientError, authorization, discovery_client, provider_client_for,
-};
+use crate::system::http::{authorization, provider_client_for};
 
 use crate::db::entities::{
     DecisionAnswer, DecisionConfidence, DecisionOutcome, DecisionQuestion, DecisionRequest,
@@ -32,15 +29,24 @@ pub(crate) struct DecisionExecution {
     pub finished_in: Duration,
 }
 
-async fn execute_native(
+pub(crate) async fn execute_native_with_sink(
     frozen: &NativeDecisionConfig,
     input: &DecisionRequest,
     body: &Value,
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
     reference: RequestRef,
-    sink: Option<&mut dyn super::providers::ProviderOutputSink>,
+    sink: &mut dyn super::providers::ProviderOutputSink,
 ) -> Result<DecisionExecution, ProviderExecutionError> {
+    if frozen
+        .endpoint
+        .as_deref()
+        .is_none_or(|endpoint| !crate::system::http::direct_diagnostic_loopback(endpoint))
+    {
+        return Err(ProviderExecutionError::Build {
+            message: "direct loopback endpoint required".into(),
+        });
+    }
     input
         .validate(&frozen.model.declared_capabilities)
         .map_err(|message| ProviderExecutionError::Build {
@@ -75,13 +81,11 @@ async fn execute_native(
         .if_some(authorization, |authorization, request| {
             request.set_header("authorization", authorization)
         });
-    if let Some(sink) = sink {
-        sink.sending(body)
-            .await
-            .map_err(|error| ProviderExecutionError::NotDelivered {
-                message: error.message,
-            })?;
-    }
+    sink.sending(body)
+        .await
+        .map_err(|error| ProviderExecutionError::NotDelivered {
+            message: error.message,
+        })?;
     let started = Instant::now();
     let sent = select(
         config.cancellation.cancelled(),
@@ -190,27 +194,6 @@ async fn execute_native(
         &redactor,
         finished_in,
     )
-}
-
-pub(crate) async fn execute_native_with_sink(
-    frozen: &NativeDecisionConfig,
-    input: &DecisionRequest,
-    body: &Value,
-    resolver: &dyn CredentialResolver,
-    config: &ProviderExecutionConfig,
-    reference: RequestRef,
-    sink: &mut dyn super::providers::ProviderOutputSink,
-) -> Result<DecisionExecution, ProviderExecutionError> {
-    if frozen
-        .endpoint
-        .as_deref()
-        .is_none_or(|endpoint| !crate::system::http::direct_diagnostic_loopback(endpoint))
-    {
-        return Err(ProviderExecutionError::Build {
-            message: "direct loopback endpoint required".into(),
-        });
-    }
-    execute_native(frozen, input, body, resolver, config, reference, Some(sink)).await
 }
 
 fn decode_decision(
@@ -574,108 +557,6 @@ fn decode_usage(usage: Option<&Value>) -> NormalizedUsage {
         raw: Some(usage.clone()),
         ..NormalizedUsage::default()
     }
-}
-
-pub(crate) async fn list_models(
-    endpoint: &str,
-    credential: Option<&str>,
-    headers: &crate::system::http::RequestHeaders,
-) -> Result<Vec<ProviderModel>, ModelListError> {
-    if !crate::system::http::discovery_permitted(endpoint) {
-        return Err(ModelListError::NotAuthorized);
-    }
-    let base =
-        super::providers::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;
-    let authorization = credential
-        .map(authorization)
-        .transpose()
-        .map_err(|_| ModelListError::Unreachable)?;
-    ntex::time::timeout(Duration::from_secs(30), async {
-        let client = discovery_client(Duration::from_secs(30), endpoint)
-            .await
-            .map_err(|error| match error {
-                DiscoveryClientError::NotAuthorized => ModelListError::NotAuthorized,
-                DiscoveryClientError::Unavailable => ModelListError::Unreachable,
-            })?;
-
-        let (status, body) = {
-            let request = headers
-                .apply(client.get(&base))
-                .set_header(ACCEPT, "application/json")
-                .if_some(authorization.clone(), |authorization, request| {
-                    request.set_header("authorization", authorization)
-                });
-            let response = request
-                .send()
-                .await
-                .map_err(|_| ModelListError::Unreachable)?;
-            let status = response.status().as_u16();
-            if status == 404 {
-                return Err(ModelListError::NotListed);
-            }
-            let body = match response.body().limit(1024 * 1024).await {
-                Ok(body) => body.to_vec(),
-                Err(_) => return Err(ModelListError::Unreachable),
-            };
-            (status, body)
-        };
-        let value = (body.len() <= 1024 * 1024)
-            .then(|| serde_json::from_slice::<Value>(&body).ok())
-            .flatten();
-        if !(200..300).contains(&status) {
-            let message = value
-                .as_ref()
-                .and_then(|value| value.get("detail"))
-                .and_then(Value::as_str)
-                .or_else(|| value.as_ref()?.get("message")?.as_str())
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("provider returned HTTP {status}"));
-            let message = credential.filter(|secret| !secret.is_empty()).map_or_else(
-                || message.clone(),
-                |secret| message.replace(secret, "[redacted]"),
-            );
-            let message = headers
-                .secrets()
-                .iter()
-                .filter(|secret| !secret.is_empty())
-                .fold(message, |message, secret| {
-                    message.replace(secret.as_str(), "[redacted]")
-                });
-            return Err(ModelListError::Rejected {
-                status_code: status,
-                message,
-            });
-        }
-        let entries = value
-            .as_ref()
-            .and_then(|value| value.get("models"))
-            .and_then(Value::as_array)
-            .ok_or(ModelListError::NotListed)?;
-        let mut models = BTreeMap::new();
-        for entry in entries {
-            let Some(name) = entry
-                .get("name")
-                .and_then(Value::as_str)
-                .filter(|name| !name.is_empty() && name.len() <= 512)
-            else {
-                continue;
-            };
-            if credential.is_some_and(|secret| !secret.is_empty() && name.contains(secret)) {
-                continue;
-            }
-            models.insert(name.to_owned(), None);
-        }
-        Ok(models
-            .into_iter()
-            .map(|(id, context_window)| ProviderModel {
-                id,
-                context_window,
-                reasoning_efforts: None,
-            })
-            .collect())
-    })
-    .await
-    .map_err(|_| ModelListError::Unreachable)?
 }
 
 pub(crate) fn request_body(
