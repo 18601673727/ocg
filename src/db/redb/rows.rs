@@ -39,6 +39,18 @@ pub(crate) fn usage_agent(row: &JobSpec, parent: Option<&JobSpec>) -> u128 {
 impl JobSpec {
     pub(super) const MUTABLE_CONVERSATION_TAG: u8 = 53;
 
+    pub(super) fn is_chunk_group(&self) -> bool {
+        self.parent_id.is_some()
+            && matches!(
+                self.kind,
+                JobKind::Group {
+                    origin: Origin::System,
+                    keep_open: false,
+                    ..
+                }
+            )
+    }
+
     pub(super) fn encode_mutable_conversation(&self) -> Vec<u8> {
         let mut encoded = self.encode();
         encoded[0] = Self::MUTABLE_CONVERSATION_TAG;

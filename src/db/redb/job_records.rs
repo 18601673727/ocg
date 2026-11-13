@@ -116,6 +116,12 @@ impl Batch {
             });
         }
         let row = self.require_mutable_conversation(conversation)?;
+        if row.is_chunk_group() {
+            refuse!(
+                "compaction_unavailable",
+                "Chunk Groups do not have conversation history"
+            );
+        }
         if automatic.is_none() {
             let (policy, _, _) =
                 self.step(|tx| reader::effective_context_policy(&tx.open_table(META)?))?;
@@ -448,8 +454,7 @@ impl Batch {
             self.insert(CONVERSATIONS, chunk_group.get(), ())?;
             self.insert(UNSETTLED, chunk_group.get(), (0, 0))?;
             self.insert(CHILDREN, (conversation.get(), chunk_group.get()), ())?;
-            self.insert(CHILD_GROUPS, (conversation.get(), chunk_group.get()), ())?;
-            self.insert(LIVE_CHILDREN, (conversation.get(), chunk_group.get()), ())?;
+            self.link_job_group(conversation, chunk_group)?;
             self.adjust_open_children(conversation, 1)?;
             for (idx, stage) in stages.iter().enumerate() {
                 if let SummarizationStage::Chunk { start, end, .. } = *stage {
@@ -583,6 +588,7 @@ impl Batch {
                 )?;
             }
             tx.open_table(PENDING)?.insert(job.id.get(), ())?;
+            // Summary producers and parallel Chunks are children outside the Turn sequence.
             tx.open_table(CHILDREN)?
                 .insert((job.parent_id.get(), job.id.get()), ())?;
             tx.open_table(UNSETTLED)?

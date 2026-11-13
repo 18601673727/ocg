@@ -959,13 +959,24 @@ pub(super) fn initialize(
     let abandoned = {
         let rebuild = match verification {
             Verification::Full => true,
-            Verification::Quick => !clean_shutdown || indexes_missing,
+            Verification::Quick => {
+                !clean_shutdown || indexes_missing || chunk_turns_indexed(&batch.tx)?
+            }
         };
         if rebuild {
             rebuild_mutable_jobs(&mut batch).map_err(|BatchError(failure)| match failure {
                 Failure::Storage(error) => error,
                 Failure::Rejected(violation) => {
                     StorageError::corrupted(format!("new-model recovery refused: {violation}"))
+                }
+            })?;
+        } else {
+            settle_rebuilt_chunk_groups(&mut batch, false).map_err(|BatchError(failure)| {
+                match failure {
+                    Failure::Storage(error) => error,
+                    Failure::Rejected(violation) => StorageError::corrupted(format!(
+                        "Chunk Group recovery refused: {violation}"
+                    )),
                 }
             })?;
         }
@@ -1051,6 +1062,8 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
         tx.delete_table(CONVERSATIONS)?;
         tx.delete_table(TURNS)?;
         tx.delete_table(CHILDREN)?;
+        tx.delete_table(CHILD_GROUPS)?;
+        tx.delete_table(LIVE_CHILDREN)?;
         tx.delete_table(SUCCESSORS)?;
         tx.delete_table(UNSETTLED)?;
         tx.delete_table(CONVERSATION_SEARCH)?;
@@ -1060,6 +1073,8 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
         tx.open_table(CONVERSATIONS)?;
         tx.open_table(TURNS)?;
         tx.open_table(CHILDREN)?;
+        tx.open_table(CHILD_GROUPS)?;
+        tx.open_table(LIVE_CHILDREN)?;
         tx.open_table(SUCCESSORS)?;
         tx.open_table(UNSETTLED)?;
         tx.open_table(CONVERSATION_SEARCH)?;
@@ -1111,46 +1126,44 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
                 continue;
             }
         };
-        let is_summary = job.summary_source.is_some();
         if job.phase != MutableJobPhase::Unsubmitted {
-            if !is_summary {
+            if !batch.is_summary_work(&job)? {
                 batch.insert(TURNS, (job.parent_id.get(), job.id.get()), ())?;
                 batch.step(|tx| {
                     indexes::update_mutable_turn_search(tx, job.parent_id, job.id, None, &job.input)
                 })?;
-                if let Some(outcome) = &state.outcome {
-                    batch.step(|tx| {
-                        let outputs = tx.open_table(JOB_OUTPUTS)?;
-                        let mut result = None;
-                        for entry in outputs.range((job.id.get(), 0)..=(job.id.get(), u32::MAX))? {
-                            let (key, value) = entry?;
-                            if rows::output_kind(value.value())? == OutputKind::Result {
-                                result = Some(decode_output(key.value(), value.value())?);
-                            }
+            }
+            if let Some(outcome) = &state.outcome {
+                batch.step(|tx| {
+                    let outputs = tx.open_table(JOB_OUTPUTS)?;
+                    let mut result = None;
+                    for entry in outputs.range((job.id.get(), 0)..=(job.id.get(), u32::MAX))? {
+                        let (key, value) = entry?;
+                        if rows::output_kind(value.value())? == OutputKind::Result {
+                            result = Some(decode_output(key.value(), value.value())?);
                         }
-                        if let Some(result) = result {
-                            indexes::append_output_search_index(
-                                tx,
-                                job.parent_id,
-                                job.id,
-                                &result,
-                                outcome.kind == OutcomeKind::Completed,
-                            )?;
-                            let mut results = tx.open_table(GROUP_RESULTS)?;
-                            let old = results
-                                .get(job.parent_id.get())?
-                                .map_or((0, 0), |v| v.value());
-                            let latest = if outcome.kind == OutcomeKind::Cancelled {
-                                old.0
-                            } else {
-                                old.0.max(job.id.get())
-                            };
-                            results
-                                .insert(job.parent_id.get(), (latest, old.1.max(job.id.get())))?;
-                        }
-                        Ok(())
-                    })?;
-                }
+                    }
+                    if let Some(result) = result {
+                        indexes::append_output_search_index(
+                            tx,
+                            job.parent_id,
+                            job.id,
+                            &result,
+                            outcome.kind == OutcomeKind::Completed,
+                        )?;
+                        let mut results = tx.open_table(GROUP_RESULTS)?;
+                        let old = results
+                            .get(job.parent_id.get())?
+                            .map_or((0, 0), |v| v.value());
+                        let latest = if outcome.kind == OutcomeKind::Cancelled {
+                            old.0
+                        } else {
+                            old.0.max(job.id.get())
+                        };
+                        results.insert(job.parent_id.get(), (latest, old.1.max(job.id.get())))?;
+                    }
+                    Ok(())
+                })?;
             }
             batch.insert(CHILDREN, (job.parent_id.get(), job.id.get()), ())?;
             if let Some(previous) = job.previous {
@@ -1245,8 +1258,9 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
             }
         }
     }
+    settle_rebuilt_conversations(batch)?;
     rebuild_native_dependencies(batch)?;
-    settle_rebuilt_conversations(batch)
+    settle_rebuilt_chunk_groups(batch, true)
 }
 
 fn rebuild_native_dependencies(batch: &mut Batch) -> Result<(), BatchError> {
@@ -1399,6 +1413,56 @@ fn settle_rebuilt_conversations(batch: &mut Batch) -> Result<(), BatchError> {
         };
         before = Some(id);
     }
+}
+
+fn settle_rebuilt_chunk_groups(batch: &mut Batch, rebuilt: bool) -> Result<(), BatchError> {
+    use std::ops::Bound::{Excluded, Unbounded};
+
+    let mut after = None;
+    loop {
+        let next = batch.step(|tx| {
+            let groups = tx.open_table(CHILD_GROUPS)?;
+            let Some(entry) = groups
+                .range((after.map_or(Unbounded, Excluded), Unbounded))?
+                .next()
+            else {
+                return Ok(None);
+            };
+            Ok(Some(entry?.0.value()))
+        })?;
+        let Some(key) = next else {
+            return Ok(());
+        };
+        after = Some(key);
+        let spec = batch.require_mutable_conversation(JobId::new(key.1))?;
+        if spec.is_chunk_group() {
+            batch.recover_chunk_group(&spec, rebuilt)?;
+        }
+    }
+}
+
+fn chunk_turns_indexed(tx: &WriteTransaction) -> Result<bool, StorageError> {
+    let groups = tx.open_table(CHILD_GROUPS)?;
+    let jobs = tx.open_table(JOBS)?;
+    let turns = tx.open_table(TURNS)?;
+    for entry in groups.iter()? {
+        let (_, group) = entry?.0.value();
+        if turns
+            .range((group, 0)..=(group, u128::MAX))?
+            .next()
+            .transpose()?
+            .is_none()
+        {
+            continue;
+        }
+        let row = jobs
+            .get(group)?
+            .ok_or_else(|| StorageError::corrupted("child Group missing"))?;
+        if JobSpec::decode_at(group, row.value())?.is_chunk_group() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 pub(super) fn allocate(tx: &WriteTransaction) -> Result<u128, StorageError> {

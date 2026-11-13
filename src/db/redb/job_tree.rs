@@ -214,6 +214,7 @@ impl Batch {
     fn require_room_for_child(&mut self, parent: JobId) -> Result<(), BatchError> {
         let row = self.require_mutable_conversation(parent)?;
         if !row.kind.is_group()
+            || row.is_chunk_group()
             || self.require_job_state(parent)?.outcome.is_some()
             || self.job_control(parent)?.closing.is_some()
         {
@@ -334,12 +335,17 @@ impl Batch {
     pub(crate) fn mutable_job_blocked(&mut self, job: &MutableJob) -> Result<bool, BatchError> {
         let mut current = Some(job.parent_id);
         let mut own = true;
+        let summary = self.is_summary_work(job)?;
         for _ in 0..=crate::db::entities::MAX_JOB_DEPTH {
             let Some(conversation) = current else {
                 return Ok(false);
             };
             let control = self.job_control(conversation)?;
-            if control.on_hold.is_some() {
+            if control.on_hold.is_some()
+                || (summary
+                    && (control.closing.is_some()
+                        || self.require_job_state(conversation)?.outcome.is_some()))
+            {
                 return Ok(true);
             }
             if own {
@@ -357,14 +363,34 @@ impl Batch {
         self.corrupted("conversation ancestry exceeds the hard depth limit".into())
     }
 
+    pub(super) fn is_summary_work(&mut self, job: &MutableJob) -> Result<bool, BatchError> {
+        Ok(job.summary_source.is_some()
+            || self
+                .require_mutable_conversation(job.parent_id)?
+                .is_chunk_group())
+    }
+
     fn stop_unsettled_turns(
         &mut self,
         conversation: JobId,
         cause: &OutcomeCause,
     ) -> Result<(Vec<AllocationToken>, Vec<JobId>), BatchError> {
+        let spec = self.require_mutable_conversation(conversation)?;
+        let chunk_group = spec.is_chunk_group();
+        let mut jobs = if chunk_group {
+            self.chunk_members(conversation)?
+        } else {
+            self.unsettled_turns(conversation)?
+        };
+        if !chunk_group && matches!(cause, OutcomeCause::Closed) {
+            jobs.extend(self.unsettled_summary_producers(conversation)?);
+        }
         let mut running = Vec::new();
         let mut ended = Vec::new();
-        for turn in self.unsettled_turns(conversation)? {
+        for turn in jobs {
+            if self.require_job_state(turn)?.outcome.is_some() {
+                continue;
+            }
             let Some(allocation) = self.pool_allocation(turn)? else {
                 let Some(job) = self.mutable_job(turn)? else {
                     return self.corrupted("turn is not a native Job".into());
@@ -412,46 +438,33 @@ impl Batch {
         by: Actor,
     ) -> Result<JobAction, BatchError> {
         self.require_mutable_conversation(conversation)?;
-        if self.job_control(conversation)?.closing.is_some() {
-            let subtree = self.live_subtree(conversation)?;
-            let mut running = Vec::new();
-            let mut ended = Vec::new();
-            for current in &subtree {
-                let (tokens, never_ran) =
-                    self.stop_unsettled_turns(*current, &OutcomeCause::Closed)?;
-                running.extend(tokens);
-                ended.extend(never_ran);
-            }
-            for current in subtree.into_iter().rev() {
-                self.settle_closing(current)?;
-            }
-            return Ok(JobAction {
-                conversation,
-                record_seq: None,
-                running,
-                ended,
-                already: true,
-                settled: self.require_job_state(conversation)?.outcome.is_some(),
-            });
-        }
+        let already = self.job_control(conversation)?.closing.is_some();
         let subtree = self.live_subtree(conversation)?;
+        for current in &subtree {
+            let mut control = self.job_control(*current)?;
+            if control.closing.is_none() {
+                control.closing = Some(JobClosing {
+                    at: self.now,
+                    by: by.clone(),
+                    running: false,
+                });
+                self.put_job_control(*current, &control)?;
+                self.void_approvals(*current, by.clone())?;
+            }
+        }
         let mut running = Vec::new();
         let mut all_ended = Vec::new();
         for current in &subtree {
-            let mut control = self.job_control(*current)?;
-            if control.closing.is_some() {
-                continue;
-            }
-            let (ended, never_ran) = self.stop_unsettled_turns(*current, &OutcomeCause::Closed)?;
+            let (tokens, never_ran) = self.stop_unsettled_turns(*current, &OutcomeCause::Closed)?;
             all_ended.extend(never_ran);
-            control.closing = Some(JobClosing {
-                at: self.now,
-                by: by.clone(),
-                running: !ended.is_empty(),
-            });
-            self.put_job_control(*current, &control)?;
-            self.void_approvals(*current, by.clone())?;
-            running.extend(ended);
+            if !tokens.is_empty() {
+                let mut control = self.job_control(*current)?;
+                if let Some(closing) = &mut control.closing {
+                    closing.running = true;
+                    self.put_job_control(*current, &control)?;
+                }
+            }
+            running.extend(tokens);
         }
         for current in subtree.into_iter().rev() {
             self.settle_closing(current)?;
@@ -461,20 +474,24 @@ impl Batch {
             record_seq: None,
             running,
             ended: all_ended,
-            already: false,
-            settled: false,
+            already,
+            settled: already && self.require_job_state(conversation)?.outcome.is_some(),
         })
     }
 
     fn settle_closing(&mut self, conversation: JobId) -> Result<(), BatchError> {
         let control = self.job_control(conversation)?;
-        let mut state = self.require_job_state(conversation)?;
         let Some(closing) = control.closing else {
             return Ok(());
         };
-        if state.outcome.is_some()
+        let spec = self.require_mutable_conversation(conversation)?;
+        if spec.is_chunk_group() {
+            return self.settle_chunk_group(&spec);
+        }
+        if self.require_job_state(conversation)?.outcome.is_some()
             || !self.unsettled_turns(conversation)?.is_empty()
             || !self.live_children(conversation)?.is_empty()
+            || !self.unsettled_summary_producers(conversation)?.is_empty()
         {
             return Ok(());
         }
@@ -494,17 +511,26 @@ impl Batch {
                 && outcome.kind == OutcomeKind::Completed
                 && outcome.cause != Some(OutcomeCause::Closed)
         });
-        state.outcome = Some(match kept {
-            Some(outcome) => outcome,
-            None => OutcomeRecord {
+        self.record_conversation_outcome(
+            &spec,
+            kept.unwrap_or(OutcomeRecord {
                 kind: OutcomeKind::Cancelled,
                 at: self.now,
                 cause: Some(OutcomeCause::Closed),
-            },
-        });
+            }),
+        )
+    }
+
+    fn record_conversation_outcome(
+        &mut self,
+        spec: &JobSpec,
+        outcome: OutcomeRecord,
+    ) -> Result<(), BatchError> {
+        let conversation = spec.id;
+        let mut state = self.require_job_state(conversation)?;
+        state.outcome = Some(outcome);
         self.put_job_state(conversation, &state)?;
-        let parent = self.require_mutable_conversation(conversation)?.parent_id;
-        if let Some(parent) = parent {
+        if let Some(parent) = spec.parent_id {
             self.remove(LIVE_CHILDREN, (parent.get(), conversation.get()))?;
         }
         let released = self.step(|tx| {
@@ -515,10 +541,171 @@ impl Batch {
                 Some(_) | None => false,
             })
         })?;
-        if released && let Some(parent) = parent {
+        if released && let Some(parent) = spec.parent_id {
             self.adjust_open_children(parent, -1)?;
         }
         Ok(())
+    }
+
+    fn chunk_members(&mut self, group: JobId) -> Result<Vec<JobId>, BatchError> {
+        self.step(|tx| {
+            tx.open_table(CHILDREN)?
+                .range((group.get(), 0)..=(group.get(), u128::MAX))?
+                .map(|entry| Ok(JobId::new(entry?.0.value().1)))
+                .collect()
+        })
+    }
+
+    fn unsettled_summary_producers(
+        &mut self,
+        conversation: JobId,
+    ) -> Result<Vec<JobId>, BatchError> {
+        self.step(|tx| {
+            let unsettled = tx.open_table(UNSETTLED)?;
+            let Some(counts) = unsettled.get(conversation.get())? else {
+                return Ok(Vec::new());
+            };
+            if counts.value().1 == 0 {
+                return Ok(Vec::new());
+            }
+            let children = tx.open_table(CHILDREN)?;
+            let jobs = tx.open_table(JOBS)?;
+            let mut producers = Vec::new();
+            for entry in
+                children.range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
+            {
+                let id = entry?.0.value().1;
+                if unsettled.get(id)?.is_none() {
+                    continue;
+                }
+                let row = jobs
+                    .get(id)?
+                    .ok_or_else(|| StorageError::corrupted("child Job missing"))?;
+                if row.value().first() == Some(&TAG_JOB)
+                    && transactions::decode_mutable_job(id, row.value())?
+                        .summary_source
+                        .is_some()
+                {
+                    producers.push(JobId::new(id));
+                }
+            }
+            Ok(producers)
+        })
+    }
+
+    pub(super) fn settle_summary_membership(&mut self, job: &MutableJob) -> Result<(), BatchError> {
+        let spec = self.require_mutable_conversation(job.parent_id)?;
+        if spec.is_chunk_group() {
+            self.settle_chunk_group(&spec)?;
+        } else if job.summary_source.is_some() {
+            self.settle_closing(spec.id)?;
+        }
+        Ok(())
+    }
+
+    fn settle_chunk_group(&mut self, spec: &JobSpec) -> Result<(), BatchError> {
+        let group = spec.id;
+        if self.require_job_state(group)?.outcome.is_some() {
+            return Ok(());
+        }
+        // Chunk Jobs are parallel members in CHILDREN. They have no sequential head in TURNS.
+        let counts = self.step(|tx| {
+            Ok(tx
+                .open_table(UNSETTLED)?
+                .get(group.get())?
+                .map(|row| row.value()))
+        })?;
+        if counts != Some((0, 0)) {
+            return Ok(());
+        }
+        let Some(outcome) = self.chunk_group_outcome(group)? else {
+            return Ok(());
+        };
+        let mut control = self.job_control(group)?;
+        if control.closing.is_none() {
+            control.closing = Some(JobClosing {
+                at: outcome.at,
+                by: Actor::Auto,
+                running: false,
+            });
+            self.put_job_control(group, &control)?;
+        }
+        self.record_conversation_outcome(spec, outcome)?;
+        if let Some(parent) = spec.parent_id {
+            self.settle_closing(parent)?;
+        }
+        Ok(())
+    }
+
+    fn chunk_group_outcome(&mut self, group: JobId) -> Result<Option<OutcomeRecord>, BatchError> {
+        let mut aggregate: Option<OutcomeRecord> = None;
+        for chunk in self.chunk_members(group)? {
+            let Some(outcome) = self.require_job_state(chunk)?.outcome else {
+                return Ok(None);
+            };
+            if outcome.kind == OutcomeKind::Unknown
+                || self
+                    .pool_allocation(chunk)?
+                    .is_some_and(|allocation| allocation.holds_capacity())
+            {
+                return Ok(None);
+            }
+            aggregate = Some(match aggregate {
+                None => outcome,
+                Some(previous) => {
+                    // A failed member determines the Group result even if others were cancelled.
+                    let at = previous.at.max(outcome.at);
+                    let worst = match (previous.kind, outcome.kind) {
+                        (OutcomeKind::Completed, _)
+                        | (OutcomeKind::Cancelled, OutcomeKind::Failed) => outcome,
+                        _ => previous,
+                    };
+                    OutcomeRecord { at, ..worst }
+                }
+            });
+        }
+        if aggregate.is_none() {
+            return self.corrupted("Chunk Group has no members".into());
+        }
+        Ok(aggregate)
+    }
+
+    pub(super) fn recover_chunk_group(
+        &mut self,
+        spec: &JobSpec,
+        rebuilt: bool,
+    ) -> Result<(), BatchError> {
+        let group = spec.id;
+        let Some(parent) = spec.parent_id else {
+            return self.corrupted("Chunk Group has no parent".into());
+        };
+        let mut state = self.require_job_state(group)?;
+        let control = self.job_control(group)?;
+        let unsettled =
+            self.step(|tx| Ok(tx.open_table(UNSETTLED)?.get(group.get())?.is_some()))?;
+        if state.outcome.is_some() {
+            if !unsettled {
+                if rebuilt
+                    && let Some(outcome) = self.chunk_group_outcome(group)?
+                    && state.outcome.as_ref() != Some(&outcome)
+                {
+                    state.outcome = Some(outcome);
+                    self.put_job_state(group, &state)?;
+                }
+                return Ok(());
+            }
+            // Older writers could close the Group while its Chunks still owned this row.
+            state.outcome = None;
+            self.put_job_state(group, &state)?;
+            self.insert(LIVE_CHILDREN, (parent.get(), group.get()), ())?;
+        }
+        let parent_closed = self.job_control(parent)?.closing.is_some()
+            || self.require_job_state(parent)?.outcome.is_some();
+        if control.closing.is_some() || parent_closed {
+            // Startup has already refused Held Allocations. Only queued work can be ended here.
+            self.stop_unsettled_turns(group, &OutcomeCause::Closed)?;
+        }
+        self.settle_chunk_group(spec)
     }
 
     pub(crate) fn hold(
@@ -663,6 +850,9 @@ impl Batch {
         };
         let conversation = turn.parent_id;
         let spec = self.require_mutable_conversation(conversation)?;
+        if spec.is_chunk_group() || turn.summary_source.is_some() {
+            return Ok(false);
+        }
         let Some(parent) = spec.parent_id else {
             return Ok(false);
         };
@@ -682,6 +872,7 @@ impl Batch {
             && outcome.kind == OutcomeKind::Completed
             && !control.user_input
             && self.live_children(conversation)?.is_empty()
+            && self.unsettled_summary_producers(conversation)?.is_empty()
             && !self.has_open_job_approvals(conversation)?
         {
             let mut control = control;

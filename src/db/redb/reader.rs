@@ -877,14 +877,7 @@ pub(crate) struct DevelopmentExecutionContext {
 
 impl DevelopmentExecutionContext {
     pub(crate) fn is_summary_work(&self) -> bool {
-        self.job.summary_source.is_some()
-            || matches!(
-                self.conversation.kind,
-                JobKind::Group {
-                    origin: Origin::System,
-                    ..
-                }
-            )
+        self.job.summary_source.is_some() || self.conversation.is_chunk_group()
     }
 }
 
@@ -2521,9 +2514,7 @@ fn tree_node(
             else {
                 return Err(StorageError::corrupted("conversation row is not a group"));
             };
-            let tip = turn_head(&rx.open_table(TURNS)?, row.id)?
-                .ok_or_else(|| StorageError::corrupted(format!("{} has no tip", row.id)))?;
-            let summary = conversation_summary(rx, row.id, tip)?;
+            let summary = conversation_summary(rx, row, conversation_tip(rx, row)?)?;
             let state = match summary.state.as_str() {
                 "open" => "open",
                 "closing" => "closing",
@@ -2801,17 +2792,26 @@ fn conversation_result(
     conversation: JobId,
 ) -> Result<Option<JobOutputRecord>, StorageError> {
     let state = read_state(rx, conversation)?;
-    if state.outcome.is_none() {
+    let Some(outcome) = state.outcome else {
         return Ok(None);
-    }
+    };
     let mut summary = String::new();
     let mut value = None;
-    let answered = rx
+    let row = read_job_row(rx, conversation)?
+        .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
+    if row.is_chunk_group() {
+        summary = match outcome.kind {
+            OutcomeKind::Completed => "All summary chunks completed.",
+            OutcomeKind::Failed => "A summary chunk failed.",
+            OutcomeKind::Cancelled => "A summary chunk was cancelled.",
+            OutcomeKind::Unknown => "The summary chunks have an unknown outcome.",
+        }
+        .to_owned();
+    } else if let Some(turn) = rx
         .open_table(GROUP_RESULTS)?
         .get(conversation.get())?
         .map(|tips| tips.value().1)
-        .filter(|turn| *turn != 0);
-    if let Some(turn) = answered
+        .filter(|turn| *turn != 0)
         && let Some((key, bytes)) = rx
             .open_table(JOB_OUTPUTS)?
             .range((turn, 0)..=(turn, u32::MAX))?
@@ -2856,9 +2856,7 @@ fn conversation_result(
         code: None,
         goal_reached: None,
         value,
-        created_at: state
-            .outcome
-            .map_or(Timestamp::from_unix_micros(0), |outcome| outcome.at),
+        created_at: outcome.at,
     }))
 }
 
@@ -3989,11 +3987,10 @@ fn conversation_title(
 
 fn conversation_summary(
     rx: &ReadTransaction,
-    conversation: JobId,
-    tip: JobId,
+    row: &JobSpec,
+    tip: Option<JobId>,
 ) -> Result<ConversationEntry, StorageError> {
-    let row = read_job_row(rx, conversation)?
-        .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
+    let conversation = row.id;
     let JobKind::Group { agent, project, .. } = row.kind else {
         return Err(StorageError::corrupted(
             "recent entry is not a conversation",
@@ -4016,14 +4013,19 @@ fn conversation_summary(
             Actor::User
         }
     });
-    let tip_state = read_state(rx, tip)?;
-    let tip_created_at = mutable_job_record_in(rx, tip)?
-        .ok_or_else(|| StorageError::corrupted("missing tip"))?
-        .job
-        .created_at;
+    let (tip_state, tip_created_at) = match tip {
+        Some(tip) => (
+            read_state(rx, tip)?,
+            mutable_job_record_in(rx, tip)?
+                .ok_or_else(|| StorageError::corrupted("missing tip"))?
+                .job
+                .created_at,
+        ),
+        None => (state.clone(), row.created_at),
+    };
     Ok(ConversationEntry {
         root_job: conversation,
-        tip_job: tip,
+        tip_job: tip.unwrap_or(conversation),
         agent,
         project,
         title,
@@ -4046,9 +4048,18 @@ fn conversation_summary(
             })
             .to_owned(),
         tip_created_at,
-        job_state: conversation_job_state(rx, conversation, tip)?,
+        job_state: conversation_job_state(rx, conversation, tip.unwrap_or(conversation))?,
         has_children: has_visible_child(rx, conversation)?,
     })
+}
+
+fn conversation_tip(rx: &ReadTransaction, row: &JobSpec) -> Result<Option<JobId>, StorageError> {
+    if row.is_chunk_group() {
+        return Ok(None);
+    }
+    turn_head(&rx.open_table(TURNS)?, row.id)?
+        .map(Some)
+        .ok_or_else(|| StorageError::corrupted(format!("{} has no tip", row.id)))
 }
 #[derive(Clone, Debug, PartialEq)]
 pub struct ChildConversationEntry {
@@ -4075,15 +4086,13 @@ pub(crate) fn read_conversation_children(
         let child = JobId::new(entry?.0.value().1);
         let row = read_job_row(&rx, child)?
             .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
+        let conversation = conversation_summary(&rx, &row, conversation_tip(&rx, &row)?)?;
         let JobKind::Group {
             origin, keep_open, ..
         } = row.kind
         else {
             return Err(StorageError::corrupted("child is not a conversation"));
         };
-        let tip = turn_head(&rx.open_table(TURNS)?, child)?
-            .ok_or_else(|| StorageError::corrupted("child tip missing"))?;
-        let conversation = conversation_summary(&rx, child, tip)?;
         children.push(ChildConversationEntry {
             job_state: conversation.job_state.clone(),
             conversation,
@@ -4169,7 +4178,7 @@ fn conversation_page(
                 break;
             }
             last = Some(conversation);
-            conversations.push(conversation_summary(&rx, conversation, tip)?);
+            conversations.push(conversation_summary(&rx, &row, Some(tip))?);
             if !terms.is_empty() && conversations.len() == limit {
                 has_more = true;
                 break;

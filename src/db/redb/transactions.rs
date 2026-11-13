@@ -1227,6 +1227,7 @@ impl Batch {
                     }
                 }
                 if !row.kind.is_group()
+                    || row.is_chunk_group()
                     || self.require_job_state(parent)?.outcome.is_some()
                     || self.job_control(parent)?.closing.is_some()
                 {
@@ -1597,6 +1598,7 @@ impl Batch {
         self.put_mutable_job_state(id, &state)?;
         self.probe = Some(Probe::Outcome(id));
         self.settle_native_dependents(id, OutcomeKind::Cancelled)?;
+        self.settle_summary_membership(job)?;
         Ok(())
     }
 
@@ -1686,6 +1688,7 @@ impl Batch {
         }
         let mut parent = self.require_mutable_conversation(job.parent_id)?;
         if !parent.kind.is_group()
+            || parent.is_chunk_group()
             || self.require_job_state(job.parent_id)?.outcome.is_some()
             || self.job_control(job.parent_id)?.closing.is_some()
         {
@@ -3085,6 +3088,12 @@ impl Batch {
                 "conversation predecessor is not settled",
             ));
         }
+        if self.is_summary_work(snapshot)? && self.mutable_job_blocked(snapshot)? {
+            return self.reject(Violation::InvalidValue(
+                "handoff",
+                "summary conversation is not eligible",
+            ));
+        }
         let expected = prepared.expected_credential_references();
         let evidence: Vec<(&str, &[u8])> = prepared.credential_evidence().collect();
         let mut credential_matches = expected.len() == evidence.len()
@@ -3184,7 +3193,9 @@ impl Batch {
             || state.outcome.is_some()
             || state.stop_confirmed_at.is_some()
             || state.stop_confirmed_by.is_some()
-            || self.job_control(job.parent_id)?.closing.is_some()
+            || (self.job_control(job.parent_id)?.closing.is_some()
+                && !(allocation.phase == AllocationPhase::StopRequested
+                    && self.is_summary_work(&job)?))
         {
             return self.reject(rejected());
         }
@@ -3487,6 +3498,7 @@ impl Batch {
             crate::db::entities::AllocationPhase::Released,
             None,
         )?;
+        self.settle_summary_membership(&job)?;
         self.freed_capacity = true;
         self.probe = Some(Probe::Outcome(token.job));
         if kind == OutcomeKind::Completed
@@ -3803,23 +3815,6 @@ impl Batch {
         self.advance_recurrence_on_settlement(job, kind)?;
         self.settle_native_dependents(token.job, kind)?;
         Ok((seq, id))
-    }
-
-    fn is_summary_work(
-        &mut self,
-        job: &crate::db::entities::MutableJob,
-    ) -> Result<bool, BatchError> {
-        if job.summary_source.is_some() {
-            return Ok(true);
-        }
-        let parent = self.require_mutable_conversation(job.parent_id)?;
-        Ok(matches!(
-            parent.kind,
-            JobKind::Group {
-                origin: Origin::System,
-                ..
-            }
-        ))
     }
 
     pub(super) fn dependency_outcome_state(
@@ -4413,7 +4408,7 @@ impl Batch {
         token: crate::db::entities::AllocationToken,
         cause: crate::db::entities::UnstartedCause,
     ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
-        self.end_untouched_reservation(
+        let (job, output) = self.end_untouched_reservation(
             token,
             OutcomeKind::Failed,
             crate::db::entities::FinalResult {
@@ -4422,7 +4417,13 @@ impl Batch {
                 goal_reached: Some(false),
                 value: None,
             },
-        )
+        )?;
+        // Offline reservation publication verifies a target-specific delta.
+        // The Chunk Group is checked at startup after the result is published.
+        if cause != crate::db::entities::UnstartedCause::OfflineReconciled {
+            self.settle_summary_membership(&job)?;
+        }
+        Ok(output)
     }
 
     fn end_untouched_reservation(
@@ -4430,7 +4431,13 @@ impl Batch {
         token: crate::db::entities::AllocationToken,
         kind: OutcomeKind,
         result: crate::db::entities::FinalResult,
-    ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
+    ) -> Result<
+        (
+            crate::db::entities::MutableJob,
+            crate::db::entities::AppendedOutput,
+        ),
+        BatchError,
+    > {
         use crate::db::entities::{AllocationPhase, MutableJobPhase};
         self.require_allocation_durability()?;
         let refused = |reason: &'static str| {
@@ -4469,10 +4476,13 @@ impl Batch {
         self.put_pool_allocation(&allocation, Some(&previous))?;
         self.freed_capacity = true;
         self.probe = Some(Probe::Outcome(token.job));
-        Ok(crate::db::entities::AppendedOutput {
-            output: id,
-            seq: i64::from(seq),
-        })
+        Ok((
+            job,
+            crate::db::entities::AppendedOutput {
+                output: id,
+                seq: i64::from(seq),
+            },
+        ))
     }
 
     pub(crate) fn reconcile_stopped_allocation(
@@ -4573,7 +4583,7 @@ impl Batch {
         let token = allocation.token;
         match allocation.phase {
             AllocationPhase::Reserved => {
-                self.end_untouched_reservation(
+                let (job, _) = self.end_untouched_reservation(
                     token,
                     OutcomeKind::Cancelled,
                     crate::db::entities::FinalResult {
@@ -4583,6 +4593,7 @@ impl Batch {
                         value: None,
                     },
                 )?;
+                self.settle_summary_membership(&job)?;
                 Ok(NativeStopRequest::EndedBeforeStart(token))
             }
             AllocationPhase::Running => {
