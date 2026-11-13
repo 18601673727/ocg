@@ -2765,17 +2765,31 @@ impl Batch {
         let current_executor = self.get(CONFIGS, token.executor.get(), |bytes| {
             decode_allocation_executor(token.executor.get(), bytes)
         })?;
-        if current_pool.as_ref() != Some(pool)
-            || current_executor.as_ref() != Some(executor)
-            || !pool.enabled
+        if current_pool.as_ref().is_none_or(|current| {
+            !current.enabled
+                || current.archived
+                || current.id != token.pool
+                || current.id != pool.id
+                || current.revision < allocation.pool_revision
+                || current.revision < pool.revision
+        }) || current_executor.as_ref().is_none_or(|current| {
+            !current.enabled
+                || current.archived
+                || current.id != token.executor
+                || current.id != executor.id
+                || current.pool != token.pool
+                || current.revision < allocation.executor_revision
+                || current.revision < executor.revision
+                || !current
+                    .capabilities
+                    .contains(&(allocation.operation, allocation.protocol))
+        }) || !pool.enabled
             || pool.archived
             || !executor.enabled
             || executor.archived
             || executor.pool != pool.id
             || pool.id != token.pool
             || executor.id != token.executor
-            || pool.revision != allocation.pool_revision
-            || executor.revision != allocation.executor_revision
             || !executor
                 .capabilities
                 .contains(&(allocation.operation, allocation.protocol))
@@ -2792,7 +2806,7 @@ impl Batch {
             let own = held.iter().any(|(owner, owner_job)| {
                 *owner == token.executor.get() && *owner_job == token.job.get()
             });
-            Ok(executor_exclusive && own && held.len() as u64 <= u64::from(pool.capacity.get()))
+            Ok(executor_exclusive && own)
         })?;
         if !occupancy_valid {
             return Err(stale());

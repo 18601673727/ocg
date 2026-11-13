@@ -944,17 +944,24 @@ impl DatabaseHandle {
     }
 
     pub(crate) fn activate_filesystem_protection(&self, reason: ProtectionReason) -> bool {
-        let active = matches!(
-            self.shared.admission(),
-            Admission::Open | Admission::Protected(_)
-        );
-        if !active {
-            return false;
+        {
+            let mut admission = self
+                .shared
+                .admission
+                .write()
+                .unwrap_or_else(PoisonError::into_inner);
+            if !matches!(*admission, Admission::Open | Admission::Protected(_)) {
+                return false;
+            }
+            let lock = self.shared.protection.lock(vec![reason.clone()]);
+            *admission = Admission::Protected(lock);
         }
-        self.shared.protection.lock(vec![reason.clone()]);
-        let _ = self
+        if let Err(error) = self
             .control_sender
-            .try_send(Control::FilesystemFailure { reason });
+            .try_send(Control::FilesystemFailure { reason })
+        {
+            log::debug!("failed to enqueue filesystem protection control notice: {error}");
+        }
         true
     }
 

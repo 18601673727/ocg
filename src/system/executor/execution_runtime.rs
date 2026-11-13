@@ -296,7 +296,9 @@ async fn capture_file_snapshots(
     static LINKS: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
         std::sync::LazyLock::new(|| regex::Regex::new(r"\]\(\s*<?([^\s)>]+)"));
     static LINES: std::sync::LazyLock<Result<regex::Regex, regex::Error>> =
-        std::sync::LazyLock::new(|| regex::Regex::new(r"(?::(\d+)(?:-\d+)?|#L(\d+)(?:-L?\d+)?)$"));
+        std::sync::LazyLock::new(|| {
+            regex::Regex::new(r"(?i)(?::(\d+)(?:-\d+)?|#L(\d+)(?:-L?\d+)?)$")
+        });
     if ACTIVE
         .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
             (count < 4).then_some(count + 1)
@@ -321,8 +323,7 @@ async fn capture_file_snapshots(
             return Vec::new();
         };
         let stamp = super::workspace_read::mutation_stamp();
-        let mut seen = std::collections::HashSet::new();
-        let mut snapshots = Vec::new();
+        let mut snapshots: Vec<serde_json::Value> = Vec::new();
         for link in links.captures_iter(&text).take(32) {
             let Some(target) = link.get(1).map(|value| value.as_str()) else {
                 continue;
@@ -343,22 +344,48 @@ async fn capture_file_snapshots(
             } else {
                 (target, 1)
             };
-            let reference_path = path.to_owned();
-            let path = std::path::Path::new(path);
-            let path = if path.is_absolute() {
-                let Ok(relative) = path.strip_prefix(workspace.root()) else {
-                    continue;
-                };
-                relative
+            let path_obj = std::path::Path::new(path);
+            let reference_path = if path_obj.is_absolute() {
+                path.to_owned()
             } else {
-                path
+                path.trim_start_matches("./").to_owned()
             };
-            let Some(path) = path.to_str() else { continue };
-            let path = path.strip_prefix("./").unwrap_or(path);
-            if !seen.insert(path.to_owned()) {
+            let relative_owned;
+            let rel_path = if path_obj.is_absolute() {
+                if let Ok(relative) = path_obj.strip_prefix(workspace.root()) {
+                    relative
+                } else if let Ok(canonical) = path_obj.canonicalize() {
+                    let Ok(relative) = canonical.strip_prefix(workspace.root()) else {
+                        continue;
+                    };
+                    relative_owned = relative.to_path_buf();
+                    relative_owned.as_path()
+                } else {
+                    continue;
+                }
+            } else {
+                path_obj
+            };
+            let Some(rel_str) = rel_path.to_str() else {
+                continue;
+            };
+            let rel_str = rel_str.trim_start_matches("./");
+            let already_covered = snapshots.iter().any(|existing| {
+                existing.get("path").and_then(serde_json::Value::as_str)
+                    == Some(reference_path.as_str())
+                    && existing
+                        .get("start_line")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|start| start <= line)
+                    && existing
+                        .get("end_line")
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|end| end >= line)
+            });
+            if already_covered {
                 continue;
             }
-            if let Ok(mut snapshot) = workspace.snapshot_range(path, line) {
+            if let Ok(mut snapshot) = workspace.snapshot_range(rel_str, line) {
                 let unchanged = snapshot
                     .get("content")
                     .and_then(|value| value.as_str())

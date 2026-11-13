@@ -455,6 +455,12 @@ pub(super) enum Event {
 impl WriteWorker {
     pub(super) fn serve(&mut self) {
         while !self.shutdown_requested {
+            if let Some(lock) = self.shared.protection.status().lock
+                && !self.receiver.is_empty()
+            {
+                self.drain_protected(&lock);
+                continue;
+            }
             if self.next_check.is_some_and(|due| Instant::now() >= due) {
                 self.check_all_paths();
                 continue;
@@ -821,6 +827,19 @@ impl WriteWorker {
             }
             lock
         };
+        self.drain_protected(&lock);
+        if storage_failed {
+            self.shared.release_database();
+        }
+        let soon = Instant::now().checked_add(self.check_interval());
+        self.next_check = match (self.next_check, soon) {
+            (Some(due), Some(soon)) => Some(due.min(soon)),
+            (due, soon) => soon.or(due),
+        };
+        lock
+    }
+
+    fn drain_protected(&mut self, lock: &ProtectionLock) {
         for message in self.receiver.drain() {
             match message {
                 Message::Run(envelope) => {
@@ -836,15 +855,6 @@ impl WriteWorker {
                 Message::Shutdown => self.shutdown_requested = true,
             }
         }
-        if storage_failed {
-            self.shared.release_database();
-        }
-        let soon = Instant::now().checked_add(self.check_interval());
-        self.next_check = match (self.next_check, soon) {
-            (Some(due), Some(soon)) => Some(due.min(soon)),
-            (due, soon) => soon.or(due),
-        };
-        lock
     }
 
     pub(super) fn check_interval(&self) -> Duration {

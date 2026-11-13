@@ -397,31 +397,34 @@ const MAX_TEST_RESULTS: usize = 32;
 const MAX_FAILED_TESTS: usize = 32;
 const MAX_TEST_DETAIL_LINES: usize = 16;
 
-fn truncate_str(text: &str, max_bytes: usize) -> String {
+fn truncate_str(text: &str, max_bytes: usize) -> (String, bool) {
     if text.len() <= max_bytes {
-        return text.to_owned();
+        return (text.to_owned(), false);
     }
     let mut end = max_bytes.saturating_sub(1);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}…", &text[..end])
+    (format!("{}…", &text[..end]), true)
 }
 
 #[derive(Default)]
 struct LineScanner {
     line: Vec<u8>,
     overflowed: bool,
+    any_overflowed: bool,
+    invalid_utf8: bool,
 }
 
 impl LineScanner {
     fn feed(&mut self, bytes: &[u8], mut on_line: impl FnMut(&str)) {
         for &byte in bytes {
             if byte == b'\n' {
-                if !self.overflowed
-                    && let Ok(line) = std::str::from_utf8(&self.line)
-                {
-                    on_line(line.trim_end_matches('\r'));
+                if !self.overflowed {
+                    match std::str::from_utf8(&self.line) {
+                        Ok(line) => on_line(line.trim_end_matches('\r')),
+                        Err(_) => self.invalid_utf8 = true,
+                    }
                 }
                 self.line.clear();
                 self.overflowed = false;
@@ -430,6 +433,7 @@ impl LineScanner {
                     self.line.push(byte);
                 } else {
                     self.overflowed = true;
+                    self.any_overflowed = true;
                     self.line.clear();
                 }
             }
@@ -437,14 +441,18 @@ impl LineScanner {
     }
 
     fn finish(&mut self, mut on_line: impl FnMut(&str)) {
-        if !self.overflowed
-            && !self.line.is_empty()
-            && let Ok(line) = std::str::from_utf8(&self.line)
-        {
-            on_line(line.trim_end_matches('\r'));
+        if !self.overflowed && !self.line.is_empty() {
+            match std::str::from_utf8(&self.line) {
+                Ok(line) => on_line(line.trim_end_matches('\r')),
+                Err(_) => self.invalid_utf8 = true,
+            }
         }
         self.line.clear();
         self.overflowed = false;
+    }
+
+    fn unreliable(&self) -> bool {
+        self.any_overflowed || self.invalid_utf8
     }
 }
 
@@ -454,47 +462,51 @@ struct CargoCheckCompactor {
     errors: Vec<String>,
     warnings: Vec<String>,
     dropped: usize,
+    truncated_line: bool,
     success: Option<bool>,
     invalid: bool,
 }
 
 impl CargoCheckCompactor {
     fn push(&mut self, bytes: &[u8]) {
-        if self.invalid {
+        if self.invalid || self.scanner.unreliable() {
+            self.invalid = true;
             return;
         }
         let invalid = &mut self.invalid;
         let errors = &mut self.errors;
         let warnings = &mut self.warnings;
         let dropped = &mut self.dropped;
+        let truncated_line = &mut self.truncated_line;
         let success = &mut self.success;
         self.scanner.feed(bytes, |line| {
             if *invalid || line.trim().is_empty() {
                 return;
             }
-            if !parse_check_line(line, errors, warnings, dropped, success) {
+            if !parse_check_line(line, errors, warnings, dropped, truncated_line, success) {
                 *invalid = true;
             }
         });
     }
 
     fn finish(mut self) -> Option<(String, bool)> {
-        if !self.invalid {
+        if !self.invalid && !self.scanner.unreliable() {
             let invalid = &mut self.invalid;
             let errors = &mut self.errors;
             let warnings = &mut self.warnings;
             let dropped = &mut self.dropped;
+            let truncated_line = &mut self.truncated_line;
             let success = &mut self.success;
             self.scanner.finish(|line| {
                 if *invalid || line.trim().is_empty() {
                     return;
                 }
-                if !parse_check_line(line, errors, warnings, dropped, success) {
+                if !parse_check_line(line, errors, warnings, dropped, truncated_line, success) {
                     *invalid = true;
                 }
             });
         }
-        if self.invalid || self.scanner.overflowed {
+        if self.invalid || self.scanner.unreliable() {
             return None;
         }
         if !self.success? && self.errors.is_empty() {
@@ -502,13 +514,13 @@ impl CargoCheckCompactor {
         }
         let mut lines = self.errors;
         lines.extend(self.warnings);
-        let omitted = self.dropped > 0;
-        if omitted {
+        if self.dropped > 0 {
             lines.push(format!(
                 "[OCG omitted {} additional diagnostics]",
                 self.dropped
             ));
         }
+        let omitted = self.dropped > 0 || self.truncated_line;
         Some((lines.join("\n"), omitted))
     }
 }
@@ -518,6 +530,7 @@ fn parse_check_line(
     errors: &mut Vec<String>,
     warnings: &mut Vec<String>,
     dropped: &mut usize,
+    truncated_line: &mut bool,
     success: &mut Option<bool>,
 ) -> bool {
     let Ok(record) = serde_json::from_str::<Value>(line) else {
@@ -563,10 +576,11 @@ fn parse_check_line(
                 return false;
             };
             let text = raw_text.split_whitespace().collect::<Vec<_>>().join(" ");
-            let formatted = truncate_str(
+            let (formatted, was_truncated) = truncate_str(
                 &format!("{path}:{line_num}:{column} {level}{code} {text}"),
                 MAX_DIAGNOSTIC_LINE_BYTES,
             );
+            *truncated_line |= was_truncated;
             if level == "error" {
                 if errors.len() < MAX_CHECK_ERRORS {
                     errors.push(formatted);
@@ -595,12 +609,18 @@ struct CargoTestCompactor {
     results: Vec<String>,
     failed: Vec<(String, Vec<String>)>,
     dropped_failures: usize,
+    dropped_results: usize,
+    dropped_detail_lines: usize,
+    truncated_line: bool,
     active_failure: Option<usize>,
     in_panic: bool,
 }
 
 impl CargoTestCompactor {
     fn push(&mut self, bytes: &[u8]) {
+        if self.scanner.unreliable() {
+            return;
+        }
         let mut lines = Vec::new();
         self.scanner.feed(bytes, |line| lines.push(line.to_owned()));
         for line in lines {
@@ -612,9 +632,20 @@ impl CargoTestCompactor {
         if line.starts_with("test result: ok.") || line.starts_with("test result: FAILED.") {
             self.active_failure = None;
             self.in_panic = false;
+            let (formatted, was_truncated) = truncate_str(line, MAX_DIAGNOSTIC_LINE_BYTES);
+            self.truncated_line |= was_truncated;
             if self.results.len() < MAX_TEST_RESULTS {
-                self.results
-                    .push(truncate_str(line, MAX_DIAGNOSTIC_LINE_BYTES));
+                self.results.push(formatted);
+            } else if line.starts_with("test result: FAILED.")
+                && let Some(pos) = self
+                    .results
+                    .iter()
+                    .rposition(|item| item.starts_with("test result: ok."))
+            {
+                self.results[pos] = formatted;
+                self.dropped_results = self.dropped_results.saturating_add(1);
+            } else {
+                self.dropped_results = self.dropped_results.saturating_add(1);
             }
             return;
         }
@@ -655,7 +686,11 @@ impl CargoTestCompactor {
                 details.clear();
             }
             if details.len() < MAX_TEST_DETAIL_LINES {
-                details.push(truncate_str(line, MAX_DIAGNOSTIC_LINE_BYTES));
+                let (formatted, was_truncated) = truncate_str(line, MAX_DIAGNOSTIC_LINE_BYTES);
+                self.truncated_line |= was_truncated;
+                details.push(formatted);
+            } else {
+                self.dropped_detail_lines = self.dropped_detail_lines.saturating_add(1);
             }
         }
     }
@@ -666,21 +701,42 @@ impl CargoTestCompactor {
         for line in tail {
             self.handle_line(&line);
         }
-        if self.results.is_empty() {
+        if self.scanner.unreliable() || self.results.is_empty() {
             return None;
         }
-        let mut output = self.results;
+        let mut output = Vec::new();
         for (name, details) in self.failed {
             output.push(name);
             output.extend(details);
         }
-        let omitted = self.dropped_failures > 0;
-        if omitted {
+        let (failed_results, ok_results): (Vec<_>, Vec<_>) = self
+            .results
+            .into_iter()
+            .partition(|line| line.starts_with("test result: FAILED."));
+        output.extend(failed_results);
+        output.extend(ok_results);
+        if self.dropped_failures > 0 {
             output.push(format!(
                 "[OCG omitted {} additional failed tests]",
                 self.dropped_failures
             ));
         }
+        if self.dropped_detail_lines > 0 {
+            output.push(format!(
+                "[OCG omitted {} additional failure detail lines]",
+                self.dropped_detail_lines
+            ));
+        }
+        if self.dropped_results > 0 {
+            output.push(format!(
+                "[OCG omitted {} additional test results]",
+                self.dropped_results
+            ));
+        }
+        let omitted = self.dropped_failures > 0
+            || self.dropped_detail_lines > 0
+            || self.dropped_results > 0
+            || self.truncated_line;
         Some((output.join("\n"), omitted))
     }
 }
@@ -696,9 +752,8 @@ fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
         compacted_capture = Some(capture);
         compacted_omitted = *omitted;
     }
-    let empty = Capture::default();
     let (stdout, stderr) = match &compacted_capture {
-        Some(stdout) => (stdout, &empty),
+        Some(stdout) => (stdout, &ended.stderr),
         None => (&ended.stdout, &ended.stderr),
     };
     let (cpu_user_ms, cpu_system_ms, peak_rss_bytes) = match &ended.finished.usage {

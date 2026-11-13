@@ -558,13 +558,6 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
             printf '%s\n' "$result" >&2
             case $result in
                 *'Database already open'*) printf '%s\n' 'OCG is running outside the service; stop it and rerun the installer.' >&2 ;;
-                *'Database repair aborted'*) printf '%s\n' 'Start the old version once, stop it, and rerun the installer.' >&2 ;;
-                *'plan: '*migrat*)
-                    keep_staged=true
-                    quoted_data=$(printf '%s' "$data" | sed "s/'/'\\\\''/g")
-                    printf "OCG_DATA_DIR='%s' '%s/ocg' migrate --to <new dir>\n" "$quoted_data" "$staged" >&2
-                    printf '%s\n' 'Set OCG_DATA_DIR in ocg.env to the new directory and rerun the installer.' >&2
-                    ;;
                 *) printf '%s\n' 'Unable to verify database compatibility; installation stopped.' >&2 ;;
             esac
             exit 1

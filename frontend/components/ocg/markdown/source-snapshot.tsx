@@ -36,7 +36,8 @@ export function fileSnapshots(value: unknown): FileSnapshot[] {
 export function sourceReference(href: string): { path: string; start: number; end: number } | null {
   if (/^(?:[a-z][\w+.-]*:\/\/|mailto:|\/\/|#)/i.test(href)) return null;
   const match = /(?::(\d+)(?:-(\d+))?|#L(\d+)(?:-L?(\d+))?)$/i.exec(href);
-  const path = match ? href.slice(0, match.index) : href;
+  const rawPath = match ? href.slice(0, match.index) : href;
+  const path = rawPath.startsWith("/") ? rawPath : rawPath.replace(/^(?:\.\/)+/, "");
   if (!/\.[a-z\d][a-z\d_-]*$/i.test(path) || path.includes("?")) return null;
   const start = Number(match?.[1] ?? match?.[3] ?? 1);
   const end = Number(match?.[2] ?? match?.[4] ?? start);

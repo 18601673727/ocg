@@ -19,10 +19,10 @@
    - If explicitly authorized through `OCG-AI-RULE-CHANGE` to commit, use a single-line commit title only. No body or `Co-authored-by` attribution.
 
 5. **Storage format**
-   - Any change to a stored key, row, or encoding bumps `DATABASE_FORMAT_VERSION` (and `RECORD_VERSION` when a record encoding changes).
-   - Every bump adds its step to `ocg migrate` in the same commit. The step runs offline on a copy, keeps every authoritative fact, and is verified before publish; the source is never modified.
-   - No compatibility shims at runtime: OCG opens only the current format and refuses any other with "run ocg migrate".
-   - The format version only tracks database format changes.
+   - One `FORMAT_VERSION` governs database metadata and all stored record headers.
+   - A change to any stored key, row, or encoding increments this single format version.
+   - Starting from Format 1, future version bumps add an offline migration step that preserves and verifies authoritative facts before publication.
+   - The runtime reads only the current format; no historical compatibility shims.
 
 6. **Single source of truth**
    - Store each fact exactly once, in the row that owns it.

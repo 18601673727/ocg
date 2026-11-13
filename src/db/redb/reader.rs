@@ -1413,7 +1413,15 @@ fn development_candidate_in(
         .map(|v| transactions::decode_allocation_executor(token.executor.get(), v.value()))
         .transpose()?
         .ok_or_else(|| context_unavailable("Executor is missing"))?;
-    if !pool.enabled || pool.archived || !executor.enabled || executor.archived {
+    if !pool.enabled
+        || pool.archived
+        || !executor.enabled
+        || executor.archived
+        || executor.pool != pool.id
+        || !executor
+            .capabilities
+            .contains(&(allocation.operation, allocation.protocol))
+    {
         return Err(context_unavailable(
             "Pool or Executor configuration changed",
         ));
