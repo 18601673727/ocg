@@ -3,127 +3,14 @@ use std::time::{Duration, Instant};
 
 use ntex::util::{Either, select};
 
-use crate::db::entities::*;
 use crate::db::{DatabaseError, DatabaseHandle, SchedulerWakeSubscription};
-use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
+use crate::service::ai::providers::CancellationToken;
 use crate::system::execution_controls::ExecutionControl;
-use crate::system::executor::execution_runtime::*;
+use crate::system::executor::execution_runtime::ExecutionRuntimeError;
 use crate::system::monitor::ProtectionWatch;
 
 const BATCH_FLOOR: Duration = Duration::from_millis(5);
 const RECONCILE: Duration = Duration::from_secs(30);
-
-/// One explicitly requested development pass. A replay is evidence only and
-/// never grants a second handoff. This adapter has no polling or public route.
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum DevelopmentPass {
-    Completed {
-        token: AllocationToken,
-        output: AppendedOutput,
-    },
-    Continue(DevelopmentReadyCursor),
-    Exhausted,
-    Replayed(PoolAllocation),
-    Unresolved,
-}
-
-#[allow(dead_code)]
-#[derive(Debug)]
-pub(crate) enum DevelopmentPassError {
-    Reservation {
-        request: DevelopmentReservationRequest,
-        error: Box<crate::db::DevelopmentReservationError>,
-    },
-    Handoff {
-        allocation: Box<PoolAllocation>,
-        error: crate::db::DevelopmentHandoffError,
-    },
-    /// The handoff proved no execution authority exists and the reservation
-    /// was ended; `settlement` is that call's result. If it failed, the
-    /// Allocation is still held.
-    NotStarted {
-        allocation: Box<PoolAllocation>,
-        cause: crate::db::entities::UnstartedCause,
-        error: Box<DatabaseError>,
-        settlement: Result<AppendedOutput, Box<DatabaseError>>,
-    },
-    Execution {
-        allocation: Box<PoolAllocation>,
-        error: Box<DatabaseError>,
-    },
-    /// The manual loopback control is disabled; nothing was reserved.
-    Disabled,
-}
-
-/// Runs a single, fresh allocator request against a direct loopback provider.
-/// All errors retain durable ownership; neither replay nor reconciliation can
-/// create a handoff. The Worker confirms both commits before execution.
-#[allow(dead_code)]
-pub(crate) async fn run_development_pass(
-    database: &DatabaseHandle,
-    fresh: DevelopmentFreshReservation,
-    config: &ProviderExecutionConfig,
-) -> Result<DevelopmentPass, DevelopmentPassError> {
-    if !ExecutionControl::ManualLoopbackExecution.is_enabled() {
-        return Err(DevelopmentPassError::Disabled);
-    }
-    let request = fresh.request();
-    let reservation = database
-        .reserve_next_development_job(request, DevelopmentReservationAttempt::New(fresh))
-        .await
-        .map_err(|error| DevelopmentPassError::Reservation {
-            request,
-            error: Box::new(error),
-        })?;
-    let allocation = match reservation {
-        DevelopmentReservation::Reserved(allocation) => allocation,
-        DevelopmentReservation::Replayed(allocation) => {
-            return Ok(DevelopmentPass::Replayed(allocation));
-        }
-        DevelopmentReservation::Unresolved => return Ok(DevelopmentPass::Unresolved),
-        DevelopmentReservation::Continue(cursor) => return Ok(DevelopmentPass::Continue(cursor)),
-        DevelopmentReservation::Exhausted => return Ok(DevelopmentPass::Exhausted),
-    };
-    let handoff = match database.checked_development_handoff(allocation.token).await {
-        Ok(handoff) => handoff,
-        Err(crate::db::DevelopmentHandoffError::NotStarted { cause, error }) => {
-            let settlement = database
-                .fail_unstarted_development_reservation(allocation.token, cause)
-                .await
-                .map_err(Box::new);
-            return Err(DevelopmentPassError::NotStarted {
-                allocation: Box::new(allocation),
-                cause,
-                error,
-                settlement,
-            });
-        }
-        Err(error) => {
-            return Err(DevelopmentPassError::Handoff {
-                allocation: Box::new(allocation),
-                error,
-            });
-        }
-    };
-    let result = match allocation.operation {
-        ExecutionOperation::LlmRequest => {
-            supervise_development_loopback(database, handoff, config).await
-        }
-        ExecutionOperation::Decision => {
-            supervise_development_decision_loopback(database, handoff, config).await
-        }
-    };
-    result
-        .map(|output| DevelopmentPass::Completed {
-            token: allocation.token,
-            output,
-        })
-        .map_err(|error| DevelopmentPassError::Execution {
-            allocation: Box::new(allocation),
-            error: Box::new(error),
-        })
-}
 
 pub(crate) struct DispatchBatch<G> {
     pub(crate) grants: Vec<G>,

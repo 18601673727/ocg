@@ -129,6 +129,14 @@ impl PreparedDevelopmentHandoff {
         }
     }
 
+    /// The frozen native Decision configuration this handoff executes, if it is one.
+    pub(crate) fn decision_configuration(&self) -> Option<&entities::NativeDecisionConfig> {
+        match &self.candidate {
+            redb::DevelopmentCandidate::Generative(_) => None,
+            redb::DevelopmentCandidate::Decision(context) => Some(&context.configuration),
+        }
+    }
+
     /// Every credential the frozen configuration names; see the private reader.
     pub(crate) fn credential_references(&self) -> Vec<&str> {
         self.expected_credential_references()
@@ -1735,7 +1743,7 @@ impl DatabaseHandle {
     }
 
     /// One reservation pass of the native scheduler, under
-    /// [`entities::ReadySelection::SingleRequestGenerative`]: the selection
+    /// [`entities::ReadySelection::Scheduled`]: the selection
     /// and the reservation are one writer transaction, as for every other
     /// pass. A pass that reserves nothing declines to commit, so it neither
     /// writes nor wakes the scheduler that asked for it; only a reservation
@@ -1748,16 +1756,21 @@ impl DatabaseHandle {
     pub(crate) async fn reserve_scheduled_job(
         &self,
         fresh: entities::DevelopmentFreshReservation,
-        policy: fn(&entities::FrozenExecutionConfig) -> bool,
+        generative_policy: fn(&entities::FrozenExecutionConfig) -> bool,
+        decision_policy: fn(&entities::NativeDecisionConfig) -> bool,
     ) -> Result<ScheduledReservation, DevelopmentReservationError> {
         let request = fresh.request();
         let result = self
             .submit(|reply| {
                 Command::custom(
-                    (request, policy),
+                    (request, generative_policy, decision_policy),
                     reply,
                     |_| 4096,
-                    |(request, policy), reply, database, operation, commit| {
+                    |(request, generative_policy, decision_policy),
+                     reply,
+                     database,
+                     operation,
+                     commit| {
                         let mut passed = ScheduledReservation::Pass(Box::new(
                             entities::DevelopmentReservation::Exhausted,
                         ));
@@ -1768,7 +1781,10 @@ impl DatabaseHandle {
                             |batch| match batch.reserve_next_development_job(
                                 request,
                                 true,
-                                entities::ReadySelection::SingleRequestGenerative { policy },
+                                entities::ReadySelection::Scheduled {
+                                    generative_policy,
+                                    decision_policy,
+                                },
                             ) {
                                 Ok(reserved @ entities::DevelopmentReservation::Reserved(_)) => {
                                     Ok(Some(ScheduledReservation::Pass(Box::new(reserved))))
@@ -2163,12 +2179,7 @@ impl DatabaseHandle {
         }
         let token = match &handoff.prepared.candidate {
             redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(_) => {
-                return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                    "handoff",
-                    "generative handoff required",
-                )));
-            }
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
         };
         let proof = DevelopmentWriteProof {
             token,
@@ -2537,12 +2548,7 @@ impl DatabaseHandle {
         }
         let token = match &handoff.prepared.candidate {
             redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(_) => {
-                return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                    "handoff",
-                    "generative handoff required",
-                )));
-            }
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
         };
         if handoff
             .prepared
@@ -2663,12 +2669,7 @@ impl DatabaseHandle {
         }
         let token = match &handoff.prepared.candidate {
             redb::DevelopmentCandidate::Generative(context) => context.allocation.token,
-            redb::DevelopmentCandidate::Decision(_) => {
-                return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                    "handoff",
-                    "generative handoff required",
-                )));
-            }
+            redb::DevelopmentCandidate::Decision(context) => context.allocation.token,
         };
         if let Some(secret) = &handoff.prepared.credentials.spellings {
             let result = match &finalization {

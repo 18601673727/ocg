@@ -472,11 +472,27 @@ impl Batch {
     ) -> Result<JobAction, BatchError> {
         self.require_mutable_conversation(conversation)?;
         if self.job_control(conversation)?.closing.is_some() {
+            // A repeated close retries the cancellation: every execution of
+            // the live subtree that has not ended is named again by its
+            // persisted Allocation token, so a cancel that was lost can be
+            // sent again. Nothing here says an execution has stopped.
+            let subtree = self.live_subtree(conversation)?;
+            let mut running = Vec::new();
+            let mut ended = Vec::new();
+            for current in &subtree {
+                let (tokens, never_ran) =
+                    self.stop_unsettled_turns(*current, &OutcomeCause::Closed)?;
+                running.extend(tokens);
+                ended.extend(never_ran);
+            }
+            for current in subtree.into_iter().rev() {
+                self.settle_closing(current)?;
+            }
             return Ok(JobAction {
                 conversation,
                 record_seq: None,
-                running: Vec::new(),
-                ended: Vec::new(),
+                running,
+                ended,
                 already: true,
                 settled: self.require_job_state(conversation)?.outcome.is_some(),
             });

@@ -1379,11 +1379,19 @@ pub(super) async fn edit_conversation(
         other => profiles::map_mutation_error(other),
     };
     if matches!(edit, JobEdit::Hide) {
-        shared
+        let action = shared
             .database
             .hide_conversation(root)
             .await
             .map_err(map_error)?;
+        // Hiding is already recorded. Cancel each affected execution by its
+        // persisted Allocation token; hiding again retries this.
+        for token in &action.running {
+            shared.scheduler.native_stops().cancel(*token);
+        }
+        if let Err(error) = shared.database.settle_child_turns(action.ended).await {
+            log::warn!("the parents of the turns hiding ended were not told: {error}");
+        }
     } else {
         shared
             .database

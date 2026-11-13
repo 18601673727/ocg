@@ -62,8 +62,9 @@ pub use scheduled_external::*;
 pub use scheduling::*;
 pub use statistics::{
     AvailabilityClassification, AvailabilityObservation, AvailabilityRequestSample,
-    AvailabilityStat, AvailabilityStatRecord, MixedRequests, ObservationCursor, ObservationFilter,
-    ObservationPage, RejectionCause, TimeRange, ToolStatRecord, UnavailableCause,
+    AvailabilityStat, AvailabilityStatRecord, DecisionTarget, MixedRequests, ObservationCursor,
+    ObservationFilter, ObservationPage, RejectionCause, TimeRange, ToolStatRecord,
+    UnavailableCause,
 };
 pub(crate) use usage::{JobUsage, TokenEvidence, TokenObservation};
 pub use usage::{

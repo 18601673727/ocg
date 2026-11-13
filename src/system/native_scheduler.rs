@@ -15,11 +15,11 @@
 //!
 //! # Selection
 //!
-//! A pass offers each enabled Executor that has the single-request Generative
-//! capability among those it discovered, in an order that rotates, to the
-//! writer, which selects and reserves in one transaction
-//! ([`crate::db::entities::ReadySelection::SingleRequestGenerative`]): the
-//! first ready Job in the ready index's order (priority, then submission time,
+//! A pass offers each enabled Executor that has either the single-request
+//! Generative capability or the native Decision capability among those it
+//! discovered, in an order that rotates, to the writer, which selects and
+//! reserves in one transaction
+//! ([`crate::db::entities::ReadySelection::Scheduled`]): the first ready Job in the ready index's order (priority, then submission time,
 //! then Job) whose frozen configuration can run as the checked single
 //! tool-free request and whose whole frozen configuration this scheduler's
 //! policy admits. Everything else is passed over untouched and stays queued:
@@ -89,8 +89,8 @@ use std::time::Duration;
 use crate::db::entities::{
     AllocationPhase, AllocationToken, ConfigId, DevelopmentFreshReservation,
     DevelopmentReadyCursor, DevelopmentReservation, ExecutionOperation, ExecutionPoolId,
-    ExecutorId, FrozenExecutionConfig, JobId, LlmTransport, OutcomeKind, PoolAllocation,
-    UnstartedCause,
+    ExecutorId, FrozenExecutionConfig, JobId, LlmTransport, NativeDecisionConfig, OutcomeKind,
+    PoolAllocation, UnstartedCause,
 };
 use crate::db::redb::{NativeResource, NativeResourceKind};
 use crate::db::{
@@ -100,7 +100,8 @@ use crate::db::{
 use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
 use crate::system::execution_controls::ExecutionControl;
 use crate::system::executor::execution_runtime::{
-    EndpointPolicy, WorkspaceTools, supervise_development_generative,
+    EndpointPolicy, WorkspaceTools, supervise_development_decision,
+    supervise_development_generative,
 };
 use crate::system::executor::native_tools::NativeTooling;
 use crate::system::loopback_activation::ArmedActivation;
@@ -123,11 +124,13 @@ const HEAD_PAGES: usize = 2;
 const DISPATCH_TIMEOUT: Duration = MAX_TIMEOUT_CEILING;
 /// The response bytes the exchange reads before it gives up.
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
-/// What an Executor must offer for the one execution this scheduler runs.
-const CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
+/// What an Executor must offer for Generative or native Decision execution.
+const GENERATIVE_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
     ExecutionOperation::LlmRequest,
     Some(LlmTransport::OpenAiChatCompletions),
 );
+const DECISION_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) =
+    (ExecutionOperation::Decision, None);
 
 /// The authority of one autonomous scheduling run. [`Self::autonomous`] is
 /// the only way to make one, and it makes none unless the build enables
@@ -248,28 +251,27 @@ pub(crate) fn loopback_eligibility(
         detail,
         endpoint: None,
     };
-    let frozen = match frozen {
+    let (endpoint, kind_label) = match frozen {
         None => {
             return none(
                 "not_frozen",
                 "the Job has no frozen configuration; only a submitted Job is scheduled",
             );
         }
-        Some(MutableFrozenConfiguration::Decision(_)) => {
-            return none(
-                "decision_job",
-                "a Decision Job is never selected by autonomous loopback scheduling",
-            );
+        Some(MutableFrozenConfiguration::Decision(decision)) => {
+            (decision.endpoint.as_deref(), "native Decision")
         }
-        Some(MutableFrozenConfiguration::Generative(frozen)) => frozen,
+        Some(MutableFrozenConfiguration::Generative(frozen)) => {
+            if frozen.native_execution_refusal().is_some() {
+                return none(
+                    "not_single_request_generative",
+                    "the frozen configuration cannot run as a native Generative execution (a chat or coding Agent, the OpenAI Chat Completions protocol and a declared context window are required)",
+                );
+            }
+            (frozen.llm.provider.endpoint.as_deref(), "native Generative")
+        }
     };
-    if frozen.native_execution_refusal().is_some() {
-        return none(
-            "not_single_request_generative",
-            "the frozen configuration cannot run as a native Generative execution (a chat or coding Agent, the OpenAI Chat Completions protocol and a declared context window are required)",
-        );
-    }
-    let Some(endpoint) = frozen.llm.provider.endpoint.as_deref() else {
+    let Some(endpoint) = endpoint else {
         return none("endpoint_missing", "the frozen Provider has no endpoint");
     };
     if ExecutionControl::ExternalProviderTransport.is_enabled() {
@@ -281,9 +283,17 @@ pub(crate) fn loopback_eligibility(
     let class = classify_loopback_endpoint(endpoint);
     let detail = match class {
         LoopbackEndpointClass::LiteralDirect => {
+            let detail = match kind_label {
+                "native Decision" => {
+                    "the frozen endpoint is a literal http://127.0.0.1:<port> endpoint no proxy intercepts, and the frozen configuration is a native Decision execution; this is not a claim that the Job will run: see not_assessed for what the scheduler also asks"
+                }
+                _ => {
+                    "the frozen endpoint is a literal http://127.0.0.1:<port> endpoint no proxy intercepts, and the frozen configuration is a native Generative execution; this is not a claim that the Job will run: see not_assessed for what the scheduler also asks"
+                }
+            };
             return LoopbackEligibility {
                 code: "eligible",
-                detail: "the frozen endpoint is a literal http://127.0.0.1:<port> endpoint no proxy intercepts, and the frozen configuration is a native Generative execution; this is not a claim that the Job will run: see not_assessed for what the scheduler also asks",
+                detail,
                 endpoint: Some(class),
             };
         }
@@ -327,6 +337,13 @@ fn scheduled_policy(frozen: &FrozenExecutionConfig) -> bool {
         .as_deref()
         .is_some_and(crate::system::http::direct_diagnostic_loopback)
         || ExecutionControl::ScheduledExternalTransport.is_enabled()
+}
+
+fn scheduled_decision_policy(native: &NativeDecisionConfig) -> bool {
+    native
+        .endpoint
+        .as_deref()
+        .is_some_and(crate::system::http::direct_diagnostic_loopback)
 }
 
 /// The cancellations of the executions this host's native scheduler runs, by
@@ -627,7 +644,8 @@ impl NativeScheduler {
                 if let NativeResource::Executor(executor) = resource
                     && executor.enabled
                     && !executor.archived
-                    && executor.capabilities.contains(&CAPABILITY)
+                    && (executor.capabilities.contains(&GENERATIVE_CAPABILITY)
+                        || executor.capabilities.contains(&DECISION_CAPABILITY))
                 {
                     executors.push((executor.pool, executor.id));
                 }
@@ -727,7 +745,7 @@ impl NativeScheduler {
             let fresh = DevelopmentFreshReservation::new(pool, executor, after);
             let passed = match self
                 .database
-                .reserve_scheduled_job(fresh, scheduled_policy)
+                .reserve_scheduled_job(fresh, scheduled_policy, scheduled_decision_policy)
                 .await
             {
                 Ok(ScheduledReservation::GlobalLimitReached) => return ExecutorPass::GlobalLimit,
@@ -910,14 +928,29 @@ pub(crate) async fn dispatch(
                 start_and_exchange(
                     database,
                     token,
+                    allocation.operation,
                     cancellation,
                     &config,
                     EndpointPolicy::Loopback,
-                    workspace_tools.map(WorkspaceTools::data_directory),
+                    workspace_tools
+                        .filter(|_| allocation.operation == ExecutionOperation::LlmRequest)
+                        .map(WorkspaceTools::data_directory),
                     stops,
                     check_prepared_native,
                 )
                 .await
+            }
+            Ok(Some(_)) if allocation.operation == ExecutionOperation::Decision => {
+                let prefix = "Decision execution is not permitted under a scheduled external grant";
+                match database
+                    .fail_unstarted_development_reservation(token, UnstartedCause::StartRefused)
+                    .await
+                {
+                    Ok(_) => format!("{prefix}; the reservation was ended and nothing was sent"),
+                    Err(settle) => {
+                        format!("{prefix}; the reservation was not ended here ({settle})")
+                    }
+                }
             }
             Ok(Some(grant)) => {
                 let config = grant.provider_config(cancellation.clone());
@@ -935,6 +968,7 @@ pub(crate) async fn dispatch(
                 start_and_exchange(
                     database,
                     token,
+                    allocation.operation,
                     cancellation,
                     &config,
                     EndpointPolicy::ScheduledExternal(&grant),
@@ -980,6 +1014,7 @@ pub(crate) async fn dispatch(
 async fn start_and_exchange(
     database: &DatabaseHandle,
     token: AllocationToken,
+    operation: ExecutionOperation,
     cancellation: &CancellationToken,
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
@@ -996,11 +1031,17 @@ async fn start_and_exchange(
     {
         Ok(handoff) => {
             let tools = tooling.into_execution();
-            let exchange = within_deadline(
-                cancellation,
-                DISPATCH_TIMEOUT,
-                supervise_development_generative(database, handoff, config, policy, tools),
-            )
+            let exchange = within_deadline(cancellation, DISPATCH_TIMEOUT, async {
+                match operation {
+                    ExecutionOperation::LlmRequest => {
+                        supervise_development_generative(database, handoff, config, policy, tools)
+                            .await
+                    }
+                    ExecutionOperation::Decision => {
+                        supervise_development_decision(database, handoff, config, policy).await
+                    }
+                }
+            })
             .await;
             match exchange {
                 Ok(_) => "the exchange returned and was recorded".to_owned(),

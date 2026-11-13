@@ -72,13 +72,23 @@ pub(crate) fn check_prepared(prepared: &PreparedDevelopmentHandoff) -> Result<()
     check_prepared_with(prepared, false)
 }
 
-/// [`check_prepared`] for a path that also runs the native tool loop: the
-/// frozen configuration need only be a native Generative one, and the request
-/// may offer the tools its Agent's Workspace grant allows, never a forced
-/// `tool_choice`.
+/// [`check_prepared`] for a path that also runs the native tool loop or a
+/// native Decision: the frozen configuration may be a native Generative one
+/// (with the tools its Agent's Workspace grant allows, never a forced
+/// `tool_choice`) or a native Decision targeting a direct loopback endpoint.
 pub(crate) fn check_prepared_native(
     prepared: &PreparedDevelopmentHandoff,
 ) -> Result<(), &'static str> {
+    if let Some(decision) = prepared.decision_configuration() {
+        if !decision
+            .endpoint
+            .as_deref()
+            .is_some_and(direct_diagnostic_loopback)
+        {
+            return Err("endpoint_not_loopback");
+        }
+        return Ok(());
+    }
     check_prepared_with(prepared, true)
 }
 

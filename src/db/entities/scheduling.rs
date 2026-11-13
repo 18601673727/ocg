@@ -193,17 +193,12 @@ pub enum ReadySelection {
     /// Only this Job: an invocation that names its Job reserves it or none,
     /// and a ready entry of any other Job is never reserved.
     Only(JobId),
-    /// The native scheduler's selection: the first ready Generative Job whose
-    /// frozen configuration can run as the checked single tool-free request
-    /// and whose whole frozen configuration `policy` admits. The policy binds
-    /// the endpoint, the credential reference, the exact Model, the trusted
-    /// proxy and the scheduled authority, so the selection and the dispatch
-    /// cannot disagree about what was authorized. Every other ready entry is
-    /// passed over untouched, and a pass that reserves nothing writes
-    /// nothing. The pass also needs a free Executor, room in its Pool and
-    /// room under [`GLOBAL_EXECUTION_LIMIT`].
-    SingleRequestGenerative {
-        policy: fn(&FrozenExecutionConfig) -> bool,
+    /// The native scheduler's selection: the first ready native Generative or
+    /// native Decision Job whose frozen configuration can run on the checked
+    /// native execution path and whose corresponding policy admits it.
+    Scheduled {
+        generative_policy: fn(&FrozenExecutionConfig) -> bool,
+        decision_policy: fn(&NativeDecisionConfig) -> bool,
     },
 }
 

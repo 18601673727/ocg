@@ -2488,7 +2488,7 @@ impl Batch {
                 "Executor is not eligible",
             ));
         }
-        if matches!(selection, ReadySelection::SingleRequestGenerative { .. }) {
+        if matches!(selection, ReadySelection::Scheduled { .. }) {
             // The scheduler never waits on capacity inside a transaction and
             // never scans for an Executor that could not take a Job: a busy
             // Executor, a full Pool or the global limit refuses the pass
@@ -2573,7 +2573,7 @@ impl Batch {
                         // The scheduler's pass writes nothing unless it
                         // reserves; the entry stays for a manual pass to
                         // retire, and the Job reports the blocked history.
-                        if !matches!(selection, ReadySelection::SingleRequestGenerative { .. }) {
+                        if !matches!(selection, ReadySelection::Scheduled { .. }) {
                             self.remove(MUTABLE_READY, *key)?;
                         }
                         continue;
@@ -2604,39 +2604,53 @@ impl Batch {
             }
             let frozen = self.frozen_configuration(&job)?;
             let mut scheduled_external = None;
-            if let ReadySelection::SingleRequestGenerative { policy } = selection {
-                // Only the frozen facts decide, so the pass and the checked
-                // start cannot disagree; a Decision, a Job that needs tools,
-                // a Workspace or another protocol, and any configuration the
-                // scheduled policy does not admit are left queued, never
-                // reserved. The durable scheduled external policy is read in
-                // this same transaction; its identity and revision become the
-                // binding the start and send transactions revalidate.
-                let FrozenConfiguration::Generative(frozen) = &frozen else {
-                    continue;
-                };
-                if frozen.native_execution_refusal().is_some() || !policy(frozen) {
-                    continue;
-                }
+            if let ReadySelection::Scheduled {
+                generative_policy,
+                decision_policy,
+            } = selection
+            {
                 // The checked start would refuse these; leave them queued.
                 if self.unsupported_start_context(&job)?.is_some() {
                     continue;
                 }
-                let loopback = frozen
-                    .llm
-                    .provider
-                    .endpoint
-                    .as_deref()
-                    .is_some_and(crate::system::http::direct_diagnostic_loopback);
-                scheduled_external = match self.scheduled_external_policy_for(frozen)? {
-                    ScheduledPolicyMatch::One(record) => Some((record.id, record.revision)),
-                    // More than one live policy admits the Job: no policy
-                    // authorizes it, and none is chosen. It stays queued and
-                    // the scan goes on.
-                    ScheduledPolicyMatch::Ambiguous => continue,
-                    ScheduledPolicyMatch::None if !loopback => continue,
-                    ScheduledPolicyMatch::None => None,
-                };
+                match &frozen {
+                    FrozenConfiguration::Generative(frozen) => {
+                        if frozen.native_execution_refusal().is_some() || !generative_policy(frozen)
+                        {
+                            continue;
+                        }
+                        let loopback = frozen
+                            .llm
+                            .provider
+                            .endpoint
+                            .as_deref()
+                            .is_some_and(crate::system::http::direct_diagnostic_loopback);
+                        scheduled_external = match self.scheduled_external_policy_for(frozen)? {
+                            ScheduledPolicyMatch::One(record) => Some((record.id, record.revision)),
+                            // More than one live policy admits the Job: no policy
+                            // authorizes it, and none is chosen. It stays queued and
+                            // the scan goes on.
+                            ScheduledPolicyMatch::Ambiguous => continue,
+                            ScheduledPolicyMatch::None if !loopback => continue,
+                            ScheduledPolicyMatch::None => None,
+                        };
+                    }
+                    FrozenConfiguration::Decision(FrozenDecisionConfig::Native(native)) => {
+                        if !decision_policy(native) {
+                            continue;
+                        }
+                        let loopback = native
+                            .endpoint
+                            .as_deref()
+                            .is_some_and(crate::system::http::direct_diagnostic_loopback);
+                        if !loopback {
+                            continue;
+                        }
+                    }
+                    FrozenConfiguration::Decision(FrozenDecisionConfig::Generative(_, _)) => {
+                        continue;
+                    }
+                }
             }
             let (operation, protocol) = match &frozen {
                 FrozenConfiguration::Generative(frozen) => (

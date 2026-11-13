@@ -2343,7 +2343,7 @@ impl Batch {
         checkpoint: crate::db::handle::DevelopmentUsageCheckpoint,
     ) -> Result<(MetricsId, crate::db::handle::DevelopmentUsageCheckpoint), BatchError> {
         use crate::db::entities::{RequestEligibility, TokenCount, UsageFinality};
-        self.require_development_write(proof)?;
+        self.require_development_write_any(proof)?;
         let job = proof.token().job;
         if metrics.job != job
             || !(5..=3 + 2 * indexes::MAX_NATIVE_USAGE_OBSERVATIONS).contains(&expected_seq)
@@ -2472,20 +2472,7 @@ impl Batch {
                 return self.reject(Violation::InvalidValue("usage", "conflicting final Token evidence"));
             }
         }
-        let Some(row) = self.mutable_job(job)? else {
-            return self.reject(Violation::NotFound(RecordRef::Job(job)));
-        };
-        let Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) = row.frozen
-        else {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "frozen generative configuration required",
-            ));
-        };
-        let identity = reader::UsageIdentity {
-            provider: frozen.llm.provider.id.get(),
-            model: frozen.llm.config.model,
-        };
+        let identity = self.development_usage_identity(job)?;
         let first_id = self.next_id()?;
         let second_id = self.next_id()?;
         let measurement = crate::db::entities::MetricsRecord {

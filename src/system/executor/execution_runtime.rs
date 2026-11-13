@@ -71,19 +71,6 @@ impl EndpointPolicy<'_> {
     }
 }
 
-/// An internal, loopback-only execution path. No scheduler or HTTP route can
-/// create its checked handoff. Unknown write or transport outcomes retain the
-/// allocation; only a returned successful exchange is finalized here.
-#[allow(dead_code)]
-pub(crate) async fn supervise_development_loopback(
-    database: &DatabaseHandle,
-    handoff: crate::db::DevelopmentHandoff,
-    config: &ProviderExecutionConfig,
-) -> Result<AppendedOutput, DatabaseError> {
-    supervise_development_generative(database, handoff, config, EndpointPolicy::Loopback, None)
-        .await
-}
-
 /// The Generative exchange of a checked handoff, to the endpoints `policy`
 /// permits: one request, or, when the Job's Agent was offered `tools`, the
 /// requests of its tool loop. Every request is recorded as sent before it
@@ -604,11 +591,11 @@ async fn settle_tool_stop(
 
 /// The native Decision protocol is distinct from Generative chat. A failed or
 /// interrupted exchange retains ownership until a safe recovery protocol exists.
-#[allow(dead_code)]
-pub(crate) async fn supervise_development_decision_loopback(
+pub(crate) async fn supervise_development_decision(
     database: &DatabaseHandle,
     handoff: crate::db::DevelopmentHandoff,
     config: &ProviderExecutionConfig,
+    policy: EndpointPolicy<'_>,
 ) -> Result<AppendedOutput, DatabaseError> {
     let (native, request, body, token) =
         handoff
@@ -620,9 +607,7 @@ pub(crate) async fn supervise_development_decision_loopback(
     let frozen = crate::db::entities::FrozenDecisionConfig::Native(native.clone());
     let local_rejection = match native.endpoint.as_deref() {
         None => Some((NOT_SENT, "explicit loopback endpoint required")),
-        Some(endpoint) if !crate::system::http::direct_diagnostic_loopback(endpoint) => {
-            Some((NOT_SENT, "direct loopback endpoint required"))
-        }
+        Some(endpoint) if !policy.permits(endpoint, config) => Some((NOT_SENT, policy.refusal())),
         Some(_) => {
             if crate::service::ai::decisive_model::request_body(&frozen, request)
                 .ok()
@@ -671,8 +656,8 @@ pub(crate) async fn supervise_development_decision_loopback(
         observation_overflow: false,
         streamed: String::new(),
     };
-    let result = crate::service::ai::decisive_model::execute_native_with_sink(
-        native,
+    let result = crate::service::ai::decisive_model::execute_decision_with_sink(
+        &frozen,
         request,
         body,
         &handoff,
@@ -736,6 +721,35 @@ pub(crate) async fn supervise_development_decision_loopback(
             },
         )
         .await?;
+    let has_usage = [
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.usage.cache_read_tokens,
+        result.usage.cache_write_tokens,
+        result.usage.reasoning_tokens,
+    ]
+    .iter()
+    .any(Option::is_some);
+    if has_usage {
+        database
+            .record_development_usage(
+                &handoff,
+                5,
+                Metrics {
+                    job: token.job,
+                    request: RequestNumber::FIRST,
+                    observed_at: Timestamp::now(),
+                    measurements: Measurements {
+                        usage: result.usage.clone(),
+                        ..Measurements::default()
+                    },
+                    token: Some(TokenAnnotation::eligible(
+                        crate::db::entities::UsageFinality::Final,
+                    )),
+                },
+            )
+            .await?;
+    }
     let returned = DevelopmentExecutionReturn { handoff: &handoff };
     database
         .finalize_development_decision(returned, 1, result.result)

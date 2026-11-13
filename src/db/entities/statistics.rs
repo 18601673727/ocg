@@ -264,6 +264,14 @@ pub struct AvailabilityStat {
     pub observation: AvailabilityObservation,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DecisionTarget {
+    pub provider: ConfigRef,
+    pub model: ConfigRef,
+    pub model_name: String,
+    pub provider_name: String,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct AvailabilityStatRecord {
     pub id: AvailabilityStatId,
@@ -271,8 +279,10 @@ pub struct AvailabilityStatRecord {
     pub job: JobId,
     /// See [`AvailabilityStat::request`].
     pub request: RequestNumber,
-    /// Read from the Job's frozen input.
-    pub target: LlmTarget,
+    /// Read from the Job's frozen input when it is an LLM Job.
+    pub target: Option<LlmTarget>,
+    /// Read from the Job's frozen input when it is a native Decision Job.
+    pub decision_target: Option<DecisionTarget>,
     /// The producer's time, see [`AvailabilityStat::observed_at`].
     pub observed_at: Timestamp,
     pub observation: AvailabilityObservation,

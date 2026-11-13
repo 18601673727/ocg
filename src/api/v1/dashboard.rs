@@ -714,6 +714,17 @@ fn availability_record(record: &AvailabilityStatRecord) -> AvailabilityObservati
         AvailabilityClassification::Rejected(_) => "rejected",
         AvailabilityClassification::Unconfirmed => "unconfirmed",
     };
+    let (model, provider) = match (&record.target, &record.decision_target) {
+        (Some(target), _) => (
+            Some(target.frozen.config.model.clone()),
+            Some(target.frozen.provider.name.clone()),
+        ),
+        (None, Some(decision)) => (
+            Some(decision.model_name.clone()),
+            Some(decision.provider_name.clone()),
+        ),
+        (None, None) => (None, None),
+    };
     AvailabilityObservationView {
         status_code: observation.status_code,
         finish_reason: observation
@@ -724,8 +735,8 @@ fn availability_record(record: &AvailabilityStatRecord) -> AvailabilityObservati
         job: record.job.to_string(),
         request: record.request.get(),
         observed_at_us: record.observed_at.as_unix_micros(),
-        model: Some(record.target.frozen.config.model.clone()),
-        provider: Some(record.target.frozen.provider.name.clone()),
+        model,
+        provider,
     }
 }
 
