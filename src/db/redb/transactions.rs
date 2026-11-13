@@ -1,8 +1,9 @@
 use super::*;
 use crate::db::entities::{
-    ConfigBody, ConfigId, DependencyCondition, ExecutionConfiguration, FrozenConfiguration,
-    FrozenDecisionConfig, OutcomeCause, OutcomeKind, OutcomeRecord, Recorded, SubmissionRecord,
-    ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, Violation,
+    ConfigBody, ConfigId, DependencyCondition, DependencyState, ExecutionConfiguration,
+    FrozenConfiguration, FrozenDecisionConfig, MutableJobPhase, OutcomeCause, OutcomeKind,
+    OutcomeRecord, Recorded, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord,
+    ToolOutcome, Violation,
 };
 use crate::system::execution_controls::ExecutionControl;
 
@@ -1419,13 +1420,25 @@ impl Batch {
                     )?
                     .map(|entry| Ok(entry?.0.value()))
                     .collect::<Result<Vec<_>, StorageError>>()?;
-                if keys.len() != 1 {
+                if keys.len() > 1 {
+                    return Err(StorageError::corrupted(
+                        "queued Job has duplicate ready entries",
+                    ));
+                }
+                if let Some(key) = keys.first() {
+                    ready.remove(*key)?;
+                    ready.insert(new_key, ())?;
+                } else if tx
+                    .open_table(UNSETTLED)?
+                    .get(id.get())?
+                    .is_some_and(|v| v.value().0 > 0)
+                {
+                    // Waiting on dependencies; it will enter MUTABLE_READY when dependencies settle.
+                } else {
                     return Err(StorageError::corrupted(
                         "queued Job has invalid ready entries",
                     ));
                 }
-                ready.remove(keys[0])?;
-                ready.insert(new_key, ())?;
                 Ok(())
             })?;
         }
@@ -1463,6 +1476,7 @@ impl Batch {
         });
         self.put_mutable_job_state(id, &state)?;
         self.release_draft_context(&job)?;
+        self.settle_native_dependents(id, OutcomeKind::Cancelled)?;
         self.probe = Some(Probe::Outcome(id));
         Ok(())
     }
@@ -1535,6 +1549,9 @@ impl Batch {
     ) -> Result<(), BatchError> {
         let id = job.id;
         let mut state = self.require_job_state(id)?;
+        if state.outcome.is_some() {
+            return Ok(());
+        }
         let submitted = job.submitted_at.ok_or_else(|| {
             BatchError(Failure::Storage(StorageError::corrupted(
                 "queued Job has no submission time",
@@ -1563,7 +1580,7 @@ impl Batch {
             }
             tx.open_table(PENDING)?.remove(id.get())?;
             let mut unsettled = tx.open_table(UNSETTLED)?;
-            if unsettled.get(id.get())?.map(|v| v.value()) != Some((0, 0)) {
+            if !matches!(unsettled.get(id.get())?.map(|v| v.value()), Some((_, 0))) {
                 return Err(StorageError::corrupted(
                     "queued Job has unsettled dependents",
                 ));
@@ -1579,6 +1596,7 @@ impl Batch {
         });
         self.put_mutable_job_state(id, &state)?;
         self.probe = Some(Probe::Outcome(id));
+        self.settle_native_dependents(id, OutcomeKind::Cancelled)?;
         Ok(())
     }
 
@@ -2451,7 +2469,8 @@ impl Batch {
             if !self.mutable_predecessor_ready(&job)? || self.mutable_job_blocked(&job)? {
                 continue;
             }
-            if job.summary_source.is_none()
+            let summary_work = self.is_summary_work(&job)?;
+            if !summary_work
                 && matches!(&job.input.content, crate::db::entities::MutableJobContent::Generative { configuration, .. } if configuration.is_none_or(|config| config.agent_profile.is_none()))
             {
                 continue;
@@ -2489,7 +2508,7 @@ impl Batch {
                 }
                 let ext_target = match &frozen {
                     FrozenConfiguration::Generative(frozen) => {
-                        let refusal = if job.summary_source.is_some() {
+                        let refusal = if summary_work {
                             frozen.provider_refusal()
                         } else {
                             frozen.native_execution_refusal()
@@ -2964,31 +2983,33 @@ impl Batch {
                     }
                     previous = turn.record.job.previous;
                 }
-                for input in context.covered_inputs.iter().rev() {
-                    if previous != Some(input.job) {
-                        return Err(stale());
+                if job.summary_source.is_none() {
+                    for input in context.covered_inputs.iter().rev() {
+                        if previous != Some(input.job) {
+                            return Err(stale());
+                        }
+                        let bounded = self.step(|tx| {
+                            Ok(tx
+                                .open_table(JOBS)?
+                                .get(input.job.get())?
+                                .is_some_and(|value| value.value().len() <= 8 * 1024 * 1024))
+                        })?;
+                        if !bounded {
+                            return Err(stale());
+                        }
+                        let row = self.read_mutable_job(input.job)?.ok_or_else(stale)?;
+                        if row.job.input.text() != input.text
+                            || row.job.input.attachments()
+                                != input
+                                    .attachments
+                                    .iter()
+                                    .map(|attachment| attachment.id)
+                                    .collect::<Vec<_>>()
+                        {
+                            return Err(stale());
+                        }
+                        previous = row.job.previous;
                     }
-                    let bounded = self.step(|tx| {
-                        Ok(tx
-                            .open_table(JOBS)?
-                            .get(input.job.get())?
-                            .is_some_and(|value| value.value().len() <= 8 * 1024 * 1024))
-                    })?;
-                    if !bounded {
-                        return Err(stale());
-                    }
-                    let row = self.read_mutable_job(input.job)?.ok_or_else(stale)?;
-                    if row.job.input.text() != input.text
-                        || row.job.input.attachments()
-                            != input
-                                .attachments
-                                .iter()
-                                .map(|attachment| attachment.id)
-                                .collect::<Vec<_>>()
-                    {
-                        return Err(stale());
-                    }
-                    previous = row.job.previous;
                 }
                 if previous.is_some() {
                     return Err(stale());
@@ -3043,7 +3064,12 @@ impl Batch {
         self.scheduled_external_authorization(job_id)?;
         let (snapshot, allocation) = match candidate {
             reader::DevelopmentCandidate::Generative(context) => {
-                if context.configuration.native_execution_refusal().is_some() {
+                let refusal = if self.is_summary_work(&context.job)? {
+                    context.configuration.provider_refusal()
+                } else {
+                    context.configuration.native_execution_refusal()
+                };
+                if refusal.is_some() {
                     return self.reject(Violation::InvalidValue(
                         "handoff",
                         "execution policy or provider requires unsupported preparation",
@@ -3775,7 +3801,157 @@ impl Batch {
             Ok(())
         })?;
         self.advance_recurrence_on_settlement(job, kind)?;
+        self.settle_native_dependents(token.job, kind)?;
         Ok((seq, id))
+    }
+
+    fn is_summary_work(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+    ) -> Result<bool, BatchError> {
+        if job.summary_source.is_some() {
+            return Ok(true);
+        }
+        let parent = self.require_mutable_conversation(job.parent_id)?;
+        Ok(matches!(
+            parent.kind,
+            JobKind::Group {
+                origin: Origin::System,
+                ..
+            }
+        ))
+    }
+
+    pub(super) fn dependency_outcome_state(
+        outcome: Option<&OutcomeRecord>,
+        condition: DependencyCondition,
+    ) -> DependencyState {
+        match outcome {
+            None => DependencyState::Waiting,
+            Some(outcome) => Self::dependency_outcome_kind_state(outcome.kind, condition),
+        }
+    }
+
+    pub(super) fn dependency_outcome_kind_state(
+        kind: OutcomeKind,
+        condition: DependencyCondition,
+    ) -> DependencyState {
+        match (kind, condition) {
+            (OutcomeKind::Unknown, _) => DependencyState::Waiting,
+            (OutcomeKind::Completed, _) => DependencyState::Satisfied,
+            (OutcomeKind::Failed | OutcomeKind::Cancelled, DependencyCondition::Settled) => {
+                DependencyState::Satisfied
+            }
+            (OutcomeKind::Failed | OutcomeKind::Cancelled, DependencyCondition::Success) => {
+                DependencyState::Impossible
+            }
+        }
+    }
+
+    fn enqueue_settled_waiter_if_eligible(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+    ) -> Result<(), BatchError> {
+        if self.pool_allocation(job.id)?.is_some() {
+            return Ok(());
+        }
+        if matches!(
+            &job.input.content,
+            crate::db::entities::MutableJobContent::Generative { .. }
+        ) {
+            match self.require_generative_predecessors(job) {
+                Ok(()) => {}
+                Err(BatchError(Failure::Rejected(Violation::InvalidValue(
+                    "execution_context",
+                    "Generative Jobs cannot follow Decision history",
+                )))) => return Ok(()),
+                Err(error) => return Err(error),
+            }
+        }
+        let submitted = job.submitted_at.ok_or_else(|| {
+            BatchError(Failure::Storage(StorageError::corrupted(
+                "queued Job has no submission time",
+            )))
+        })?;
+        let frozen = self.frozen_configuration(job)?;
+        let req_tag = mutable_configuration_requirement(&frozen);
+        let priority = mutable_priority(job.input.priority);
+        let submitted_micros = submitted.as_unix_micros();
+        let inserted = self.step(|tx| {
+            let mut ready = tx.open_table(MUTABLE_READY)?;
+            let already_ready = ready
+                .range(
+                    (priority, submitted_micros, job.id.get(), 0)
+                        ..=(priority, submitted_micros, job.id.get(), u16::MAX),
+                )?
+                .next()
+                .transpose()?
+                .is_some();
+            if already_ready {
+                return Ok(false);
+            }
+            ready.insert((priority, submitted_micros, job.id.get(), req_tag), ())?;
+            Ok(true)
+        })?;
+        if inserted {
+            self.wake_scheduler();
+        }
+        Ok(())
+    }
+
+    pub(super) fn settle_native_dependents(
+        &mut self,
+        prerequisite: JobId,
+        kind: OutcomeKind,
+    ) -> Result<(), BatchError> {
+        if kind == OutcomeKind::Unknown {
+            return Ok(());
+        }
+        let waiters = self.step(|tx| {
+            let table = tx.open_table(DEPENDENCY_WAITERS)?;
+            let mut found = Vec::new();
+            for entry in table.range((prerequisite.get(), 0)..=(prerequisite.get(), u128::MAX))? {
+                let (key, value) = entry?;
+                let condition = DependencyCondition::from_code(value.value())
+                    .ok_or_else(|| StorageError::corrupted("invalid dependency condition code"))?;
+                found.push((JobId::new(key.value().1), condition));
+            }
+            Ok(found)
+        })?;
+        for (waiter_id, condition) in waiters {
+            let Some(waiter_job) = self.mutable_job(waiter_id)? else {
+                continue;
+            };
+            let waiter_state = self.require_job_state(waiter_id)?;
+            if waiter_job.phase != MutableJobPhase::Queued || waiter_state.outcome.is_some() {
+                continue;
+            }
+            match Self::dependency_outcome_kind_state(kind, condition) {
+                DependencyState::Waiting => {}
+                DependencyState::Impossible => {
+                    self.end_queued_native_job(&waiter_job, OutcomeCause::DependencyImpossible)?;
+                }
+                DependencyState::Satisfied => {
+                    let ready_now = self.step(|tx| {
+                        let mut unsettled = tx.open_table(UNSETTLED)?;
+                        let Some((dependencies, children)) =
+                            unsettled.get(waiter_id.get())?.map(|v| v.value())
+                        else {
+                            return Ok(false);
+                        };
+                        let dependencies = dependencies.checked_sub(1).ok_or_else(|| {
+                            StorageError::corrupted("native Job dependency count underflow")
+                        })?;
+                        unsettled.insert(waiter_id.get(), (dependencies, children))?;
+                        Ok(dependencies == 0 && children == 0)
+                    })?;
+                    if ready_now {
+                        self.enqueue_settled_waiter_if_eligible(&waiter_job)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     fn planning_policy_for(
@@ -3914,7 +4090,7 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(DEPENDENCY_WAITERS)?.insert(
                 (dec_id.get(), job.id.get()),
-                DependencyCondition::Settled.code(),
+                DependencyCondition::Success.code(),
             )?;
             Ok(())
         })?;

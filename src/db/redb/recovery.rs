@@ -1111,45 +1111,46 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
                 continue;
             }
         };
-        if job.summary_source.is_some() {
-            continue;
-        }
+        let is_summary = job.summary_source.is_some();
         if job.phase != MutableJobPhase::Unsubmitted {
-            batch.insert(TURNS, (job.parent_id.get(), job.id.get()), ())?;
-            batch.step(|tx| {
-                indexes::update_mutable_turn_search(tx, job.parent_id, job.id, None, &job.input)
-            })?;
-            if let Some(outcome) = &state.outcome {
+            if !is_summary {
+                batch.insert(TURNS, (job.parent_id.get(), job.id.get()), ())?;
                 batch.step(|tx| {
-                    let outputs = tx.open_table(JOB_OUTPUTS)?;
-                    let mut result = None;
-                    for entry in outputs.range((job.id.get(), 0)..=(job.id.get(), u32::MAX))? {
-                        let (key, value) = entry?;
-                        if rows::output_kind(value.value())? == OutputKind::Result {
-                            result = Some(decode_output(key.value(), value.value())?);
-                        }
-                    }
-                    if let Some(result) = result {
-                        indexes::append_output_search_index(
-                            tx,
-                            job.parent_id,
-                            job.id,
-                            &result,
-                            outcome.kind == OutcomeKind::Completed,
-                        )?;
-                        let mut results = tx.open_table(GROUP_RESULTS)?;
-                        let old = results
-                            .get(job.parent_id.get())?
-                            .map_or((0, 0), |v| v.value());
-                        let latest = if outcome.kind == OutcomeKind::Cancelled {
-                            old.0
-                        } else {
-                            old.0.max(job.id.get())
-                        };
-                        results.insert(job.parent_id.get(), (latest, old.1.max(job.id.get())))?;
-                    }
-                    Ok(())
+                    indexes::update_mutable_turn_search(tx, job.parent_id, job.id, None, &job.input)
                 })?;
+                if let Some(outcome) = &state.outcome {
+                    batch.step(|tx| {
+                        let outputs = tx.open_table(JOB_OUTPUTS)?;
+                        let mut result = None;
+                        for entry in outputs.range((job.id.get(), 0)..=(job.id.get(), u32::MAX))? {
+                            let (key, value) = entry?;
+                            if rows::output_kind(value.value())? == OutputKind::Result {
+                                result = Some(decode_output(key.value(), value.value())?);
+                            }
+                        }
+                        if let Some(result) = result {
+                            indexes::append_output_search_index(
+                                tx,
+                                job.parent_id,
+                                job.id,
+                                &result,
+                                outcome.kind == OutcomeKind::Completed,
+                            )?;
+                            let mut results = tx.open_table(GROUP_RESULTS)?;
+                            let old = results
+                                .get(job.parent_id.get())?
+                                .map_or((0, 0), |v| v.value());
+                            let latest = if outcome.kind == OutcomeKind::Cancelled {
+                                old.0
+                            } else {
+                                old.0.max(job.id.get())
+                            };
+                            results
+                                .insert(job.parent_id.get(), (latest, old.1.max(job.id.get())))?;
+                        }
+                        Ok(())
+                    })?;
+                }
             }
             batch.insert(CHILDREN, (job.parent_id.get(), job.id.get()), ())?;
             if let Some(previous) = job.previous {
@@ -1244,7 +1245,107 @@ fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
             }
         }
     }
+    rebuild_native_dependencies(batch)?;
     settle_rebuilt_conversations(batch)
+}
+
+fn rebuild_native_dependencies(batch: &mut Batch) -> Result<(), BatchError> {
+    use crate::db::entities::{
+        DependencyCondition, DependencyState, MutableJobPhase, OutcomeCause,
+    };
+
+    let mut impossible_waiters = Vec::new();
+    let mut after: Option<(u128, u128)> = None;
+    loop {
+        let next = batch.step(|tx| {
+            use std::ops::Bound::{Excluded, Unbounded};
+            let waiters = tx.open_table(DEPENDENCY_WAITERS)?;
+            let mut range = waiters.range((after.map_or(Unbounded, Excluded), Unbounded))?;
+            let Some(entry) = range.next() else {
+                return Ok(None);
+            };
+            let (key, value) = entry?;
+            let (prereq_raw, waiter_raw) = key.value();
+            let condition = DependencyCondition::from_code(value.value())
+                .ok_or_else(|| StorageError::corrupted("invalid dependency condition code"))?;
+            Ok(Some(((prereq_raw, waiter_raw), condition)))
+        })?;
+        let Some(((prereq_raw, waiter_raw), condition)) = next else {
+            break;
+        };
+        after = Some((prereq_raw, waiter_raw));
+        let waiter_id = JobId::new(waiter_raw);
+        let Some(waiter_job) = batch.mutable_job(waiter_id)? else {
+            continue;
+        };
+        let waiter_state = batch.require_job_state(waiter_id)?;
+        if waiter_job.phase != MutableJobPhase::Queued || waiter_state.outcome.is_some() {
+            continue;
+        }
+        let prereq_id = JobId::new(prereq_raw);
+        let prereq_outcome = batch.step(|tx| {
+            let states = tx.open_table(JOB_STATES)?;
+            Ok(states
+                .get(prereq_id.get())?
+                .map(|row| JobState::decode_at(prereq_id.get(), row.value()))
+                .transpose()?
+                .and_then(|state| state.outcome))
+        })?;
+        match Batch::dependency_outcome_state(prereq_outcome.as_ref(), condition) {
+            DependencyState::Satisfied => {}
+            DependencyState::Waiting => {
+                let submitted = waiter_job.submitted_at.ok_or_else(|| {
+                    BatchError(Failure::Storage(StorageError::corrupted(
+                        "queued Job missing submission time",
+                    )))
+                })?;
+                let prefix = (
+                    transactions::mutable_priority(waiter_job.input.priority),
+                    submitted.as_unix_micros(),
+                    waiter_id.get(),
+                );
+                batch.step(|tx| {
+                    let mut unsettled = tx.open_table(UNSETTLED)?;
+                    let (dependencies, children) = unsettled
+                        .get(waiter_id.get())?
+                        .map(|row| row.value())
+                        .ok_or_else(|| {
+                            StorageError::corrupted("waiting Job unsettled row missing")
+                        })?;
+                    let dependencies = dependencies.checked_add(1).ok_or_else(|| {
+                        StorageError::corrupted("waiting Job dependency count overflow")
+                    })?;
+                    unsettled.insert(waiter_id.get(), (dependencies, children))?;
+
+                    let mut ready = tx.open_table(MUTABLE_READY)?;
+                    let keys = ready
+                        .range(
+                            (prefix.0, prefix.1, prefix.2, 0)
+                                ..=(prefix.0, prefix.1, prefix.2, u16::MAX),
+                        )?
+                        .map(|entry| Ok(entry?.0.value()))
+                        .collect::<Result<Vec<_>, StorageError>>()?;
+                    for key in keys {
+                        ready.remove(key)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            DependencyState::Impossible => {
+                impossible_waiters.push(waiter_id);
+            }
+        }
+    }
+    for waiter_id in impossible_waiters {
+        let Some(waiter_job) = batch.mutable_job(waiter_id)? else {
+            continue;
+        };
+        let waiter_state = batch.require_job_state(waiter_id)?;
+        if waiter_job.phase == MutableJobPhase::Queued && waiter_state.outcome.is_none() {
+            batch.end_queued_native_job(&waiter_job, OutcomeCause::DependencyImpossible)?;
+        }
+    }
+    Ok(())
 }
 
 fn settle_rebuilt_conversations(batch: &mut Batch) -> Result<(), BatchError> {

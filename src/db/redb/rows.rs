@@ -81,6 +81,11 @@ impl JobSpec {
                 JobKind::Group {
                     origin: Origin::Agent { .. },
                     ..
+                }
+                | JobKind::Group {
+                    origin: Origin::System,
+                    keep_open: false,
+                    ..
                 } => parent_id.is_some(),
                 JobKind::Group {
                     origin: Origin::User | Origin::System,

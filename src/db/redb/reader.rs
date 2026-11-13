@@ -875,6 +875,19 @@ pub(crate) struct DevelopmentExecutionContext {
     pub estimated_tokens: u64,
 }
 
+impl DevelopmentExecutionContext {
+    pub(crate) fn is_summary_work(&self) -> bool {
+        self.job.summary_source.is_some()
+            || matches!(
+                self.conversation.kind,
+                JobKind::Group {
+                    origin: Origin::System,
+                    ..
+                }
+            )
+    }
+}
+
 #[allow(dead_code)]
 pub(crate) struct DevelopmentDecisionContext {
     pub allocation: crate::db::entities::PoolAllocation,
@@ -1728,7 +1741,7 @@ fn development_candidate_in(
     }
     covered_inputs.reverse();
     history.reverse();
-    if covered_inputs.len() != covered.len() {
+    if record.job.summary_source.is_none() && covered_inputs.len() != covered.len() {
         return Err(StorageError::corrupted(
             "verified summary coverage is incomplete",
         ));

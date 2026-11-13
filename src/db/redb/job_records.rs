@@ -277,7 +277,7 @@ impl Batch {
             }
             Ok(Some((
                 NativeSummaryManifest {
-                    schema_version: 1,
+                    schema_version: 2,
                     conversation,
                     through_job: through,
                     sources: boundaries,

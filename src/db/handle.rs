@@ -93,7 +93,7 @@ impl PreparedDevelopmentHandoff {
     pub(crate) fn is_summary_producer(&self) -> bool {
         matches!(
             &self.candidate,
-            redb::DevelopmentCandidate::Generative(context) if context.job.summary_source.is_some()
+            redb::DevelopmentCandidate::Generative(context) if context.is_summary_work()
         )
     }
 
@@ -444,7 +444,7 @@ fn prepare_development_handoff(
                 .agent
                 .as_ref()
                 .is_some_and(|agent| agent.manages_jobs());
-            let is_summary = snapshot.job.summary_source.is_some();
+            let is_summary = snapshot.is_summary_work();
             if is_summary {
                 if frozen.provider_refusal().is_some() || offer.is_some() {
                     return Err(unavailable());
@@ -1672,7 +1672,7 @@ impl DatabaseHandle {
             .map_err(classify_unstarted)?;
         let offer = match &resolved {
             redb::DevelopmentResolvedCandidate::Generative(context)
-                if context.snapshot.job.summary_source.is_none() =>
+                if !context.snapshot.is_summary_work() =>
             {
                 tooling
                     .offer(
