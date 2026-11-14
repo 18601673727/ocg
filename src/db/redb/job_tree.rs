@@ -215,6 +215,7 @@ impl Batch {
         let row = self.require_mutable_conversation(parent)?;
         if !row.kind.is_group()
             || row.is_chunk_group()
+            || row.is_standalone_decision_group()
             || self.require_job_state(parent)?.outcome.is_some()
             || self.job_control(parent)?.closing.is_some()
         {
@@ -548,6 +549,61 @@ impl Batch {
         Ok(())
     }
 
+    pub(super) fn settle_standalone_decision(
+        &mut self,
+        job: &MutableJob,
+    ) -> Result<(), BatchError> {
+        let spec = self.require_mutable_conversation(job.parent_id)?;
+        if !spec.is_standalone_decision_group() {
+            return Ok(());
+        }
+        if !matches!(
+            job.input.content,
+            crate::db::entities::MutableJobContent::Decision { .. }
+        ) {
+            return self.corrupted("standalone Decision Group contains a non-Decision Job".into());
+        }
+        if self.require_job_state(spec.id)?.outcome.is_some() {
+            return Ok(());
+        }
+        let Some(outcome) = self.require_job_state(job.id)?.outcome else {
+            return Ok(());
+        };
+        let counts = self.step(|tx| {
+            Ok(tx
+                .open_table(UNSETTLED)?
+                .get(spec.id.get())?
+                .map(|row| row.value()))
+        })?;
+        let Some(counts) = counts else {
+            return self.corrupted("standalone Decision Group unsettled row missing".into());
+        };
+        if outcome.kind == OutcomeKind::Unknown
+            || counts != (0, 0)
+            || self
+                .pool_allocation(job.id)?
+                .is_some_and(|allocation| allocation.holds_capacity())
+            || !self.unsettled_turns(spec.id)?.is_empty()
+            || !self.live_children(spec.id)?.is_empty()
+            || !self.unsettled_summary_producers(spec.id)?.is_empty()
+        {
+            return Ok(());
+        }
+        let mut control = self.job_control(spec.id)?;
+        if control.closing.is_none() {
+            control.closing = Some(JobClosing {
+                at: outcome.at,
+                by: Actor::Auto,
+                running: false,
+            });
+            self.put_job_control(spec.id, &control)?;
+        }
+        self.record_conversation_outcome(&spec, outcome.clone())?;
+        self.settle_native_dependents(spec.id, outcome.kind)?;
+        self.wake_scheduler();
+        Ok(())
+    }
+
     fn chunk_members(&mut self, group: JobId) -> Result<Vec<JobId>, BatchError> {
         self.step(|tx| {
             tx.open_table(CHILDREN)?
@@ -682,25 +738,18 @@ impl Batch {
         let Some(parent) = spec.parent_id else {
             return self.corrupted("Chunk Group has no parent".into());
         };
-        let mut state = self.require_job_state(group)?;
+        let state = self.require_job_state(group)?;
         let control = self.job_control(group)?;
         let unsettled =
             self.step(|tx| Ok(tx.open_table(UNSETTLED)?.get(group.get())?.is_some()))?;
         if state.outcome.is_some() {
             if !unsettled {
-                if rebuilt
-                    && let Some(outcome) = self.chunk_group_outcome(group)?
-                    && state.outcome.as_ref() != Some(&outcome)
-                {
-                    state.outcome = Some(outcome);
-                    self.put_job_state(group, &state)?;
+                if rebuilt && self.chunk_group_outcome(group)?.as_ref() != state.outcome.as_ref() {
+                    return self.corrupted("settled Chunk Group contradicts its members".into());
                 }
                 return Ok(());
             }
-            // Older writers could close the Group while its Chunks still owned this row.
-            state.outcome = None;
-            self.put_job_state(group, &state)?;
-            self.insert(LIVE_CHILDREN, (parent.get(), group.get()), ())?;
+            return self.corrupted("settled Chunk Group still has unsettled members".into());
         }
         let parent_closed = self.job_control(parent)?.closing.is_some()
             || self.require_job_state(parent)?.outcome.is_some();

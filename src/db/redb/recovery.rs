@@ -223,7 +223,7 @@ pub(super) fn check_identity(
     };
     if found != FORMAT_VERSION {
         return Err(unsupported_format(&format!(
-            "database format {found} is not supported; this build opens only format {FORMAT_VERSION}; run `ocg migrate --check`"
+            "database format {found} is not supported; this build opens only format {FORMAT_VERSION}; no migration is available"
         )));
     }
     if !meta
@@ -231,7 +231,7 @@ pub(super) fn check_identity(
         .is_some_and(|value| value.value() == SCHEMA_FINGERPRINT)
     {
         return Err(unsupported_format(&format!(
-            "database format {found} has a different schema fingerprint; run `ocg migrate --check`"
+            "database format {found} has a different schema fingerprint"
         )));
     }
     Ok(())
@@ -576,6 +576,96 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
         return Err(StorageError::corrupted(
             "the Allocation indexes differ from their source rows",
         ));
+    }
+    let jobs = tx.open_table(JOBS)?;
+    let turns = tx.open_table(TURNS)?;
+    for entry in jobs.iter()? {
+        let (key, value) = entry?;
+        if value.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
+            let spec = JobSpec::decode_at(key.value(), value.value())?;
+            if spec.is_standalone_decision_group() {
+                let mut members = turns.range((spec.id.get(), 0)..=(spec.id.get(), u128::MAX))?;
+                let member = members
+                    .next()
+                    .transpose()?
+                    .ok_or_else(|| StorageError::corrupted("standalone Decision Group has no Job"))?
+                    .0
+                    .value()
+                    .1;
+                if members.next().transpose()?.is_some() {
+                    return Err(StorageError::corrupted(
+                        "standalone Decision Group has multiple Jobs",
+                    ));
+                }
+                let row = jobs
+                    .get(member)?
+                    .ok_or_else(|| StorageError::corrupted("standalone Decision Job is missing"))?;
+                let job = transactions::decode_mutable_job(member, row.value())?;
+                if job.parent_id != spec.id
+                    || job.previous.is_some()
+                    || job.summary_source.is_some()
+                    || !matches!(
+                        job.input.content,
+                        crate::db::entities::MutableJobContent::Decision { .. }
+                    )
+                {
+                    return Err(StorageError::corrupted("invalid standalone Decision Job"));
+                }
+                let states = tx.open_table(JOB_STATES)?;
+                let group_state = states.get(spec.id.get())?.ok_or_else(|| {
+                    StorageError::corrupted("standalone Decision Group state is missing")
+                })?;
+                let job_state = states.get(member)?.ok_or_else(|| {
+                    StorageError::corrupted("standalone Decision state is missing")
+                })?;
+                let group_outcome =
+                    JobState::decode_at(spec.id.get(), group_state.value())?.outcome;
+                let job_outcome = JobState::decode_at(member, job_state.value())?.outcome;
+                let confirmed = job_outcome
+                    .as_ref()
+                    .filter(|outcome| outcome.kind != OutcomeKind::Unknown);
+                if group_outcome.as_ref() != confirmed {
+                    return Err(StorageError::corrupted(
+                        "standalone Decision Group outcome disagrees with its Job",
+                    ));
+                }
+            }
+            continue;
+        }
+        let job = transactions::decode_mutable_job(key.value(), value.value())?;
+        let parent = jobs
+            .get(job.parent_id.get())?
+            .ok_or_else(|| StorageError::corrupted("mutable Job conversation is missing"))?;
+        let spec = JobSpec::decode_at(job.parent_id.get(), parent.value())?;
+        if spec.is_standalone_decision_group()
+            && (job.previous.is_some()
+                || job.summary_source.is_some()
+                || !matches!(
+                    job.input.content,
+                    crate::db::entities::MutableJobContent::Decision { .. }
+                ))
+        {
+            return Err(StorageError::corrupted("invalid standalone Decision Job"));
+        }
+        let expected = job.phase != crate::db::entities::MutableJobPhase::Unsubmitted
+            && job.summary_source.is_none()
+            && !spec.is_chunk_group();
+        if turns.get((job.parent_id.get(), job.id.get()))?.is_some() != expected {
+            return Err(StorageError::corrupted("turn index differs from its Job"));
+        }
+    }
+    for entry in turns.iter()? {
+        let (key, _) = entry?;
+        let (parent, id) = key.value();
+        let row = jobs
+            .get(id)?
+            .ok_or_else(|| StorageError::corrupted("turn index Job missing"))?;
+        let job = transactions::decode_mutable_job(id, row.value())?;
+        if job.parent_id.get() != parent {
+            return Err(StorageError::corrupted(
+                "turn index names another conversation",
+            ));
+        }
     }
     if let Ok(states) = tx.open_table(JOB_STATES) {
         for entry in states.iter()? {
@@ -956,9 +1046,7 @@ pub(super) fn initialize(
     let abandoned = {
         let rebuild = match verification {
             Verification::Full => true,
-            Verification::Quick => {
-                !clean_shutdown || indexes_missing || chunk_turns_indexed(&batch.tx)?
-            }
+            Verification::Quick => !clean_shutdown || indexes_missing,
         };
         if rebuild {
             rebuild_mutable_jobs(&mut batch).map_err(|BatchError(failure)| match failure {
@@ -1436,30 +1524,6 @@ fn settle_rebuilt_chunk_groups(batch: &mut Batch, rebuilt: bool) -> Result<(), B
             batch.recover_chunk_group(&spec, rebuilt)?;
         }
     }
-}
-
-fn chunk_turns_indexed(tx: &WriteTransaction) -> Result<bool, StorageError> {
-    let groups = tx.open_table(CHILD_GROUPS)?;
-    let jobs = tx.open_table(JOBS)?;
-    let turns = tx.open_table(TURNS)?;
-    for entry in groups.iter()? {
-        let (_, group) = entry?.0.value();
-        if turns
-            .range((group, 0)..=(group, u128::MAX))?
-            .next()
-            .transpose()?
-            .is_none()
-        {
-            continue;
-        }
-        let row = jobs
-            .get(group)?
-            .ok_or_else(|| StorageError::corrupted("child Group missing"))?;
-        if JobSpec::decode_at(group, row.value())?.is_chunk_group() {
-            return Ok(true);
-        }
-    }
-    Ok(false)
 }
 
 pub(super) fn allocate(tx: &WriteTransaction) -> Result<u128, StorageError> {

@@ -3,8 +3,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
-
 #[derive(Clone, Debug)]
 pub struct BackendConfig {
     pub data_dir: PathBuf,
@@ -65,13 +63,21 @@ pub struct BackendProcess {
 }
 
 struct ChildOwner {
-    child: Child,
+    child: Option<Child>,
 }
 
 impl Drop for ChildOwner {
     fn drop(&mut self) {
-        let _ = terminate(&mut self.child);
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take()
+            && child.try_wait().ok().flatten().is_none()
+        {
+            let _ = child.kill();
+            let _ = std::thread::Builder::new()
+                .name("backend-benchmark-reaper".to_owned())
+                .spawn(move || {
+                    let _ = child.wait();
+                });
+        }
     }
 }
 
@@ -96,14 +102,15 @@ impl BackendProcess {
         }
         std::fs::create_dir_all(&config.data_dir)?;
         std::fs::create_dir_all(&config.workspace)?;
-        if !database_exists(&config.data_dir)? {
-            create_database(&binary, config)?;
-        }
-        let activation = preflight(&binary, config)?;
-        let child = serve(&binary, config, &activation)?;
+        let child = command(&binary, config)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
         let pid = child.id();
-        let mut owner = ChildOwner { child };
-        let address = read_address(&mut owner.child, started, config.startup_timeout, pid)?;
+        let mut owner = ChildOwner { child: Some(child) };
+        let child = owner.child.as_mut().ok_or("backend child is missing")?;
+        let address = read_address(child, started, config.startup_timeout, pid)?;
         Ok(Self {
             owner,
             address,
@@ -147,18 +154,23 @@ impl BackendProcess {
     }
 
     pub fn shutdown(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        terminate(&mut self.owner.child)?;
+        let child = self
+            .owner
+            .child
+            .as_mut()
+            .ok_or("backend child is missing")?;
+        terminate(child)?;
         let deadline = Instant::now() + self.shutdown_timeout;
         loop {
-            if let Some(status) = self.owner.child.try_wait()? {
+            if let Some(status) = child.try_wait()? {
                 if status.success() {
                     return Ok(());
                 }
                 return Err(format!("backend child exited unsuccessfully: {status}").into());
             }
             if Instant::now() >= deadline {
-                self.owner.child.kill()?;
-                let status = self.owner.child.wait()?;
+                child.kill()?;
+                let status = child.wait()?;
                 return Err(format!(
                     "backend child required forced termination after {:?}; it is not a clean close (status {status})",
                     self.shutdown_timeout
@@ -190,19 +202,6 @@ fn host_binary() -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
     Ok(binary)
 }
 
-fn database_exists(data_dir: &Path) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    if !data_dir.is_dir() {
-        return Ok(false);
-    }
-    for entry in std::fs::read_dir(data_dir)? {
-        let entry = entry?;
-        if entry.path().extension().is_some_and(|kind| kind == "redb") {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 fn command(binary: &Path, config: &BackendConfig) -> Command {
     let mut command = Command::new(binary);
     #[cfg(unix)]
@@ -222,118 +221,6 @@ fn command(binary: &Path, config: &BackendConfig) -> Command {
         .env("NO_PROXY", &excluded)
         .env("no_proxy", &excluded);
     command
-}
-
-fn create_database(
-    binary: &Path,
-    config: &BackendConfig,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let started = Instant::now();
-    let mut child = command(binary, config)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let pid = child.id();
-    let address = read_address(&mut child, started, config.startup_timeout, pid)?;
-    let _ = address;
-    terminate(&mut child)?;
-    let status = child.wait()?;
-    if !status.success() {
-        return Err(format!("the database-creating host exited with {status}").into());
-    }
-    Ok(())
-}
-
-fn preflight(
-    binary: &Path,
-    config: &BackendConfig,
-) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let first = run_cli(binary, config, &["loopback-scheduling", "preflight"])?;
-    let identity = first
-        .get("database_identity")
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("the preflight named no database identity: {first}"))?
-        .to_owned();
-    let second = run_cli(
-        binary,
-        config,
-        &[
-            "loopback-scheduling",
-            "preflight",
-            "--database",
-            identity.as_str(),
-        ],
-    )?;
-    if second.get("verdict").and_then(Value::as_str) != Some("pass") {
-        return Err(format!("the activation preflight refused this run: {second}").into());
-    }
-    if second
-        .get("confirmation_challenge")
-        .and_then(Value::as_str)
-        .is_none()
-    {
-        return Err(format!("the preflight issued no challenge: {second}").into());
-    }
-    Ok(second)
-}
-
-fn run_cli(
-    binary: &Path,
-    config: &BackendConfig,
-    arguments: &[&str],
-) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-    let output = command(binary, config)
-        .args(arguments)
-        .arg("--data-dir")
-        .arg(&config.data_dir)
-        .stdin(Stdio::null())
-        .output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let trimmed = stdout.trim();
-    if trimmed.is_empty() {
-        return Err(format!(
-            "`{}` printed nothing (status {}): {}",
-            arguments.join(" "),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-        .into());
-    }
-    serde_json::from_str(trimmed)
-        .map_err(|error| format!("`{}` printed no JSON: {error}", arguments.join(" ")).into())
-}
-
-fn serve(
-    binary: &Path,
-    config: &BackendConfig,
-    activation: &Value,
-) -> Result<Child, Box<dyn std::error::Error + Send + Sync>> {
-    let identity = activation["requested"]["database_identity"]
-        .as_str()
-        .or_else(|| activation["database_identity"].as_str())
-        .ok_or("the preflight report carries no database identity")?;
-    let challenge = activation["confirmation_challenge"]
-        .as_str()
-        .ok_or("the preflight report carries no challenge")?;
-    let child = command(binary, config)
-        .args([
-            "loopback-scheduling",
-            "serve",
-            "--data-dir",
-            &config.data_dir.to_string_lossy(),
-            "--database",
-            identity,
-            "--confirm-first-activation",
-            "--confirm-loopback-only",
-            "--confirm-challenge",
-            challenge,
-        ])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    Ok(child)
 }
 
 fn terminate(child: &mut Child) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -378,13 +265,26 @@ fn read_address(
         let sender = sender.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stream);
+            let mut receiving = true;
             loop {
                 let mut line = String::new();
                 match reader.read_line(&mut line) {
                     Ok(0) => return,
                     Ok(_) => {
-                        if sender.send(line).is_err() {
-                            return;
+                        if receiving {
+                            match sender.send(line) {
+                                Ok(()) => continue,
+                                Err(error) => {
+                                    receiving = false;
+                                    line = error.0;
+                                }
+                            }
+                        }
+                        let trimmed = line.trim();
+                        if !trimmed.is_empty()
+                            && !trimmed.starts_with("OCG local browser pairing code:")
+                        {
+                            eprintln!("backend {pid}: {trimmed}");
                         }
                     }
                     Err(error) => {
@@ -397,6 +297,8 @@ fn read_address(
     }
     drop(sender);
     let deadline = started + timeout;
+    let mut address = None;
+    let mut signal_ready = false;
     loop {
         let remaining = deadline
             .checked_duration_since(Instant::now())
@@ -406,10 +308,16 @@ fn read_address(
         match receiver.recv_timeout(remaining) {
             Ok(line) => {
                 let trimmed = line.trim();
-                if let Some(address) = listening_address(trimmed) {
+                if let Some(found) = listening_address(trimmed) {
+                    address = Some(found);
+                }
+                if trimmed == "OCG signal listener ready" {
+                    signal_ready = true;
+                }
+                if signal_ready && let Some(address) = address.take() {
                     return Ok(address);
                 }
-                if !trimmed.is_empty() {
+                if !trimmed.is_empty() && !trimmed.starts_with("OCG local browser pairing code:") {
                     eprintln!("backend {pid}: {trimmed}");
                 }
             }

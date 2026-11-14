@@ -574,7 +574,14 @@ async fn execute_job(
     }
     .await;
     if let Err(error) = result {
-        observation.error = Some(error);
+        let details = match observation.job_id.as_deref() {
+            Some(job) => client.get_json(&format!("/api/v1/jobs/{job}")).await.ok(),
+            None => None,
+        };
+        observation.error = Some(match details {
+            Some(details) => format!("{error}; job state: {details}"),
+            None => error,
+        });
     }
     observation
 }
@@ -743,8 +750,8 @@ async fn stream_job(
                 if event.name != "output" || event.data["output"]["kind"] == "result" {
                     return Ok(());
                 }
-                let Some(text) = event.data["output"]["value"]["text"].as_str() else {
-                    return Err(format!("content output omitted value.text: {}", event.data));
+                let Some(text) = event.data["output"]["summary"].as_str() else {
+                    return Err(format!("content output omitted summary: {}", event.data));
                 };
                 if text.is_empty() {
                     return Ok(());
@@ -793,7 +800,7 @@ async fn stream_job(
 }
 
 async fn drain_admitted(client: &BenchmarkClient, options: &Options, result: &mut WorkResult) {
-    for observation in result.jobs.iter_mut().rev() {
+    for observation in &mut result.jobs {
         if observation.error.is_some() {
             continue;
         }
@@ -1261,7 +1268,7 @@ async fn measure_admission(context: &MeasurementContext, options: &Options) -> R
     for &concurrency in &options.clients {
         let parameters = context.parameters(options, "admission", concurrency, options.jobs)
             .with("observation_mechanism", json!("POST /api/v1/jobs then POST /api/v1/jobs/{job}/submit, each answered once committed"))
-            .with("completion_drain", json!("outside admission timing window; reverse job-key order"))
+            .with("completion_drain", json!("outside admission timing window; ascending job-key order"))
             .with("units", json!({"latency": "ms"}));
         emit_begin(&parameters);
         for trial in 0..options.trials {

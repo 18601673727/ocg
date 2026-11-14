@@ -51,6 +51,18 @@ impl JobSpec {
             )
     }
 
+    pub(super) fn is_standalone_decision_group(&self) -> bool {
+        self.parent_id.is_none()
+            && matches!(
+                self.kind,
+                JobKind::Group {
+                    origin: Origin::System,
+                    keep_open: false,
+                    ..
+                }
+            )
+    }
+
     pub(super) fn encode_mutable_conversation(&self) -> Vec<u8> {
         let mut encoded = self.encode();
         encoded[0] = Self::MUTABLE_CONVERSATION_TAG;
@@ -93,12 +105,12 @@ impl JobSpec {
                 JobKind::Group {
                     origin: Origin::Agent { .. },
                     ..
-                }
-                | JobKind::Group {
+                } => parent_id.is_some(),
+                JobKind::Group {
                     origin: Origin::System,
                     keep_open: false,
                     ..
-                } => parent_id.is_some(),
+                } => true,
                 JobKind::Group {
                     origin: Origin::User | Origin::System,
                     ..

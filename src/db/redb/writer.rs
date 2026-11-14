@@ -412,8 +412,12 @@ impl Batch {
     }
 
     pub(crate) fn config(&mut self, id: ConfigId) -> Result<Option<ConfigRow>, BatchError> {
-        self.get(CONFIGS, id.get(), |bytes| {
-            ConfigRow::decode_at(id.get(), bytes)
+        self.step(|tx| {
+            tx.open_table(CONFIGS)?
+                .get(id.get())?
+                .map(|bytes| ConfigRow::scan_at(id.get(), bytes.value()))
+                .transpose()
+                .map(Option::flatten)
         })
     }
 
@@ -1668,6 +1672,7 @@ impl Batch {
         }
         let mut evidence = checkpoint.evidence();
         let old = evidence.sample();
+        let ids = [self.next_id()?, self.next_id()?, self.next_id()?];
         let mut prepared_usages = Vec::with_capacity(usages.len());
         let mut next_seq = 5u32;
         for (expected_seq, metrics) in usages {
@@ -1751,12 +1756,12 @@ impl Batch {
                 failure: stat.observation.failure,
             },
         ];
-        let mut ids = [0u128; 3];
-        for (offset, (seq, payload)) in [2u32, 3, 4].into_iter().zip(payloads).enumerate() {
-            ids[offset] = self.insert_development_request_event(
+        for ((seq, payload), id) in [2u32, 3, 4].into_iter().zip(payloads).zip(ids) {
+            self.insert_development_request_event_with_id(
                 &identity,
                 job,
                 stat.request,
+                id,
                 seq,
                 observed_at,
                 payload,
@@ -1984,17 +1989,11 @@ impl Batch {
         let Some(row) = self.mutable_job(job)? else {
             return self.reject(Violation::NotFound(RecordRef::Job(job)));
         };
-        let Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) = row.frozen
-        else {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "frozen generative configuration required",
-            ));
-        };
+        let identity = self.development_usage_identity(job)?;
         let parent = self.require_mutable_conversation(row.parent_id)?;
         let agent = usage_agent(&parent, None);
-        let provider = frozen.llm.provider.id.get();
-        let hash = *ContentDigest::of(frozen.llm.config.model.as_bytes()).as_bytes();
+        let provider = identity.provider;
+        let hash = *ContentDigest::of(identity.model.as_bytes()).as_bytes();
         let key = |sample: &crate::db::entities::TokenRequestSample| {
             (
                 sample

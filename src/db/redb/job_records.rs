@@ -116,10 +116,10 @@ impl Batch {
             });
         }
         let row = self.require_mutable_conversation(conversation)?;
-        if row.is_chunk_group() {
+        if row.is_chunk_group() || row.is_standalone_decision_group() {
             refuse!(
                 "compaction_unavailable",
-                "Chunk Groups do not have conversation history"
+                "this Group does not support conversation compaction"
             );
         }
         if automatic.is_none() {

@@ -78,7 +78,16 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn until_signalled() {
-    let signals = ntex::rt::signals::signal().await;
+    let receiver = ntex::rt::signals::signal();
+    // ntex queues signal subscription on the primary runtime. A subsequent task
+    // on that same FIFO queue completes only after the subscription is installed.
+    let barrier = ntex::rt::System::current().handle().spawn(async {});
+    if barrier.await.is_err() {
+        log::error!("signal subscription barrier failed");
+        return;
+    }
+    eprintln!("OCG signal listener ready");
+    let signals = receiver.await;
     log::info!("OCG received {signals:?}; shutting down");
 }
 

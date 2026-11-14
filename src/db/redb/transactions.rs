@@ -1,9 +1,8 @@
 use super::*;
 use crate::db::entities::{
-    ConfigBody, ConfigId, DependencyCondition, DependencyState, ExecutionConfiguration,
-    FrozenConfiguration, FrozenDecisionConfig, MutableJobPhase, OutcomeCause, OutcomeKind,
-    OutcomeRecord, Recorded, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord,
-    ToolOutcome, Violation,
+    ConfigId, DependencyCondition, DependencyState, ExecutionConfiguration, FrozenConfiguration,
+    FrozenDecisionConfig, MutableJobPhase, OutcomeCause, OutcomeKind, OutcomeRecord, Recorded,
+    SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, Violation,
 };
 use crate::system::execution_controls::ExecutionControl;
 
@@ -1228,6 +1227,7 @@ impl Batch {
                 }
                 if !row.kind.is_group()
                     || row.is_chunk_group()
+                    || row.is_standalone_decision_group()
                     || self.require_job_state(parent)?.outcome.is_some()
                     || self.job_control(parent)?.closing.is_some()
                 {
@@ -1599,6 +1599,7 @@ impl Batch {
         self.probe = Some(Probe::Outcome(id));
         self.settle_native_dependents(id, OutcomeKind::Cancelled)?;
         self.settle_summary_membership(job)?;
+        self.settle_standalone_decision(job)?;
         Ok(())
     }
 
@@ -3515,6 +3516,7 @@ impl Batch {
             None,
         )?;
         self.settle_summary_membership(&job)?;
+        self.settle_standalone_decision(&job)?;
         self.freed_capacity = true;
         self.probe = Some(Probe::Outcome(token.job));
         if kind == OutcomeKind::Completed
@@ -4490,6 +4492,7 @@ impl Batch {
         let previous = allocation.clone();
         allocation.phase = AllocationPhase::Released;
         self.put_pool_allocation(&allocation, Some(&previous))?;
+        self.settle_standalone_decision(&job)?;
         self.freed_capacity = true;
         self.probe = Some(Probe::Outcome(token.job));
         Ok((
@@ -4827,23 +4830,20 @@ impl Batch {
             },
             (Some(_), None) | (None, _) => false,
         };
-        let value = create(self)?;
         if !replay && let Some(candidate) = candidate {
             let crate::db::AdmissionCandidate::Decision(executor, _) = candidate;
-            if !self
-                .config_record(executor.into())?
-                .is_some_and(|row| matches!(row.body, ConfigBody::Pool(_)))
-            {
-                return self.reject(Violation::NotFound(RecordRef::Executor(executor)));
-            }
-            if !self.step(|tx| reader::candidate_compatible(tx, candidate))? {
-                return self.reject(Violation::InvalidValue(
-                    "executor_incompatible",
-                    "the Executor cannot run this request",
-                ));
+            match self.step(|tx| reader::candidate_compatible(tx, candidate))? {
+                None => return self.reject(Violation::NotFound(RecordRef::Executor(executor))),
+                Some(false) => {
+                    return self.reject(Violation::InvalidValue(
+                        "executor_incompatible",
+                        "the Executor cannot run this request",
+                    ));
+                }
+                Some(true) => {}
             }
         }
-        Ok(value)
+        create(self)
     }
 
     pub(crate) fn global_headers(

@@ -4,8 +4,8 @@ pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
-pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v1";
-pub(super) const FORMAT_VERSION: u64 = 1;
+pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v2";
+pub(super) const FORMAT_VERSION: u64 = 2;
 
 pub(super) const fn record_version_byte() -> u8 {
     const { assert!(FORMAT_VERSION <= u8::MAX as u64) };

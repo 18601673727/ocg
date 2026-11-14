@@ -3196,8 +3196,9 @@ pub(crate) fn read_config(
 fn config(rx: &ReadTransaction, id: ConfigId) -> Result<Option<ConfigRecord>, StorageError> {
     rx.open_table(CONFIGS)?
         .get(id.get())?
-        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()).map(config_record))
+        .map(|bytes| ConfigRow::scan_at(id.get(), bytes.value()))
         .transpose()
+        .map(|row| row.flatten().map(config_record))
 }
 
 pub(crate) fn read_credential_ref_in_use(
@@ -3704,24 +3705,30 @@ fn pools_offering_capability(
 pub(super) fn candidate_compatible(
     rx: &impl TxRead,
     candidate: crate::db::AdmissionCandidate,
-) -> Result<bool, StorageError> {
+) -> Result<Option<bool>, StorageError> {
     let (executor, model, decision) = match candidate {
         crate::db::AdmissionCandidate::Decision(executor, model) => (executor, model, true),
     };
     let configs = rx.table(CONFIGS)?;
-    let Some(pool) = configs
-        .get(executor.get())?
-        .map(|bytes| ConfigRow::decode_at(executor.get(), bytes.value()))
-        .transpose()?
-    else {
-        return Ok(false);
+    let Some(bytes) = configs.get(executor.get())? else {
+        return Ok(None);
     };
+    if bytes.value().first() != Some(&transactions::TAG_ALLOCATION_EXECUTOR) {
+        ConfigRow::scan_at(executor.get(), bytes.value())?;
+        return Ok(None);
+    }
+    let executor = transactions::decode_allocation_executor(executor.get(), bytes.value())?;
+    let pool = configs
+        .get(executor.pool.get())?
+        .ok_or_else(|| StorageError::corrupted("Executor references a missing Pool"))?;
+    let pool = transactions::decode_allocation_pool(executor.pool.get(), pool.value())?;
     let Some(model_row) = configs
         .get(model.get())?
-        .map(|bytes| ConfigRow::decode_at(model.get(), bytes.value()))
+        .map(|bytes| ConfigRow::scan_at(model.get(), bytes.value()))
         .transpose()?
+        .flatten()
     else {
-        return Ok(false);
+        return Ok(Some(false));
     };
     let capability = match model_row.body {
         ConfigBody::DecisionModel(_) if decision => Some((ExecutionOperation::Decision, None)),
@@ -3750,8 +3757,13 @@ pub(super) fn candidate_compatible(
         | ConfigBody::DecisionModel(_)
         | ConfigBody::DecisionAgent(_) => None,
     };
-    Ok(pool.archived_at.is_none()
-        && matches!(pool.body, ConfigBody::Pool(body) if body.enabled && capability.is_some_and(|(operation, protocol)| body.offers(operation, protocol))))
+    Ok(Some(
+        executor.enabled
+            && !executor.archived
+            && pool.enabled
+            && !pool.archived
+            && capability.is_some_and(|capability| executor.capabilities.contains(&capability)),
+    ))
 }
 
 pub(super) fn compatible_executors(
@@ -5090,7 +5102,7 @@ pub(crate) fn read_context_state(
                 predictor_model = Some(frozen.model_ref().id);
                 policy.predictive = previous_binding;
                 crate::service::jobs::bind_prediction(&mut policy, &frozen);
-                if !decision_executor_available(&rx.open_table(CONFIGS)?, &frozen)? {
+                if !decision_executor_available(&rx, &frozen)? {
                     Some("no enabled Executor offers the project decision model".to_owned())
                 } else if active.llm.config.context_window.is_none() {
                     Some("foreground model capacity is unknown".to_owned())
@@ -5238,7 +5250,7 @@ fn read_config_record(
 }
 
 pub(super) fn decision_executor_available(
-    configs: &impl ReadableTable<u128, &'static [u8]>,
+    rx: &impl TxRead,
     frozen: &crate::db::entities::FrozenDecisionConfig,
 ) -> Result<bool, StorageError> {
     let (operation, protocol) = match frozen {
@@ -5250,18 +5262,7 @@ pub(super) fn decision_executor_available(
             Some(active.llm.provider.transport),
         ),
     };
-    for entry in configs.iter()? {
-        let (key, bytes) = entry?;
-        let row = ConfigRow::decode_at(key.value(), bytes.value())?;
-        if row.archived_at.is_none()
-            && let ConfigBody::Pool(pool) = row.body
-            && pool.enabled
-            && pool.offers(operation, protocol)
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
+    Ok(!pools_offering_capability(rx, operation, protocol)?.is_empty())
 }
 
 fn approved_calls(

@@ -209,7 +209,7 @@ impl MockProvider {
     }
 
     pub async fn stop(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.handle.stop(true).await;
+        self.handle.stop(false).await;
         self.server
             .await
             .map_err(|_| "the mock provider panicked")?

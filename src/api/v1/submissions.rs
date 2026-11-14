@@ -622,7 +622,7 @@ async fn admit(
 }
 
 const DECISION_EXECUTOR_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::UNPROCESSABLE_ENTITY,
+    StatusCode::NOT_FOUND,
     "executor_not_found",
     "no such Executor; nothing was submitted",
 );
@@ -1134,15 +1134,31 @@ async fn admitted_decision_value(
     job: JobId,
 ) -> Result<Value, Refusal> {
     let record = shared.database.submission(key).await?.ok_or(INTERNAL)?;
-    let turn = shared.database.job(job).await?.ok_or(INTERNAL)?;
-    let work = shared.database.decision_work(job).await?.ok_or(INTERNAL)?;
+    let crate::db::redb::MutableJobDetailsLookup::Found(details) =
+        shared.database.mutable_job_details(job, None).await?
+    else {
+        return Err(INTERNAL);
+    };
+    let model = match details.record.job.frozen.as_ref().ok_or(INTERNAL)? {
+        crate::db::entities::MutableFrozenConfiguration::Generative(frozen) => {
+            frozen.llm.config.model.clone()
+        }
+        crate::db::entities::MutableFrozenConfiguration::Decision(frozen) => {
+            frozen.model.model.clone()
+        }
+    };
+    let kept = details
+        .record
+        .outcome
+        .as_ref()
+        .is_some_and(|outcome| outcome.kind == crate::db::entities::OutcomeKind::Cancelled);
     Ok(admission(AdmissionView::Admitted {
         job: job.to_string(),
-        conversation: turn.group.map(|id| id.to_string()),
+        conversation: Some(details.record.job.parent_id.to_string()),
         seq: record.seq,
         joined: record.seq > 1,
-        model: work.frozen.model_name().to_owned(),
-        kept: turn.cancelled_at.is_some(),
+        model,
+        kept,
     }))
 }
 

@@ -323,6 +323,13 @@ impl BenchmarkClient {
             .and_then(Value::as_str)
             .ok_or_else(|| format!("/api/v1/projects: answer names no Project: {project}"))?
             .to_owned();
+        // The reference workload measures three model rounds and two file reads;
+        // project planning would add a separate Decision request to that contract.
+        self.post_json(
+            &format!("/api/v1/projects/{project}/decision"),
+            &json!({"enabled": false, "decision_profile": null, "minimum_confidence": 0.6}),
+        )
+        .await?;
         Ok(FixtureIdentities {
             executor,
             pool,

@@ -452,14 +452,25 @@ impl Worker {
     fn open_next_file(&mut self) -> bool {
         let dir = self.shared.database.log_directory().to_path_buf();
         let now = time::OffsetDateTime::now_utc();
-        let seq = self.next_sequence;
-        self.next_sequence += 1;
-        let path = dir.join(runtime_file_name(now, seq));
-        let file = match OpenOptions::new().create_new(true).write(true).open(&path) {
-            Ok(file) => file,
-            Err(error) => {
-                self.record_failure(path, "create", &error);
+        let mut attempts = 0;
+        let (path, file) = loop {
+            let seq = self.next_sequence;
+            let Some(next) = seq.checked_add(1) else {
+                let path = dir.join(runtime_file_name(now, seq));
+                self.record_failure(path, "create", &io::Error::other("log sequence exhausted"));
                 return false;
+            };
+            self.next_sequence = next;
+            let path = dir.join(runtime_file_name(now, seq));
+            match OpenOptions::new().create_new(true).write(true).open(&path) {
+                Ok(file) => break (path, file),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists && attempts < 4095 => {
+                    attempts += 1;
+                }
+                Err(error) => {
+                    self.record_failure(path, "create", &error);
+                    return false;
+                }
             }
         };
         let meta = match file.metadata() {

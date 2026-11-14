@@ -645,14 +645,15 @@ fn run_every_section(options: &Options) -> Result<()> {
         "history",
         "database",
     ];
-    for section in HOST_SECTIONS {
-        let mut run = options.clone();
-        run.section = section.to_owned();
-        run_measurement_section(&run)?;
-    }
-    let mut run = options.clone();
-    run.section = "search".to_owned();
-    run_measurement_section(&run)?;
+    let options_owned = options.clone();
+    ntex::rt::System::new("benchmark-client", ntex::rt::DefaultRuntime).block_on(async move {
+        for section in HOST_SECTIONS.into_iter().chain(["search"]) {
+            let mut run = options_owned.clone();
+            run.section = section.to_owned();
+            workload::run(&run).await?;
+        }
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })?;
     #[cfg(unix)]
     {
         let mut run = options.clone();
