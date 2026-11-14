@@ -8,7 +8,6 @@ use crate::db::entities::{
     SummarizationStage, UsageFinality,
 };
 
-pub(super) const RECORD_VERSION: u8 = 1;
 pub(super) const TAG_CONFIG: u8 = 1;
 pub(super) const TAG_JOB: u8 = 2;
 pub(super) const TAG_JOB_STATE: u8 = 3;
@@ -33,7 +32,7 @@ pub(super) struct Enc(pub(super) Vec<u8>);
 
 impl Enc {
     pub(super) fn new(tag: u8) -> Self {
-        Enc(vec![tag, RECORD_VERSION])
+        Enc(vec![tag, super::record_version_byte()])
     }
     pub(super) fn u8(&mut self, v: u8) {
         self.0.push(v);
@@ -344,7 +343,9 @@ pub(super) type DecodeResult<T> = Result<T, StorageError>;
 impl<'a> Dec<'a> {
     pub(super) fn new(bytes: &'a [u8], tag: u8) -> DecodeResult<Self> {
         match bytes {
-            [found, version, ..] if *found == tag && *version == RECORD_VERSION => {
+            [found, version, ..]
+                if *found == tag && u64::from(*version) == super::FORMAT_VERSION =>
+            {
                 Ok(Dec { bytes, at: 2 })
             }
             _ => Err(StorageError::corrupted(format!(

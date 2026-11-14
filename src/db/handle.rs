@@ -1463,15 +1463,21 @@ impl DatabaseHandle {
         fresh: entities::DevelopmentFreshReservation,
         generative_policy: fn(&entities::FrozenExecutionConfig) -> bool,
         decision_policy: fn(&entities::NativeDecisionConfig) -> bool,
+        workspace_permit: bool,
     ) -> Result<ScheduledReservation, DevelopmentReservationError> {
         let request = fresh.request();
         let result = self
             .submit(|reply| {
                 Command::custom(
-                    (request, generative_policy, decision_policy),
+                    (
+                        request,
+                        generative_policy,
+                        decision_policy,
+                        workspace_permit,
+                    ),
                     reply,
                     |_| 4096,
-                    |(request, generative_policy, decision_policy),
+                    |(request, generative_policy, decision_policy, workspace_permit),
                      reply,
                      database,
                      operation,
@@ -1489,6 +1495,7 @@ impl DatabaseHandle {
                                 entities::ReadySelection::Scheduled {
                                     generative_policy,
                                     decision_policy,
+                                    workspace_permit,
                                 },
                             ) {
                                 Ok(reserved @ entities::DevelopmentReservation::Reserved(_)) => {
@@ -1931,6 +1938,7 @@ impl DatabaseHandle {
         &self,
         handoff: &DevelopmentHandoff,
         answer: ProviderAnswer,
+        usages: Vec<(u32, Metrics)>,
     ) -> Result<(), DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let response: serde_json::Value =
@@ -1971,18 +1979,42 @@ impl DatabaseHandle {
                     "answer evidence contains credential material",
                 )));
             }
+            if usages.iter().any(|(_, metrics)| {
+                metrics
+                    .measurements
+                    .usage
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| development_contains_secret(raw, secret))
+            }) {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "usage",
+                    "usage evidence contains credential material",
+                )));
+            }
         }
+        let request = answer.stat.request;
+        let has_usages = !usages.is_empty();
+        let checkpoint = handoff
+            .usage_checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .for_request(request);
         let response_digest = answer.response.digest();
         let result = self
             .submit(|reply| {
                 Command::custom(
-                    (proof, answer),
+                    (proof, answer, usages, checkpoint),
                     reply,
-                    |(_, answer)| {
-                        byte_count(answer.response.byte_length())
-                            .saturating_add(json_bytes(answer.measurements.usage.raw.as_ref()))
+                    |(_, answer, usages, _)| {
+                        let base = byte_count(answer.response.byte_length())
+                            .saturating_add(json_bytes(answer.measurements.usage.raw.as_ref()));
+                        usages.iter().fold(base, |acc, (_, metrics)| {
+                            acc.saturating_add(json_bytes(metrics.measurements.usage.raw.as_ref()))
+                        })
                     },
-                    |(proof, answer), reply, database, operation, commit| {
+                    |(proof, answer, usages, checkpoint), reply, database, operation, commit| {
                         let ids = std::cell::Cell::new(None);
                         let mut result = run(
                             database,
@@ -1991,14 +2023,16 @@ impl DatabaseHandle {
                             OperationKind::RecordProviderAnswer,
                             reply,
                             |batch| {
-                                let value =
-                                    batch.record_development_provider_answer(&proof, answer)?;
-                                ids.set(Some(value));
-                                Ok(())
+                                let (metrics, availability, usage_ids, next_checkpoint) = batch
+                                    .record_development_provider_answer(
+                                        &proof, answer, usages, checkpoint,
+                                    )?;
+                                ids.set(Some((metrics, availability, usage_ids)));
+                                Ok(next_checkpoint)
                             },
                         );
                         if result.committed
-                            && let Some((metrics, availability)) = ids.get()
+                            && let Some((metrics, availability, usage_ids)) = ids.take()
                         {
                             result
                                 .observations
@@ -2007,6 +2041,11 @@ impl DatabaseHandle {
                                 proof.token.job,
                                 availability,
                             ));
+                            for id in usage_ids {
+                                result
+                                    .observations
+                                    .push(ObservationChange::Metrics(proof.token.job, id));
+                            }
                         }
                         result
                     },
@@ -2014,98 +2053,18 @@ impl DatabaseHandle {
             })
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
-        if result.is_ok() {
+        result.map(|next_checkpoint| {
             handoff
                 .recorder
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remember_response(response_digest);
-        }
-        result
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn record_development_usage(
-        &self,
-        handoff: &DevelopmentHandoff,
-        expected_seq: u32,
-        metrics: Metrics,
-    ) -> Result<MetricsId, DatabaseError> {
-        let (mut guard, proof) = self.begin_development_write(handoff)?;
-        if handoff
-            .prepared
-            .credentials
-            .spellings
-            .as_ref()
-            .is_some_and(|secret| {
-                metrics
-                    .measurements
-                    .usage
-                    .raw
-                    .as_ref()
-                    .is_some_and(|raw| development_contains_secret(raw, secret))
-            })
-        {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "usage",
-                "usage evidence contains credential material",
-            )));
-        }
-        let request = metrics.request;
-        let checkpoint = handoff
-            .usage_checkpoint
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            .for_request(request);
-        let result = self
-            .submit(|reply| {
-                Command::custom(
-                    (proof, expected_seq, metrics, checkpoint),
-                    reply,
-                    |(_, _, metrics, _)| json_bytes(metrics.measurements.usage.raw.as_ref()),
-                    |(proof, expected_seq, metrics, checkpoint),
-                     reply,
-                     database,
-                     operation,
-                     commit| {
-                        let id = std::cell::Cell::new(None);
-                        let mut result = run(
-                            database,
-                            operation,
-                            commit,
-                            OperationKind::RecordMetrics,
-                            reply,
-                            |batch| {
-                                let value = batch.record_development_usage(
-                                    &proof,
-                                    expected_seq,
-                                    metrics,
-                                    checkpoint,
-                                )?;
-                                id.set(Some(value.0));
-                                Ok(value)
-                            },
-                        );
-                        if result.committed
-                            && let Some(id) = id.get()
-                        {
-                            result
-                                .observations
-                                .push(ObservationChange::Metrics(proof.token.job, id));
-                        }
-                        result
-                    },
-                )
-            })
-            .await;
-        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
-        result.map(|(id, checkpoint)| {
-            *handoff
-                .usage_checkpoint
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner) = checkpoint.of_request(request);
-            id
+            if has_usages {
+                *handoff
+                    .usage_checkpoint
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = next_checkpoint.of_request(request);
+            }
         })
     }
 

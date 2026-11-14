@@ -5,7 +5,12 @@ pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
 pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-genesis-v1";
-pub(super) const DATABASE_FORMAT_VERSION: u64 = 1;
+pub(super) const FORMAT_VERSION: u64 = 1;
+
+pub(super) const fn record_version_byte() -> u8 {
+    const { assert!(FORMAT_VERSION <= u8::MAX as u64) };
+    FORMAT_VERSION as u8
+}
 pub(crate) const CACHE_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const P_MAX: u64 = 1_048_576;
 pub(crate) const MAX_PAGE: usize = 1_000;

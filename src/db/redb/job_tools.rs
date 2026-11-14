@@ -510,12 +510,13 @@ impl Batch {
                     keep_open: false,
                     ..
                 }
-            ) || row.parent_id != Some(conversation)
+            ) || row.is_chunk_group()
+                || row.parent_id != Some(conversation)
                 || self.job_control(id)?.user_input
             {
                 return self.reject(Violation::InvalidValue(
                     "depends_on",
-                    "dependencies must be sibling conversations with keep_open false and no user message",
+                    "dependencies must be sibling non-system conversations with keep_open false and no user message",
                 ));
             }
             let condition = match dependency.condition.as_str() {

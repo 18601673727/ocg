@@ -68,8 +68,8 @@ pub(crate) use reader::{
     NativeResource, NativeResourceKind, PoolAllocationPage, read_native_resources,
     read_pool_allocations,
 };
+pub(crate) use reader::{OfflineVerification, inspect_held_allocations_offline, verify_offline};
 pub(crate) use reader::{ProfilePageRecord, read_global_compaction_settings};
-pub(crate) use reader::{inspect_held_allocations_offline, verify_offline};
 #[cfg(unix)]
 pub(crate) use reader::{verify_recovered_publication, verify_reserved_publication};
 pub(crate) use recovery::{
@@ -135,7 +135,7 @@ pub(crate) use schema::{
 };
 
 pub(crate) const fn storage_format_versions() -> (u64, u8) {
-    (schema::DATABASE_FORMAT_VERSION, codec::RECORD_VERSION)
+    (schema::FORMAT_VERSION, schema::record_version_byte())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

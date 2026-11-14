@@ -1,7 +1,5 @@
 use super::*;
 
-pub const GLOBAL_EXECUTION_LIMIT: u8 = 16;
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AllocationPool {
     pub id: ExecutionPoolId,
@@ -165,6 +163,7 @@ pub enum ReadySelection {
     Scheduled {
         generative_policy: fn(&FrozenExecutionConfig) -> bool,
         decision_policy: fn(&NativeDecisionConfig) -> bool,
+        workspace_permit: bool,
     },
 }
 

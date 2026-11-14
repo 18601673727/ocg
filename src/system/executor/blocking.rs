@@ -20,6 +20,9 @@ const COMMAND_WAIT: Duration = Duration::from_secs(10 * 60);
 const CPU: usize = 2;
 const FILES: usize = 4;
 const MAX_WAITERS: usize = 64;
+/// The waiter list is full: the call was refused before it queued, so it did
+/// no work and may be retried.
+pub(crate) const QUEUE_FULL: &str = "the blocking work queue is full";
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(5);
 const STARTUP_GRACE: Duration = Duration::from_millis(50);
 const POLL: Duration = Duration::from_millis(10);
@@ -39,6 +42,7 @@ struct Counts {
     files: usize,
     waiters: Vec<(u64, Waker)>,
     next_waiter: u64,
+    scheduler: Option<Waker>,
 }
 
 #[derive(Default)]
@@ -55,6 +59,25 @@ pub(crate) struct Permit {
 }
 
 impl Permit {
+    pub(crate) fn try_file() -> Option<Self> {
+        let governor = GOVERNOR
+            .get_or_init(|| Arc::new(Governor::default()))
+            .clone();
+        let mut counts = governor
+            .counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if counts.total >= TOTAL || counts.files >= FILES {
+            return None;
+        }
+        counts.total += 1;
+        counts.files += 1;
+        drop(counts);
+        Some(Self {
+            governor,
+            kind: Kind::File,
+        })
+    }
     async fn acquire_async(kind: Kind, stop: Option<&StopSignal>) -> Result<Self, &'static str> {
         struct Registration {
             governor: Arc<Governor>,
@@ -112,7 +135,7 @@ impl Permit {
                 }
             } else {
                 if counts.waiters.len() >= MAX_WAITERS {
-                    return Poll::Ready(Err("the blocking work queue is full"));
+                    return Poll::Ready(Err(QUEUE_FULL));
                 }
                 let Some(next) = counts.next_waiter.checked_add(1) else {
                     return Poll::Ready(Err("the blocking work queue cannot register a waiter"));
@@ -214,12 +237,35 @@ impl Drop for Permit {
             .iter()
             .map(|(_, waker)| waker.clone())
             .collect::<Vec<_>>();
+        let scheduler = counts.scheduler.take();
         drop(counts);
         self.governor.changed.notify_all();
+        if let Some(waker) = scheduler {
+            waker.wake();
+        }
         for waker in waiters {
             waker.wake();
         }
     }
+}
+
+pub(crate) async fn file_capacity_available() {
+    let governor = GOVERNOR
+        .get_or_init(|| Arc::new(Governor::default()))
+        .clone();
+    std::future::poll_fn(|context| {
+        let mut counts = governor
+            .counts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if counts.total < TOTAL && counts.files < FILES {
+            Poll::Ready(())
+        } else {
+            counts.scheduler = Some(context.waker().clone());
+            Poll::Pending
+        }
+    })
+    .await;
 }
 
 pub(crate) struct Sentinel {
@@ -775,6 +821,26 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let permit = Permit::acquire_async(kind, None).await?;
+    run_permitted(permit, work).await
+}
+
+pub(crate) async fn run_permitted<T, F>(permit: Permit, work: F) -> Result<T, &'static str>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (_permit, result) = run_permitted_retained(permit, work).await?;
+    Ok(result)
+}
+
+pub(crate) async fn run_permitted_retained<T, F>(
+    permit: Permit,
+    work: F,
+) -> Result<(Permit, T), &'static str>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
     let queued = Queued::new((permit, work));
     let pending = queued.handle();
     ntex::rt::spawn_blocking(move || {
@@ -782,8 +848,8 @@ where
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()?;
-        let _permit = permit;
-        Some(work())
+        let result = work();
+        Some((permit, result))
     })
     .await
     .map_err(|_| "the blocking task ended without a result")?

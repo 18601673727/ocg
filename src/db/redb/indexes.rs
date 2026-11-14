@@ -65,7 +65,7 @@ fn searchable_turn_context(
     let turn_row = jobs
         .get(turn.get())?
         .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
-    if matches!(turn_row.value(), [TAG_JOB, codec::RECORD_VERSION, ..]) {
+    if matches!(turn_row.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION) {
         let mutable = transactions::decode_mutable_job(turn.get(), turn_row.value())?;
         return Ok(
             searchable_conversation(&JobSpec::decode_at(conversation.get(), row.value())?)

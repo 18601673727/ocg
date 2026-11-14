@@ -73,7 +73,7 @@ fn inspect_database(
     let meta = tx.open_table(META)?;
     let format = read_format(&meta)?;
     let fingerprint = read_fingerprint(&meta)?;
-    if format == DATABASE_FORMAT_VERSION {
+    if format == FORMAT_VERSION {
         if fingerprint.as_slice() != SCHEMA_FINGERPRINT {
             return Err(format!(
                 "database format {} has an unexpected schema fingerprint; this build opens only `{}`",
@@ -88,7 +88,7 @@ fn inspect_database(
     }
     let Some(step) = STEPS.iter().find(|step| step.from == format) else {
         return Err(format!(
-            "database format {format} is not supported; this build opens only format {DATABASE_FORMAT_VERSION} and has no migration from it"
+            "database format {format} is not supported; this build opens only format {FORMAT_VERSION} and has no migration from it"
         )
         .into());
     };
@@ -102,7 +102,7 @@ fn inspect_database(
     let digest = digest_tables(&tx, &names)?;
     Ok(MigrationInspection::Upgrade(MigrationPlan {
         from: format,
-        to: DATABASE_FORMAT_VERSION,
+        to: FORMAT_VERSION,
         digest,
     }))
 }
@@ -126,10 +126,7 @@ pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std
     (step.apply)(&tx)?;
     {
         let mut table = tx.open_table(META)?;
-        table.insert(
-            DATABASE_FORMAT_KEY,
-            DATABASE_FORMAT_VERSION.to_le_bytes().as_slice(),
-        )?;
+        table.insert(DATABASE_FORMAT_KEY, FORMAT_VERSION.to_le_bytes().as_slice())?;
         table.insert(SCHEMA_FINGERPRINT_KEY, SCHEMA_FINGERPRINT)?;
     }
     tx.commit()?;
@@ -167,10 +164,9 @@ fn read_format(
         Some(value) => <[u8; 8]>::try_from(value.value())
             .map(u64::from_le_bytes)
             .map_err(|_| "database format marker is malformed".into()),
-        None => Err(format!(
-            "unmarked database; this build opens only format {DATABASE_FORMAT_VERSION}"
-        )
-        .into()),
+        None => {
+            Err(format!("unmarked database; this build opens only format {FORMAT_VERSION}").into())
+        }
     }
 }
 
@@ -268,7 +264,7 @@ fn require_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Er
     ] {
         if !names.iter().any(|name| name == required) {
             return Err(format!(
-                "database lacks the {required} table this format defines; it is not a complete format {DATABASE_FORMAT_VERSION} database"
+                "database lacks the {required} table this format defines; it is not a complete format {FORMAT_VERSION} database"
             )
             .into());
         }
@@ -500,7 +496,7 @@ fn digest_tables(
             }
             other => {
                 return Err(format!(
-                    "unexpected table `{other}` in a format {DATABASE_FORMAT_VERSION} database"
+                    "unexpected table `{other}` in a format {FORMAT_VERSION} database"
                 )
                 .into());
             }

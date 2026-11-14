@@ -87,50 +87,78 @@ fn with_offline_database<T>(
     Ok((result, identity))
 }
 
+pub(crate) struct OfflineVerification {
+    pub(crate) report: serde_json::Value,
+    pub(crate) passed: bool,
+}
+
 pub(crate) fn verify_offline(
     directory: &std::path::Path,
     pages: bool,
-) -> Result<serde_json::Value, StorageError> {
+) -> Result<OfflineVerification, StorageError> {
     use serde_json::json;
-    let (mut report, file) = with_offline_database(
+    let ((mut report, passed), file) = with_offline_database(
         directory,
         OfflineOptions {
             force_copy: pages,
             require_host_lock: false,
         },
-        |access| {
-            let (access_note, page_checksums) = match access {
-                OfflineAccess::InPlace(database) => {
-                    let logical = recovery::verify_full(database);
-                    return Ok(json!({
+        |access| match access {
+            OfflineAccess::InPlace(database) => {
+                let (logical, logical_passed) = residual_logical_report(database);
+                Ok((
+                    json!({
                         "access": "read-only; the database file was not copied",
-                        "logical_checks": logical_report(logical),
+                        "logical_checks": logical,
                         "page_checksums": "not checked; pass --pages to check them on a private copy",
-                    }));
-                }
-                OfflineAccess::Copy(database) => {
-                    let logical = logical_report(recovery::verify_full(&*database));
-                    let intact = database.check_integrity()?;
-                    (
-                        "read from a private unlinked copy; the original file was not opened for writing",
-                        (logical, intact),
-                    )
-                }
-            };
-            Ok(json!({
-                "access": access_note,
-                "logical_checks": page_checksums.0,
-                "page_checksums": if page_checksums.1 {
-                    "every page checksum verified"
-                } else {
-                    "redb found damage and had to repair the copy; the original needs restoring from a backup"
-                },
-            }))
+                    }),
+                    logical_passed,
+                ))
+            }
+            OfflineAccess::Copy(database) => {
+                let (logical, logical_passed) = residual_logical_report(&*database);
+                let intact = database.check_integrity()?;
+                Ok((
+                    json!({
+                        "access": "read from a private unlinked copy; the original file was not opened for writing",
+                        "logical_checks": logical,
+                        "page_checksums": if intact {
+                            "every page checksum verified"
+                        } else {
+                            "redb found damage and had to repair the copy; the original needs restoring from a backup"
+                        },
+                    }),
+                    logical_passed && intact,
+                ))
+            }
         },
     )?;
     report["file_bytes"] = json!(file.bytes);
     report["file_unchanged_during_check"] = json!(true);
-    Ok(report)
+    Ok(OfflineVerification { report, passed })
+}
+
+fn residual_logical_report(database: &impl ::redb::ReadableDatabase) -> (serde_json::Value, bool) {
+    match recovery::verify_reserved_residual(database) {
+        Ok(residual) => (
+            serde_json::json!({
+                "passed": true,
+                "held_allocations": residual.ownership.held.len(),
+                "retained_unknown_outcomes": residual.ownership.retained_unknown.len(),
+                "resolved_unknown_outcomes": residual.ownership.resolved_unknown.len(),
+                "normal_startup": if residual.normal_startup_accepts {
+                    "accepted"
+                } else {
+                    "refused_residual_held_ownership"
+                },
+            }),
+            true,
+        ),
+        Err(error) => (
+            serde_json::json!({"passed": false, "detail": error.detail}),
+            false,
+        ),
+    }
 }
 
 fn logical_report(result: Result<recovery::Verification, StorageError>) -> serde_json::Value {
@@ -282,16 +310,7 @@ fn verify_publication_with_exclusive_lock(
         let logical = if recovered {
             logical_report(recovery::verify_recovered(&database))
         } else {
-            match recovery::verify_reserved_residual(&database) {
-                Ok(residual) => serde_json::json!({
-                    "passed": true,
-                    "held_allocations": residual.ownership.held.len(),
-                    "retained_unknown_outcomes": residual.ownership.retained_unknown.len(),
-                    "resolved_unknown_outcomes": residual.ownership.resolved_unknown.len(),
-                    "normal_startup": if residual.normal_startup_accepts { "accepted" } else { "refused_residual_held_ownership" },
-                }),
-                Err(error) => serde_json::json!({"passed": false, "detail": error.detail}),
-            }
+            residual_logical_report(&database).0
         };
         let intact = database.check_integrity()?;
         Ok::<_, StorageError>((logical, intact))
@@ -622,7 +641,7 @@ fn inspect_held_in(
         .collect();
     Ok(json!({
         "database": {
-            "format": DATABASE_FORMAT_VERSION,
+            "format": FORMAT_VERSION,
             "schema_fingerprint": String::from_utf8_lossy(SCHEMA_FINGERPRINT),
             "open_epoch": open_epoch,
             "clean_shutdown": clean_shutdown,
@@ -833,7 +852,8 @@ pub(super) fn mutable_job_record_in(
     let state = states
         .get(id.get())?
         .ok_or_else(|| StorageError::corrupted("mutable Job state is missing"))?;
-    if !matches!(state.value(), [TAG_JOB_STATE, codec::RECORD_VERSION, ..]) {
+    if !matches!(state.value(), [TAG_JOB_STATE, version, ..] if u64::from(*version) == FORMAT_VERSION)
+    {
         return Err(StorageError::corrupted("invalid mutable Job state version"));
     }
     let state = JobState::decode_at(id.get(), state.value())?;
@@ -1284,6 +1304,7 @@ where
     let manifest: crate::db::entities::NativeSummaryManifest =
         serde_json::from_slice(manifest_bytes.value())
             .map_err(|_| StorageError::corrupted("malformed summary manifest"))?;
+    manifest.validate().map_err(StorageError::corrupted)?;
     if manifest.conversation != conversation {
         return Err(context_unavailable(
             "summary manifest has an unsupported scope",
@@ -2444,23 +2465,24 @@ fn dependency_state(
     dependency: JobId,
     condition: DependencyCondition,
 ) -> Result<DependencyState, StorageError> {
-    if rx.open_table(UNSETTLED)?.get(dependency.get())?.is_some() {
-        return Ok(DependencyState::Waiting);
-    }
+    let target = match read_job_row(rx, dependency)? {
+        Some(row) if !row.is_chunk_group() => {
+            match turn_head(&rx.open_table(TURNS)?, dependency)? {
+                Some(head) => head,
+                None => return Ok(DependencyState::Waiting),
+            }
+        }
+        Some(_) | None => dependency,
+    };
     let state = rx
         .open_table(JOB_STATES)?
-        .get(dependency.get())?
-        .map(|bytes| JobState::decode_at(dependency.get(), bytes.value()))
+        .get(target.get())?
+        .map(|bytes| JobState::decode_at(target.get(), bytes.value()))
         .transpose()?;
-    let completed = state
-        .as_ref()
-        .and_then(|state| state.outcome.as_ref())
-        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
-    Ok(if completed || condition == DependencyCondition::Settled {
-        DependencyState::Satisfied
-    } else {
-        DependencyState::Impossible
-    })
+    Ok(Batch::dependency_outcome_state(
+        state.as_ref().and_then(|state| state.outcome.as_ref()),
+        condition,
+    ))
 }
 
 fn cap_title(title: &str) -> String {
@@ -4355,7 +4377,7 @@ fn resolve_model_name(
         return Ok(None);
     };
     if let Some(value) = rx.open_table(JOBS)?.get(job.get())?
-        && matches!(value.value(), [TAG_JOB, codec::RECORD_VERSION, ..])
+        && matches!(value.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION)
     {
         let row = transactions::decode_mutable_job(job.get(), value.value())?;
         let (actual_provider, model) = match row.frozen {

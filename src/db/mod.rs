@@ -74,7 +74,7 @@ pub(crate) fn inspect_held_allocations_offline(
 pub(crate) fn verify_offline(
     directory: &std::path::Path,
     pages: bool,
-) -> Result<serde_json::Value, DatabaseError> {
+) -> Result<redb::OfflineVerification, DatabaseError> {
     redb::verify_offline(directory, pages).map_err(DatabaseError::Read)
 }
 

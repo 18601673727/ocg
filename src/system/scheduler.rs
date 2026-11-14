@@ -15,6 +15,7 @@ const RECONCILE: Duration = Duration::from_secs(30);
 pub(crate) struct DispatchBatch<G> {
     pub(crate) grants: Vec<G>,
     pub(crate) next_due: Option<Duration>,
+    pub(crate) wait_for_blocking: bool,
 }
 
 pub(crate) struct Scheduler {
@@ -41,17 +42,19 @@ impl Scheduler {
         mut claim: Claim,
         mut spawn: Spawn,
     ) where
-        Claim: FnMut() -> ClaimFuture,
+        Claim: FnMut(bool) -> ClaimFuture,
         ClaimFuture: Future<Output = Result<DispatchBatch<G>, DatabaseError>>,
         Spawn: FnMut(G) -> SpawnFuture,
         SpawnFuture: Future<Output = ()>,
     {
         let mut previous_batch = None;
         let mut next_due = None;
+        let mut wait_for_blocking = false;
         loop {
             if self.shutdown.is_cancelled() {
                 return;
             }
+            let mut database_changed = false;
             let mut recovered = false;
             while self.protection.status().lock.is_some() {
                 match select(self.shutdown.cancelled(), self.protection.changed()).await {
@@ -68,12 +71,23 @@ impl Scheduler {
                     let timer = batch_delay(previous, next_due);
                     let waking = select(
                         self.wake.recv_async(),
-                        select(self.protection.changed(), ntex::time::sleep(timer)),
+                        select(
+                            self.protection.changed(),
+                            select(ntex::time::sleep(timer), async {
+                                if wait_for_blocking {
+                                    crate::system::executor::blocking::file_capacity_available()
+                                        .await;
+                                } else {
+                                    std::future::pending::<()>().await;
+                                }
+                            }),
+                        ),
                     );
                     match select(self.shutdown.cancelled(), waking).await {
                         Either::Left(()) => return,
                         Either::Right(Either::Left(Err(_))) => return,
-                        Either::Right(_) => {}
+                        Either::Right(Either::Left(Ok(()))) => database_changed = true,
+                        Either::Right(Either::Right(_)) => {}
                     }
                 }
                 let remaining = BATCH_FLOOR.saturating_sub(previous.elapsed());
@@ -86,12 +100,15 @@ impl Scheduler {
             if self.protection.status().lock.is_some() {
                 continue;
             }
-            while self.wake.try_recv().is_ok() {}
-            let batch = claim().await;
+            while self.wake.try_recv().is_ok() {
+                database_changed = true;
+            }
+            let batch = claim(database_changed).await;
             previous_batch = Some(Instant::now());
             match batch {
                 Ok(batch) => {
                     next_due = batch.next_due;
+                    wait_for_blocking = batch.wait_for_blocking;
                     for grant in batch.grants {
                         spawn(grant).await;
                     }
@@ -99,6 +116,7 @@ impl Scheduler {
                 Err(error) => {
                     log::error!("dispatcher claim batch failed: {error}");
                     next_due = None;
+                    wait_for_blocking = false;
                 }
             }
         }

@@ -1440,7 +1440,7 @@ impl Batch {
 
     pub(crate) fn turn_conversation(&mut self, id: JobId) -> Result<Option<JobId>, BatchError> {
         self.get(JOBS, id.get(), |bytes| {
-            if matches!(bytes, [TAG_JOB, codec::RECORD_VERSION, ..]) {
+            if matches!(bytes, [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION) {
                 return transactions::decode_mutable_job(id.get(), bytes)
                     .map(|job| Some(job.parent_id));
             }
@@ -1623,11 +1623,21 @@ impl Batch {
         Ok(identity)
     }
 
-    pub(crate) fn record_development_provider_answer(
+    pub(in crate::db) fn record_development_provider_answer(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
         answer: crate::db::entities::ProviderAnswer,
-    ) -> Result<(MetricsId, AvailabilityStatId), BatchError> {
+        usages: Vec<(u32, crate::db::entities::Metrics)>,
+        checkpoint: crate::db::handle::DevelopmentUsageCheckpoint,
+    ) -> Result<
+        (
+            MetricsId,
+            AvailabilityStatId,
+            Vec<MetricsId>,
+            crate::db::handle::DevelopmentUsageCheckpoint,
+        ),
+        BatchError,
+    > {
         self.require_development_write_any(proof)?;
         let job = proof.token().job;
         let stat = answer.stat;
@@ -1656,6 +1666,74 @@ impl Batch {
                 "request missing or answer already recorded",
             ));
         }
+        let mut evidence = checkpoint.evidence();
+        let old = evidence.sample();
+        let mut prepared_usages = Vec::with_capacity(usages.len());
+        let mut next_seq = 5u32;
+        for (expected_seq, metrics) in usages {
+            if metrics.job != job
+                || metrics.request != stat.request
+                || expected_seq != next_seq
+                || expected_seq < 5
+                || expected_seq.is_multiple_of(2)
+            {
+                return self.reject(Violation::InvalidValue(
+                    "usage",
+                    "wrong Job, request or event sequence",
+                ));
+            }
+            let Some(token) = metrics.token else {
+                return self.reject(Violation::InvalidValue(
+                    "usage",
+                    "Token annotation required",
+                ));
+            };
+            let Some(token_seq) = expected_seq.checked_add(1) else {
+                return self.reject(Violation::ValueOutOfRange("seq"));
+            };
+            let Some(next_expected) = expected_seq.checked_add(2) else {
+                return self.reject(Violation::ValueOutOfRange("seq"));
+            };
+            next_seq = next_expected;
+            let first_id = self.next_id()?;
+            let second_id = self.next_id()?;
+            let measurement = crate::db::entities::MetricsRecord {
+                id: MetricsId::new(first_id),
+                job,
+                request: stat.request,
+                target: None,
+                decision_target: None,
+                observed_at: metrics.observed_at,
+                measurements: metrics.measurements.clone(),
+                token: Some(token),
+                recorded_at: self.now,
+            };
+            let Some(observation) =
+                crate::db::entities::TokenObservation::from_record(&measurement)
+            else {
+                return self.reject(Violation::InvalidValue(
+                    "usage",
+                    "Token annotation required",
+                ));
+            };
+            if evidence.add(observation).is_err() {
+                return self.reject(Violation::InvalidValue(
+                    "usage",
+                    "inconsistent Token evidence",
+                ));
+            }
+            prepared_usages.push((
+                first_id,
+                second_id,
+                expected_seq,
+                token_seq,
+                metrics.observed_at,
+                metrics.measurements,
+                token,
+            ));
+        }
+        let new = evidence.sample();
+        self.step(|_| indexes::validate_native_sample(new.as_ref()))?;
         let identity = self.development_usage_identity(job)?;
         self.put_message(&answer.response)?;
         let observed_at = stat.observed_at;
@@ -1684,7 +1762,48 @@ impl Batch {
                 payload,
             )?;
         }
-        Ok((MetricsId::new(ids[0]), AvailabilityStatId::new(ids[2])))
+        let mut usage_ids = Vec::with_capacity(prepared_usages.len());
+        let mut last_token_seq = None;
+        for (first_id, second_id, expected_seq, token_seq, observed_at, measurements, token) in
+            prepared_usages
+        {
+            self.insert_development_request_event_with_id(
+                &identity,
+                job,
+                stat.request,
+                first_id,
+                expected_seq,
+                observed_at,
+                RequestPayload::Measurement { measurements },
+            )?;
+            self.insert_development_request_event_with_id(
+                &identity,
+                job,
+                stat.request,
+                second_id,
+                token_seq,
+                observed_at,
+                RequestPayload::Token {
+                    eligibility: token.eligibility,
+                    finality: token.finality,
+                },
+            )?;
+            usage_ids.push(MetricsId::new(first_id));
+            last_token_seq = Some(token_seq);
+        }
+        let next_checkpoint = match last_token_seq {
+            Some(token_seq) => {
+                self.replace_development_usage_total(job, old, new)?;
+                crate::db::handle::DevelopmentUsageCheckpoint::advanced(token_seq, evidence)
+            }
+            None => checkpoint,
+        };
+        Ok((
+            MetricsId::new(ids[0]),
+            AvailabilityStatId::new(ids[2]),
+            usage_ids,
+            next_checkpoint,
+        ))
     }
 
     fn insert_development_request_event(
@@ -1697,6 +1816,29 @@ impl Batch {
         payload: RequestPayload,
     ) -> Result<u128, BatchError> {
         let id = self.next_id()?;
+        self.insert_development_request_event_with_id(
+            identity,
+            job,
+            request,
+            id,
+            seq,
+            observed_at,
+            payload,
+        )?;
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_development_request_event_with_id(
+        &mut self,
+        identity: &crate::db::redb::reader::UsageIdentity,
+        job: JobId,
+        request: RequestNumber,
+        id: u128,
+        seq: u32,
+        observed_at: Timestamp,
+        payload: RequestPayload,
+    ) -> Result<(), BatchError> {
         let event = RequestEventRecord {
             id: crate::db::entities::RequestEventId::new(id),
             job_id: job,
@@ -1726,8 +1868,7 @@ impl Batch {
                 indexes::record_usage_model(tx, key, job)?;
             }
             Ok(())
-        })?;
-        Ok(id)
+        })
     }
 
     fn development_only_sent(
@@ -1923,117 +2064,6 @@ impl Batch {
         Ok(())
     }
 
-    pub(in crate::db) fn record_development_usage(
-        &mut self,
-        proof: &crate::db::handle::DevelopmentWriteProof,
-        expected_seq: u32,
-        metrics: crate::db::entities::Metrics,
-        checkpoint: crate::db::handle::DevelopmentUsageCheckpoint,
-    ) -> Result<(MetricsId, crate::db::handle::DevelopmentUsageCheckpoint), BatchError> {
-        self.require_development_write_any(proof)?;
-        let job = proof.token().job;
-        if metrics.job != job || expected_seq < 5 || expected_seq.is_multiple_of(2) {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "wrong Job, request or event sequence",
-            ));
-        }
-        let Some(token) = metrics.token else {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "Token annotation required",
-            ));
-        };
-        let Some(token_seq) = expected_seq.checked_add(1) else {
-            return self.reject(Violation::ValueOutOfRange("seq"));
-        };
-        let request = metrics.request;
-        let mut evidence = checkpoint.evidence();
-        let old = evidence.sample();
-        let identity = self.development_usage_identity(job)?;
-        let first_id = self.next_id()?;
-        let second_id = self.next_id()?;
-        let measurement = crate::db::entities::MetricsRecord {
-            id: MetricsId::new(first_id),
-            job,
-            request,
-            target: None,
-            decision_target: None,
-            observed_at: metrics.observed_at,
-            measurements: metrics.measurements.clone(),
-            token: Some(token),
-            recorded_at: self.now,
-        };
-        let Some(observation) = crate::db::entities::TokenObservation::from_record(&measurement)
-        else {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "Token annotation required",
-            ));
-        };
-        if evidence.add(observation).is_err() {
-            return self.reject(Violation::InvalidValue(
-                "usage",
-                "inconsistent Token evidence",
-            ));
-        }
-        let new = evidence.sample();
-        self.step(|_| indexes::validate_native_sample(new.as_ref()))?;
-        let events = [
-            RequestEventRecord {
-                id: crate::db::entities::RequestEventId::new(first_id),
-                job_id: job,
-                request,
-                seq: expected_seq,
-                observed_at: metrics.observed_at,
-                recorded_at: self.now,
-                payload: RequestPayload::Measurement {
-                    measurements: metrics.measurements,
-                },
-            },
-            RequestEventRecord {
-                id: crate::db::entities::RequestEventId::new(second_id),
-                job_id: job,
-                request,
-                seq: token_seq,
-                observed_at: metrics.observed_at,
-                recorded_at: self.now,
-                payload: RequestPayload::Token {
-                    eligibility: token.eligibility,
-                    finality: token.finality,
-                },
-            },
-        ];
-        for event in events {
-            let timeline = indexes::request_timeline_key(Some(&identity), &event);
-            let model = indexes::usage_model_key(Some(&identity), &event);
-            self.step(|tx| {
-                tx.open_table(REQUEST_EVENTS)?.insert(
-                    (job.get(), request.get(), event.seq),
-                    encode_request_event(&event).as_slice(),
-                )?;
-                if let Some(kind) =
-                    observations::observation_kind(&tx.open_table(REQUEST_EVENTS)?, &event)?
-                {
-                    tx.open_table(JOB_OBSERVATIONS)?
-                        .insert((job.get(), kind, event.id.get()), (1, event.seq))?;
-                }
-                if let Some(key) = timeline {
-                    tx.open_table(REQUEST_TIMELINE)?.insert(key, ())?;
-                }
-                if let Some(key) = model {
-                    indexes::record_usage_model(tx, key, job)?;
-                }
-                Ok(())
-            })?;
-        }
-        self.replace_development_usage_total(job, old, new)?;
-        Ok((
-            MetricsId::new(first_id),
-            crate::db::handle::DevelopmentUsageCheckpoint::advanced(token_seq, evidence),
-        ))
-    }
-
     pub(super) fn write_output(
         &mut self,
         job: JobId,
@@ -2093,7 +2123,7 @@ impl Batch {
                     .open_table(JOBS)?
                     .get(job.get())?
                     .map(|bytes| {
-                        if matches!(bytes.value(), [TAG_JOB, codec::RECORD_VERSION, ..]) {
+                        if matches!(bytes.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION) {
                             return transactions::decode_mutable_job(job.get(), bytes.value())
                                 .map(|job| Some(job.parent_id));
                         }

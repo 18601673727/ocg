@@ -116,7 +116,7 @@ impl JobSpec {
                 allocation,
             });
         }
-        if bytes.get(1) == Some(&codec::RECORD_VERSION) {
+        if bytes.get(1).copied().map(u64::from) == Some(FORMAT_VERSION) {
             return Err(StorageError::corrupted(
                 "mutable Job requires the new-model reader",
             ));
@@ -1204,7 +1204,7 @@ pub(super) fn decode_credential<'a>(
     let Some((&[tag, version], rest)) = bytes.split_first_chunk::<2>() else {
         return Err(StorageError::corrupted("short credential record"));
     };
-    if tag != codec::TAG_CREDENTIAL || version != codec::RECORD_VERSION {
+    if tag != codec::TAG_CREDENTIAL || u64::from(version) != FORMAT_VERSION {
         return Err(StorageError::corrupted("invalid credential record header"));
     }
     let Some((&key_id, rest)) = rest.split_first_chunk::<8>() else {
@@ -1268,7 +1268,7 @@ impl CredentialKey {
         }
         let mut encoded = Vec::with_capacity(2 + 8 + 12 + ciphertext.len());
         encoded.push(codec::TAG_CREDENTIAL);
-        encoded.push(codec::RECORD_VERSION);
+        encoded.push(record_version_byte());
         encoded.extend_from_slice(&self.key_id);
         encoded.extend_from_slice(&nonce);
         encoded.extend_from_slice(&ciphertext);

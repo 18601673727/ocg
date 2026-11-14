@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 
+use super::blocking;
 use super::tool_loop::{
     ASK_USER_TOOL_NAME, REQUEST_COMMAND_TOOL_NAME, ToolExecution, ToolLoopLimits,
 };
@@ -19,17 +20,20 @@ pub(crate) struct NativeTooling<'a> {
     data_directory: Option<&'a crate::system::data_directory::DataDirectory>,
     stops: crate::system::native_scheduler::NativeStops,
     built: RefCell<Option<ToolExecution>>,
+    permit: RefCell<Option<blocking::Permit>>,
 }
 
 impl<'a> NativeTooling<'a> {
     pub(crate) fn new(
         data_directory: Option<&'a crate::system::data_directory::DataDirectory>,
         stops: crate::system::native_scheduler::NativeStops,
+        permit: Option<blocking::Permit>,
     ) -> Self {
         Self {
             data_directory,
             stops,
             built: RefCell::new(None),
+            permit: RefCell::new(permit),
         }
     }
 
@@ -77,9 +81,17 @@ impl DevelopmentTooling for NativeTooling<'_> {
             jobs,
             plan: !context.plan_step,
         };
-        let (execution, offer) =
-            build(self.data_directory, project, wiring, self.stops.clone()).await?;
+        let permit = self.permit.borrow_mut().take();
+        let (execution, offer, permit) = build(
+            self.data_directory,
+            project,
+            wiring,
+            self.stops.clone(),
+            permit,
+        )
+        .await?;
         *self.built.borrow_mut() = Some(execution);
+        *self.permit.borrow_mut() = permit;
         Ok(Some(offer))
     }
 }
@@ -123,33 +135,59 @@ fn register_ask_user(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
 }
 
 #[cfg(unix)]
+async fn authorize_workspace(
+    root: &std::path::Path,
+    data_directory: &crate::system::data_directory::DataDirectory,
+    permit: blocking::Permit,
+) -> Result<(Workspace, Option<String>, blocking::Permit), &'static str> {
+    let root = root.to_path_buf();
+    let directory = data_directory.clone();
+    match blocking::run_permitted_retained(permit, move || {
+        let workspace = Workspace::authorize(&root, &directory)?;
+        let agents_md = read_agents_md(&workspace);
+        Ok::<_, workspace_read::WorkspaceError>((workspace, agents_md))
+    })
+    .await
+    {
+        Ok((permit, Ok((workspace, agents_md)))) => Ok((workspace, agents_md, permit)),
+        Ok((_, Err(error))) => {
+            log::warn!("the Project's root no longer authorizes: {error}");
+            Err("workspace_unauthorized")
+        }
+        Err(error) => {
+            log::warn!("the Project's root could not be checked: {error}");
+            Err("workspace_unchecked")
+        }
+    }
+}
+
+#[cfg(unix)]
 async fn build(
     data_directory: Option<&crate::system::data_directory::DataDirectory>,
     project: Option<&ProjectRecord>,
     wiring: Wiring,
     stops: crate::system::native_scheduler::NativeStops,
-) -> Result<(ToolExecution, DevelopmentToolOffer), &'static str> {
-    use super::blocking::{self, Kind};
+    mut permit: Option<blocking::Permit>,
+) -> Result<
+    (
+        ToolExecution,
+        DevelopmentToolOffer,
+        Option<blocking::Permit>,
+    ),
+    &'static str,
+> {
     let mut agents_md = None;
     let workspace = match (data_directory, project) {
         (Some(data_directory), Some(project)) => {
             let root = std::path::PathBuf::from(&project.root);
-            let directory = data_directory.clone();
-            let workspace =
-                blocking::run(Kind::File, move || Workspace::authorize(&root, &directory))
-                    .await
-                    .map_err(|error| {
-                        log::warn!("the Project's root could not be checked: {error}");
-                        "workspace_unchecked"
-                    })?
-                    .map_err(|error| {
-                        log::warn!("the Project's root no longer authorizes: {error}");
-                        "workspace_unauthorized"
-                    })?;
+            let held = permit.take().ok_or("workspace_unchecked")?;
+            let (workspace, content, held) =
+                authorize_workspace(&root, data_directory, held).await?;
+            permit = Some(held);
             if workspace.root() != std::path::Path::new(&project.root) {
                 return Err("workspace_root_changed");
             }
-            agents_md = read_agents_md(&workspace).await;
+            agents_md = content;
             Some((workspace, project.commands.as_slice()))
         }
         _ => None,
@@ -171,6 +209,7 @@ async fn build(
             grant: granted.then(|| offered_grant(mutation)),
             agents_md,
         },
+        permit,
     ))
 }
 
@@ -180,7 +219,15 @@ async fn build(
     _project: Option<&ProjectRecord>,
     _wiring: Wiring,
     _stops: crate::system::native_scheduler::NativeStops,
-) -> Result<(ToolExecution, DevelopmentToolOffer), &'static str> {
+    _permit: Option<blocking::Permit>,
+) -> Result<
+    (
+        ToolExecution,
+        DevelopmentToolOffer,
+        Option<blocking::Permit>,
+    ),
+    &'static str,
+> {
     Err("workspace_unsupported")
 }
 
@@ -265,12 +312,10 @@ fn tools_of(
 }
 
 #[cfg(unix)]
-async fn read_agents_md(workspace: &Workspace) -> Option<String> {
-    use super::blocking::{self, Kind};
+fn read_agents_md(workspace: &Workspace) -> Option<String> {
     use super::workspace_read::{Refusal, Step};
 
-    let workspace = workspace.clone();
-    let result = blocking::run(Kind::File, move || -> Result<Option<String>, String> {
+    let result = (|| -> Result<Option<String>, String> {
         let (parent, name) = match workspace.parent("AGENTS.md") {
             Ok(located) => located,
             Err(Refusal::NotFound) => return Ok(None),
@@ -293,16 +338,11 @@ async fn read_agents_md(workspace: &Workspace) -> Option<String> {
             return Err("AGENTS.md contains a NUL byte".to_owned());
         }
         Ok(Some(text))
-    })
-    .await;
+    })();
     match result {
-        Ok(Ok(content)) => content,
-        Ok(Err(reason)) => {
+        Ok(content) => content,
+        Err(reason) => {
             log::warn!("skipping AGENTS.md: {reason}");
-            None
-        }
-        Err(error) => {
-            log::warn!("skipping AGENTS.md: blocking task failed: {error}");
             None
         }
     }

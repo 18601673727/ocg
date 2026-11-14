@@ -17,6 +17,7 @@ use crate::db::{
 };
 use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
 use crate::system::execution_controls::ExecutionControl;
+use crate::system::executor::blocking::Permit;
 use crate::system::executor::execution_runtime::{
     EndpointPolicy, WorkspaceTools, supervise_development_decision,
     supervise_development_generative,
@@ -270,9 +271,9 @@ pub(crate) async fn run_with(
     ));
     Scheduler::new(&database, wake, shutdown)
         .run(
-            || {
+            |database_changed| {
                 let scheduler = scheduler.clone();
-                async move { scheduler.claim().await }
+                async move { scheduler.claim(database_changed).await }
             },
             |allocation| {
                 let scheduler = scheduler.clone();
@@ -288,6 +289,7 @@ pub(crate) enum ExecutorPass {
     Reserved(Box<PoolAllocation>),
     Nothing,
     BudgetSpent,
+    Rescan,
     IndexExhausted,
     Halted,
 }
@@ -330,7 +332,11 @@ pub(crate) struct NativeScheduler {
     _authority: SchedulingAuthority,
     shutdown: CancellationToken,
     stops: NativeStops,
-    resume: Cell<Option<DevelopmentReadyCursor>>,
+    // A scan may skip Jobs that another capability set or a file permit admits.
+    // Two capability bits and one permit bit bound the independent cursors.
+    resume: Cell<[Option<DevelopmentReadyCursor>; 8]>,
+    // A changed queue may make a Job eligible in a previously scanned segment.
+    rescan: Cell<u8>,
     discovery: Cell<Discovery>,
     turns: Cell<u64>,
     workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
@@ -352,7 +358,8 @@ impl NativeScheduler {
             _authority: authority,
             shutdown,
             stops,
-            resume: Cell::new(None),
+            resume: Cell::new([None; 8]),
+            rescan: Cell::new(0),
             discovery: Cell::new(Discovery::default()),
             turns: Cell::new(0),
             running: RefCell::new(Vec::new()),
@@ -368,7 +375,19 @@ impl NativeScheduler {
         }
     }
 
-    pub(crate) async fn claim(&self) -> Result<DispatchBatch<PoolAllocation>, DatabaseError> {
+    pub(crate) async fn claim(
+        &self,
+        database_changed: bool,
+    ) -> Result<DispatchBatch<(PoolAllocation, Option<Permit>)>, DatabaseError> {
+        if database_changed {
+            let mut rescan = self.rescan.get();
+            for (index, cursor) in self.resume.get().iter().enumerate() {
+                if cursor.is_some() {
+                    rescan |= 1 << index;
+                }
+            }
+            self.rescan.set(rescan);
+        }
         let mut grants = Vec::new();
         let (finished, running): (Vec<_>, Vec<_>) = std::mem::take(&mut *self.running.borrow_mut())
             .into_iter()
@@ -390,6 +409,7 @@ impl NativeScheduler {
             return Ok(DispatchBatch {
                 grants,
                 next_due: None,
+                wait_for_blocking: false,
             });
         }
         let recurrence_due = self.database.claim_due_recurrences(16).await?;
@@ -402,6 +422,7 @@ impl NativeScheduler {
                 return Ok(DispatchBatch {
                     grants,
                     next_due: None,
+                    wait_for_blocking: false,
                 });
             }
             let page = self
@@ -415,7 +436,11 @@ impl NativeScheduler {
                     && (executor.capabilities.contains(&GENERATIVE_CAPABILITY)
                         || executor.capabilities.contains(&DECISION_CAPABILITY))
                 {
-                    executors.push((executor.pool, executor.id));
+                    let capabilities =
+                        usize::from(executor.capabilities.contains(&GENERATIVE_CAPABILITY))
+                            | (usize::from(executor.capabilities.contains(&DECISION_CAPABILITY))
+                                << 1);
+                    executors.push((executor.pool, executor.id, capabilities));
                 }
             }
             reached = page.next;
@@ -430,15 +455,33 @@ impl NativeScheduler {
             executors.rotate_left(start);
         }
         let mut rotating = false;
-        for (pool, executor) in executors {
+        let mut revisit = false;
+        let mut wait_for_blocking = false;
+        let mut exhausted = 0u8;
+        for (pool, executor, capabilities) in executors {
             if self.halted.get() || self.shutdown.is_cancelled() {
                 break;
             }
-            match self.reserve_for(pool, executor).await {
-                ExecutorPass::Reserved(allocation) => grants.push(*allocation),
+            let permit = Permit::try_file();
+            let workspace_permit = permit.is_some();
+            wait_for_blocking |= !workspace_permit;
+            let scan = capabilities | (usize::from(workspace_permit) << 2);
+            if exhausted & (1 << scan) != 0 {
+                continue;
+            }
+            match self
+                .reserve_for(pool, executor, workspace_permit, scan)
+                .await
+            {
+                ExecutorPass::Reserved(allocation) => grants.push((*allocation, permit)),
                 ExecutorPass::Nothing => {}
                 ExecutorPass::BudgetSpent => rotating = true,
-                ExecutorPass::IndexExhausted | ExecutorPass::Halted => break,
+                ExecutorPass::Rescan => {
+                    exhausted |= 1 << scan;
+                    revisit = true;
+                }
+                ExecutorPass::IndexExhausted => exhausted |= 1 << scan,
+                ExecutorPass::Halted => break,
             }
         }
         let discovery = discovery.advanced(reached);
@@ -446,22 +489,30 @@ impl NativeScheduler {
         if reached.is_none() {
             self.turns.set(turn.wrapping_add(1));
         }
-        let dispatch_due = ((rotating && self.resume.get().is_some() || discovery.sweep.is_some())
+        let dispatch_due = ((revisit
+            || rotating && self.resume.get().iter().any(Option::is_some)
+            || discovery.sweep.is_some())
             && !self.halted.get())
         .then_some(Duration::ZERO);
         let next_due = match (dispatch_due, recurrence_due) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        Ok(DispatchBatch { grants, next_due })
+        Ok(DispatchBatch {
+            grants,
+            next_due,
+            wait_for_blocking,
+        })
     }
 
     pub(crate) async fn reserve_for(
         &self,
         pool: ExecutionPoolId,
         executor: ExecutorId,
+        workspace_permit: bool,
+        scan: usize,
     ) -> ExecutorPass {
-        let resume = self.resume.get();
+        let resume = self.resume.get()[scan];
         let mut after: Option<DevelopmentReadyCursor> = None;
         for page in 0..MAX_READY_PAGES {
             if page == HEAD_PAGES
@@ -473,7 +524,12 @@ impl NativeScheduler {
             let fresh = DevelopmentFreshReservation::new(pool, executor, after);
             let passed = self
                 .database
-                .reserve_scheduled_job(fresh, scheduled_policy, scheduled_decision_policy)
+                .reserve_scheduled_job(
+                    fresh,
+                    scheduled_policy,
+                    scheduled_decision_policy,
+                    workspace_permit,
+                )
                 .await
                 .map(|ScheduledReservation::Pass(passed)| *passed);
             match passed {
@@ -486,8 +542,16 @@ impl NativeScheduler {
                 }
                 Ok(DevelopmentReservation::Continue(cursor)) => after = Some(cursor),
                 Ok(DevelopmentReservation::Exhausted) => {
-                    self.resume.set(None);
-                    return ExecutorPass::IndexExhausted;
+                    let mut cursors = self.resume.get();
+                    cursors[scan] = None;
+                    self.resume.set(cursors);
+                    let rescan = self.rescan.get();
+                    self.rescan.set(rescan & !(1 << scan));
+                    return if rescan & (1 << scan) != 0 {
+                        ExecutorPass::Rescan
+                    } else {
+                        ExecutorPass::IndexExhausted
+                    };
                 }
                 Ok(DevelopmentReservation::Replayed(_) | DevelopmentReservation::Unresolved) => {
                     self.halt("a first reservation attempt was answered as a replay");
@@ -506,12 +570,15 @@ impl NativeScheduler {
             }
         }
         if after.is_some_and(|reached| resume.is_none_or(|resume| reached.0 > resume.0)) {
-            self.resume.set(after);
+            let mut cursors = self.resume.get();
+            cursors[scan] = after;
+            self.resume.set(cursors);
         }
         ExecutorPass::BudgetSpent
     }
 
-    pub(crate) fn spawn(&self, allocation: PoolAllocation) {
+    pub(crate) fn spawn(&self, grant: (PoolAllocation, Option<Permit>)) {
+        let (allocation, permit) = grant;
         let database = self.database.clone();
         let cancellation = self.shutdown.child();
         let registration = self.stops.register(allocation.token, cancellation.clone());
@@ -526,6 +593,7 @@ impl NativeScheduler {
                 &cancellation,
                 workspace_tools.as_ref(),
                 &stops,
+                permit,
             )
             .await;
             dispatched.log();
@@ -677,12 +745,41 @@ async fn within_deadline<F: std::future::Future>(
     output
 }
 
+fn protection_refused(error: &DatabaseError) -> bool {
+    matches!(
+        error,
+        DatabaseError::DiskProtected(_) | DatabaseError::RefusedByDiskProtection { .. }
+    )
+}
+
+async fn wait_for_protection_recovery(
+    database: &DatabaseHandle,
+    cancellation: &CancellationToken,
+) -> bool {
+    use ntex::util::{Either, select};
+
+    let protection = database.watch_disk_protection();
+    loop {
+        if cancellation.is_cancelled() {
+            return false;
+        }
+        if protection.status().lock.is_none() {
+            return true;
+        }
+        match select(cancellation.cancelled(), protection.changed()).await {
+            Either::Left(()) | Either::Right(None) => return false,
+            Either::Right(Some(_)) => {}
+        }
+    }
+}
+
 pub(crate) async fn dispatch(
     database: &DatabaseHandle,
     allocation: PoolAllocation,
     cancellation: &CancellationToken,
     workspace_tools: Option<&crate::system::executor::execution_runtime::WorkspaceTools>,
     stops: &NativeStops,
+    permit: Option<Permit>,
 ) -> Dispatched {
     let token = allocation.token;
     let detail = if cancellation.is_cancelled() {
@@ -718,6 +815,7 @@ pub(crate) async fn dispatch(
                         .map(WorkspaceTools::data_directory),
                     stops,
                     check_prepared_native,
+                    permit,
                 )
                 .await
             }
@@ -758,6 +856,7 @@ pub(crate) async fn dispatch(
                         .map(WorkspaceTools::data_directory),
                     stops,
                     guard,
+                    permit,
                 )
                 .await
             }
@@ -799,13 +898,24 @@ async fn start_and_exchange(
     policy: EndpointPolicy<'_>,
     data_directory: Option<&crate::system::data_directory::DataDirectory>,
     stops: &NativeStops,
-    guard: impl FnOnce(&crate::db::PreparedDevelopmentHandoff) -> Result<(), &'static str>,
+    guard: impl Fn(&crate::db::PreparedDevelopmentHandoff) -> Result<(), &'static str>,
+    permit: Option<Permit>,
 ) -> String {
-    let tooling = NativeTooling::new(data_directory, stops.clone());
-    match database
-        .checked_development_handoff_guarded(token, &tooling, guard)
-        .await
-    {
+    let tooling = NativeTooling::new(data_directory, stops.clone(), permit);
+    let handoff = loop {
+        match database
+            .checked_development_handoff_guarded(token, &tooling, &guard)
+            .await
+        {
+            Err(DevelopmentHandoffError::Database(error)) if protection_refused(&error) => {
+                if !wait_for_protection_recovery(database, cancellation).await {
+                    return "protection interrupted the start; the reservation remains held".into();
+                }
+            }
+            result => break result,
+        }
+    };
+    match handoff {
         Ok(handoff) => {
             let tools = tooling.into_execution();
             let exchange = within_deadline(cancellation, DISPATCH_TIMEOUT, async {
@@ -832,10 +942,20 @@ async fn start_and_exchange(
             }
         }
         Err(DevelopmentHandoffError::NotStarted { cause, error }) => {
-            match database
-                .fail_unstarted_development_reservation(token, cause)
-                .await
-            {
+            let settled = loop {
+                match database
+                    .fail_unstarted_development_reservation(token, cause)
+                    .await
+                {
+                    Err(error) if protection_refused(&error) => {
+                        if !wait_for_protection_recovery(database, cancellation).await {
+                            return "protection interrupted settlement; the reservation remains held".into();
+                        }
+                    }
+                    result => break result,
+                }
+            };
+            match settled {
                 Ok(_) => format!(
                     "the start was refused before any request ({error}); the reservation was ended"
                 ),

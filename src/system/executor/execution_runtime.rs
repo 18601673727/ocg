@@ -500,6 +500,18 @@ fn offer_mismatch(
     }
 }
 
+fn has_usage_counts(usage: &providers::openai_compatible::NormalizedUsage) -> bool {
+    [
+        usage.input_tokens,
+        usage.output_tokens,
+        usage.cache_read_tokens,
+        usage.cache_write_tokens,
+        usage.reasoning_tokens,
+    ]
+    .iter()
+    .any(Option::is_some)
+}
+
 async fn record_answered_request(
     database: &DatabaseHandle,
     handoff: &crate::db::DevelopmentHandoff,
@@ -521,6 +533,31 @@ async fn record_answered_request(
             "response cannot be recorded",
         ))
     })?;
+    let mut usage_seq = 5u32;
+    let mut usages = Vec::new();
+    for observation in observations {
+        if let ProviderFact::Usage { usage, finality } = &observation.fact {
+            if !has_usage_counts(usage) {
+                continue;
+            }
+            usages.push((
+                usage_seq,
+                Metrics {
+                    job,
+                    request,
+                    observed_at: observation.observed_at,
+                    measurements: Measurements {
+                        usage: usage.clone(),
+                        ..Measurements::default()
+                    },
+                    token: Some(TokenAnnotation::eligible(*finality)),
+                },
+            ));
+            usage_seq = usage_seq
+                .checked_add(2)
+                .ok_or(DatabaseError::Rejected(Violation::ValueOutOfRange("usage")))?;
+        }
+    }
     database
         .record_development_provider_answer(
             handoff,
@@ -534,45 +571,9 @@ async fn record_answered_request(
                 measurements: providers::metrics(result),
                 response,
             },
+            usages,
         )
-        .await?;
-    let mut usage_seq = 5u32;
-    for observation in observations {
-        if let ProviderFact::Usage { usage, finality } = &observation.fact {
-            if [
-                usage.input_tokens,
-                usage.output_tokens,
-                usage.cache_read_tokens,
-                usage.cache_write_tokens,
-                usage.reasoning_tokens,
-            ]
-            .iter()
-            .all(Option::is_none)
-            {
-                continue;
-            }
-            database
-                .record_development_usage(
-                    handoff,
-                    usage_seq,
-                    Metrics {
-                        job,
-                        request,
-                        observed_at: observation.observed_at,
-                        measurements: Measurements {
-                            usage: usage.clone(),
-                            ..Measurements::default()
-                        },
-                        token: Some(TokenAnnotation::eligible(*finality)),
-                    },
-                )
-                .await?;
-            usage_seq = usage_seq
-                .checked_add(2)
-                .ok_or(DatabaseError::Rejected(Violation::ValueOutOfRange("usage")))?;
-        }
-    }
-    Ok(())
+        .await
 }
 
 async fn settle_tool_stop(
@@ -711,6 +712,25 @@ pub(crate) async fn supervise_development_decision(
             "Decision response cannot be recorded",
         ))
     })?;
+    let usages = if has_usage_counts(&result.usage) {
+        vec![(
+            5,
+            Metrics {
+                job: token.job,
+                request: RequestNumber::FIRST,
+                observed_at: Timestamp::now(),
+                measurements: Measurements {
+                    usage: result.usage.clone(),
+                    ..Measurements::default()
+                },
+                token: Some(TokenAnnotation::eligible(
+                    crate::db::entities::UsageFinality::Final,
+                )),
+            },
+        )]
+    } else {
+        Vec::new()
+    };
     database
         .record_development_provider_answer(
             &handoff,
@@ -734,37 +754,9 @@ pub(crate) async fn supervise_development_decision(
                 },
                 response,
             },
+            usages,
         )
         .await?;
-    let has_usage = [
-        result.usage.input_tokens,
-        result.usage.output_tokens,
-        result.usage.cache_read_tokens,
-        result.usage.cache_write_tokens,
-        result.usage.reasoning_tokens,
-    ]
-    .iter()
-    .any(Option::is_some);
-    if has_usage {
-        database
-            .record_development_usage(
-                &handoff,
-                5,
-                Metrics {
-                    job: token.job,
-                    request: RequestNumber::FIRST,
-                    observed_at: Timestamp::now(),
-                    measurements: Measurements {
-                        usage: result.usage.clone(),
-                        ..Measurements::default()
-                    },
-                    token: Some(TokenAnnotation::eligible(
-                        crate::db::entities::UsageFinality::Final,
-                    )),
-                },
-            )
-            .await?;
-    }
     let returned = DevelopmentExecutionReturn { handoff: &handoff };
     database
         .finalize_development_decision(returned, sink.output_seq, result.result)

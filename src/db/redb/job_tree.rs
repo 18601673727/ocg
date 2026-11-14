@@ -315,21 +315,22 @@ impl Batch {
         prerequisite: JobId,
         condition: DependencyCondition,
     ) -> Result<DependencyState, BatchError> {
+        if self
+            .require_mutable_conversation(prerequisite)?
+            .is_chunk_group()
+        {
+            return Ok(Batch::dependency_outcome_state(
+                self.require_job_state(prerequisite)?.outcome.as_ref(),
+                condition,
+            ));
+        }
         let Some(head) = self.group_head(prerequisite)? else {
             return Ok(DependencyState::Waiting);
         };
-        Ok(match self.require_job_state(head)?.outcome {
-            None => DependencyState::Waiting,
-            Some(outcome) => match (outcome.kind, condition) {
-                (OutcomeKind::Completed, _) | (_, DependencyCondition::Settled)
-                    if outcome.kind != OutcomeKind::Unknown =>
-                {
-                    DependencyState::Satisfied
-                }
-                (OutcomeKind::Unknown, _) => DependencyState::Waiting,
-                (_, _) => DependencyState::Impossible,
-            },
-        })
+        Ok(Batch::dependency_outcome_state(
+            self.require_job_state(head)?.outcome.as_ref(),
+            condition,
+        ))
     }
 
     pub(crate) fn mutable_job_blocked(&mut self, job: &MutableJob) -> Result<bool, BatchError> {
@@ -632,8 +633,10 @@ impl Batch {
         }
         self.record_conversation_outcome(spec, outcome)?;
         if let Some(parent) = spec.parent_id {
+            self.end_impossible_dependents(parent, group)?;
             self.settle_closing(parent)?;
         }
+        self.wake_scheduler();
         Ok(())
     }
 
@@ -894,33 +897,50 @@ impl Batch {
         parent: JobId,
         settled: JobId,
     ) -> Result<(), BatchError> {
-        for sibling in self.live_children(parent)? {
-            if sibling == settled {
-                continue;
-            }
-            let control = self.job_control(sibling)?;
-            if control.closing.is_some() {
-                continue;
-            }
-            let mut impossible = false;
-            for (prerequisite, condition) in &control.after {
-                if self.prerequisite_state(*prerequisite, *condition)?
-                    == DependencyState::Impossible
-                {
-                    impossible = true;
+        let mut ended = Vec::new();
+        loop {
+            let mut progressed = false;
+            for sibling in self.live_children(parent)? {
+                if sibling == settled || ended.contains(&sibling) {
+                    continue;
+                }
+                let control = self.job_control(sibling)?;
+                if control.closing.is_some() {
+                    continue;
+                }
+                let mut impossible = false;
+                for (prerequisite, condition) in &control.after {
+                    if self.prerequisite_state(*prerequisite, *condition)?
+                        == DependencyState::Impossible
+                    {
+                        impossible = true;
+                        break;
+                    }
+                }
+                if impossible {
+                    let _ =
+                        self.stop_unsettled_turns(sibling, &OutcomeCause::DependencyImpossible)?;
+                    let mut control = control;
+                    control.closing = Some(JobClosing {
+                        at: self.now,
+                        by: Actor::Auto,
+                        running: false,
+                    });
+                    self.put_job_control(sibling, &control)?;
+                    self.settle_closing(sibling)?;
+                    ended.push(sibling);
+                    progressed = true;
                 }
             }
-            if impossible {
-                let _ = self.stop_unsettled_turns(sibling, &OutcomeCause::DependencyImpossible)?;
-                let mut control = control;
-                control.closing = Some(JobClosing {
-                    at: self.now,
-                    by: Actor::Auto,
-                    running: false,
-                });
-                self.put_job_control(sibling, &control)?;
-                self.settle_closing(sibling)?;
+            if !progressed {
+                break;
             }
+        }
+        if !ended.is_empty() {
+            self.wake_scheduler();
+        }
+        for sibling in ended {
+            self.return_child_results(parent, sibling)?;
         }
         Ok(())
     }

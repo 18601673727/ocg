@@ -24,7 +24,7 @@ fn frozen_decision_target(
     let Some(bytes) = jobs.get(job.get())? else {
         return Ok(None);
     };
-    if !matches!(bytes.value(), [TAG_JOB, codec::RECORD_VERSION, ..]) {
+    if !matches!(bytes.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION) {
         return Ok(None);
     }
     let row = transactions::decode_mutable_job(job.get(), bytes.value())?;
@@ -81,7 +81,7 @@ pub(super) fn frozen_llm_target(
     {
         let jobs = rx.open_table(JOBS)?;
         if let Some(bytes) = jobs.get(job.get())?
-            && matches!(bytes.value(), [TAG_JOB, codec::RECORD_VERSION, ..])
+            && matches!(bytes.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION)
         {
             let job = transactions::decode_mutable_job(job.get(), bytes.value())?;
             return match job.frozen {

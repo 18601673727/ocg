@@ -486,10 +486,62 @@ pub const COMPACTION_JOB_NAME: &str = "Compact conversation context";
 
 pub const SUMMARIZER_OUTPUT_RESERVE: u32 = 4096;
 
+fn deserialize_content_digest<'de, D>(deserializer: D) -> Result<ContentDigest, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct DigestVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for DigestVisitor {
+        type Value = ContentDigest;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a 64-character hex SHA-256 digest or 32-byte array")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            let trimmed = value.trim();
+            if trimmed.len() != 64 {
+                return Err(E::invalid_length(trimmed.len(), &self));
+            }
+            let mut bytes = [0u8; 32];
+            for (index, slot) in bytes.iter_mut().enumerate() {
+                let pair = trimmed
+                    .get(index * 2..index * 2 + 2)
+                    .ok_or_else(|| E::custom("source digest must be ASCII hex"))?;
+                *slot = u8::from_str_radix(pair, 16).map_err(E::custom)?;
+            }
+            Ok(ContentDigest::from_bytes(bytes))
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut bytes = [0u8; 32];
+            for (index, slot) in bytes.iter_mut().enumerate() {
+                *slot = seq
+                    .next_element()?
+                    .ok_or_else(|| serde::de::Error::invalid_length(index, &self))?;
+            }
+            if seq.next_element::<u8>()?.is_some() {
+                return Err(serde::de::Error::invalid_length(33, &self));
+            }
+            Ok(ContentDigest::from_bytes(bytes))
+        }
+    }
+
+    deserializer.deserialize_any(DigestVisitor)
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummarizationResult {
     pub schema_version: u32,
+    #[serde(deserialize_with = "deserialize_content_digest")]
     pub source: ContentDigest,
     pub summary: String,
     pub omitted_details: Vec<String>,

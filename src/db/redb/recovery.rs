@@ -214,16 +214,16 @@ pub(super) fn check_identity(
     let found = match meta.get(DATABASE_FORMAT_KEY)? {
         None => {
             return Err(unsupported_format(&format!(
-                "unmarked database; this build opens only format {DATABASE_FORMAT_VERSION}"
+                "unmarked database; this build opens only format {FORMAT_VERSION}"
             )));
         }
         Some(value) => <[u8; 8]>::try_from(value.value())
             .map(u64::from_le_bytes)
             .map_err(|_| unsupported_format("database format marker is malformed"))?,
     };
-    if found != DATABASE_FORMAT_VERSION {
+    if found != FORMAT_VERSION {
         return Err(unsupported_format(&format!(
-            "database format {found} is not supported; this build opens only format {DATABASE_FORMAT_VERSION}; run `ocg migrate --check`"
+            "database format {found} is not supported; this build opens only format {FORMAT_VERSION}; run `ocg migrate --check`"
         )));
     }
     if !meta
@@ -502,7 +502,7 @@ fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
     ] {
         if !present.iter().any(|table| table == required) {
             return Err(StorageError::corrupted(format!(
-                "database is marked format {DATABASE_FORMAT_VERSION} but lacks the {required} table; it is not a complete database"
+                "database is marked format {FORMAT_VERSION} but lacks the {required} table; it is not a complete database"
             )));
         }
     }
@@ -699,7 +699,7 @@ fn held_ownership(held: u64, unknown: u64) -> StorageError {
 
 pub(super) fn check_preflight_header(bytes: &[u8], tags: &[u8]) -> Result<(), StorageError> {
     let valid = match bytes {
-        [tag, version, ..] if tags.contains(tag) => *version == codec::RECORD_VERSION,
+        [tag, version, ..] if tags.contains(tag) => u64::from(*version) == FORMAT_VERSION,
         _ => false,
     };
     if valid {
@@ -847,10 +847,7 @@ pub(super) fn initialize(
     let (epoch, clean_shutdown) = {
         let mut meta = tx.open_table(META).map_err(StorageError::from)?;
         if empty {
-            meta.insert(
-                DATABASE_FORMAT_KEY,
-                DATABASE_FORMAT_VERSION.to_le_bytes().as_slice(),
-            )?;
+            meta.insert(DATABASE_FORMAT_KEY, FORMAT_VERSION.to_le_bytes().as_slice())?;
             meta.insert(SCHEMA_FINGERPRINT_KEY, SCHEMA_FINGERPRINT)?;
             let settings = crate::db::entities::GlobalCompactionSettings::default();
             let mut encoded = Enc::new(TAG_GLOBAL_COMPACTION);
@@ -2283,8 +2280,8 @@ fn held_recovery_plan_in(
     }
     let canonical = json!({
         "kind": "ocg-held-recovery-plan-v1",
-        "database_format": DATABASE_FORMAT_VERSION,
-        "record_version": codec::RECORD_VERSION,
+        "database_format": FORMAT_VERSION,
+        "record_version": FORMAT_VERSION,
         "source_sha256": source_sha256,
         "open_epoch": epoch,
         "clean_shutdown": clean,

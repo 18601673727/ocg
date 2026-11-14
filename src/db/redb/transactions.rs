@@ -2393,7 +2393,7 @@ impl Batch {
             if !room {
                 return self.reject(Violation::InvalidValue(
                     "allocation",
-                    "the Executor, its Pool or the global limit has no room",
+                    "the Executor or its Pool has no room",
                 ));
             }
         }
@@ -2437,6 +2437,11 @@ impl Batch {
             {
                 return self.corrupted("invalid mutable ready entry".to_owned());
             }
+            if matches!(selection, ReadySelection::Scheduled { .. })
+                && (!self.mutable_predecessor_ready(&job)? || self.mutable_job_blocked(&job)?)
+            {
+                continue;
+            }
             if job.context_selection == crate::db::entities::MutableContextSelection::FullHistory
                 && job.previous.is_some()
                 && let Some((producer, source)) = self.latest_verified_summary(job.parent_id, id)?
@@ -2469,7 +2474,9 @@ impl Batch {
                     Err(error) => return Err(error),
                 }
             }
-            if !self.mutable_predecessor_ready(&job)? || self.mutable_job_blocked(&job)? {
+            if !matches!(selection, ReadySelection::Scheduled { .. })
+                && (!self.mutable_predecessor_ready(&job)? || self.mutable_job_blocked(&job)?)
+            {
                 continue;
             }
             let summary_work = self.is_summary_work(&job)?;
@@ -2504,6 +2511,7 @@ impl Batch {
             if let ReadySelection::Scheduled {
                 generative_policy,
                 decision_policy,
+                workspace_permit,
             } = selection
             {
                 if self.unsupported_start_context(&job)?.is_some() {
@@ -2511,6 +2519,15 @@ impl Batch {
                 }
                 let ext_target = match &frozen {
                     FrozenConfiguration::Generative(frozen) => {
+                        if !workspace_permit
+                            && !summary_work
+                            && frozen
+                                .agent
+                                .as_ref()
+                                .is_some_and(|agent| agent.workspace_grant().is_some())
+                        {
+                            continue;
+                        }
                         let refusal = if summary_work {
                             frozen.provider_refusal()
                         } else {
@@ -2616,17 +2633,17 @@ impl Batch {
         scheduled_external: Option<(crate::db::entities::ScheduledExternalPolicyId, u32)>,
     ) -> Result<crate::db::entities::PoolAllocation, BatchError> {
         use crate::db::entities::{AllocationPhase, AllocationToken, PoolAllocation};
-        let available = self.step(|tx| {
+        let (executor_free, occupied) = self.step(|tx| {
             let held =
                 active_allocations(&tx.open_table(ACTIVE_ALLOCATIONS)?, pool.id.get(), None)?;
             let occupied = held.len() as u64;
             let executor_free = !held.iter().any(|(exec, _)| *exec == executor.id.get());
             Ok((executor_free, occupied))
         })?;
-        if !available.0 || available.1 >= u64::from(pool.capacity.get()) {
+        if !executor_free || occupied >= u64::from(pool.capacity.get()) {
             return self.reject(Violation::InvalidValue(
                 "allocation",
-                "Job, Executor or Pool capacity is unavailable",
+                "Executor or Pool capacity is unavailable",
             ));
         }
         let allocation = PoolAllocation {
@@ -2748,7 +2765,7 @@ impl Batch {
             let meta = tx.open_table(META)?;
             Ok(meta
                 .get(DATABASE_FORMAT_KEY)?
-                .is_some_and(|value| value.value() == DATABASE_FORMAT_VERSION.to_le_bytes())
+                .is_some_and(|value| value.value() == FORMAT_VERSION.to_le_bytes())
                 && meta
                     .get(SCHEMA_FINGERPRINT_KEY)?
                     .is_some_and(|value| value.value() == SCHEMA_FINGERPRINT)
@@ -3088,10 +3105,10 @@ impl Batch {
                 "conversation predecessor is not settled",
             ));
         }
-        if self.is_summary_work(snapshot)? && self.mutable_job_blocked(snapshot)? {
+        if self.mutable_job_blocked(snapshot)? {
             return self.reject(Violation::InvalidValue(
                 "handoff",
-                "summary conversation is not eligible",
+                "conversation is not eligible",
             ));
         }
         let expected = prepared.expected_credential_references();
@@ -3194,8 +3211,7 @@ impl Batch {
             || state.stop_confirmed_at.is_some()
             || state.stop_confirmed_by.is_some()
             || (self.job_control(job.parent_id)?.closing.is_some()
-                && !(allocation.phase == AllocationPhase::StopRequested
-                    && self.is_summary_work(&job)?))
+                && allocation.phase != AllocationPhase::StopRequested)
         {
             return self.reject(rejected());
         }
