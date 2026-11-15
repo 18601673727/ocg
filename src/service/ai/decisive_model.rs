@@ -10,13 +10,12 @@ use super::providers::{
     CredentialResolver, MAX_PROVIDER_ERROR_BYTES, ProviderExecutionConfig, ProviderExecutionError,
     ResponseFacts,
 };
-use crate::db::entities::NormalizedUsage;
-use crate::system::http::{authorization, provider_client_for};
-
 use crate::db::entities::{
-    DecisionAnswer, DecisionConfidence, DecisionOutcome, DecisionQuestion, DecisionRequest,
-    DecisionResult, FrozenDecisionConfig, NativeDecisionConfig, RequestRef,
+    AvailabilityObservation, ChatFinishReason, DecisionAnswer, DecisionConfidence, DecisionOutcome,
+    DecisionQuestion, DecisionRequest, DecisionResult, FrozenDecisionConfig, NativeDecisionConfig,
+    NormalizedUsage, RequestRef,
 };
+use crate::system::http::{authorization, provider_client_for};
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -25,7 +24,7 @@ pub(crate) struct DecisionExecution {
     pub result: DecisionResult,
     pub usage: NormalizedUsage,
     pub raw: Value,
-    pub status_code: u16,
+    pub availability: AvailabilityObservation,
     pub finished_in: Duration,
 }
 
@@ -236,7 +235,12 @@ fn decode_decision(
         result,
         usage,
         raw,
-        status_code: status,
+        availability: AvailabilityObservation {
+            status_code: Some(status),
+            finish_reason: Some(ChatFinishReason::Stop),
+            raw_finish_reason: None,
+            failure: None,
+        },
         finished_in,
     })
 }
@@ -695,10 +699,10 @@ pub(crate) async fn execute_decision_with_sink(
                     facts: facts(),
                 })?;
             Ok(DecisionExecution {
+                availability: observe::success_observation(&execution),
                 raw: json!({"text": execution.text, "response_items": execution.response_items}),
                 result,
                 usage: execution.usage,
-                status_code: execution.status_code,
                 finished_in: execution.finished_in,
             })
         }

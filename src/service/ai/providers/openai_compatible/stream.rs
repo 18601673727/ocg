@@ -8,6 +8,28 @@ use crate::db::entities::{
 
 use super::request::{MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALLS};
 
+pub(crate) fn finish_reason_str(reason: ChatFinishReason) -> &'static str {
+    match reason {
+        ChatFinishReason::Stop => "stop",
+        ChatFinishReason::Length => "length",
+        ChatFinishReason::ToolCalls => "tool_calls",
+        ChatFinishReason::ContentFilter => "content_filter",
+        ChatFinishReason::Error => "error",
+        ChatFinishReason::Other => "other",
+    }
+}
+
+pub(crate) fn parse_finish_reason(raw: &str) -> ChatFinishReason {
+    match raw {
+        "stop" => ChatFinishReason::Stop,
+        "length" => ChatFinishReason::Length,
+        "tool_calls" => ChatFinishReason::ToolCalls,
+        "content_filter" => ChatFinishReason::ContentFilter,
+        "error" => ChatFinishReason::Error,
+        _ => ChatFinishReason::Other,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatStreamEvent {
     Image {
@@ -316,7 +338,7 @@ impl ToolCallAssembler {
                 ToolCallRefusal::Incomplete,
                 format!(
                     "tool calls ended with finish reason `{}`",
-                    finish.map_or("none", ChatFinishReason::as_openai_str)
+                    finish.map_or("none", finish_reason_str)
                 ),
             ));
         }

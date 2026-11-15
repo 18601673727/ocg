@@ -22,6 +22,11 @@ pub(crate) const MAX_PROVIDER_ERROR_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
+pub(crate) struct StreamFinish {
+    pub(crate) reason: ChatFinishReason,
+    pub(crate) raw: String,
+}
+
 pub mod anthropic;
 mod cancellation;
 mod models;

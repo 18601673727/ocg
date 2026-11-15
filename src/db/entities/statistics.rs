@@ -41,24 +41,17 @@ impl AvailabilityObservation {
 
     #[must_use]
     pub fn classification(&self) -> AvailabilityClassification {
-        match self.status_code {
-            Some(200) if self.normal_termination().is_some() => {
-                AvailabilityClassification::Available
-            }
-            status => classify_status(status),
-        }
-    }
-
-    fn normal_termination(&self) -> Option<ChatFinishReason> {
-        let finish = self.finish_reason?;
-        let normal = matches!(finish, ChatFinishReason::Stop | ChatFinishReason::Length);
-        (normal
+        if self.status_code == Some(200)
             && self.failure.is_none()
-            && self
-                .raw_finish_reason
-                .as_deref()
-                .is_none_or(|raw| raw == finish.as_openai_str()))
-        .then_some(finish)
+            && matches!(
+                self.finish_reason,
+                Some(ChatFinishReason::Stop | ChatFinishReason::Length)
+            )
+        {
+            AvailabilityClassification::Available
+        } else {
+            classify_status(self.status_code)
+        }
     }
 }
 

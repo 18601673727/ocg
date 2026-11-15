@@ -1,5 +1,6 @@
 use super::contracts::envelope;
 use super::{DatabaseHandle, DatabaseStatus, Value};
+use crate::system::monitor::{database_disk_usage, process_memory};
 
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "ActiveSystemSettings")]
@@ -65,48 +66,6 @@ pub(crate) struct HealthView {
     quarantined_error: Option<QuarantinedErrorView>,
 }
 
-fn process_memory() -> (Option<u64>, Option<u64>) {
-    let mut peak = None;
-    #[cfg(unix)]
-    {
-        let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut rusage) } == 0 {
-            #[cfg(target_os = "macos")]
-            {
-                peak = Some(rusage.ru_maxrss.max(0) as u64);
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                peak = Some((rusage.ru_maxrss.max(0) as u64).saturating_mul(1024));
-            }
-        }
-    }
-
-    #[allow(unused_mut)]
-    let mut current = None;
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
-                        current = Some(kb.saturating_mul(1024));
-                    }
-                }
-                if let Some(rest) = line.strip_prefix("VmHWM:") {
-                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
-                        peak = Some(kb.saturating_mul(1024));
-                    }
-                }
-            }
-        }
-    }
-
-    (current, peak)
-}
-
 pub(super) async fn health(database: &DatabaseHandle) -> Value {
     let status = match database.status() {
         DatabaseStatus::Open => "open",
@@ -117,16 +76,10 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
     };
     let readable = database.check_readable().await.is_ok();
     let directory = database.data_directory().database_path().to_path_buf();
-    let (database_bytes, available_bytes) = ntex::rt::spawn_blocking(move || {
-        (
-            std::fs::metadata(crate::db::database_file(&directory))
-                .map(|metadata| metadata.len())
-                .ok(),
-            fs4::available_space(&directory).ok(),
-        )
-    })
-    .await
-    .unwrap_or((None, None));
+    let ((database_bytes, available_bytes), (rss_bytes, peak_rss_bytes)) =
+        ntex::rt::spawn_blocking(move || (database_disk_usage(&directory), process_memory()))
+            .await
+            .unwrap_or_default();
     let queue = match database.queue_counts().await {
         Ok(counts) => Some(counts),
         Err(error) => {
@@ -135,7 +88,6 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
         }
     };
     let (commit_us_mean, commit_us_max) = database.commit_timing();
-    let (rss_bytes, peak_rss_bytes) = process_memory();
     let (quarantined, quarantined_error) = match database.uncertain_allocations().await {
         Ok(uncertain) => (
             Some(

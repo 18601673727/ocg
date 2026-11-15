@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::fs;
-use std::fs::{File, Metadata, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,7 +18,7 @@ pub const LOG_BUFFER_BYTES: usize = 64 * 1024;
 
 pub(crate) struct LogStore {
     directory: PathBuf,
-    files: Mutex<HashMap<PathBuf, Metadata>>,
+    files: Mutex<HashSet<PathBuf>>,
     changes: Notifications,
 }
 
@@ -39,22 +39,22 @@ impl LogStore {
         self.changes.subscribe()
     }
 
-    pub(crate) fn changed(&self) {
+    fn changed(&self) {
         self.changes.publish();
     }
 
-    pub(crate) fn is_open(&self, path: &Path) -> bool {
+    fn is_open(&self, path: &Path) -> bool {
         self.files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains_key(path)
+            .contains(path)
     }
 
-    fn opened(&self, path: PathBuf, meta: Metadata) {
+    fn opened(&self, path: PathBuf) {
         self.files
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(path, meta);
+            .insert(path);
     }
 
     fn closed(&self, path: &Path) {
@@ -524,15 +524,8 @@ impl Worker {
                 }
             }
         };
-        let meta = match file.metadata() {
-            Ok(meta) => meta,
-            Err(error) => {
-                self.record_failure(path, "metadata", &error);
-                return false;
-            }
-        };
         let logs = Arc::clone(&self.shared.logs);
-        logs.opened(path.clone(), meta);
+        logs.opened(path.clone());
         self.file = Some(ActiveFile {
             path,
             file,

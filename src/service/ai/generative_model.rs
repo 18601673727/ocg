@@ -747,7 +747,7 @@ async fn parse_stream_body(
             })?;
             buffer.clear();
             saw_event = true;
-            let event = if anthropic {
+            let (event, finish) = if anthropic {
                 messages
                     .event(&event, config.max_output_bytes)
                     .map_err(|message| {
@@ -763,7 +763,7 @@ async fn parse_stream_body(
                         }
                     })?
             } else {
-                event
+                (event, None)
             };
             let reported = if anthropic {
                 messages.reported_usage()
@@ -802,7 +802,7 @@ async fn parse_stream_body(
                     status_code,
                 ));
             }
-            let event = if native {
+            let (event, finish) = if native {
                 responses
                     .event(&event, config.max_output_bytes)
                     .map_err(|message| {
@@ -818,7 +818,7 @@ async fn parse_stream_body(
                         }
                     })?
             } else {
-                event
+                (event, finish)
             };
             if let Some(error) = event.get("error").filter(|error| error.is_object()) {
                 let (message, provider_code) = observe::parse_provider_error(&event.to_string())
@@ -851,7 +851,7 @@ async fn parse_stream_body(
                     },
                 });
             }
-            if native && responses.terminal {
+            if native && finish.is_some() {
                 response = StreamedResponse {
                     usage: std::mem::take(&mut response.usage),
                     ..Default::default()
@@ -892,12 +892,12 @@ async fn parse_stream_body(
             {
                 saw_delta = true;
             }
-            if native && responses.terminal {
-                response.raw_finish_reason = Some("completed".to_owned());
-                break 'stream;
-            }
-            if anthropic && messages.terminal {
-                response.raw_finish_reason = messages.stop_reason.clone();
+            if let Some(finish) = finish {
+                response.finish_reason = Some(finish.reason);
+                response.raw_finish_reason = Some(finish.raw);
+                if native {
+                    break 'stream;
+                }
             }
             for (kind, delta) in delta {
                 output.buffer(kind, &delta).await.map_err(|error| {
@@ -1077,7 +1077,7 @@ fn consume_event(
     }
     if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
         response.raw_finish_reason = Some(raw.to_owned());
-        response.finish_reason = Some(ChatFinishReason::from_openai_str(raw));
+        response.finish_reason = Some(openai_compatible::stream::parse_finish_reason(raw));
     }
     Ok(deltas)
 }

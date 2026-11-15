@@ -716,12 +716,7 @@ pub(crate) async fn supervise_development_decision(
                     job: token.job,
                     request: RequestNumber::FIRST,
                     observed_at: Timestamp::now(),
-                    observation: crate::db::entities::AvailabilityObservation {
-                        status_code: Some(result.status_code),
-                        finish_reason: None,
-                        raw_finish_reason: None,
-                        failure: None,
-                    },
+                    observation: result.availability,
                 },
                 measurements: Measurements {
                     request_finished_in_ms: Some(

@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use super::{
-    ChatConversation, HeaderValue, NormalizedUsage, ProviderExecutionError, UsageFinality, Value,
-    json, usage,
+    ChatConversation, ChatFinishReason, HeaderValue, NormalizedUsage, ProviderExecutionError,
+    StreamFinish, UsageFinality, Value, json, usage,
 };
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1";
@@ -197,7 +197,7 @@ pub(crate) struct MessageStream {
     blocks: BTreeMap<u32, Block>,
     started: bool,
     pub(crate) terminal: bool,
-    pub(crate) stop_reason: Option<String>,
+    stop_reason: Option<String>,
     usage: serde_json::Map<String, Value>,
     bytes: usize,
 }
@@ -249,15 +249,19 @@ impl MessageStream {
         })
     }
 
-    pub(crate) fn event(&mut self, event: &Value, limit: usize) -> Result<Value, &'static str> {
+    pub(crate) fn event(
+        &mut self,
+        event: &Value,
+        limit: usize,
+    ) -> Result<(Value, Option<StreamFinish>), &'static str> {
         let kind = event["type"]
             .as_str()
             .ok_or("Anthropic event has no type")?;
         if kind == "ping" {
-            return Ok(json!({}));
+            return Ok((json!({}), None));
         }
         if kind == "error" {
-            return Ok(event.clone());
+            return Ok((event.clone(), None));
         }
         if self.terminal {
             return Err("Anthropic event followed message_stop");
@@ -270,13 +274,13 @@ impl MessageStream {
             if let Some(usage) = event["message"]["usage"].as_object() {
                 self.usage.extend(usage.clone());
             }
-            return Ok(json!({}));
+            return Ok((json!({}), None));
         }
         if !self.started {
             return Err("Anthropic stream omitted message_start");
         }
         let mut delta = json!({});
-        let mut finish = Value::Null;
+        let mut finish = None;
         match kind {
             "content_block_start" => {
                 let index = Self::index(event)?;
@@ -326,7 +330,7 @@ impl MessageStream {
                     Some("thinking_delta") => ("thinking", "reasoning_content", "thinking"),
                     Some("signature_delta") => ("signature", "", "thinking"),
                     Some("input_json_delta") => ("partial_json", "", "tool_use"),
-                    _ => return Ok(json!({})),
+                    _ => return Ok((json!({}), None)),
                 };
                 if block.content["type"] != expected {
                     return Err("Anthropic delta changed content block type");
@@ -391,17 +395,18 @@ impl MessageStream {
                 if self.blocks.values().any(|block| !block.done) {
                     return Err("Anthropic message stopped with an open content block");
                 }
-                finish = json!(match self
+                let raw = self
                     .stop_reason
-                    .as_deref()
-                    .ok_or("Anthropic message has no stop reason")?
-                {
-                    "end_turn" | "stop_sequence" => "stop",
-                    "tool_use" => "tool_calls",
-                    "max_tokens" | "model_context_window_exceeded" => "length",
-                    "refusal" => "content_filter",
-                    _ => "other",
-                });
+                    .take()
+                    .ok_or("Anthropic message has no stop reason")?;
+                let reason = match raw.as_str() {
+                    "end_turn" | "stop_sequence" => ChatFinishReason::Stop,
+                    "tool_use" => ChatFinishReason::ToolCalls,
+                    "max_tokens" | "model_context_window_exceeded" => ChatFinishReason::Length,
+                    "refusal" => ChatFinishReason::ContentFilter,
+                    _ => ChatFinishReason::Other,
+                };
+                finish = Some(StreamFinish { reason, raw });
                 self.terminal = true;
             }
             _ => {}
@@ -409,6 +414,6 @@ impl MessageStream {
         if self.bytes > limit {
             return Err("Anthropic output exceeded its limit");
         }
-        Ok(json!({"choices":[{"delta":delta,"finish_reason":finish}]}))
+        Ok((json!({"choices":[{"delta":delta}]}), finish))
     }
 }

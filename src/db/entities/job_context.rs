@@ -636,8 +636,6 @@ pub enum SummarizationStage {
     Reduce,
 }
 
-impl SummarizationWork {}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobGroup {
     pub name: Option<String>,

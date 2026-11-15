@@ -1,6 +1,9 @@
 use std::collections::BTreeMap;
 
-use super::{ChatConversation, MAX_SSE_LINE_BYTES, ProviderExecutionError, Value, json};
+use super::{
+    ChatConversation, ChatFinishReason, MAX_SSE_LINE_BYTES, ProviderExecutionError, StreamFinish,
+    Value, json,
+};
 
 fn build(message: &str) -> ProviderExecutionError {
     ProviderExecutionError::Build {
@@ -135,7 +138,6 @@ struct Item {
 pub(crate) struct ResponseStream {
     items: BTreeMap<u32, Item>,
     pub(crate) output: Vec<Value>,
-    pub(crate) terminal: bool,
     bytes: usize,
 }
 
@@ -332,7 +334,11 @@ impl ResponseStream {
         Ok(())
     }
 
-    pub(crate) fn event(&mut self, event: &Value, limit: usize) -> Result<Value, &'static str> {
+    pub(crate) fn event(
+        &mut self,
+        event: &Value,
+        limit: usize,
+    ) -> Result<(Value, Option<StreamFinish>), &'static str> {
         let kind = event["type"]
             .as_str()
             .ok_or("Responses event has no type")?;
@@ -381,9 +387,9 @@ impl ResponseStream {
                 self.arguments(index, text, snapshot, &mut delta)?;
             }
             "response.completed" => {
-                if event["response"]["status"] != "completed" {
+                let Some(status @ "completed") = event["response"]["status"].as_str() else {
                     return Err("Responses completion has an invalid status");
-                }
+                };
                 let output = event["response"]["output"]
                     .as_array()
                     .ok_or("Responses completion has no output")?;
@@ -405,28 +411,29 @@ impl ResponseStream {
                     return Err("Responses output metadata exceeded its limit");
                 }
                 self.output = output.clone();
-                finish = Some(
-                    if self
-                        .items
-                        .values()
-                        .any(|item| item.kind.as_deref() == Some("function_call"))
-                    {
-                        "tool_calls"
-                    } else {
-                        "stop"
-                    },
-                );
-                self.terminal = true;
+                let reason = if self
+                    .items
+                    .values()
+                    .any(|item| item.kind.as_deref() == Some("function_call"))
+                {
+                    ChatFinishReason::ToolCalls
+                } else {
+                    ChatFinishReason::Stop
+                };
+                finish = Some(StreamFinish {
+                    reason,
+                    raw: status.to_owned(),
+                });
             }
             "response.failed" | "response.incomplete" => {
                 return Err("Responses request failed or ended incomplete");
             }
-            "error" => return Ok(json!({"error":event})),
+            "error" => return Ok((json!({"error":event}), None)),
             _ => {}
         }
         if self.bytes > limit {
             return Err("Responses output exceeded its limit");
         }
-        Ok(json!({"choices":[{"delta":delta,"finish_reason":finish}]}))
+        Ok((json!({"choices":[{"delta":delta}]}), finish))
     }
 }

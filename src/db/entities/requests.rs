@@ -251,32 +251,6 @@ pub enum ChatFinishReason {
     Other,
 }
 
-impl ChatFinishReason {
-    #[must_use]
-    pub fn as_openai_str(self) -> &'static str {
-        match self {
-            Self::Stop => "stop",
-            Self::Length => "length",
-            Self::ToolCalls => "tool_calls",
-            Self::ContentFilter => "content_filter",
-            Self::Error => "error",
-            Self::Other => "other",
-        }
-    }
-
-    #[must_use]
-    pub fn from_openai_str(raw: &str) -> Self {
-        match raw {
-            "stop" => Self::Stop,
-            "length" => Self::Length,
-            "tool_calls" => Self::ToolCalls,
-            "content_filter" => Self::ContentFilter,
-            "error" => Self::Error,
-            _ => Self::Other,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NormalizedUsage {
     pub input_tokens: Option<u32>,
