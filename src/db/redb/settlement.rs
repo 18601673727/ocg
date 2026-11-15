@@ -1,5 +1,21 @@
-use super::*;
-use crate::db::entities::*;
+use super::StorageError;
+use crate::db::entities::{
+    AppendedOutput, DependencyCondition, DependencyState, ExecutionConfiguration,
+    ExecutionEventKind, FrozenConfiguration, FrozenDecisionConfig, FrozenExecutionConfig, JobId,
+    JobSpec, MutableJobPhase, Origin, OutcomeCause, OutcomeKind, OutcomeRecord, OutputKind,
+    ProfileId, ProjectId, RecordRef, ToolCallRef, ToolDecision, ToolOutcome, Violation,
+};
+use crate::db::redb::batch::{Batch, BatchError, Failure};
+use crate::db::redb::codec::Code;
+use crate::db::redb::jobs::{decode_mutable_job, mutable_priority};
+use crate::db::redb::reservations::mutable_configuration_requirement;
+use crate::db::redb::rows::decode_output;
+use crate::db::redb::schema::{
+    CHILDREN, DEPENDENCY_WAITERS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, META, MUTABLE_READY,
+    RECURRENCE_DUE, RECURRENCES, TURNS,
+};
+use crate::db::redb::{reads, state};
+use ::redb::ReadableTable;
 
 impl Batch {
     pub(super) fn maybe_trigger_native_compaction(
@@ -17,8 +33,8 @@ impl Batch {
             .max_completion_tokens
             .or(frozen.llm.config.parameters.max_tokens)
             .unwrap_or(crate::db::entities::SUMMARIZER_OUTPUT_RESERVE);
-        let (policy, _, _) =
-            self.step(|tx| reads::effective_context_policy(&tx.open_table(META)?))?;
+        let (policy, _) =
+            self.step(|tx| reads::catalog::effective_context_policy(&tx.open_table(META)?))?;
         let Ok(recipe) = policy.recipe(Some(window), reserve, 1024, 0) else {
             return Ok(());
         };
@@ -28,7 +44,7 @@ impl Batch {
         let summarizer = policy.summarization_model.unwrap_or(frozen.llm.model.id);
         let total_tokens = self.step(|tx| {
             let turns = tx.open_table(TURNS)?;
-            let Some(tip) = reads::turn_head(&turns, conversation)? else {
+            let Some(tip) = reads::jobs::turn_head(&turns, conversation)? else {
                 return Ok(0usize);
             };
             let jobs = tx.open_table(JOBS)?;

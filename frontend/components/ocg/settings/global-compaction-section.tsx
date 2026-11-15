@@ -3,14 +3,14 @@
 import Link from "next/link";
 
 import { useEffect, useState } from "react";
-import { Button } from "@/components/ui/button";
 import type { ProfilesSnapshot } from "../contracts";
 import type { GlobalCompactionSettings } from "../contracts/api";
-import { useI18n } from "../i18n";
-import { DismissibleNotice } from "../primitives/dismissible-notice";
 import type { ApiClient } from "../runtime/api-client";
+import { useI18n } from "../i18n";
+import { Section, describeError } from "./settings-parts";
+import { Button } from "@/components/ui/button";
+import { DismissibleNotice } from "../primitives/dismissible-notice";
 import { CompactionPolicyFields } from "./compaction-policy-fields";
-import { describeError, Section } from "./settings-parts";
 
 export function GlobalCompactionSection({
   client,

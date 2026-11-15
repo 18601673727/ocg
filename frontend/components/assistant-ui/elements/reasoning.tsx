@@ -1,17 +1,17 @@
 "use client";
 
+import { cn } from "@/lib/utils";
+import { Collapsible, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ChevronDown } from "lucide-react";
 import {
-  type ComponentProps,
   createContext,
-  type ReactNode,
   useContext,
   useId,
   useState,
+  type ComponentProps,
+  type ReactNode,
 } from "react";
 import { useI18n } from "@/components/ocg/i18n";
-import { Collapsible, CollapsibleTrigger } from "@/components/ui/collapsible";
-import { cn } from "@/lib/utils";
 
 export const ANIMATION_DURATION = 180;
 export const estimateReasoningTokens = (text: string) =>
@@ -96,10 +96,11 @@ export function ReasoningContent({
   const { t } = useI18n();
   const { open, contentId } = useContext(ReasoningContext);
   return (
-    <section
+    <div
       {...props}
       id={contentId}
       hidden={!open}
+      role="region"
       aria-label={t("chat.thinking")}
       data-streaming={streaming ? "true" : undefined}
       className={cn(
@@ -108,7 +109,7 @@ export function ReasoningContent({
       )}
     >
       {open ? children : null}
-    </section>
+    </div>
   );
 }
 export function ReasoningText({ children }: { children: ReactNode }) {

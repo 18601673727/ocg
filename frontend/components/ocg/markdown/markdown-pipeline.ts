@@ -1,10 +1,10 @@
-import hljs from "highlight.js/lib/common";
 import MarkdownIt, {
   type MarkdownIt as MarkdownItType,
   type StateBlock,
   type StateInline,
 } from "markdown-it";
 import taskLists from "markdown-it-task-lists";
+import hljs from "highlight.js/lib/common";
 
 const DOLLAR = "$";
 
@@ -124,10 +124,7 @@ export type { Token } from "markdown-it";
 
 export function sanitizeUrl(rawUrl: string): string | null {
   const url = rawUrl.trim();
-  if (
-    [...url].some((character) => character <= "\x1f" || character === "\x7f" || character === "\\")
-  )
-    return null;
+  if (/[\u0000-\u001f\u007f\\]/.test(url)) return null;
   if (!url) return null;
   if (url.startsWith("//")) return null;
   if (!/^[a-z][a-z\d+.-]*:/i.test(url)) return url;

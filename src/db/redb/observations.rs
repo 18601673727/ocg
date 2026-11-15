@@ -3,12 +3,23 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::rows::decode_request_event;
-use super::*;
+use super::{StorageError, jobs};
 use crate::db::entities::{
     AvailabilityObservation, AvailabilityStatRecord, DecisionTarget, MetricsRecord,
     ObservationCursor, ObservationFilter, ObservationPage, RequestEventRecord, RequestPayload,
     TokenAnnotation,
 };
+use crate::db::entities::{
+    AvailabilityStatId, ContentDigest, JobId, LlmTarget, Measurements, MetricsId, ProviderResponse,
+    ProviderResponsesPage, RequestNumber, Timestamp,
+};
+use crate::db::redb::reads::read;
+use crate::db::redb::rows::ConfigRow;
+use crate::db::redb::schema::{
+    CONFIGS, JOB_OBSERVATIONS, JOBS, MAX_PAGE, MESSAGES, REQUEST_EVENTS, REQUEST_TIMELINE,
+    RequestTimelineKey,
+};
+use ::redb::{Database, ReadTransaction, ReadableTable};
 
 #[derive(Clone)]
 enum ObservationTarget {
@@ -576,7 +587,10 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
         text
     };
     let decoded = DecodedMessage {
-        escaped_len: text.chars().map(super::escaped_json_char_cost).sum(),
+        escaped_len: text
+            .chars()
+            .map(crate::db::entities::escaped_json_char_cost)
+            .sum(),
         text: Arc::from(text),
         requests_tools: output.is_some_and(|items| {
             items.iter().any(|item| {

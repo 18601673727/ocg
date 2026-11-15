@@ -1,5 +1,25 @@
-use super::*;
+use crate::db::entities::{
+    AgentModelConfig, AttachmentRecord, CredentialSecret, CursorPage, ProfilePageRecord,
+    ProfilePageRecords, ProjectRecord, SubmissionKey, SubmissionRecord,
+};
+use crate::db::entities::{AttachmentId, ProjectId};
 use crate::db::entities::{ConfigBody, ConfigId, ConfigKind, ConfigRecord};
+use crate::db::redb::StorageError;
+use crate::db::redb::TxRead;
+use crate::db::redb::allocations;
+use crate::db::redb::allocations::compatible_executors;
+use crate::db::redb::codec::{Dec, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS};
+use crate::db::redb::reads::read;
+use crate::db::redb::rows::{
+    ConfigRow, CredentialKey, decode_attachment, decode_credential, decode_project,
+    decode_submission,
+};
+use crate::db::redb::schema::MAX_PAGE;
+use crate::db::redb::schema::{
+    ATTACHMENTS, CONFIGS, CREDENTIALS, EXECUTORS, META, POOLS, PROJECTS, SUBMISSIONS,
+};
+use ::redb::{Database, ReadTransaction, ReadableTable};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn read_submission(
     database: &Database,
@@ -99,21 +119,24 @@ pub(crate) fn config(
         .map(|row| row.map(config_record))
 }
 
-pub(crate) fn read_credential_ref_in_use(
-    database: &Database,
-    reference: &str,
-) -> Result<bool, StorageError> {
-    let rx = read(database)?;
-    let mut matching_connections = std::collections::BTreeSet::new();
+/// Credential references held by Connections that a live (unarchived) Model uses.
+pub(crate) fn live_credential_refs(
+    tx: &impl TxRead,
+) -> Result<std::collections::BTreeSet<String>, StorageError> {
+    let mut connection_refs = std::collections::BTreeMap::new();
     let mut live_connections = std::collections::BTreeSet::new();
-    for entry in rx.open_table(CONFIGS)?.iter()? {
+    for entry in tx.table(CONFIGS)?.iter()? {
         let (key, bytes) = entry?;
         let row = ConfigRow::decode_at(key.value(), bytes.value())?;
         match &row.body {
             ConfigBody::Connection(connection) => {
-                if connection.credential_refs().any(|used| used == reference) {
-                    matching_connections.insert(row.id);
-                }
+                connection_refs.insert(
+                    row.id,
+                    connection
+                        .credential_refs()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>(),
+                );
             }
             ConfigBody::Model(model) if row.archived_at.is_none() => {
                 live_connections.insert(model.connection_id);
@@ -127,7 +150,18 @@ pub(crate) fn read_credential_ref_in_use(
             | ConfigBody::DecisionAgent(_) => {}
         }
     }
-    Ok(!matching_connections.is_disjoint(&live_connections))
+    Ok(live_connections
+        .iter()
+        .filter_map(|id| connection_refs.remove(id))
+        .flatten()
+        .collect())
+}
+
+pub(crate) fn read_credential_ref_in_use(
+    database: &Database,
+    reference: &str,
+) -> Result<bool, StorageError> {
+    Ok(live_credential_refs(&read(database)?)?.contains(reference))
 }
 
 pub(crate) fn read_configs(
@@ -366,4 +400,62 @@ pub(crate) fn read_agent_model_configs(
             })
         })
         .collect()
+}
+
+pub(crate) fn global_compaction_settings(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<crate::db::entities::GlobalCompactionSettings, StorageError> {
+    let bytes = meta
+        .get("compaction_settings")?
+        .ok_or_else(|| StorageError::corrupted("global compaction settings missing"))?;
+    let mut d = Dec::new(bytes.value(), TAG_GLOBAL_COMPACTION)?;
+    let settings = crate::db::entities::GlobalCompactionSettings {
+        revision: d.u64()?,
+        prediction_enabled: d.bool()?,
+        policy: d.compaction_policy()?,
+    };
+    d.end()?;
+    Ok(settings)
+}
+
+pub(crate) fn global_outbound_headers(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<crate::db::entities::GlobalHeaders, StorageError> {
+    let Some(bytes) = meta.get("outbound_headers")? else {
+        return Ok(crate::db::entities::GlobalHeaders::default());
+    };
+    let mut d = Dec::new(bytes.value(), TAG_GLOBAL_HEADERS)?;
+    let headers = crate::db::entities::GlobalHeaders {
+        revision: d.u32()?,
+        fields: d.outbound_headers()?,
+    };
+    d.end()?;
+    Ok(headers)
+}
+
+pub(crate) fn read_global_outbound_headers(
+    database: &Database,
+) -> Result<crate::db::entities::GlobalHeaders, StorageError> {
+    global_outbound_headers(&read(database)?.open_table(META)?)
+}
+
+pub(crate) fn read_global_compaction_settings(
+    database: &Database,
+) -> Result<crate::db::entities::GlobalCompactionSettings, StorageError> {
+    global_compaction_settings(&read(database)?.open_table(META)?)
+}
+
+pub(crate) fn effective_context_policy(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<(crate::db::entities::CompactionPolicy, u64), StorageError> {
+    let mut settings = global_compaction_settings(meta)?;
+    if !settings.prediction_enabled
+        || matches!(
+            settings.policy.mode,
+            crate::db::entities::CompactionMode::Off
+        )
+    {
+        settings.policy.predictive = None;
+    }
+    Ok((settings.policy, settings.revision))
 }

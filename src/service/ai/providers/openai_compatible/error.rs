@@ -1,26 +1,6 @@
 use std::fmt;
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct ProviderFailure {
-    pub message: String,
-    pub status_code: Option<u16>,
-    pub provider_code: Option<String>,
-    pub response_body: Option<String>,
-    pub request_id: Option<String>,
-    pub retry_after_ms: Option<u64>,
-    pub retryable: bool,
-}
-
-impl fmt::Display for ProviderFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self.status_code {
-            Some(status) => write!(f, "HTTP {status}: {}", self.message),
-            None => f.write_str(&self.message),
-        }
-    }
-}
-
-impl std::error::Error for ProviderFailure {}
+use crate::db::entities::ProviderFailure;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportError {

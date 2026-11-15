@@ -1,4 +1,9 @@
-use super::*;
+use crate::db::entities::identity::{AttachmentId, ConfigId, JobId, ProjectId};
+use crate::db::entities::{
+    AllocationToken, ConfigRef, ContentDigest, DecisionAnswer, DecisionOutcome, DecisionResult,
+    FrozenExecutionConfig, FrozenLlmConfig, JobOutputRecord, MutableJobDetails, Timestamp,
+    ToolCallRef, ToolEvidenceRecord,
+};
 
 pub const MAX_JOB_DEPTH: u8 = 16;
 
@@ -631,49 +636,7 @@ pub enum SummarizationStage {
     Reduce,
 }
 
-impl SummarizationWork {
-    pub fn validate_stage(&self) -> Result<(), &'static str> {
-        if self.target_tokens == 0
-            || self.frozen.agent.is_some()
-            || self.frozen.agent_ref.is_some()
-            || self.chain.is_some()
-                && (self.policy_revision.is_some()
-                    || self.policy_profile.is_some()
-                    || self.prediction.is_some()
-                    || self.reserved_tokens != 0
-                    || self.reserved_requests != 0)
-            || self.prediction.is_some()
-                && (self.policy_revision.is_none()
-                    || self.reserved_tokens == 0
-                    || self.reserved_requests == 0)
-        {
-            return Err("invalid summary authority or reservation");
-        }
-        match self.stage {
-            SummarizationStage::Direct
-                if self.chain.is_none() && self.minimum_savings_tokens > 0 =>
-            {
-                Ok(())
-            }
-            SummarizationStage::Chunk { start, end, .. }
-                if start < end
-                    && end <= 7 * 256 * 1024
-                    && (self.chain.is_some() || start == 0)
-                    && self.minimum_savings_tokens == 0 =>
-            {
-                Ok(())
-            }
-            SummarizationStage::Reduce
-                if self.chain.is_some() && self.minimum_savings_tokens > 0 =>
-            {
-                Ok(())
-            }
-            SummarizationStage::Direct
-            | SummarizationStage::Chunk { .. }
-            | SummarizationStage::Reduce => Err("invalid summary stage or source span"),
-        }
-    }
-}
+impl SummarizationWork {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobGroup {

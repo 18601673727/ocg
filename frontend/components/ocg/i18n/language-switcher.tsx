@@ -1,5 +1,6 @@
 "use client";
 
+import { cn } from "@/lib/utils";
 import {
   Select,
   SelectContent,
@@ -7,10 +8,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { cn } from "@/lib/utils";
 import { SELECTED_OPTION } from "../primitives/selection";
+import { LOCALES, LOCALE_LABEL, type Locale } from "./locale";
 import { useI18n } from "./context";
-import { LOCALE_LABEL, LOCALES, type Locale } from "./locale";
 
 export function LanguageSwitcher({
   variant = "segmented",
@@ -52,7 +52,11 @@ export function LanguageSwitcher({
   }
 
   return (
-    <fieldset aria-label={t("language.title")} className={cn("flex flex-wrap gap-2", className)}>
+    <div
+      role="group"
+      aria-label={t("language.title")}
+      className={cn("flex flex-wrap gap-2", className)}
+    >
       {LOCALES.map((option) => (
         <button
           key={option}
@@ -69,6 +73,6 @@ export function LanguageSwitcher({
           {LOCALE_LABEL[option]}
         </button>
       ))}
-    </fieldset>
+    </div>
   );
 }

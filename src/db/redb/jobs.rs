@@ -1,5 +1,23 @@
-use super::*;
-use crate::db::entities::*;
+use super::{StorageError, StorageErrorKind, execution};
+use crate::db::entities::{
+    Appended, AttachmentId, ConfigId, ExecutionConfiguration, ExecutionEventKind,
+    ExecutionOperation, FrozenConfiguration, FrozenDecisionConfig, JobGroup, JobId, JobLifecycle,
+    JobSpec, JobState, LlmTransport, Origin, OutcomeCause, OutcomeKind, OutcomeRecord, ProfileId,
+    ProjectId, RecordRef, Recurrence, RecurrenceHalt, RecurrencePhase, SubmissionRecord, Violation,
+};
+use crate::db::redb::batch::{Batch, BatchError, Commit, Failure, Probe};
+use crate::db::redb::codec::{Dec, DecodeResult, Enc, TAG_JOB};
+use crate::db::redb::reservations::mutable_configuration_requirement;
+use crate::db::redb::rows::encode_submission;
+use crate::db::redb::schema::{
+    CHILD_GROUPS, CHILDREN, CONVERSATIONS, DRAFT_CONTEXTS, JOB_INPUTS, JOB_OUTPUTS, JOB_RUNTIME,
+    JOBS, LIVE_CHILDREN, MESSAGES, MUTABLE_READY, PENDING, RECURRENCE_DUE, RECURRENCES, RETRY_JOBS,
+    SUBMISSIONS, SUCCESSORS, TOOL_CALLS, TURNS,
+};
+use crate::db::redb::state::JobRuntime;
+use crate::db::redb::{indexes, reads, state};
+use ::redb::ReadableTable;
+use std::collections::BTreeSet;
 
 pub(super) fn mutable_priority(priority: crate::db::entities::JobQueuePriority) -> u8 {
     use crate::db::entities::JobQueuePriority;
@@ -10,7 +28,6 @@ pub(super) fn mutable_priority(priority: crate::db::entities::JobQueuePriority) 
     }
 }
 
-#[allow(dead_code)]
 pub(super) fn encode_mutable_job(job: &crate::db::entities::MutableJob) -> Vec<u8> {
     use crate::db::entities::{MutableContextSelection, MutableJobPhase};
     let mut e = Enc::new(TAG_JOB);
@@ -256,7 +273,6 @@ fn decode_mutable_input(d: &mut Dec<'_>) -> DecodeResult<crate::db::entities::Mu
     Ok(MutableJobInput { priority, content })
 }
 
-#[allow(dead_code)]
 pub(super) fn decode_mutable_job(
     key: u128,
     bytes: &[u8],
@@ -447,7 +463,6 @@ pub(super) fn validate_retry_source(
     Ok(())
 }
 
-#[allow(dead_code)]
 fn encode_mutable_input_revision(
     id: JobId,
     revision: u32,
@@ -576,7 +591,7 @@ impl Batch {
             return Ok(true);
         };
         self.step(|tx| {
-            match reads::verify_native_summary_tables(
+            match reads::execution_context::verify_native_summary_tables(
                 &tx.open_table(JOBS)?,
                 &tx.open_table(JOB_RUNTIME)?,
                 &tx.open_table(JOB_OUTPUTS)?,

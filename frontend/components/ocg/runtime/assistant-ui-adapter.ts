@@ -10,10 +10,10 @@ import type {
   ThreadUserMessagePart,
   ToolCallMessagePart,
 } from "@assistant-ui/react";
+import type { ChatMessage, MessageRole } from "../types";
 import { retryInput } from "../chat/retry";
 import type { TranslateFn } from "../i18n";
 import { en } from "../i18n/dictionaries";
-import type { ChatMessage, MessageRole } from "../types";
 
 type OcgMetadata = Record<string, unknown>;
 

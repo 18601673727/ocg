@@ -1,7 +1,7 @@
 "use client";
 
-import { ArrowRight, MessageSquare, Plus, SlidersHorizontal, Workflow } from "lucide-react";
 import Link from "next/link";
+import { ArrowRight, MessageSquare, Plus, SlidersHorizontal, Workflow } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "../i18n";
 import { WorkspaceIllustration } from "../primitives/workspace-illustration";

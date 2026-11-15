@@ -1,7 +1,6 @@
 use crate::api::v1::ServerConfig;
 use crate::system::data_directory::DataDirectory;
 
-mod inspect_held;
 mod llm_target;
 #[cfg(unix)]
 mod reconcile_reserved;
@@ -9,7 +8,6 @@ mod scheduled_external_policy;
 pub mod typescript;
 #[cfg(unix)]
 mod update;
-mod verify;
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);
@@ -24,7 +22,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         if command == "inspect-held" {
-            return inspect_held::run(arguments.collect());
+            return inspect_held(arguments.collect());
         }
         #[cfg(unix)]
         if command == "reconcile-reserved" {
@@ -35,7 +33,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             return reconcile_reserved::run_held(arguments.collect());
         }
         if command == "verify" {
-            return verify::run(arguments.collect());
+            return verify(arguments.collect());
         }
         #[cfg(unix)]
         if command == "update" {
@@ -102,4 +100,29 @@ fn usage() -> &'static str {
        register-llm\n\
        help, --help, -h\n\
        --version, -V"
+}
+
+fn inspect_held(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let [directory] = arguments.as_slice() else {
+        return Err("usage: ocg inspect-held <data-directory>".into());
+    };
+    let report = crate::db::inspect_held_allocations_offline(std::path::Path::new(directory))
+        .map_err(crate::db::DatabaseError::Read)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}
+
+fn verify(arguments: Vec<String>) -> Result<(), Box<dyn std::error::Error>> {
+    let (directory, pages) = match arguments.as_slice() {
+        [directory] => (directory, false),
+        [directory, flag] if flag == "--pages" => (directory, true),
+        _ => return Err("usage: ocg verify <data-directory> [--pages]".into()),
+    };
+    let verification = crate::db::verify_offline(std::path::Path::new(directory), pages)
+        .map_err(crate::db::DatabaseError::Read)?;
+    println!("{}", serde_json::to_string_pretty(&verification.report)?);
+    if !verification.passed {
+        return Err("offline verification failed".into());
+    }
+    Ok(())
 }

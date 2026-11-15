@@ -1,7 +1,7 @@
 "use client";
 
-import { FileDiff } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
+import { FileDiff } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -11,8 +11,8 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import type { ToolCall } from "../contracts";
-import { useI18n } from "../i18n";
 import { useOcgRuntime } from "../runtime/runtime-context";
+import { useI18n } from "../i18n";
 import { artifactTitle, changedLines, fileArtifact } from "./artifact-model";
 import { ArtifactPreview } from "./artifact-preview";
 

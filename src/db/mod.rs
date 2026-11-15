@@ -4,42 +4,15 @@ pub mod entities;
 pub(crate) mod mutations;
 mod redb;
 
-use std::io::Write;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockWriteGuard};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use ::redb::Database;
-
-use crate::db::attachments::AttachmentStore;
 pub use crate::db::attachments::{
     AttachmentCleanupReport, AttachmentContent, AttachmentError, AttachmentImageError, Reclamation,
     ReclamationError, StoreError, attachment_images,
 };
-use crate::db::entities::{Actor, Appended, Entry, ExecutionConfiguration, JobAction, JobGroup};
-use crate::db::entities::{
-    AppendedOutput, Attachment, AttachmentId, AttachmentOrigin, AttachmentRecord,
-    AvailabilityStatId, AvailabilityStatRecord, Config, ConfigBody, ConfigId, ConfigKind,
-    ConfigRecord, ContentDigest, ExecutorId, JobEdit, JobFinalization, JobId, JobOutput,
-    JobOutputRecord, JobRecord, Metrics, MetricsId, MetricsRecord, ObservationCursor,
-    ObservationFilter, ObservationPage, OperationId, OperationKind, Project, ProjectCommand,
-    ProjectId, ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber, Submission,
-    SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord, ToolOutcome,
-    Violation,
-};
-use crate::db::mutations::PublishedAttachment;
+use crate::db::entities::{AvailabilityStatId, JobId, MetricsId};
 pub(crate) use crate::db::redb::{Batch, BatchError, Failure};
-use crate::db::redb::{BatchFailure, Commit, CompactFailure, OpenedFile, Probe};
 pub use crate::db::redb::{StorageError, StorageErrorKind};
-use crate::system::data_directory::DataDirectory;
-use crate::system::monitor::{
-    self, FilesystemConfig, FilesystemConfigError, ProtectedArea, ProtectionCell, ProtectionLock,
-    ProtectionReason, ProtectionWatch, RecoveryError, RecoveryReport, ReopenFailure,
-    SpaceMeasurement, SpaceShortage,
-};
-use crate::system::policy::{SystemPolicy, SystemPolicyError};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
 
@@ -93,22 +66,13 @@ mod shared;
 
 mod worker;
 
-use commands::{Command, Envelope, InFlightCommand, Maintenance, Message, Reply};
-use errors::operation_status;
 pub use errors::{
     CommandOutcome, CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError,
     DatabaseStatus, MaintenanceError, OperationStatus, UnknownCause,
 };
-pub use handle::Vitals;
 pub use scheduler_wake::SchedulerWakeSubscription;
-use scheduler_wake::{SchedulerWake, affects_scheduling, releases_capacity};
 
-use shared::{
-    Admission, Opened, ReadJob, ReadMessage, ReadWorkerExit, ReleaseOnPanic, Shared,
-    StagingBarrier, admitted, flush_staged, serve_reads,
-};
 pub use worker::{DatabaseHandle, DatabaseWorker};
-use worker::{Executed, run, settle};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ObservationChange {

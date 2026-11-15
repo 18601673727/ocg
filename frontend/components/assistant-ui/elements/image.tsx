@@ -1,6 +1,15 @@
 "use client";
 
-import type { ImageMessagePart, ImageMessagePartComponent } from "@assistant-ui/react";
+import {
+  memo,
+  useState,
+  useEffect,
+  useCallback,
+  useRef,
+  type ComponentProps,
+  type PropsWithChildren,
+} from "react";
+import { createPortal } from "react-dom";
 import { cva, type VariantProps } from "class-variance-authority";
 import {
   CopyIcon,
@@ -12,18 +21,9 @@ import {
   ShieldAlertIcon,
   XIcon,
 } from "lucide-react";
-import {
-  type ComponentProps,
-  memo,
-  type PropsWithChildren,
-  useCallback,
-  useEffect,
-  useRef,
-  useState,
-} from "react";
-import { createPortal } from "react-dom";
-import { useI18n } from "@/components/ocg/i18n";
+import type { ImageMessagePart, ImageMessagePartComponent } from "@assistant-ui/react";
 import { cn } from "@/lib/utils";
+import { useI18n } from "@/components/ocg/i18n";
 import { hostOf, safeHref } from "../utils/href";
 
 const extensionForMimeType = (mimeType?: string): string => {
@@ -247,8 +247,7 @@ function ImagePreview({
           <ImageOffIcon className="text-muted-foreground size-8" />
         </div>
       ) : (
-        /* eslint-disable @next/next/no-img-element -- Preserve the browser URL and intrinsic dimensions. */
-        // biome-ignore lint/performance/noImgElement: The image loads directly at its browser URL.
+        // eslint-disable-next-line @next/next/no-img-element
         <img
           ref={imgRef}
           src={src}
@@ -273,7 +272,6 @@ function ImagePreview({
           }}
           {...props}
         />
-        /* eslint-enable @next/next/no-img-element */
       )}
     </div>
   );
@@ -305,8 +303,7 @@ function ImageSource({ className, label, url, iconUrl, ...props }: ImageSourcePr
       {...props}
     >
       {showIcon ? (
-        /* eslint-disable @next/next/no-img-element -- Preserve the browser URL and intrinsic dimensions. */
-        // biome-ignore lint/performance/noImgElement: The image loads directly at its browser URL.
+        // eslint-disable-next-line @next/next/no-img-element
         <img
           data-slot="image-source-icon"
           src={iconUrl}
@@ -314,7 +311,6 @@ function ImageSource({ className, label, url, iconUrl, ...props }: ImageSourcePr
           className="size-4 shrink-0 rounded-sm"
           onError={() => setFailedIconUrl(iconUrl)}
         />
-        /* eslint-enable @next/next/no-img-element */
       ) : (
         <span
           data-slot="image-source-icon-fallback"
@@ -367,7 +363,7 @@ function ImageZoom({ src, alt, children }: ImageZoomProps) {
   const { t } = useI18n();
   const resolvedAlt = alt ?? t("aui.imagePreview");
   const [isOpen, setIsOpen] = useState(false);
-  const triggerRef = useRef<HTMLButtonElement>(null);
+  const triggerRef = useRef<HTMLDivElement>(null);
   const closeRef = useRef<HTMLButtonElement>(null);
   const overlayRef = useRef<HTMLDivElement>(null);
 
@@ -418,15 +414,27 @@ function ImageZoom({ src, alt, children }: ImageZoomProps) {
 
   return (
     <>
-      <button
+      <div
         ref={triggerRef}
-        type="button"
         onClick={handleOpen}
-        className="aui-image-zoom-trigger block w-full cursor-zoom-in"
+        onKeyDown={(e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            e.currentTarget.click();
+          } else if (e.key === " ") {
+            e.preventDefault();
+          }
+        }}
+        onKeyUp={(e) => {
+          if (e.key === " ") e.currentTarget.click();
+        }}
+        role="button"
+        tabIndex={0}
+        className="aui-image-zoom-trigger cursor-zoom-in"
         aria-label={t("aui.zoomImage")}
       >
         {children}
-      </button>
+      </div>
       {isOpen &&
         createPortal(
           <div
@@ -435,25 +443,20 @@ function ImageZoom({ src, alt, children }: ImageZoomProps) {
             role="dialog"
             aria-modal="true"
             className="aui-image-zoom-overlay fade-in animate-in fixed inset-0 z-50 flex items-center justify-center bg-black/80 duration-200"
+            onClick={handleClose}
             aria-label={t("aui.zoomedImage")}
           >
-            <button
-              type="button"
-              tabIndex={-1}
-              aria-label={t("aui.closeZoomedImage")}
-              onClick={handleClose}
-              className="absolute inset-0 flex cursor-zoom-out items-center justify-center"
-            >
-              {/* biome-ignore-start lint/performance/noImgElement: The image loads directly to preserve browser URL and sizing behavior. */}
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                data-slot="image-zoom-content"
-                src={src}
-                alt={resolvedAlt}
-                className="aui-image-zoom-content fade-in zoom-in-95 animate-in max-h-[90%] max-w-[90%] object-contain duration-200"
-              />
-              {/* biome-ignore-end lint/performance/noImgElement: End of the direct image. */}
-            </button>
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              data-slot="image-zoom-content"
+              src={src}
+              alt={resolvedAlt}
+              className="aui-image-zoom-content fade-in zoom-in-95 animate-in max-h-[90%] max-w-[90%] cursor-zoom-out object-contain duration-200"
+              onClick={(e) => {
+                e.stopPropagation();
+                handleClose();
+              }}
+            />
             <button
               ref={closeRef}
               type="button"
@@ -617,13 +620,13 @@ Image.ContentFilterError = ImageContentFilterError;
 
 export {
   Image,
-  ImageActions,
-  ImageContentFilterError,
-  ImageFilename,
-  ImageGenerating,
-  ImagePreview,
   ImageRoot,
+  ImagePreview,
   ImageSource,
+  ImageFilename,
   ImageZoom,
+  ImageActions,
+  ImageGenerating,
+  ImageContentFilterError,
   imageVariants,
 };

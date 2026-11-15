@@ -3,9 +3,31 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use super::{scheduled_external::ScheduledPolicyMatch, *};
-use crate::db::entities::*;
+use super::{StorageError, StorageErrorKind, execution, scheduled_external::ScheduledPolicyMatch};
+use crate::db::entities::{
+    AllocationPhase, DevelopmentCandidate, ExecutionOperation, FrozenConfiguration,
+    FrozenDecisionConfig, FrozenExecutionConfig, JobId, LlmTransport, MutableJobPhase,
+    OutcomeCause, OutcomeKind, OutcomeRecord, RecordRef, Violation,
+};
+use crate::db::redb::allocations::{
+    STOPPED_BEFORE_START_CODE, STOPPED_BEFORE_START_SUMMARY, active_allocations,
+    allocation_by_request, decode_allocation_executor, decode_allocation_pool,
+    decode_pool_allocation, encode_pool_allocation, valid_reservation_request_id,
+};
+use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
+use crate::db::redb::codec::{Code, encode_scheduled_external_binding};
+use crate::db::redb::jobs::{decode_mutable_job, mutable_priority};
+use crate::db::redb::reads::read;
+use crate::db::redb::rows::{decode_attachment, decode_output};
+use crate::db::redb::schema::{
+    ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, ATTACHMENTS, CREDENTIALS, DATABASE_FORMAT_KEY,
+    EXECUTORS, FORMAT_VERSION, JOB_EVENTS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MESSAGES, META,
+    MUTABLE_READY, PENDING, POOL_ALLOCATIONS, POOLS, RECURRENCE_DUE, REQUEST_EVENTS,
+    SCHEDULED_EXTERNAL_BINDING, TOOL_CALLS,
+};
+use crate::db::redb::{allocations, reads, state};
 use crate::system::data_directory::{current_boot_id, current_host_id};
+use ::redb::{Database, ReadableTable};
 
 static PROMOTION_CLOCK_BASE: OnceLock<(i64, Instant)> = OnceLock::new();
 
@@ -614,8 +636,8 @@ impl Batch {
                 if context.configuration != configuration {
                     return Err(stale());
                 }
-                let compaction =
-                    self.step(|tx| reads::global_compaction_settings(&tx.open_table(META)?))?;
+                let compaction = self
+                    .step(|tx| reads::catalog::global_compaction_settings(&tx.open_table(META)?))?;
                 if context.compaction != compaction {
                     return Err(stale());
                 }
@@ -630,29 +652,30 @@ impl Batch {
                     if source != summary.summary.source {
                         return Err(stale());
                     }
-                    let current = self.step(|tx| {
-                        match reads::verify_native_summary_tables(
-                            &tx.open_table(JOBS)?,
-                            &tx.open_table(JOB_RUNTIME)?,
-                            &tx.open_table(JOB_OUTPUTS)?,
-                            &tx.open_table(MESSAGES)?,
-                            job.parent_id,
-                            job.id,
-                            producer,
-                            source,
-                        ) {
-                            Ok(value) => Ok(Some(value)),
-                            Err(error)
-                                if matches!(
-                                    error.kind,
-                                    StorageErrorKind::Other | StorageErrorKind::Corrupted
-                                ) =>
-                            {
-                                Ok(None)
-                            }
-                            Err(error) => Err(error),
-                        }
-                    })?;
+                    let current =
+                        self.step(
+                            |tx| match reads::execution_context::verify_native_summary_tables(
+                                &tx.open_table(JOBS)?,
+                                &tx.open_table(JOB_RUNTIME)?,
+                                &tx.open_table(JOB_OUTPUTS)?,
+                                &tx.open_table(MESSAGES)?,
+                                job.parent_id,
+                                job.id,
+                                producer,
+                                source,
+                            ) {
+                                Ok(value) => Ok(Some(value)),
+                                Err(error)
+                                    if matches!(
+                                        error.kind,
+                                        StorageErrorKind::Other | StorageErrorKind::Corrupted
+                                    ) =>
+                                {
+                                    Ok(None)
+                                }
+                                Err(error) => Err(error),
+                            },
+                        )?;
                     let Some(current) = current else {
                         return Err(stale());
                     };
@@ -989,7 +1012,7 @@ impl Batch {
 
     pub(crate) fn reconcile_stopped_allocation(
         &mut self,
-        action: &super::recovery::RecoveryAction,
+        action: &super::recovery::held::RecoveryAction,
     ) -> Result<(), BatchError> {
         use crate::db::entities::{AllocationPhase, MutableJobPhase, OutcomeRecord};
 

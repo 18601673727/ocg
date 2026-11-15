@@ -6,11 +6,11 @@ use ntex::util::{Either, select};
 use serde_json::{Value, json};
 
 use super::providers::observe::{self, Redactor};
-use super::providers::openai_compatible::NormalizedUsage;
 use super::providers::{
     CredentialResolver, MAX_PROVIDER_ERROR_BYTES, ProviderExecutionConfig, ProviderExecutionError,
     ResponseFacts,
 };
+use crate::db::entities::NormalizedUsage;
 use crate::system::http::{authorization, provider_client_for};
 
 use crate::db::entities::{

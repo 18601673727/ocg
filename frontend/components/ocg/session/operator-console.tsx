@@ -1,17 +1,19 @@
 "use client";
 
-import { LoaderCircle, RotateCw } from "lucide-react";
+import type * as Api from "@/components/ocg/contracts/api";
 
 import { useEffect, useRef, useState } from "react";
-import type * as Api from "@/components/ocg/contracts/api";
-import { AppShell } from "@/components/ocg/layout/app-shell";
-import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/operator-login";
-import { type ApiClient, ApiError, createApiClient } from "@/components/ocg/runtime/api-client";
-import { Button } from "@/components/ui/button";
-import { useI18n } from "../i18n";
-import { SessionActions } from "../login/access-boundary";
+
+import { LoaderCircle, RotateCw } from "lucide-react";
+
 import { AccessScreen } from "../login/access-screen";
+import { Button } from "@/components/ui/button";
+import { ApiError, createApiClient, type ApiClient } from "@/components/ocg/runtime/api-client";
+import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/operator-login";
 import { OcgRuntimeProvider } from "../runtime/runtime-context";
+import { SessionActions } from "../login/access-boundary";
+import { AppShell } from "@/components/ocg/layout/app-shell";
+import { useI18n } from "../i18n";
 
 type Phase = "checking" | "out" | "in" | "unreachable";
 

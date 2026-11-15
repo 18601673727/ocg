@@ -1,5 +1,5 @@
 use super::contracts::envelope;
-use super::*;
+use super::{DatabaseHandle, Duration, INTERNAL, INVALID_REQUEST, Refusal, Reply, StatusCode};
 
 pub(super) const UPDATE_BODY_LIMIT: usize = 64;
 

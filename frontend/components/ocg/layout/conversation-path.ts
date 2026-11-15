@@ -20,7 +20,7 @@ export function conversationPath(ids: readonly string[]) {
     new Set(ids).size !== ids.length
   )
     throw new Error("Invalid conversation path.");
-  return `/${ids.map((id) => `jobs/${id}`).join("/")}`;
+  return "/" + ids.map((id) => `jobs/${id}`).join("/");
 }
 
 export async function conversationAncestors(

@@ -1,4 +1,11 @@
-use super::*;
+use super::MAX_OBSERVATION_SCAN;
+use crate::db::entities::{AvailabilityStatId, JobId, MetricsId};
+use crate::db::entities::{
+    AvailabilityStatRecord, MetricsRecord, ObservationCursor, ObservationFilter, ObservationPage,
+};
+use crate::db::errors::DatabaseError;
+use crate::db::redb;
+use crate::db::worker::DatabaseHandle;
 
 impl DatabaseHandle {
     pub async fn tool_stats(

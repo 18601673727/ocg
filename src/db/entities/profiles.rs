@@ -1,5 +1,10 @@
-use super::*;
+use crate::db::entities::identity::{ConfigId, ExecutorId, LlmProviderId};
+use crate::db::entities::{
+    CompactionPolicy, FrozenHeaders, OutboundHeader, OutboundHeaderValue, Timestamp,
+};
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::num::NonZeroU32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LlmTransport {
@@ -36,6 +41,27 @@ pub enum ModelCapability {
 }
 
 impl ModelCapability {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Tools => "tools",
+            Self::Vision => "vision",
+            Self::Reasoning => "reasoning",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "chat" => Some(Self::Chat),
+            "tools" => Some(Self::Tools),
+            "vision" => Some(Self::Vision),
+            "reasoning" => Some(Self::Reasoning),
+            _ => None,
+        }
+    }
+
     pub fn code(self) -> u8 {
         match self {
             Self::Chat => 1,
@@ -66,6 +92,25 @@ pub enum DecisionCapability {
 }
 
 impl DecisionCapability {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Choice => "choice",
+            Self::OrdinalScore => "ordinal_score",
+            Self::BinaryProbability => "binary_probability",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "choice" => Some(Self::Choice),
+            "ordinal_score" => Some(Self::OrdinalScore),
+            "binary_probability" => Some(Self::BinaryProbability),
+            _ => None,
+        }
+    }
+
     pub fn code(self) -> u8 {
         match self {
             Self::Choice => 1,

@@ -94,6 +94,7 @@ use wire::{
 
 struct Shared {
     database: DatabaseHandle,
+    logs: Arc<crate::system::logger::LogStore>,
     scheduler: SchedulerHandle,
     submissions: submissions::Registry,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,

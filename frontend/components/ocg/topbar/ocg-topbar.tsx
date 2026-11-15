@@ -1,14 +1,14 @@
 "use client";
 
-import { ChevronRight, LayoutGrid, PanelLeft } from "lucide-react";
 import Link from "next/link";
-import { Button } from "@/components/ui/button";
-import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { ChevronRight, LayoutGrid, PanelLeft } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { ConversationErrorHeader } from "../chat/conversation-errors";
+import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipTrigger, TooltipContent } from "@/components/ui/tooltip";
+import type { ChatSession } from "../types";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
-import type { ChatSession } from "../types";
+import { ConversationErrorHeader } from "../chat/conversation-errors";
 
 type OcgTopbarProps = {
   session?: ChatSession;
@@ -92,19 +92,18 @@ export function OcgTopbar({
         <ChevronRight className="size-3 shrink-0 text-muted-foreground" aria-hidden="true" />
       )}
       {title && (activeView !== "chat" || session) && (
-        <div aria-hidden={!titleVisible} className="contents">
-          <h1
-            className={cn(
-              "min-w-0 max-w-full truncate px-2 text-sm font-medium transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none",
-              titleVisible
-                ? "translate-y-0 opacity-100"
-                : "pointer-events-none translate-y-1 opacity-0",
-              activeView === "chat" && "sr-only",
-            )}
-          >
-            {title}
-          </h1>
-        </div>
+        <h1
+          aria-hidden={!titleVisible}
+          className={cn(
+            "min-w-0 max-w-full truncate px-2 text-sm font-medium transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none",
+            titleVisible
+              ? "translate-y-0 opacity-100"
+              : "pointer-events-none translate-y-1 opacity-0",
+            activeView === "chat" && "sr-only",
+          )}
+        >
+          {title}
+        </h1>
       )}
       {projectSelector && (
         <div className="flex min-w-0 shrink-0 items-center">{projectSelector}</div>

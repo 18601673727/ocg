@@ -1,4 +1,24 @@
-use super::*;
+use super::{
+    ResidualOwnership, check_identity, check_records, residual_ownership_in,
+    verify_reserved_residual,
+};
+use crate::db::entities::{JobId, JobSpec, OutcomeKind};
+use crate::db::redb::execution;
+use crate::db::redb::recovery::audit::{
+    audit_delta, verify_active_allocation_delta, verify_reserved_output_delta,
+    verify_reserved_settlement_delta, verify_unrelated_recovery_rows,
+};
+use crate::db::redb::recovery::offline::{
+    apply_reconciliation, finalization_copy, with_reconciliation_copy,
+};
+use crate::db::redb::schema::{
+    APPROVALS, CONVERSATIONS, EXECUTORS, JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, LIVE_CHILDREN,
+    META, POOL_ALLOCATIONS, POOLS, REQUEST_EVENTS, TOOL_CALLS,
+};
+use crate::db::redb::state::JobRuntime;
+use crate::db::redb::{StorageError, StorageErrorKind, allocations, reads};
+use crate::system::data_directory::{current_boot_id, current_host_id};
+use ::redb::ReadableDatabase;
 
 #[derive(Debug)]
 pub(crate) struct ReservedRefusal {
@@ -158,7 +178,7 @@ fn reserved_preflight_in(
     let mut residual = ownership.clone();
     residual.held.remove(&job.get());
 
-    let record = reads::mutable_job_record_in(&tx, job)?
+    let record = reads::jobs::mutable_job_record_in(&tx, job)?
         .ok_or_else(|| ReservedRefusal::new("job_missing", "the reserved Job does not exist"))?;
     if let Some(outcome) = &record.outcome {
         return Err(ReservedRefusal::new(
@@ -352,7 +372,7 @@ pub(crate) fn reconcile_reserved_apply(
                 ReservedRefusal::new("inconsistent_or_corrupt", "Allocation vanished")
             })?;
         let released = allocations::decode_pool_allocation(job.get(), row.value())?;
-        let record = reads::mutable_job_record_in(&tx, job)?;
+        let record = reads::jobs::mutable_job_record_in(&tx, job)?;
         let failed = record
             .as_ref()
             .and_then(|record| record.outcome.as_ref())
@@ -405,7 +425,7 @@ pub(crate) fn verify_reserved_publication_delta(
             }
             let residual = verify_reserved_residual_against(&*database, &residual)?;
             let source_tx = source_database.begin_read().map_err(StorageError::from)?;
-            let source_record = reads::mutable_job_record_in(&source_tx, job)?
+            let source_record = reads::jobs::mutable_job_record_in(&source_tx, job)?
                 .ok_or_else(|| audit_delta("the rollback source Job vanished"))?;
             let parent = source_record.job.parent_id;
             let parent_row = source_tx

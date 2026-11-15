@@ -1,10 +1,19 @@
-use super::*;
+use super::StorageError;
+use crate::db::entities::{
+    Actor, AgentCapability, AgentConfig, AttachmentOrigin, AuthorizationBasis, ChatFinishReason,
+    CleanupKind, ConfigId, ConfigRef, DependencyCondition, EffectConclusion, ExecutionOperation,
+    FrozenExecutionConfig, FrozenLlmConfig, JobId, LlmConfig, LlmParameters, LlmProviderId,
+    LlmTransport, ModelCapability, NormalizedUsage, OutcomeKind, OutputKind, ProviderFailure,
+    ProviderSnapshot, RecurrenceHalt, RequestNumber, StopProof, Timestamp, ToolCallRefusal,
+    ToolEffect, UncertainCause, WithheldReason,
+};
 use crate::db::entities::{
     CommandOwner, CommandStatus, CompactionMode, CompactionPolicy, CompactionPreset, ConfigKind,
     CustomPolicy, DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig,
     DecisionProtocol, FrozenDecisionAgent, NativeDecisionConfig, PredictionAcceptance,
     PredictionMode, PredictiveCompaction, RequestEligibility, UsageFinality,
 };
+use std::collections::BTreeSet;
 
 pub(super) const TAG_CONFIG: u8 = 1;
 pub(super) const TAG_JOB: u8 = 2;
@@ -27,7 +36,7 @@ pub(super) struct Enc(pub(super) Vec<u8>);
 
 impl Enc {
     pub(super) fn new(tag: u8) -> Self {
-        Enc(vec![tag, super::record_version_byte()])
+        Enc(vec![tag, crate::db::redb::schema::record_version_byte()])
     }
     pub(super) fn u8(&mut self, v: u8) {
         self.0.push(v);
@@ -264,7 +273,8 @@ impl<'a> Dec<'a> {
     pub(super) fn new(bytes: &'a [u8], tag: u8) -> DecodeResult<Self> {
         match bytes {
             [found, version, ..]
-                if *found == tag && u64::from(*version) == super::FORMAT_VERSION =>
+                if *found == tag
+                    && u64::from(*version) == crate::db::redb::schema::FORMAT_VERSION =>
             {
                 Ok(Dec { bytes, at: 2 })
             }

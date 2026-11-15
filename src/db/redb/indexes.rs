@@ -1,7 +1,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::*;
+use super::{StorageError, jobs};
+use crate::db::entities::{
+    AttachmentRecord, ContentDigest, Entry, JobId, JobOutputRecord, JobSpec, Origin, OutcomeKind,
+    OutputKind,
+};
 use crate::db::entities::{RequestEventRecord, RequestPayload};
+use crate::db::redb::schema::{
+    ATTACHMENTS, CHILD_GROUPS, CHILDREN, CONTENT_RECLAIM, CONTENT_REFERENCES, CONVERSATION_SEARCH,
+    CONVERSATIONS, DRAFT_CONTEXTS, JOB_OUTPUTS, JOBS, LIVE_CHILDREN, MUTABLE_READY, PENDING,
+    POOL_ALLOCATIONS, SUCCESSORS, USAGE_MODEL,
+};
+use crate::db::redb::{allocations, reads, reservations, rows, schema, state};
+use ::redb::{ReadTransaction, ReadableTable, WriteTransaction};
 
 pub(super) fn search_gram(chars: &[char]) -> u64 {
     chars
@@ -160,9 +171,9 @@ pub(super) fn search_output_text(output: &JobOutputRecord, completed: bool) -> O
 }
 
 fn indexed_identity<'a>(
-    identity: Option<&'a reads::UsageIdentity>,
+    identity: Option<&'a reads::jobs::UsageIdentity>,
     event: &RequestEventRecord,
-) -> Option<&'a reads::UsageIdentity> {
+) -> Option<&'a reads::jobs::UsageIdentity> {
     identity.filter(|_| {
         !matches!(
             event.payload,
@@ -174,7 +185,7 @@ fn indexed_identity<'a>(
 }
 
 pub(super) fn request_timeline_key(
-    identity: Option<&reads::UsageIdentity>,
+    identity: Option<&reads::jobs::UsageIdentity>,
     event: &RequestEventRecord,
 ) -> Option<schema::RequestTimelineKey> {
     indexed_identity(identity, event).map(|_| {
@@ -188,7 +199,7 @@ pub(super) fn request_timeline_key(
 }
 
 pub(super) fn usage_model_key(
-    identity: Option<&reads::UsageIdentity>,
+    identity: Option<&reads::jobs::UsageIdentity>,
     event: &RequestEventRecord,
 ) -> Option<(u128, [u8; 32])> {
     indexed_identity(identity, event).map(|identity| {

@@ -8,7 +8,7 @@ use aws_lc_rs::digest::{Context, SHA256};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::db::entities::JobId;
+use crate::db::entities::{ContentDigest, JobId};
 use crate::db::{DATABASE_FILE_NAME, storage_format_versions};
 use crate::system::data_directory::{DATABASE_LOCK_FILE, private_file};
 
@@ -262,16 +262,6 @@ fn unfinalized(error: Refused) -> Refused {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(DIGITS[(byte >> 4) as usize] as char);
-        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
 fn valid_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -280,9 +270,7 @@ fn valid_digest(value: &str) -> bool {
 }
 
 fn digest_bytes(bytes: &[u8]) -> String {
-    let mut context = Context::new(&SHA256);
-    context.update(bytes);
-    hex(context.finish().as_ref())
+    ContentDigest::of(bytes).to_string()
 }
 
 fn digest(file: &mut File) -> std::io::Result<(String, u64)> {
@@ -306,7 +294,7 @@ fn copy_with_digest(
         destination.write_all(&buffer[..read])?;
         length += read as u64;
     }
-    Ok((hex(context.finish().as_ref()), length))
+    Ok((ContentDigest::finish(context).to_string(), length))
 }
 
 fn sync_directory(directory: &Path) -> std::io::Result<()> {

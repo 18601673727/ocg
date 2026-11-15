@@ -1,8 +1,8 @@
 "use client";
 
-import { type ToolCallMessagePartComponent, useAuiState } from "@assistant-ui/react";
+import { useEffect, useState, type ReactNode } from "react";
+import { useAuiState, type ToolCallMessagePartComponent } from "@assistant-ui/react";
 import { Check, Copy, FileCode2 } from "lucide-react";
-import { type ReactNode, useEffect, useState } from "react";
 import {
   ToolFallback,
   toolArgumentSummary,
@@ -74,10 +74,10 @@ function FileCode({
         </Button>
       </header>
       {lines.length ? (
-        <section
+        <div
           className="ocg-subtle-scrollbar max-h-96 overflow-auto outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          // biome-ignore lint/a11y/noNoninteractiveTabindex: Keyboard users can focus and scroll this results region.
           tabIndex={0}
+          role="region"
           aria-label={path}
         >
           <div className="grid w-max min-w-full grid-cols-[auto_minmax(0,1fr)] font-mono text-xs leading-5">
@@ -91,7 +91,6 @@ function FileCode({
               {highlighted ? (
                 <code
                   className="hljs bg-transparent! p-0!"
-                  // biome-ignore lint/security/noDangerouslySetInnerHtml: highlight.js escapes source text before emitting syntax markup.
                   dangerouslySetInnerHTML={{ __html: highlighted.html }}
                 />
               ) : (
@@ -99,7 +98,7 @@ function FileCode({
               )}
             </pre>
           </div>
-        </section>
+        </div>
       ) : (
         <p className="px-3 py-4 text-sm text-muted-foreground">{t("chat.fileTool.empty")}</p>
       )}
@@ -137,7 +136,6 @@ export function WorkspaceTool({
     (call.name === "workspace_run_command" &&
       (call.outcome_kind === "not_applied" || call.outcome_kind === "uncertain"));
   const needsRead = supportedTool && recordedResult && (call.arguments_cut || call.result_cut);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Changing attempt explicitly retries this operation.
   useEffect(() => {
     if (!needsRead || !client || !jobId || loaded?.key === key) return;
     const controller = new AbortController();
@@ -221,10 +219,10 @@ export function WorkspaceTool({
         {file.excerpt && (
           <p className="mb-2 text-xs text-muted-foreground">{t("chat.artifacts.excerpt")}</p>
         )}
-        <section
+        <div
           className="ocg-subtle-scrollbar max-h-96 overflow-auto"
-          // biome-ignore lint/a11y/noNoninteractiveTabindex: Keyboard users can focus and scroll this results region.
           tabIndex={0}
+          role="region"
           aria-label={path}
         >
           <DiffViewer
@@ -236,7 +234,7 @@ export function WorkspaceTool({
             maxCollapsedLines={80}
             className="max-w-full rounded-lg"
           />
-        </section>
+        </div>
       </div>
     );
   }

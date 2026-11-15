@@ -1,4 +1,19 @@
-use super::*;
+use crate::db::entities::{JobId, OutcomeKind, OutcomeRecord};
+use crate::db::redb::StorageError;
+use crate::db::redb::execution;
+use crate::db::redb::recovery::reserved::ReservedRefusal;
+use crate::db::redb::schema::{
+    ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, APPROVAL_CALLS, APPROVALS, ATTACHMENTS, CHILD_GROUPS,
+    CHILDREN, CONFIGS, CONTENT_RECLAIM, CONTENT_REFERENCES, CONVERSATION_SEARCH, CONVERSATIONS,
+    CREDENTIALS, DEPENDENCY_WAITERS, DRAFT_CONTEXTS, EXECUTION_COMMITS, EXECUTORS, JOB_EVENTS,
+    JOB_INPUTS, JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, LIVE_CHILDREN, MESSAGES, META,
+    MUTABLE_READY, OPEN_APPROVALS, PENDING, POOL_ALLOCATIONS, POOL_EXECUTORS, POOLS, PROJECTS,
+    RECURRENCE_DUE, RECURRENCES, REQUEST_EVENTS, REQUEST_TIMELINE, RETRY_JOBS,
+    SCHEDULED_EXTERNAL_BINDING, SCHEDULED_EXTERNAL_POLICY, SEQUENCES, SUBMISSIONS, SUCCESSORS,
+    TOOL_CALL_IDS, TOOL_CALLS, TOOL_STATS, TURNS, USAGE_MODEL, USAGE_TOTALS,
+};
+use crate::db::redb::{rows, state};
+use ::redb::{Key, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition, Value};
 
 pub(crate) fn audit_delta(detail: impl Into<String>) -> ReservedRefusal {
     ReservedRefusal::new("audit_failed", detail)

@@ -7,6 +7,7 @@ use std::time::Duration;
 use ntex::util::{Either, select};
 
 use super::tools::{FailureCertainty, ToolFailure, ToolFuture, ToolOffer, ToolStart};
+use crate::db::entities::ToolCallRefusal;
 use crate::db::entities::{
     AuthorizationBasis, ContentDigest, JobToolCall, MAX_STORED_TOOL_ARGUMENTS_BYTES,
     NotInvokedReason, RequestNumber, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
@@ -16,7 +17,7 @@ use crate::db::entities::{
 use crate::db::{DatabaseError, DatabaseHandle, DevelopmentHandoff};
 use crate::service::ai::providers::CancellationToken;
 use crate::service::ai::providers::openai_compatible::{
-    ChatConversation, CompletedToolCall, InvalidToolCall, ToolCallRefusal,
+    ChatConversation, CompletedToolCall, InvalidToolCall,
 };
 
 const DEFAULT_MAX_PROVIDER_REQUESTS: u32 = 2048;

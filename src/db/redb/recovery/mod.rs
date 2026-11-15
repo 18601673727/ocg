@@ -1,17 +1,35 @@
-use super::*;
-use crate::db::entities::{JobId, OutcomeKind, OutcomeRecord, Timestamp};
-use crate::system::data_directory::{current_boot_id, current_host_id};
+use super::{StorageError, StorageErrorKind, TxRead, execution, jobs};
+use crate::db::entities::{
+    ApprovalRecord, ContentDigest, ExecutionOperation, ExecutionPoolId, ExecutorId, JobSpec,
+    JobState, LlmTransport, OutputKind, Recurrence,
+};
+use crate::db::entities::{JobId, OutcomeKind, Timestamp};
+use crate::db::redb::batch::{Batch, BatchError, Commit, Failure};
+use crate::db::redb::codec::{Code, Enc, TAG_GLOBAL_COMPACTION};
+use crate::db::redb::rows::ConfigRow;
+use crate::db::redb::schema::{
+    ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, APPROVALS, ATTACHMENTS, CACHE_BYTES, CHILD_GROUPS,
+    CHILDREN, CONFIGS, CONTENT_RECLAIM, CONVERSATIONS, CREDENTIALS, DATABASE_FILE_NAME,
+    DATABASE_FORMAT_KEY, DEPENDENCY_WAITERS, EXECUTION_COMMITS, EXECUTORS, FORMAT_VERSION,
+    JOB_EVENTS, JOB_INPUTS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, LIVE_CHILDREN, MAX_PAGE, META,
+    POOL_ALLOCATIONS, POOL_EXECUTORS, POOLS, PROJECTS, RECURRENCES, REQUEST_EVENTS,
+    REQUEST_TIMELINE, RETRY_JOBS, SCHEDULED_EXTERNAL_BINDING, SCHEDULED_EXTERNAL_POLICY, SEQUENCES,
+    SUBMISSIONS, TOOL_CALLS, TURNS, check_record_headers, check_required_tables, create_tables,
+};
+use crate::db::redb::state::JobRuntime;
+use crate::db::redb::{allocations, codec, indexes, job_tree, reads, reservations, rows, state};
+use ::redb::{
+    Database, Durability, ReadTransaction, ReadableTable, TableDefinition, TableError,
+    WriteTransaction,
+};
+use std::path::{Path, PathBuf};
 
 mod audit;
-mod held;
-mod offline;
-mod reserved;
+pub(super) mod held;
+pub(super) mod offline;
+pub(super) mod reserved;
 mod settle;
 
-pub(crate) use audit::*;
-pub(crate) use held::*;
-pub(crate) use offline::*;
-pub(crate) use reserved::*;
 pub(crate) use settle::*;
 
 pub(crate) fn database_file(directory: &Path) -> PathBuf {
@@ -233,7 +251,7 @@ fn startup_metadata(tx: &ReadTransaction) -> Result<bool, StorageError> {
         .get("compaction_settings")?
         .ok_or_else(|| StorageError::corrupted("missing compaction settings"))?;
     check_preflight_header(settings.value(), &[TAG_GLOBAL_COMPACTION])?;
-    reads::global_compaction_settings(&meta)?;
+    reads::catalog::global_compaction_settings(&meta)?;
     Ok(clean)
 }
 
@@ -273,7 +291,7 @@ fn residual_ownership_in(tx: &ReadTransaction) -> Result<ResidualOwnership, Stor
             continue;
         }
         let job = allocation.token.job;
-        let record = match reads::mutable_job_record_in(tx, job) {
+        let record = match reads::jobs::mutable_job_record_in(tx, job) {
             Ok(Some(record)) => record,
             Ok(None) => {
                 return Err(StorageError::corrupted(format!(
@@ -998,8 +1016,8 @@ fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError>
     Ok(())
 }
 
-fn unknown_outcomes_exist(tx: &ReadTransaction) -> Result<bool, StorageError> {
-    for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
+fn unknown_outcomes_exist(tx: &impl TxRead) -> Result<bool, StorageError> {
+    for entry in tx.table(JOB_RUNTIME)?.iter()? {
         let (key, value) = entry?;
         if state::decode_state(key.value(), value.value())?
             .outcome
@@ -1040,7 +1058,7 @@ fn resolved_unknown_ownership(
         return Ok(false);
     }
     Ok(
-        reads::mutable_job_record_in(tx, state.job_id)?.is_some_and(|record| {
+        reads::jobs::mutable_job_record_in(tx, state.job_id)?.is_some_and(|record| {
             record.job.phase == MutableJobPhase::Executing
                 && record.job.revision == allocation.job_revision
         }),
@@ -1584,4 +1602,13 @@ fn unsupported_format(detail: &str) -> StorageError {
         os_error: None,
         detail: detail.to_owned(),
     }
+}
+
+pub(crate) fn record_clean_shutdown(database: &Database) -> Result<(), StorageError> {
+    let tx = database.begin_write()?;
+    let unknown = unknown_outcomes_exist(&tx)?;
+    tx.open_table(META)?
+        .insert("clean_shutdown", [u8::from(!unknown)].as_slice())?;
+    tx.commit()?;
+    Ok(())
 }

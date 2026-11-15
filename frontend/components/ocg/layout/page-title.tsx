@@ -2,11 +2,11 @@
 
 import {
   createContext,
-  type ReactNode,
   useContext,
   useLayoutEffect,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { cn } from "@/lib/utils";
 
@@ -35,17 +35,16 @@ export function PageTitle({ children, className }: { children: ReactNode; classN
   }, [onVisibilityChange]);
 
   return (
-    <div aria-hidden={!visible} className="contents">
-      <h1
-        ref={titleRef}
-        className={cn(
-          "transition-opacity duration-200 ease-out motion-reduce:transition-none",
-          visible ? "opacity-100" : "opacity-0",
-          className,
-        )}
-      >
-        {children}
-      </h1>
-    </div>
+    <h1
+      ref={titleRef}
+      aria-hidden={!visible}
+      className={cn(
+        "transition-opacity duration-200 ease-out motion-reduce:transition-none",
+        visible ? "opacity-100" : "opacity-0",
+        className,
+      )}
+    >
+      {children}
+    </h1>
   );
 }

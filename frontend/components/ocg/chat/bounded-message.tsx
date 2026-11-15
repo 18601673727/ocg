@@ -1,7 +1,7 @@
 "use client";
 
-import { ChevronDown } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
+import { ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
 import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./message-bounds";
@@ -47,7 +47,6 @@ export function BoundedMessage({
   const toggle = expandable ? boundedToggle(overflowing, expanded) : null;
   return (
     <>
-      {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: The conditional roles are paired with an accessible label. */}
       <div
         ref={viewport}
         data-message-bounds={expanded ? "expanded" : "bounded"}

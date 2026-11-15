@@ -1,12 +1,25 @@
-use super::*;
+use crate::db::ObservationChange;
+use crate::db::commands::Command;
 use crate::db::commands::{
     byte_count, debug_bytes, json_bytes, output_bytes, search_index_bytes, text_bytes,
 };
+use crate::db::entities::JobId;
+use crate::db::entities::{
+    AppendedOutput, JobFinalization, JobOutput, Metrics, OperationKind, ProviderAnswer,
+    ProviderRequestRecord, RequestNumber, ToolCallRef, ToolEvidence, ToolEvidenceRecord,
+    ToolOutcome, Violation,
+};
+use crate::db::errors::DatabaseError;
 use crate::db::handoff::{
     DevelopmentHandoff, DevelopmentHandoffError, DevelopmentOutputGuard,
     DevelopmentUsageCheckpoint, DevelopmentWriteProof, PreparedDevelopmentHandoff,
     classify_unstarted, development_contains_secret,
 };
+use crate::db::redb::StorageErrorKind;
+use crate::db::worker::{DatabaseHandle, run};
+use crate::db::{entities, mutations, redb};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 
 impl DatabaseHandle {
     pub(crate) async fn provider_responses(

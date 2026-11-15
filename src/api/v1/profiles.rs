@@ -1,6 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::contracts::*;
+use super::contracts::{
+    CompactionPolicyInput, GlobalCompactionSettingsInput, GlobalOutboundHeadersInput,
+    GlobalOutboundHeadersView, OutboundHeaderInput, OutboundHeaderView, compaction_policy_view,
+    envelope,
+};
 use ntex::http::StatusCode;
 use serde::Deserialize;
 use serde_json::Value;
@@ -166,42 +170,6 @@ pub(crate) fn profile_id(text: &str) -> Result<ProfileId, Refusal> {
     crate::db::entities::parse_entity_id(text)
         .map(ProfileId::new)
         .ok_or(INVALID_REQUEST)
-}
-
-fn capability_str(capability: ModelCapability) -> &'static str {
-    match capability {
-        ModelCapability::Chat => "chat",
-        ModelCapability::Tools => "tools",
-        ModelCapability::Vision => "vision",
-        ModelCapability::Reasoning => "reasoning",
-    }
-}
-
-fn parse_capability(value: &str) -> Option<ModelCapability> {
-    match value {
-        "chat" => Some(ModelCapability::Chat),
-        "tools" => Some(ModelCapability::Tools),
-        "vision" => Some(ModelCapability::Vision),
-        "reasoning" => Some(ModelCapability::Reasoning),
-        _ => None,
-    }
-}
-
-fn decision_capability_str(capability: DecisionCapability) -> &'static str {
-    match capability {
-        DecisionCapability::Choice => "choice",
-        DecisionCapability::OrdinalScore => "ordinal_score",
-        DecisionCapability::BinaryProbability => "binary_probability",
-    }
-}
-
-fn parse_decision_capability(value: &str) -> Option<DecisionCapability> {
-    match value {
-        "choice" => Some(DecisionCapability::Choice),
-        "ordinal_score" => Some(DecisionCapability::OrdinalScore),
-        "binary_probability" => Some(DecisionCapability::BinaryProbability),
-        _ => None,
-    }
 }
 
 #[derive(Default, Deserialize)]
@@ -1012,7 +980,7 @@ fn build_profiles_page(
                     declared_capabilities: model
                         .declared_capabilities
                         .iter()
-                        .map(|cap| capability_str(*cap).to_owned())
+                        .map(|cap| cap.as_str().to_owned())
                         .collect(),
                     parameters: model.parameters,
                     editable: true,
@@ -1096,7 +1064,7 @@ fn build_profiles_page(
                     declared_capabilities: model
                         .declared_capabilities
                         .iter()
-                        .map(|capability| decision_capability_str(*capability).to_owned())
+                        .map(|capability| capability.as_str().to_owned())
                         .collect(),
                     limits: DecisionLimitsView {
                         max_input_tokens_per_request: model.limits.max_input_tokens_per_request,
@@ -1291,7 +1259,7 @@ pub(crate) async fn save_profile(
                 .transpose()?;
             let capabilities = parse_capability_set(
                 &declared_capabilities,
-                parse_capability,
+                ModelCapability::parse,
                 INVALID_CAPABILITIES,
             )?;
             if parameters
@@ -1436,7 +1404,7 @@ pub(crate) async fn save_profile(
                 .ok_or(UNSUPPORTED_DECISION_PROTOCOL)?;
             let capabilities = parse_capability_set(
                 &declared_capabilities,
-                parse_decision_capability,
+                DecisionCapability::parse,
                 INVALID_DECISION_CAPABILITIES,
             )?;
             let decision_limits = DecisionLimits {
@@ -1675,7 +1643,7 @@ pub(crate) async fn import_models(
     }
     let capabilities = parse_capability_set(
         &request.declared_capabilities,
-        parse_capability,
+        ModelCapability::parse,
         INVALID_CAPABILITIES,
     )?;
     let headers;

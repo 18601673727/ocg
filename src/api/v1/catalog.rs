@@ -1,4 +1,4 @@
-use super::contracts::*;
+use super::contracts::{CompactionPolicyInput, compaction_policy_view, envelope};
 use ntex::web::HttpRequest;
 use serde_json::Value;
 
@@ -8,7 +8,7 @@ use super::{
 };
 use crate::db::entities::{
     ConfigBody, ConfigKind, DependencyCondition, DependencyState, JobEdit, JobId, JobTree,
-    ModelCapability, ProfileId, RecordRef, Recurrence, TreeFacts, TreeNode, Violation,
+    ProfileId, RecordRef, Recurrence, TreeFacts, TreeNode, Violation,
 };
 use crate::db::{DatabaseError, DatabaseHandle};
 
@@ -793,15 +793,6 @@ pub(super) fn bound_conversation_turns(shared: &Shared, mut body: Value) -> Resu
     dashboard::bounded(shared, body)
 }
 
-fn capability(capability: ModelCapability) -> &'static str {
-    match capability {
-        ModelCapability::Chat => "chat",
-        ModelCapability::Tools => "tools",
-        ModelCapability::Vision => "vision",
-        ModelCapability::Reasoning => "reasoning",
-    }
-}
-
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "LlmTarget")]
 pub(crate) struct LlmTargetView {
@@ -882,7 +873,7 @@ pub(super) async fn agent_profiles(
                 declared_capabilities: model
                     .declared_capabilities
                     .iter()
-                    .map(|declared| capability(*declared).to_owned())
+                    .map(|declared| declared.as_str().to_owned())
                     .collect(),
                 executors: executors.iter().map(ToString::to_string).collect(),
             });

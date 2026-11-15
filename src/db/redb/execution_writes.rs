@@ -1,6 +1,20 @@
 use super::rows::{decode_request_event, encode_request_event};
-use super::*;
-use crate::db::entities::*;
+use super::{StorageError, jobs, observations};
+use crate::db::entities::{
+    AppendedOutput, AvailabilityStatId, ConfigId, ContentDigest, ExecutionEventKind,
+    ExecutionOperation, JobId, JobOutputId, JobOutputRecord, MetricsId, OutcomeKind, OutputKind,
+    RecordRef, RequestEventRecord, RequestNumber, RequestPayload, Timestamp, ToolCallRef,
+    Violation,
+};
+use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
+use crate::db::redb::jobs::{decode_mutable_job, encode_mutable_job};
+use crate::db::redb::rows::encode_output;
+use crate::db::redb::schema::{
+    CHILDREN, JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MESSAGES, META, REQUEST_EVENTS,
+    REQUEST_TIMELINE, TOOL_CALLS, USAGE_TOTALS,
+};
+use crate::db::redb::{indexes, reads, rows, state};
+use ::redb::ReadableTable;
 
 impl Batch {
     pub(crate) fn append_development_output(
@@ -124,19 +138,19 @@ impl Batch {
     pub(super) fn development_usage_identity(
         &mut self,
         job: JobId,
-    ) -> Result<reads::UsageIdentity, BatchError> {
+    ) -> Result<reads::jobs::UsageIdentity, BatchError> {
         let Some(row) = self.mutable_job(job)? else {
             return self.reject(Violation::NotFound(RecordRef::Job(job)));
         };
         let identity = match row.frozen {
             Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) => {
-                reads::UsageIdentity {
+                reads::jobs::UsageIdentity {
                     provider: frozen.llm.provider.id.get(),
                     model: frozen.llm.config.model,
                 }
             }
             Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)) => {
-                reads::UsageIdentity {
+                reads::jobs::UsageIdentity {
                     provider: frozen.connection_ref.id.get(),
                     model: frozen.model.model,
                 }
@@ -340,7 +354,7 @@ impl Batch {
 
     fn insert_development_request_event(
         &mut self,
-        identity: &crate::db::redb::reads::UsageIdentity,
+        identity: &crate::db::redb::reads::jobs::UsageIdentity,
         job: JobId,
         request: RequestNumber,
         seq: u32,
@@ -363,7 +377,7 @@ impl Batch {
     #[allow(clippy::too_many_arguments)]
     fn insert_development_request_event_with_id(
         &mut self,
-        identity: &crate::db::redb::reads::UsageIdentity,
+        identity: &crate::db::redb::reads::jobs::UsageIdentity,
         job: JobId,
         request: RequestNumber,
         id: u128,
@@ -1027,8 +1041,8 @@ impl Batch {
         );
         if outcome.is_ok()
             && let Some(true_probability) = predictive_accept
-            && let Ok((policy, _, _)) =
-                self.step(|tx| reads::effective_context_policy(&tx.open_table(META)?))
+            && let Ok((policy, _)) =
+                self.step(|tx| reads::catalog::effective_context_policy(&tx.open_table(META)?))
             && let Some(pred) = &policy.predictive
             && pred.mode == crate::db::entities::PredictionMode::Prepare
         {
@@ -1234,7 +1248,7 @@ impl Batch {
         })?;
         for (producer, source) in candidates {
             let ok = self.step(|tx| {
-                Ok(reads::verify_native_summary_tables(
+                Ok(reads::execution_context::verify_native_summary_tables(
                     &tx.open_table(JOBS)?,
                     &tx.open_table(JOB_RUNTIME)?,
                     &tx.open_table(JOB_OUTPUTS)?,

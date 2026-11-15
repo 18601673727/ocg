@@ -1,4 +1,11 @@
-use super::*;
+use crate::db::entities::identity::JobId;
+use crate::db::entities::{
+    Actor, AllocationExecutor, AllocationPhase, AllocationPool, AttachmentRecord,
+    DependencyCondition, DependencyState, FrozenDecisionConfig, FrozenExecutionConfig,
+    GlobalCompactionSettings, JobClosing, JobLifecycle, JobOutputRecord, JobSpec, MutableJob,
+    MutableJobPhase, MutableJobRecord, NativeSummaryManifest, OutcomeRecord, PoolAllocation,
+    ProjectRecord, RequestNumber, StopProof, SummarizationResult, Timestamp, ToolCallRef,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExecutionEvent {

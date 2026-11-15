@@ -1,18 +1,18 @@
 "use client";
 
-import { type ReasoningMessagePartComponent, useScrollLock } from "@assistant-ui/react";
 import { forwardRef, memo, useCallback, useRef } from "react";
+import { useScrollLock, type ReasoningMessagePartComponent } from "@assistant-ui/react";
 import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
 import {
   ANIMATION_DURATION,
   estimateReasoningTokens,
-  ReasoningContent,
-  ReasoningFade,
   ReasoningRoot as ReasoningRootBase,
-  type ReasoningRootProps,
-  ReasoningText,
   ReasoningTrigger,
+  ReasoningContent,
+  ReasoningText,
+  ReasoningFade,
   reasoningVariants,
+  type ReasoningRootProps,
 } from "./reasoning";
 
 export type { ReasoningRootProps } from "./reasoning";
@@ -70,10 +70,10 @@ Reasoning.Fade = ReasoningFade;
 export {
   estimateReasoningTokens,
   Reasoning,
-  ReasoningContent,
-  ReasoningFade,
   ReasoningRoot,
-  ReasoningText,
   ReasoningTrigger,
+  ReasoningContent,
+  ReasoningText,
+  ReasoningFade,
   reasoningVariants,
 };

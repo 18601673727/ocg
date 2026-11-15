@@ -3,9 +3,9 @@
 import { ExternalLink, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import type { ChatMessage, ChatSession } from "../types";
 import { runtimeStateLabel, useI18n } from "../i18n";
 import { executionDetail, executionLabel } from "../runtime/job-status";
-import type { ChatMessage, ChatSession } from "../types";
 import { ConversationContext } from "./conversation-context";
 import { ConversationLimitsEditor } from "./conversation-limits";
 

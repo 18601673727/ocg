@@ -1,4 +1,11 @@
-use super::*;
+use crate::db::entities::identity::{
+    AttachmentId, ConfigId, ExecutorId, JobId, ProfileId, ProjectId,
+};
+use crate::db::entities::{
+    ConfigKind, DependencyState, LlmTransport, RecordRef, RequestEligibility, RequestNumber,
+    ToolCallRef,
+};
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OperationId {

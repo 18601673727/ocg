@@ -173,7 +173,7 @@ pub(super) fn open(
         | Topic::Usage(_)
         | Topic::Availability(_)
         | Topic::Catalog => shared.database.subscribe_catalog(),
-        Topic::Logs(_) => shared.database.subscribe_logs(),
+        Topic::Logs(_) => shared.logs.subscribe(),
         Topic::ObservationChanges(_) => shared.database.subscribe_observations(),
     };
     let now = Instant::now();

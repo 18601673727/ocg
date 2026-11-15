@@ -1,12 +1,3 @@
-use std::collections::BTreeSet;
-use std::fmt;
-use std::num::NonZeroU32;
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use crate::service::ai::providers::openai_compatible::{
-    ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
-};
-
 mod approvals;
 mod attachments;
 mod execution;
@@ -20,17 +11,17 @@ pub(crate) mod output_filter;
 mod profiles;
 mod projects;
 mod requests;
-mod scheduled_external;
 mod scheduling;
 mod statistics;
 mod usage;
 
 pub use approvals::{
     ApprovalDecision, ApprovalRecord, AuthorizationBasis, EffectConclusion,
-    MAX_HANDLER_VERSION_BYTES, MAX_STORED_TOOL_ARGUMENTS_BYTES, NotInvokedReason, Recorded,
-    ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolEvidence, ToolEvidenceRecord,
+    MAX_FUNCTION_NAME_BYTES, MAX_HANDLER_VERSION_BYTES, MAX_STORED_TOOL_ARGUMENTS_BYTES,
+    MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_DEFINITION_BYTES, NotInvokedReason, Recorded, ToolAdmission,
+    ToolCallRef, ToolCallRefusal, ToolDecision, ToolEffect, ToolEvidence, ToolEvidenceRecord,
     ToolOutcome, ToolOutcomeKind, ToolPayload, ToolReconciliation, UncertainCause, WithheldReason,
-    is_handler_version,
+    is_function_name, is_handler_version,
 };
 pub use attachments::*;
 pub(crate) use execution::*;
@@ -62,7 +53,6 @@ pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};
 pub use profiles::*;
 pub use projects::*;
 pub use requests::*;
-pub use scheduled_external::*;
 pub use scheduling::*;
 pub use statistics::{
     AvailabilityClassification, AvailabilityObservation, AvailabilityRequestSample,

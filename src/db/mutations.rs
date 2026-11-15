@@ -1,8 +1,13 @@
-use crate::db::entities::*;
-use crate::db::redb::{Batch, BatchError};
-use crate::service::ai::providers::openai_compatible::{
-    MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_DEFINITION_BYTES, is_function_name,
+use crate::db::entities::{
+    Actor, Attachment, AttachmentId, AttachmentOrigin, AttachmentRecord, CommandOwner, Config,
+    ConfigId, ContentDigest, DecisionCapability, DecisionLimits, DecisionProtocol, JobEdit, JobId,
+    LlmParameters, LlmTransport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENT_MIME_BYTES,
+    MAX_STORED_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_DEFINITION_BYTES,
+    ModelCapability, ProfileId, Project, ProjectCommand, ProjectDecisionConfig, ProjectId,
+    ProjectRecord, RecordRef, Timestamp, ToolCallRef, ToolEvidence, ToolOutcome, Violation,
+    is_function_name, is_handler_version, sanitize_display_name, validate_project_commands,
 };
+use crate::db::redb::{Batch, BatchError};
 
 pub(crate) type OpResult<T> = Result<T, BatchError>;
 

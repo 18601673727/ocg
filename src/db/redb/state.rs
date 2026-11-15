@@ -1,5 +1,11 @@
-use super::*;
+use super::{StorageError, TxRead};
+use crate::db::entities::{
+    DependencyCondition, JobId, JobLifecycle, JobLimits, JobState, OutcomeKind,
+};
 use crate::db::entities::{JobClosing, OutcomeCause, OutcomeRecord, UncertaintyReason};
+use crate::db::redb::codec::{Code, Dec, DecodeResult, Enc, TAG_JOB_RUNTIME};
+use crate::db::redb::schema::JOB_RUNTIME;
+use ::redb::{ReadableTable, WriteTransaction};
 
 /// Mutable facts for one Job, kept together under its JobId.
 #[derive(Clone, Debug, PartialEq, Eq)]

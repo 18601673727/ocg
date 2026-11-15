@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use super::contracts::*;
+use super::contracts::envelope;
 use aws_lc_rs::digest::{Context, SHA256};
 use ntex::http::StatusCode;
 use ntex::http::header::HeaderMap;

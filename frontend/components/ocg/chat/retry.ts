@@ -15,7 +15,8 @@ export function retryInput(
   const index = messages.findIndex((message) => message.id === messageId);
   const failed = messages[index];
   if (
-    failed?.role !== "assistant" ||
+    !failed ||
+    failed.role !== "assistant" ||
     (failed.status !== "failed" && failed.status !== "unknown" && failed.status !== "cancelled")
   )
     return null;

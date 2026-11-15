@@ -1,4 +1,4 @@
-use super::*;
+use crate::db::entities::OperationKind;
 
 pub(super) struct SchedulerWake {
     permit_tx: flume::Sender<()>,

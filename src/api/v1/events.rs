@@ -8,7 +8,7 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use super::contracts::*;
+use super::contracts::envelope;
 use super::jobs::{JobView, mutable_job_view};
 use super::outputs::output_view;
 use ntex::http::StatusCode;

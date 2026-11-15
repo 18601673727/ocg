@@ -90,14 +90,10 @@ type DropdownMenuTriggerProps = {
 export const DropdownMenuTrigger = React.forwardRef<HTMLButtonElement, DropdownMenuTriggerProps>(
   function DropdownMenuTrigger({ children, asChild, className }, ref) {
     const { open, setOpen, triggerRef } = useDropdownMenu();
-    const attachTrigger: React.RefCallback<HTMLButtonElement> = React.useCallback(
-      (node) => {
-        triggerRef.current = node;
-        if (typeof ref === "function") return ref(node);
-        if (ref) ref.current = node;
-      },
-      [ref, triggerRef],
-    );
+    const localRef = React.useRef<HTMLButtonElement>(null);
+
+    React.useImperativeHandle(ref, () => localRef.current!);
+    React.useImperativeHandle(triggerRef, () => localRef.current as HTMLElement);
 
     if (asChild && React.isValidElement(children)) {
       const childProps = children.props as Record<string, unknown>;
@@ -110,14 +106,14 @@ export const DropdownMenuTrigger = React.forwardRef<HTMLButtonElement, DropdownM
         },
         "aria-expanded": open,
         "aria-haspopup": "menu",
-        ref: attachTrigger,
+        ref: localRef,
       };
       return React.cloneElement(children, clonedProps);
     }
 
     return (
       <button
-        ref={attachTrigger}
+        ref={localRef}
         type="button"
         onClick={() => setOpen(!open)}
         aria-expanded={open}
@@ -147,14 +143,7 @@ export const DropdownMenuContent = React.forwardRef<HTMLDivElement, DropdownMenu
     const contentRef = React.useRef<HTMLDivElement>(null);
     const focusedIndex = React.useRef(-1);
 
-    const attachContent: React.RefCallback<HTMLDivElement> = React.useCallback(
-      (node) => {
-        contentRef.current = node;
-        if (typeof ref === "function") return ref(node);
-        if (ref) ref.current = node;
-      },
-      [ref],
-    );
+    React.useImperativeHandle(ref, () => contentRef.current!);
 
     const focusByKey = React.useCallback((key: MenuNavigationKey) => {
       const items = menuFocusables(contentRef.current);
@@ -228,7 +217,7 @@ export const DropdownMenuContent = React.forwardRef<HTMLDivElement, DropdownMenu
 
     return (
       <div
-        ref={attachContent}
+        ref={contentRef}
         role="menu"
         className={cn(
           "absolute z-50 min-w-[8rem] rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md",
@@ -253,6 +242,10 @@ type DropdownMenuItemProps = {
 export const DropdownMenuItem = React.forwardRef<HTMLButtonElement, DropdownMenuItemProps>(
   function DropdownMenuItem({ children, onSelect, disabled, className }, ref) {
     const { setOpen, triggerRef } = useDropdownMenu();
+    const localRef = React.useRef<HTMLButtonElement>(null);
+
+    React.useImperativeHandle(ref, () => localRef.current!);
+
     const handleSelect = () => {
       if (disabled) return;
       onSelect?.();
@@ -264,7 +257,7 @@ export const DropdownMenuItem = React.forwardRef<HTMLButtonElement, DropdownMenu
 
     return (
       <button
-        ref={ref}
+        ref={localRef}
         type="button"
         role="menuitem"
         disabled={disabled}

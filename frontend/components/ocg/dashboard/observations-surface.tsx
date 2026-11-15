@@ -1,8 +1,15 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type * as Api from "@/components/ocg/contracts/api";
+
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ApiClient } from "../runtime/api-client";
+import { useI18n } from "../i18n";
+import { ContentContainer, ContentHeader } from "../layout/content-container";
+import { HealthChart, ReliabilityChart, UsageChart } from "./chart";
+import { LoadMore } from "../primitives/load-more";
+import { ListStatus } from "../primitives/list-status";
 import {
   Select,
   SelectContent,
@@ -10,12 +17,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { useI18n } from "../i18n";
-import { ContentContainer, ContentHeader } from "../layout/content-container";
-import { ListStatus } from "../primitives/list-status";
-import { LoadMore } from "../primitives/load-more";
-import type { ApiClient } from "../runtime/api-client";
-import { HealthChart, ReliabilityChart, UsageChart } from "./chart";
 
 type Usage = Api.Usage["observations"][number];
 type Availability = Api.Availability["observations"][number];
@@ -253,7 +254,7 @@ export function ObservationsSurface({
             <p className="my-2 text-sm text-muted-foreground">
               {t("observations.quarantinedNote")}
             </p>
-            {!health?.quarantined || health.quarantined.length === 0 ? (
+            {!health || !health.quarantined || health.quarantined.length === 0 ? (
               <p className="py-2 text-sm text-muted-foreground">
                 {t(
                   !health
@@ -278,7 +279,6 @@ export function ObservationsSurface({
                       <tr key={item.job}>
                         <td className={cell}>
                           <button
-                            type="button"
                             className="font-mono underline underline-offset-4"
                             onClick={() => onJob(item.job)}
                           >
@@ -344,7 +344,6 @@ export function ObservationsSurface({
                     </td>
                     <td className={cell}>
                       <button
-                        type="button"
                         className="block max-w-48 truncate text-left font-mono underline decoration-muted-foreground underline-offset-4 hover:decoration-foreground focus-visible:outline-2 focus-visible:outline-offset-2"
                         title={row.job}
                         onClick={() => onJob(row.job)}

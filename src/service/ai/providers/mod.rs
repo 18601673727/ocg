@@ -11,13 +11,11 @@ use ntex::client::{ClientResponse, error::ClientError};
 use ntex::http::header::{ACCEPT, HeaderValue};
 use serde_json::{Value, json};
 
+use crate::db::entities::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::db::entities::{
     FrozenExecutionConfig, IntermediateOutputKind, Timestamp, UsageFinality,
 };
-use openai_compatible::{
-    ChatConversation, ChatFinishReason, ChatMessage, CompletedToolCall, InvalidToolCall,
-    NormalizedUsage, ProviderFailure,
-};
+use openai_compatible::{ChatConversation, ChatMessage, CompletedToolCall, InvalidToolCall};
 
 pub(crate) const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PROVIDER_ERROR_BYTES: usize = 64 * 1024;

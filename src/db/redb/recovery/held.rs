@@ -1,4 +1,26 @@
-use super::*;
+use super::{
+    check_identity, check_records, refuse_unresolved_ownership, resolved_unknown_ownership,
+    verify_recovered,
+};
+use crate::db::entities::{ContentDigest, OutcomeKind, OutputKind, StopProof};
+use crate::db::redb::StorageError;
+use crate::db::redb::recovery::audit::{
+    verify_held_publication_preservation, verify_unrelated_recovery_rows,
+};
+use crate::db::redb::recovery::offline::{
+    apply_reconciliation, finalization_copy, with_reconciliation_copy,
+};
+use crate::db::redb::recovery::reserved::ReservedRefusal;
+use crate::db::redb::schema::FORMAT_VERSION;
+use crate::db::redb::schema::{
+    ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, APPROVALS, EXECUTORS, JOB_OUTPUTS, JOB_RUNTIME,
+    LIVE_CHILDREN, META, MUTABLE_READY, PENDING, POOL_ALLOCATIONS, POOLS, REQUEST_EVENTS,
+    SCHEDULED_EXTERNAL_BINDING, TOOL_CALLS,
+};
+use crate::db::redb::state::JobRuntime;
+use crate::db::redb::{allocations, reads, rows, state};
+use crate::system::data_directory::{current_boot_id, current_host_id};
+use ::redb::{ReadTransaction, ReadableDatabase, ReadableTable};
 
 #[derive(Clone, Debug)]
 pub(crate) struct RecoveryAction {
@@ -39,27 +61,14 @@ fn recovery_proof_name(proof: StopProof) -> &'static str {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    const DIGITS: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        encoded.push(DIGITS[(byte >> 4) as usize] as char);
-        encoded.push(DIGITS[(byte & 0x0f) as usize] as char);
-    }
-    encoded
-}
-
 fn sha256_json(value: &serde_json::Value) -> Result<String, ReservedRefusal> {
-    use aws_lc_rs::digest::{Context, SHA256};
     let bytes = serde_json::to_vec(value).map_err(|error| {
         ReservedRefusal::new(
             "unverifiable",
             format!("cannot encode the recovery plan: {error}"),
         )
     })?;
-    let mut context = Context::new(&SHA256);
-    context.update(&bytes);
-    Ok(hex(context.finish().as_ref()))
+    Ok(ContentDigest::of(&bytes).to_string())
 }
 
 fn held_recovery_plan_in(
@@ -184,10 +193,7 @@ fn held_recovery_plan_in(
 }
 
 fn sha256_bytes(bytes: &[u8]) -> String {
-    use aws_lc_rs::digest::{Context, SHA256};
-    let mut context = Context::new(&SHA256);
-    context.update(bytes);
-    hex(context.finish().as_ref())
+    ContentDigest::of(bytes).to_string()
 }
 
 fn recovery_action_in(
@@ -242,7 +248,7 @@ fn recovery_action_in(
             "the held Allocation lacks a started, unconfirmed shape"
         );
     }
-    let Some(record) = reads::mutable_job_record_in(tx, job_id)? else {
+    let Some(record) = reads::jobs::mutable_job_record_in(tx, job_id)? else {
         ineligible!("job_not_native", "a native mutable Job is required");
     };
     if record.job.phase != MutableJobPhase::Executing

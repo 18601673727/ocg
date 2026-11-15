@@ -1,4 +1,6 @@
-use super::*;
+use crate::db::entities::identity::AttachmentId;
+use crate::db::entities::{ContentDigest, Timestamp};
+use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachmentOrigin {

@@ -1,6 +1,6 @@
 import type { ChatSession, OcgRuntimeEvent } from "../types";
-import { emptyRuntimeSnapshot, RuntimeStore } from "./runtime-store";
 import type { CreateSessionInput, OcgRuntimeClient, RuntimeSnapshot } from "./runtime-types";
+import { emptyRuntimeSnapshot, RuntimeStore } from "./runtime-store";
 
 export abstract class RuntimeClientBase implements OcgRuntimeClient {
   private readonly listeners = new Set<(event: OcgRuntimeEvent) => void>();

@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import type { LlmProfile } from "../contracts";
-import type { I18nKey, TranslateFn } from "../i18n";
 import { ApiError } from "../runtime/api-client";
+import type { I18nKey, TranslateFn } from "../i18n";
 
 export function Section({
   id,

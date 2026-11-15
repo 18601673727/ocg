@@ -1,8 +1,13 @@
 "use client";
 
+import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactElement } from "react";
 import { MessageSquare, Search, X } from "lucide-react";
-import { type ReactElement, useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import { cn } from "@/lib/utils";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
 import {
   Dialog,
   DialogClose,
@@ -12,21 +17,16 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Skeleton } from "@/components/ui/skeleton";
-import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
-import { cn } from "@/lib/utils";
-import { useI18n } from "../i18n";
-import { SELECTED_ROW } from "../primitives/selection";
-import type { ApiClient } from "../runtime/api-client";
 import type { ChatSession } from "../types";
+import { useI18n } from "../i18n";
+import type { ApiClient } from "../runtime/api-client";
 import {
   appendSearchResults,
   conversationSearchMatches,
   type SearchConversation,
   type SearchMatch,
 } from "./conversation-search-results";
+import { SELECTED_ROW } from "../primitives/selection";
 
 export type ConversationSearchProps = {
   trigger: ReactElement;
@@ -97,7 +97,6 @@ export function ConversationSearch({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [open, changeOpen]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Changing attempt explicitly retries this operation.
   useEffect(() => {
     if (!open || !api || !needle) return;
     let cancelled = false;
@@ -270,7 +269,7 @@ export function ConversationSearch({
               </Button>
             </div>
           )}
-          <div
+          <ul
             id={listId}
             aria-busy={loading}
             role="listbox"
@@ -281,32 +280,33 @@ export function ConversationSearch({
               const active = session.id === activeSessionId;
               const highlighted = index === highlightedIndex;
               return (
-                <button
-                  key={session.id}
-                  id={`${listId}-option-${index}`}
-                  type="button"
-                  role="option"
-                  tabIndex={-1}
-                  aria-selected={highlighted}
-                  aria-current={active ? "page" : undefined}
-                  onClick={() => select(session)}
-                  className={cn(
-                    "flex w-full min-w-0 items-center gap-2 rounded-md border border-transparent px-2 py-2 text-left",
-                    TYPOGRAPHY_SCALE.body_sm,
-                    "transition-colors",
-                    highlighted || (active && highlightedIndex < 0)
-                      ? cn(SELECTED_ROW, "font-medium")
-                      : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
-                  )}
-                >
-                  <MessageSquare className="size-3.5 shrink-0" aria-hidden="true" />
-                  <span className="line-clamp-2 min-w-0 flex-1 break-words">
-                    {session.title || untitledLabel}
-                  </span>
-                </button>
+                <li key={session.id} role="presentation">
+                  <button
+                    id={`${listId}-option-${index}`}
+                    type="button"
+                    role="option"
+                    tabIndex={-1}
+                    aria-selected={highlighted}
+                    aria-current={active ? "page" : undefined}
+                    onClick={() => select(session)}
+                    className={cn(
+                      "flex w-full min-w-0 items-center gap-2 rounded-md border border-transparent px-2 py-2 text-left",
+                      TYPOGRAPHY_SCALE.body_sm,
+                      "transition-colors",
+                      highlighted || (active && highlightedIndex < 0)
+                        ? cn(SELECTED_ROW, "font-medium")
+                        : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                    )}
+                  >
+                    <MessageSquare className="size-3.5 shrink-0" aria-hidden="true" />
+                    <span className="line-clamp-2 min-w-0 flex-1 break-words">
+                      {session.title || untitledLabel}
+                    </span>
+                  </button>
+                </li>
               );
             })}
-          </div>
+          </ul>
           {matches.length === 0 &&
             !loading &&
             !failed &&
@@ -315,11 +315,7 @@ export function ConversationSearch({
               conversationList === "loading" ? (
                 <div className="flex flex-col gap-1 py-2">
                   {Array.from({ length: 5 }, (_, i) => (
-                    <Skeleton
-                      // biome-ignore lint/suspicious/noArrayIndexKey: Each skeleton represents a fixed placeholder position.
-                      key={`search-skeleton-${i}`}
-                      className="h-8 w-full rounded-md"
-                    />
+                    <Skeleton key={`search-skeleton-${i}`} className="h-8 w-full rounded-md" />
                   ))}
                 </div>
               ) : conversationList === "failed" ? (

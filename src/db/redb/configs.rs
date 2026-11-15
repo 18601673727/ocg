@@ -1,12 +1,25 @@
-use super::*;
-use crate::db::entities::*;
+use crate::db::entities::{
+    ConfigBody, ConfigId, ConfigKind, ConnectionConfig, DecisionModelConfig,
+    ExecutionConfiguration, ExecutionOperation, FrozenConfiguration, JobId, LlmTransport,
+    ModelConfig, RecordRef, Violation, valid_credential_ref,
+};
+use crate::db::redb::batch::{Batch, BatchError, Failure};
+use crate::db::redb::codec::{Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS};
+use crate::db::redb::reads;
+use crate::db::redb::reads::catalog::live_credential_refs;
+use crate::db::redb::rows::{ConfigRow, decode_project};
+use crate::db::redb::schema::{CONFIGS, CREDENTIALS, JOB_RUNTIME, META, PROJECTS};
+use crate::db::redb::state::JobRuntime;
+use ::redb::ReadableTable;
+use std::collections::BTreeSet;
 
 impl Batch {
     pub(crate) fn set_global_compaction_settings(
         &mut self,
         mut settings: crate::db::entities::GlobalCompactionSettings,
     ) -> Result<(), BatchError> {
-        let current = self.step(|tx| reads::global_compaction_settings(&tx.open_table(META)?))?;
+        let current =
+            self.step(|tx| reads::catalog::global_compaction_settings(&tx.open_table(META)?))?;
         if settings.revision != current.revision {
             return self.reject(Violation::InvalidValue(
                 "revision",
@@ -30,7 +43,7 @@ impl Batch {
     }
 
     fn provision_decision_executor(&mut self, model: ConfigId) -> Result<(), BatchError> {
-        use crate::db::entities::*;
+        use crate::db::entities::{ConfigBody, DecisionCapability, ExecutionOperation};
         let row = self.require_config(model)?;
         if !matches!(&row.body, ConfigBody::DecisionModel(body) if body.declared_capabilities.contains(&DecisionCapability::Choice))
         {
@@ -80,7 +93,8 @@ impl Batch {
         &mut self,
         id: ConfigId,
     ) -> Result<Option<crate::db::entities::ConfigRecord>, BatchError> {
-        self.config(id).map(|row| row.map(reads::config_record))
+        self.config(id)
+            .map(|row| row.map(reads::catalog::config_record))
     }
 
     pub(crate) fn require_config(&mut self, id: ConfigId) -> Result<ConfigRow, BatchError> {
@@ -452,46 +466,14 @@ impl Batch {
 
     fn purge_unused_credentials(&mut self) -> Result<(), BatchError> {
         self.step(|tx| {
-            let mut connection_refs = std::collections::BTreeMap::new();
-            let mut live_connections = std::collections::BTreeSet::new();
-            for entry in tx.open_table(CONFIGS)?.iter()? {
-                let (key, bytes) = entry?;
-                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
-                match &row.body {
-                    ConfigBody::Connection(connection) => {
-                        connection_refs.insert(
-                            row.id,
-                            connection
-                                .credential_refs()
-                                .map(str::to_owned)
-                                .collect::<Vec<_>>(),
-                        );
-                    }
-                    ConfigBody::Model(model) if row.archived_at.is_none() => {
-                        live_connections.insert(model.connection_id);
-                    }
-                    ConfigBody::DecisionModel(model) if row.archived_at.is_none() => {
-                        live_connections.insert(model.connection_id);
-                    }
-                    ConfigBody::Model(_)
-                    | ConfigBody::DecisionModel(_)
-                    | ConfigBody::Agent(_)
-                    | ConfigBody::DecisionAgent(_) => {}
-                }
-            }
-            let used_refs: std::collections::BTreeSet<&str> = live_connections
-                .iter()
-                .filter_map(|id| connection_refs.get(id))
-                .flatten()
-                .map(String::as_str)
-                .collect();
+            let used = live_credential_refs(tx)?;
             let mut credentials = tx.open_table(CREDENTIALS)?;
             let unused: Vec<String> = credentials
                 .iter()?
                 .map(|entry| entry.map(|(key, _)| key.value().to_owned()))
                 .collect::<Result<Vec<_>, _>>()?
                 .into_iter()
-                .filter(|reference| !used_refs.contains(reference.as_str()))
+                .filter(|reference| !used.contains(reference))
                 .collect();
             for reference in unused {
                 credentials.remove(reference.as_str())?;
@@ -1016,7 +998,7 @@ impl Batch {
             )?;
         }
         let mut settings =
-            self.step(|tx| reads::global_compaction_settings(&tx.open_table(META)?))?;
+            self.step(|tx| reads::catalog::global_compaction_settings(&tx.open_table(META)?))?;
         let before = settings.policy.clone();
         clear_policy(&mut settings.policy);
         if settings.policy != before {
@@ -1055,7 +1037,7 @@ impl Batch {
     pub(crate) fn global_headers(
         &mut self,
     ) -> Result<crate::db::entities::GlobalHeaders, BatchError> {
-        self.step(|tx| reads::global_outbound_headers(&tx.open_table(META)?))
+        self.step(|tx| reads::catalog::global_outbound_headers(&tx.open_table(META)?))
     }
 
     pub(crate) fn save_global_headers(
@@ -1101,7 +1083,8 @@ impl Batch {
         }
         let global = self.global_headers()?;
         crate::service::jobs::ConfigurationResolver::new(|id| {
-            self.config(id).map(|row| row.map(reads::config_record))
+            self.config(id)
+                .map(|row| row.map(reads::catalog::config_record))
         })
         .with_global_headers(global)
         .freeze_configuration(configuration)
@@ -1113,7 +1096,8 @@ impl Batch {
     ) -> Result<FrozenConfiguration, BatchError> {
         let global = self.global_headers()?;
         crate::service::jobs::ConfigurationResolver::new(|id| {
-            self.config(id).map(|row| row.map(reads::config_record))
+            self.config(id)
+                .map(|row| row.map(reads::catalog::config_record))
         })
         .with_global_headers(global)
         .freeze_configuration(configuration)

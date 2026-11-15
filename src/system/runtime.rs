@@ -1,11 +1,11 @@
 use std::future::Future;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use crate::api::v1::{ApiServer, ServerConfig};
 use crate::db::{DatabaseHandle, DatabaseWorker};
 use crate::system::data_directory::DataDirectory;
-use crate::system::log_cleanup;
-use crate::system::logger::RuntimeLogger;
+use crate::system::logger::{LogStore, RuntimeLogger};
 use crate::system::monitor::report_protection;
 use crate::system::policy::SystemPolicy;
 use crate::system::scheduler::{ExecutionRuntime, SchedulerHandle};
@@ -240,7 +240,8 @@ where
         scheduler: execution.scheduler(),
         api_address: None,
     };
-    let logger = match RuntimeLogger::start(handle.clone()) {
+    let logs = LogStore::new(handle.data_directory().logs_path());
+    let logger = match RuntimeLogger::start(handle.clone(), logs.clone()) {
         Ok(logger) => logger,
         Err(error) => {
             report.attempt::<(), _>(Phase::Logger, Err(error));
@@ -280,7 +281,7 @@ where
 
     crate::system::http::log_configuration();
     report.attempted.push(Phase::LogCleanup);
-    let cleanup = match log_cleanup::start_retention(&handle).await {
+    let cleanup = match crate::system::logger::start_retention(&handle, logs.clone()) {
         Ok(cleanup) => Some(cleanup),
         Err(error) => {
             log::error!("log retention did not start: {error}");
@@ -291,6 +292,7 @@ where
     serve_api(
         &mut report,
         context,
+        logs,
         server_config,
         workspace_tools,
         until_stopped,
@@ -319,6 +321,7 @@ where
 async fn serve_api<F>(
     report: &mut HostReport,
     mut context: HostContext,
+    logs: Arc<LogStore>,
     server_config: Option<ServerConfig>,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     until_stopped: impl FnOnce(HostContext) -> F,
@@ -329,9 +332,10 @@ async fn serve_api<F>(
         None => None,
         Some(config) => {
             report.attempted.push(Phase::ApiServer);
-            match ApiServer::start_with_workspace(
+            match ApiServer::start(
                 config,
                 context.database.clone(),
+                logs,
                 context.scheduler.clone(),
                 workspace_tools,
             ) {

@@ -1,7 +1,7 @@
 "use client";
 
-import { useAuiState } from "@assistant-ui/react";
 import { useEffect, useState } from "react";
+import { useAuiState } from "@assistant-ui/react";
 import { useShallow } from "zustand/react/shallow";
 
 const useFileSrc = (file: File | undefined) => {

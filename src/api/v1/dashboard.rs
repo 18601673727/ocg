@@ -3,8 +3,11 @@ use std::io::{Read, Seek, SeekFrom};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 
-use super::contracts::*;
-use super::*;
+use super::contracts::envelope;
+use super::{
+    INTERNAL, INVALID_REQUEST, JobId, NOT_FOUND, OUTPUT_TOO_LARGE, ProfileId, Refusal, Reply,
+    Shared, StatusCode, Value, catalog, decimal,
+};
 use crate::db::ObservationChange;
 use crate::db::entities::{
     AvailabilityClassification, LlmProviderId, ObservationCursor, ObservationFilter, RequestNumber,
@@ -833,7 +836,7 @@ pub(crate) struct LogsView {
 }
 
 pub(super) async fn logs(shared: &Shared, query: LogQuery) -> Result<Reply, Refusal> {
-    let directory = shared.database.log_directory().to_path_buf();
+    let directory = shared.logs.directory().to_path_buf();
     let value = ntex::rt::spawn_blocking(move || log_tail(&directory, query))
         .await
         .map_err(|_| INTERNAL)??;

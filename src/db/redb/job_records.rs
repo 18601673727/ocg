@@ -1,9 +1,29 @@
 use super::rows::encode_request_event;
-use super::*;
+use super::{StorageError, jobs, observations};
+use crate::db::entities::{
+    AttachmentId, AttachmentRecord, ConfigId, ContentDigest, DependencyCondition,
+    FrozenExecutionConfig, JobId, JobLifecycle, JobSpec, JobState, Origin, ProjectId,
+    ProjectRecord, RecordRef, RequestNumber, SubmissionKey, SubmissionRecord, Timestamp,
+    ToolEvidenceRecord,
+};
 use crate::db::entities::{
     ConfigBody, ConfigKind, ExecutionConfiguration, OutcomeKind, Submission, Violation,
 };
 use crate::db::entities::{RequestEventRecord, RequestPayload, ToolCallRef};
+use crate::db::redb::batch::{Batch, BatchError, Failure};
+use crate::db::redb::codec::Code;
+use crate::db::redb::rows::{
+    decode_attachment, decode_project, decode_project_root, decode_submission,
+    decode_tool_evidence, encode_attachment, encode_project, encode_tool_evidence, tool_call_key,
+};
+use crate::db::redb::schema::{
+    ATTACHMENTS, CHILDREN, CONVERSATIONS, DEPENDENCY_WAITERS, EXECUTORS, JOB_OBSERVATIONS,
+    JOB_OUTPUTS, JOB_RUNTIME, JOBS, LIVE_CHILDREN, MESSAGES, META, MUTABLE_READY, P_MAX, PENDING,
+    POOL_ALLOCATIONS, POOLS, PROJECTS, REQUEST_EVENTS, REQUEST_TIMELINE, SUBMISSIONS, TOOL_CALLS,
+    TURNS,
+};
+use crate::db::redb::{allocations, indexes, reads, reservations, rows, state};
+use ::redb::ReadableTable;
 use ::redb::ReadableTableMetadata;
 
 impl Batch {
@@ -91,8 +111,8 @@ impl Batch {
             );
         }
         if automatic.is_none() {
-            let (policy, _, _) =
-                self.step(|tx| reads::effective_context_policy(&tx.open_table(META)?))?;
+            let (policy, _) =
+                self.step(|tx| reads::catalog::effective_context_policy(&tx.open_table(META)?))?;
             let allowed_by_policy = policy.summarization_model == Some(model);
             let allowed_by_agent = match row.agent {
                 Some(agent_id) => match self.require_config_kind(agent_id, ConfigKind::Agent)?.body
@@ -187,7 +207,7 @@ impl Batch {
             }
         }
         let sealed = self.step(|tx| {
-            let tables = reads::NativeSummaryTables {
+            let tables = reads::execution_context::NativeSummaryTables {
                 jobs: tx.open_table(JOBS)?,
                 states: tx.open_table(JOB_RUNTIME)?,
                 allocations: tx.open_table(POOL_ALLOCATIONS)?,
@@ -197,14 +217,14 @@ impl Batch {
                 pools: tx.open_table(POOLS)?,
                 executors: tx.open_table(EXECUTORS)?,
             };
-            let mut summary_budget = reads::SummaryBudget {
+            let mut summary_budget = reads::execution_context::SummaryBudget {
                 bytes: 0,
                 outputs: 0,
             };
             let mut boundaries = Vec::new();
             let mut cursor = Some(through);
             while let Some(id) = cursor {
-                let (boundary, prev) = match reads::native_source_boundary(
+                let (boundary, prev) = match reads::execution_context::native_source_boundary(
                     &tables,
                     id,
                     conversation,
@@ -233,7 +253,7 @@ impl Batch {
                     .range((boundary.job.get(), 0)..=(boundary.job.get(), u32::MAX))?
                 {
                     let (key, val) = entry?;
-                    let out = crate::db::redb::decode_output(key.value(), val.value())?;
+                    let out = crate::db::redb::rows::decode_output(key.value(), val.value())?;
                     if let Some(t) = out.display_text() {
                         turn_text.push_str("Assistant: ");
                         turn_text.push_str(&t);
@@ -567,10 +587,10 @@ impl Batch {
     }
 
     pub(crate) fn group_head(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
-        self.step(|tx| reads::turn_head(&tx.open_table(TURNS)?, conversation))
+        self.step(|tx| reads::jobs::turn_head(&tx.open_table(TURNS)?, conversation))
     }
     pub(crate) fn active_job(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
-        self.step(|tx| Ok(reads::active_job_in(tx, conversation)?.map(|job| job.id)))
+        self.step(|tx| Ok(reads::jobs::active_job_in(tx, conversation)?.map(|job| job.id)))
     }
 
     pub(crate) fn live_children(&mut self, conversation: JobId) -> Result<Vec<JobId>, BatchError> {

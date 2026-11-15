@@ -1,7 +1,20 @@
-use super::*;
+use crate::db::entities::identity::JobId;
+use crate::db::entities::{ContentDigest, RequestNumber, Timestamp};
+use std::fmt;
 
 pub const MAX_STORED_TOOL_ARGUMENTS_BYTES: usize = 64 * 1024;
 pub const MAX_HANDLER_VERSION_BYTES: usize = 64;
+pub const MAX_FUNCTION_NAME_BYTES: usize = 64;
+pub const MAX_TOOL_CALL_ID_BYTES: usize = 256;
+pub const MAX_TOOL_DEFINITION_BYTES: usize = 64 * 1024;
+
+#[must_use]
+pub fn is_function_name(name: &str) -> bool {
+    (1..=MAX_FUNCTION_NAME_BYTES).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+}
 
 pub fn is_handler_version(version: &str) -> bool {
     !version.is_empty()
@@ -246,5 +259,43 @@ impl ToolEvidenceRecord {
             | ToolDecision::AwaitingApproval(_)
             | ToolDecision::AwaitingAnswer(_) => None,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolCallRefusal {
+    Malformed,
+    ConflictingIdentity,
+    AmbiguousIdentity,
+    LimitExceeded,
+    Incomplete,
+    Unauthorized,
+    MissingSchema,
+    UnsupportedSchema,
+    InvalidArguments,
+    NoDecider,
+}
+
+impl ToolCallRefusal {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Malformed => "malformed",
+            Self::ConflictingIdentity => "conflicting identity",
+            Self::AmbiguousIdentity => "ambiguous identity",
+            Self::LimitExceeded => "limit exceeded",
+            Self::Incomplete => "incomplete",
+            Self::Unauthorized => "unauthorized",
+            Self::MissingSchema => "missing parameter schema",
+            Self::UnsupportedSchema => "unsupported parameter schema",
+            Self::InvalidArguments => "invalid arguments",
+            Self::NoDecider => "no decider",
+        }
+    }
+}
+
+impl std::fmt::Display for ToolCallRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }

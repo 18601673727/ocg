@@ -1,4 +1,41 @@
-use super::*;
+use super::{
+    COMMAND_QUEUE_CAPACITY, COMPACTION_COOLDOWN, COMPACTION_MIN_FILE_BYTES,
+    COMPACTION_MIN_RECLAIMABLE_BYTES, COMPACTION_MIN_RECLAIMABLE_DIVISOR, GROUP_LIMIT,
+    MAINTENANCE_QUEUE_CAPACITY, ObservationChange, READ_QUEUE_CAPACITY, READ_WORKERS,
+    TRANSACTION_ALLOWANCE_BYTES, next_check_interval,
+};
+use crate::db::attachments::AttachmentStore;
+use crate::db::commands::{Envelope, Maintenance, Message, Reply};
+use crate::db::entities::{JobId, OperationId, OperationKind};
+use crate::db::errors::{
+    CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError, MaintenanceError,
+    OperationStatus, UnknownCause, operation_status,
+};
+use crate::db::redb::{
+    BatchError, BatchFailure, Commit, CompactFailure, OpenedFile, Probe, StorageError,
+    StorageErrorKind,
+};
+use crate::db::scheduler_wake::{
+    SchedulerWake, SchedulerWakeSubscription, affects_scheduling, releases_capacity,
+};
+use crate::db::shared::{
+    Admission, Opened, ReadMessage, ReadWorkerExit, ReleaseOnPanic, Shared, StagingBarrier,
+    flush_staged, serve_reads,
+};
+use crate::db::{entities, redb};
+use crate::system::data_directory::DataDirectory;
+use crate::system::monitor;
+use crate::system::monitor::{
+    FilesystemConfig, ProtectedArea, ProtectionCell, ProtectionLock, ProtectionReason,
+    RecoveryError, RecoveryReport, ReopenFailure, SpaceMeasurement, SpaceShortage,
+};
+use crate::system::policy::SystemPolicy;
+use ::redb::Database;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 pub(super) struct StorageFailure {
     pub(super) error: StorageError,
@@ -144,7 +181,6 @@ impl DatabaseWorker {
             .validate(&SystemPolicy::path(data_directory))
             .map_err(DatabaseError::StartupPolicy)?;
         let config = policy.filesystem_config;
-        let log_directory = data_directory.logs_path();
         let attachment_directory = data_directory.attachments_path();
         let directory = data_directory.database_path().to_path_buf();
         let data_directory = data_directory.clone();
@@ -235,13 +271,10 @@ impl DatabaseWorker {
                     catalog_changes: Default::default(),
                     observation_changes: Default::default(),
                     output_changes: Default::default(),
-                    log_changes: Default::default(),
                     scheduler_wake,
                     scheduler_subscription: std::sync::Mutex::new(Some(scheduler_subscription)),
                     active_policy: policy,
                     database_directory: directory.to_path_buf(),
-                    log_directory,
-                    log_files: Arc::new(crate::system::logger::LogFiles::default()),
                     admission: RwLock::new(Admission::Open),
                     update_paused: AtomicBool::new(false),
                     database: RwLock::new(Some(Opened { database, epoch })),

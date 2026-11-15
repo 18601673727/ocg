@@ -1,16 +1,29 @@
 use std::collections::BTreeSet;
 
-use super::*;
+use super::StorageError;
 use crate::db::entities::{
     AttachmentCleanup, AttachmentId, AttachmentOrigin, AttachmentRecord, AuthorizationBasis,
     CleanupKind, CommandOwner, CommandStatus, ConfigBody, ConfigId, ConfigKind, ConnectionConfig,
     ContentDigest, EffectConclusion, JobId, JobOutputId, JobOutputRecord, LlmParameters,
     LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason, ProjectCommand,
-    ProjectDecisionConfig, ProjectId, ProjectRecord, Recorded, RequestEventRecord,
-    RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord, Timestamp,
-    ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome,
-    ToolPayload, ToolReconciliation, UncertainCause, UsageFinality, WithheldReason,
+    ProjectDecisionConfig, ProjectId, ProjectRecord, Recorded, Recurrence, RecurrenceHalt,
+    RecurrencePhase, RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload,
+    SubmissionKey, SubmissionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
+    ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
+    UsageFinality, WithheldReason,
 };
+use crate::db::entities::{
+    ChatFinishReason, CredentialSecret, JobSpec, Origin, OutputKind, RequestEligibility,
+    ToolCallRefusal, valid_credential_ref,
+};
+use crate::db::redb::codec;
+use crate::db::redb::codec::TAG_RECURRENCE;
+use crate::db::redb::codec::{
+    Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_OUTPUT, TAG_PROJECT,
+    TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL,
+};
+use crate::db::redb::schema::{CREDENTIAL_KEY_FILE_NAME, FORMAT_VERSION, record_version_byte};
+use std::path::Path;
 
 fn check_table_key(table: &str, key: u128, embedded: u128) -> DecodeResult<()> {
     if key == embedded {
@@ -1002,4 +1015,51 @@ pub(crate) fn create_credential_key(
         .map_err(::redb::Error::Io)?;
     let _ = crate::system::data_directory::restrict_file(&key_path);
     Ok(key)
+}
+
+impl Recurrence {
+    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        let mut d = Dec::new(bytes, TAG_RECURRENCE)?;
+        let phase = match d.u8()? {
+            0 => RecurrencePhase::Active,
+            1 => RecurrencePhase::WaitingDue { due: d.i64()? },
+            2 => RecurrencePhase::Halted {
+                reason: d.code_with(RecurrenceHalt::from_code, |_| {
+                    StorageError::corrupted("invalid recurrence halt")
+                })?,
+            },
+            _ => return Err(StorageError::corrupted("invalid recurrence phase")),
+        };
+        let row = Self {
+            phase,
+            n: d.u64()?,
+            current_turn: JobId::new(d.u128()?),
+            previous_turn: d.ou128()?.map(JobId::new),
+            interval_s: d.u32()?,
+        };
+        d.end()?;
+        Ok(row)
+    }
+
+    pub(super) fn encode(&self) -> Vec<u8> {
+        let mut e = Enc::new(TAG_RECURRENCE);
+        match self.phase {
+            RecurrencePhase::Active => {
+                e.u8(0);
+            }
+            RecurrencePhase::WaitingDue { due } => {
+                e.u8(1);
+                e.i64(due);
+            }
+            RecurrencePhase::Halted { reason } => {
+                e.u8(2);
+                e.u8(reason.code());
+            }
+        }
+        e.u64(self.n);
+        e.u128(self.current_turn.get());
+        e.ou128(self.previous_turn.map(JobId::get));
+        e.u32(self.interval_s);
+        e.0
+    }
 }

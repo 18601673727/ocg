@@ -154,7 +154,10 @@ mod supported {
     use rustix::fs::{AtFlags, FileType, Mode, OFlags, RenameFlags};
     use rustix::io::Errno;
 
-    use super::*;
+    use super::{
+        Arc, ContentDigest, ContentPin, File, Path, Pins, Reclamation, STAGING_PREFIX, StoreError,
+        is_staging_name,
+    };
 
     const STAGING_ATTEMPTS: usize = 8;
 

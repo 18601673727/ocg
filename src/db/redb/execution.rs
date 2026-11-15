@@ -1,9 +1,24 @@
-use super::*;
+use super::{StorageError, TxRead, execution, jobs};
 use crate::db::entities::{
     AllocationPhase, DependencyState, ExecutionEvent, ExecutionEventKind, ExecutionSnapshot,
     JobClosing, MutableJobPhase, OutcomeCause, OutcomeRecord, PoolAllocation, ToolCallRef,
     UncertaintyReason,
 };
+use crate::db::entities::{
+    DependencyCondition, ExecutionHistoryItem, ExecutionHistoryPage, JobId, JobState, OutcomeKind,
+    RequestNumber, StopProof, Timestamp,
+};
+use crate::db::redb::batch::{Batch, BatchError};
+use crate::db::redb::codec::{Code, Dec, DecodeResult, Enc};
+use crate::db::redb::reads::read;
+use crate::db::redb::rows::tool_call_key;
+use crate::db::redb::schema::{
+    EXECUTION_COMMITS, JOB_EVENTS, JOB_INPUTS, JOB_OUTPUTS, JOBS, MAX_PAGE, REQUEST_EVENTS,
+    SEQUENCES, TOOL_CALLS,
+};
+use crate::db::redb::{allocations, reads};
+use ::redb::{Database, ReadTransaction, ReadableTable};
+use std::collections::BTreeSet;
 
 pub(super) const TAG_EXECUTION_EVENT: u8 = 55;
 pub(super) const EVENT_SEQUENCE_KEY: &str = "execution_event";
@@ -886,7 +901,7 @@ fn execution_job_visible(
     job: JobId,
     context: Option<crate::db::entities::ComposerContextId>,
 ) -> Result<bool, StorageError> {
-    if reads::read_conversation_row(rx, job)?.is_some() {
+    if reads::jobs::read_conversation_row(rx, job)?.is_some() {
         return Ok(true);
     }
     let jobs = rx.open_table(JOBS)?;

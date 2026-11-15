@@ -497,7 +497,7 @@ fn offer_mismatch(
     }
 }
 
-fn has_usage_counts(usage: &providers::openai_compatible::NormalizedUsage) -> bool {
+fn has_usage_counts(usage: &crate::db::entities::NormalizedUsage) -> bool {
     [
         usage.input_tokens,
         usage.output_tokens,
@@ -746,7 +746,7 @@ enum DevelopmentSettlement {
         message: String,
     },
     Refused {
-        failure: Box<crate::service::ai::providers::openai_compatible::ProviderFailure>,
+        failure: Box<crate::db::entities::ProviderFailure>,
         observation: crate::db::entities::AvailabilityObservation,
     },
     Held(crate::db::entities::UncertaintyReason),

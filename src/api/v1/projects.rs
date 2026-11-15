@@ -1,4 +1,4 @@
-use super::contracts::*;
+use super::contracts::envelope;
 use ntex::http::StatusCode;
 use serde::Deserialize;
 

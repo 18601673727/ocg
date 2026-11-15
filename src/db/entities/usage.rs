@@ -1,4 +1,5 @@
-use super::{JobId, MetricsId, MetricsRecord, MixedRequests, RequestNumber, RequestRef, Timestamp};
+use crate::db::entities::identity::{JobId, MetricsId};
+use crate::db::entities::{MetricsRecord, MixedRequests, RequestNumber, RequestRef, Timestamp};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestEligibility {
@@ -245,35 +246,6 @@ impl TokenRequestSample {
             evidence.add(observation)?;
         }
         Ok(evidence.sample())
-    }
-
-    pub fn per_request<'a>(
-        records: impl IntoIterator<Item = &'a MetricsRecord>,
-    ) -> Result<Vec<Self>, TokenEvidenceError> {
-        let mut requests: std::collections::BTreeMap<RequestRef, TokenEvidence> =
-            std::collections::BTreeMap::new();
-        for observation in records
-            .into_iter()
-            .filter_map(TokenObservation::from_record)
-        {
-            let request = RequestRef {
-                job: observation.metrics.job,
-                request: observation.metrics.request,
-            };
-            if let Some((first, _)) = requests.first_key_value()
-                && first.job != request.job
-            {
-                return Err(TokenEvidenceError::MixedRequests(MixedRequests {
-                    first: *first,
-                    other: request,
-                }));
-            }
-            requests.entry(request).or_default().add(observation)?;
-        }
-        Ok(requests
-            .values()
-            .filter_map(TokenEvidence::sample)
-            .collect())
     }
 }
 

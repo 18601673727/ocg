@@ -1,25 +1,25 @@
 "use client";
 
-import { Check, Copy } from "lucide-react";
-import { type FormEvent, useCallback, useEffect, useState } from "react";
-import type { Project } from "@/components/ocg/contracts";
-import { Pill } from "@/components/ocg/primitives";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import type {
-  ApiClient,
-  ProjectCommand,
-  ProjectCreate,
-  ProjectUpdate,
-} from "@/components/ocg/runtime/api-client";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { Check, Copy } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import { Pill } from "@/components/ocg/primitives";
+import type { Project } from "@/components/ocg/contracts";
+import type {
+  ProjectCommand,
+  ProjectCreate,
+  ProjectUpdate,
+  ApiClient,
+} from "@/components/ocg/runtime/api-client";
+import { Section, describeError, refusalText } from "./settings-parts";
+import { useI18n, type I18nKey } from "../i18n";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import { type I18nKey, useI18n } from "../i18n";
-import { type CommandDraft, toCommandDrafts, toProjectCommands } from "./command-drafts";
+import { toCommandDrafts, toProjectCommands, type CommandDraft } from "./command-drafts";
 import { CommandEditor } from "./command-editor";
 import { ProjectDecisionConfigButton } from "./command-management";
-import { describeError, refusalText, Section } from "./settings-parts";
 
 const PROJECT_REFUSALS: Partial<Record<string, I18nKey>> = {
   project_root_invalid: "settings.projects.refusal.rootInvalid",

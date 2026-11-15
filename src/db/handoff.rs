@@ -1,4 +1,10 @@
-use super::*;
+use crate::db::entities;
+use crate::db::entities::{AttachmentId, Violation};
+use crate::db::errors::{DatabaseError, OperationStatus};
+use crate::db::redb::StorageErrorKind;
+use crate::db::shared::Shared;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 pub(crate) struct PreparedDevelopmentHandoff {
     pub(super) candidate: crate::db::entities::DevelopmentCandidate,

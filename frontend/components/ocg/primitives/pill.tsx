@@ -1,10 +1,10 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { BORDER_RADIUS, TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { cn } from "@/lib/utils";
 import { StatusDot } from "./status-dot";
-import { TEXT_TONE, TONE_CLASS, type Tone } from "./tone";
+import { TONE_CLASS, TEXT_TONE, type Tone } from "./tone";
+import { TYPOGRAPHY_SCALE, BORDER_RADIUS } from "@/lib/design-tokens";
 
 export function Pill({
   children,

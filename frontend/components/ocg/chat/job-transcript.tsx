@@ -1,25 +1,25 @@
 "use client";
 
-import { ChevronRight } from "lucide-react";
-import { useState } from "react";
-import {
-  estimateReasoningTokens,
-  ReasoningContent,
-  ReasoningRoot,
-  ReasoningTrigger,
-} from "@/components/assistant-ui/elements/reasoning";
-import type { ToolCall, ToolOutcomeKind } from "@/components/ocg/contracts";
-import { TEXT_TONE } from "@/components/ocg/primitives";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { useState } from "react";
+import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { type I18nKey, type TranslateFn, useI18n } from "../i18n";
-import { MarkdownBody } from "../markdown/markdown-body";
-import type { ApiClient } from "../runtime/api-client";
+import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { TEXT_TONE } from "@/components/ocg/primitives";
+import type { ToolCall, ToolOutcomeKind } from "@/components/ocg/contracts";
 import type { TranscriptTurn } from "./job-transcript-model";
+import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
 import { ToolActivityLabel } from "./tool-activity-label";
 import { formatToolJson, jobPlanTitles } from "./tool-activity-summary";
+import { MarkdownBody } from "../markdown/markdown-body";
+import type { ApiClient } from "../runtime/api-client";
 import { WorkspaceTool } from "./workspace-tool";
+import {
+  ReasoningRoot,
+  ReasoningTrigger,
+  ReasoningContent,
+  estimateReasoningTokens,
+} from "@/components/assistant-ui/elements/reasoning";
 
 const STATUS_NOTE: Partial<Record<TranscriptTurn["status"], I18nKey>> = {
   streaming: "transcript.status.streaming",
@@ -133,7 +133,6 @@ function TurnRow({
                     rel="noreferrer"
                     className="group relative block overflow-hidden rounded-md border border-border bg-background transition-shadow hover:shadow-md"
                   >
-                    {/* biome-ignore-start lint/performance/noImgElement: The image loads directly to preserve browser URL and sizing behavior. */}
                     {/* eslint-disable-next-line @next/next/no-img-element */}
                     <img
                       src={url}
@@ -141,7 +140,6 @@ function TurnRow({
                       className="max-h-48 max-w-xs rounded object-contain"
                       loading="lazy"
                     />
-                    {/* biome-ignore-end lint/performance/noImgElement: End of the direct image. */}
                     <span className="absolute bottom-1 right-1 rounded bg-background/80 px-1 py-0.5 font-mono text-[10px] text-muted-foreground">
                       {id}
                     </span>

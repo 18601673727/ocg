@@ -1,7 +1,7 @@
 "use client";
 
 import { useI18n } from "../i18n";
-import { type ToolActivity, toolActivityLabels } from "./tool-activity-summary";
+import { toolActivityLabels, type ToolActivity } from "./tool-activity-summary";
 
 export function ToolActivityLabel({ tools }: { tools: readonly ToolActivity[] }) {
   const { t, locale } = useI18n();

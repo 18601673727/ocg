@@ -1,6 +1,6 @@
 "use client";
 
-import { type CSSProperties, type ReactNode, useRef, useState } from "react";
+import { useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { cn } from "@/lib/utils";
 
 const MARQUEE_FADE_PX = 16;
@@ -13,7 +13,6 @@ export function HoverMarquee({ children, className }: { children: ReactNode; cla
   const [marquee, setMarquee] = useState<{ shift: number; duration: number } | null>(null);
 
   return (
-    // biome-ignore lint/a11y/noStaticElementInteractions: Hover animates a label without adding an action.
     <span
       ref={viewportRef}
       className={cn(

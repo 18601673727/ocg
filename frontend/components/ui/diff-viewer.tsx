@@ -1,10 +1,10 @@
 "use client";
 
+import { type ComponentProps, useId, useMemo, useState } from "react";
 import { cva, type VariantProps } from "class-variance-authority";
 import { diffLines } from "diff";
 import { CheckIcon, CopyIcon } from "lucide-react";
 import parseDiff from "parse-diff";
-import { type ComponentProps, useId, useMemo, useState } from "react";
 
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { cn } from "@/lib/utils";
@@ -163,19 +163,19 @@ function pairLinesForSplit(lines: ParsedLine[]): SplitLinePair[] {
   let i = 0;
 
   while (i < lines.length) {
-    const line = lines[i];
+    const line = lines[i]!;
     if (line.type === "normal") {
       pairs.push({ left: line, right: line });
       i++;
     } else if (line.type === "del") {
       const deletions: ParsedLine[] = [];
-      while (lines[i]?.type === "del") {
-        deletions.push(lines[i]);
+      while (i < lines.length && lines[i]!.type === "del") {
+        deletions.push(lines[i]!);
         i++;
       }
       const additions: ParsedLine[] = [];
-      while (lines[i]?.type === "add") {
-        additions.push(lines[i]);
+      while (i < lines.length && lines[i]!.type === "add") {
+        additions.push(lines[i]!);
         i++;
       }
       const maxLen = Math.max(deletions.length, additions.length);
@@ -511,22 +511,20 @@ function DiffViewerFileContent({
       />
       <DiffViewerContent id={contentId} className="py-2">
         {viewMode === "split"
-          ? splitLinePairs.slice(0, visibleLineCount).map((pair, pairIndex) => (
-              <DiffViewerSplitLine
-                // biome-ignore lint/suspicious/noArrayIndexKey: Positions identify rows in this diff, including repeated markers.
-                key={pairIndex}
-                pair={pair}
-                showLineNumbers={showLineNumbers}
-              />
-            ))
-          : file.lines.slice(0, visibleLineCount).map((line, lineIndex) => (
-              <DiffViewerLine
-                // biome-ignore lint/suspicious/noArrayIndexKey: Positions identify rows in this diff, including repeated markers.
-                key={lineIndex}
-                line={line}
-                showLineNumbers={showLineNumbers}
-              />
-            ))}
+          ? splitLinePairs
+              .slice(0, visibleLineCount)
+              .map((pair, pairIndex) => (
+                <DiffViewerSplitLine
+                  key={pairIndex}
+                  pair={pair}
+                  showLineNumbers={showLineNumbers}
+                />
+              ))
+          : file.lines
+              .slice(0, visibleLineCount)
+              .map((line, lineIndex) => (
+                <DiffViewerLine key={lineIndex} line={line} showLineNumbers={showLineNumbers} />
+              ))}
       </DiffViewerContent>
       {isCollapsible && (
         <div className="border-foreground/10 flex border-t px-3.5 py-1.5">
@@ -629,7 +627,7 @@ function DiffViewer({
     >
       {parsedFiles.map((file, fileIndex) => (
         <DiffViewerFileContent
-          key={JSON.stringify([file.oldName, file.newName])}
+          key={fileIndex}
           file={file}
           splitLinePairs={splitLinePairs[fileIndex] ?? []}
           viewMode={viewMode}
@@ -646,20 +644,20 @@ function DiffViewer({
 
 DiffViewer.displayName = "DiffViewer";
 
-export type { ParsedFile, ParsedLine, SplitLinePair };
+export type { ParsedLine, ParsedFile, SplitLinePair };
 
 export {
-  computeDiff,
   DiffViewer,
-  DiffViewerContent,
   DiffViewerFile,
-  DiffViewerFileBadge,
   DiffViewerHeader,
+  DiffViewerContent,
   DiffViewerLine,
   DiffViewerSplitLine,
+  DiffViewerFileBadge,
   DiffViewerStats,
-  diffLineTextVariants,
-  diffLineVariants,
   diffViewerVariants,
+  diffLineVariants,
+  diffLineTextVariants,
   parsePatch,
+  computeDiff,
 };

@@ -1,20 +1,69 @@
 use std::collections::HashMap;
 use std::ffi::OsStr;
+use std::fs;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::db::{DatabaseHandle, DatabaseStatus};
+use crate::system::notification::{Notifications, Subscription};
 
 pub const LOG_QUEUE_CAPACITY: usize = 256;
 pub const MAX_LOG_MESSAGE_BYTES: usize = 4000;
 pub const LOG_BUFFER_BYTES: usize = 64 * 1024;
 
-pub(crate) type LogFiles = Mutex<HashMap<PathBuf, Metadata>>;
+pub(crate) struct LogStore {
+    directory: PathBuf,
+    files: Mutex<HashMap<PathBuf, Metadata>>,
+    changes: Notifications,
+}
+
+impl LogStore {
+    pub(crate) fn new(directory: PathBuf) -> Arc<Self> {
+        Arc::new(Self {
+            directory,
+            files: Mutex::default(),
+            changes: Notifications::default(),
+        })
+    }
+
+    pub(crate) fn directory(&self) -> &Path {
+        &self.directory
+    }
+
+    pub(crate) fn subscribe(&self) -> Subscription {
+        self.changes.subscribe()
+    }
+
+    pub(crate) fn changed(&self) {
+        self.changes.publish();
+    }
+
+    pub(crate) fn is_open(&self, path: &Path) -> bool {
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(path)
+    }
+
+    fn opened(&self, path: PathBuf, meta: Metadata) {
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(path, meta);
+    }
+
+    fn closed(&self, path: &Path) {
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(path);
+    }
+}
 
 pub(crate) fn runtime_file_name(now: time::OffsetDateTime, sequence: u64) -> String {
     format!(
@@ -176,6 +225,7 @@ pub enum LoggerError {
 
 struct Shared {
     database: DatabaseHandle,
+    logs: Arc<LogStore>,
     config: LoggerConfig,
     accepting: AtomicBool,
     last_failure: Mutex<Option<Arc<LoggerFailure>>>,
@@ -243,7 +293,10 @@ pub struct RuntimeLogger {
 }
 
 impl RuntimeLogger {
-    pub fn start(database: DatabaseHandle) -> Result<Self, LoggerError> {
+    pub(crate) fn start(
+        database: DatabaseHandle,
+        logs: Arc<LogStore>,
+    ) -> Result<Self, LoggerError> {
         if database.status() != DatabaseStatus::Open {
             return Err(LoggerError::DatabaseNotOpen);
         }
@@ -251,6 +304,7 @@ impl RuntimeLogger {
         config.validate().map_err(LoggerError::Configuration)?;
         let shared = Arc::new(Shared {
             database,
+            logs,
             config,
             accepting: AtomicBool::new(true),
             last_failure: Mutex::new(None),
@@ -306,15 +360,12 @@ struct ActiveFile {
     path: PathBuf,
     file: File,
     size: u64,
-    log_files: Arc<LogFiles>,
+    logs: Arc<LogStore>,
 }
 
 impl Drop for ActiveFile {
     fn drop(&mut self) {
-        self.log_files
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&self.path);
+        self.logs.closed(&self.path);
     }
 }
 
@@ -450,7 +501,7 @@ impl Worker {
     }
 
     fn open_next_file(&mut self) -> bool {
-        let dir = self.shared.database.log_directory().to_path_buf();
+        let dir = self.shared.logs.directory().to_path_buf();
         let now = time::OffsetDateTime::now_utc();
         let mut attempts = 0;
         let (path, file) = loop {
@@ -480,17 +531,125 @@ impl Worker {
                 return false;
             }
         };
-        let log_files = self.shared.database.log_files();
-        log_files
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(path.clone(), meta);
+        let logs = Arc::clone(&self.shared.logs);
+        logs.opened(path.clone(), meta);
         self.file = Some(ActiveFile {
             path,
             file,
             size: 0,
-            log_files,
+            logs,
         });
         true
+    }
+}
+
+pub const RETENTION_CHECK_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Debug, thiserror::Error)]
+pub enum CleanupError {
+    #[error("failed to start log cleanup worker: {0}")]
+    Spawn(#[source] io::Error),
+    #[error("log cleanup worker panicked")]
+    WorkerPanicked,
+}
+
+pub struct CoreLogCleanup {
+    stop: flume::Sender<()>,
+    thread: Option<JoinHandle<()>>,
+}
+
+pub(crate) fn start_retention(
+    database: &DatabaseHandle,
+    logs: Arc<LogStore>,
+) -> Result<CoreLogCleanup, CleanupError> {
+    let database = database.clone();
+    let (stop_tx, stop_rx) = flume::bounded(1);
+    let thread = std::thread::Builder::new()
+        .name("ocg-log-cleanup".to_owned())
+        .spawn(move || {
+            loop {
+                cleanup_expired(&database, &logs);
+                match stop_rx.recv_timeout(RETENTION_CHECK_INTERVAL) {
+                    Ok(()) | Err(flume::RecvTimeoutError::Disconnected) => break,
+                    Err(flume::RecvTimeoutError::Timeout) => {}
+                }
+            }
+        })
+        .map_err(CleanupError::Spawn)?;
+    Ok(CoreLogCleanup {
+        stop: stop_tx,
+        thread: Some(thread),
+    })
+}
+
+impl CoreLogCleanup {
+    pub fn shutdown(mut self) -> Result<(), CleanupError> {
+        let _ = self.stop.try_send(());
+        if let Some(thread) = self.thread.take() {
+            thread.join().map_err(|_| CleanupError::WorkerPanicked)?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for CoreLogCleanup {
+    fn drop(&mut self) {
+        let _ = self.stop.try_send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn cleanup_expired(database: &DatabaseHandle, logs: &LogStore) {
+    let policy = database.active_system_policy();
+    let Some(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(
+        u64::from(policy.logger_config.retention_days) * 86400,
+    )) else {
+        return;
+    };
+    let limit = policy
+        .filesystem_config
+        .cleanup_config
+        .max_log_files_per_run;
+    let Ok(entries) = fs::read_dir(logs.directory()) else {
+        return;
+    };
+    let mut deleted = 0u32;
+    for entry in entries.flatten() {
+        if deleted >= limit {
+            break;
+        }
+        if !is_runtime_file_name(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        if logs.is_open(&path) {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if meta.is_file() && meta.modified().is_ok_and(|m| m < cutoff) {
+            match fs::remove_file(&path) {
+                Ok(()) => deleted += 1,
+                Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
+                    database.activate_filesystem_protection(
+                        super::monitor::ProtectionReason::FilesystemWriteFailed {
+                            area: super::monitor::ProtectedArea::Logs,
+                            path,
+                            kind: error.kind(),
+                            os_error: error.raw_os_error(),
+                            detail: error.to_string(),
+                        },
+                    );
+                    break;
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    if deleted > 0 {
+        logs.changed();
     }
 }

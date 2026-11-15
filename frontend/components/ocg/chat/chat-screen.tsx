@@ -1,31 +1,31 @@
 "use client";
 
-import { useAuiState } from "@assistant-ui/react";
 import {
   createContext,
-  type FC,
-  type ReactNode,
-  useCallback,
   useContext,
   useEffect,
+  useCallback,
   useMemo,
   useState,
+  type FC,
+  type ReactNode,
 } from "react";
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
-import type { ChatModelSelection } from "../contracts";
-import { useI18n } from "../i18n";
-import { TaskStatus } from "../job/task-status";
+import { useAuiState } from "@assistant-ui/react";
 import { OcgAssistantProvider } from "../runtime/assistant-ui-provider";
-import { executionDetail, executionLabel } from "../runtime/job-status";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import type { ChatSession } from "../types";
-import { ConversationCardStrip, ConversationChildrenStrip } from "./chat-view";
-import { ContextTranscript } from "./context-transcript";
+import { ConversationChildrenStrip, ConversationCardStrip } from "./chat-view";
+import { WorkspaceToolFallback } from "./workspace-tool";
+import { TaskStatus } from "../job/task-status";
 import { ConversationArtifacts } from "./conversation-artifacts";
 import { FileChanges } from "./file-changes";
 import { readModelPreference, writeModelPreference } from "./model-preference";
-import { contextForSession, MutableComposer } from "./mutable-composer";
-import { WorkspaceToolFallback } from "./workspace-tool";
+import { useI18n } from "../i18n";
+import { executionDetail, executionLabel } from "../runtime/job-status";
+import type { ChatSession } from "../types";
+import type { ChatModelSelection } from "../contracts";
+import { ContextTranscript } from "./context-transcript";
+import { MutableComposer, contextForSession } from "./mutable-composer";
 
 export interface ChatScreenProps {
   session: ChatSession;
@@ -76,7 +76,8 @@ const ChatComposerSlot: FC = () => {
         setModel("error");
       });
     return () => abort.abort();
-  }, [api, sessionId, conversationId]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [api, sessionId]);
   if (!value) return null;
   if (model === "checking" || probedSession !== sessionId)
     return <p role="status">Checking Composer availability…</p>;

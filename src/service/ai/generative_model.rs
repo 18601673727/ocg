@@ -8,8 +8,7 @@ use serde_json::{Value, json};
 
 use super::providers::observe::{self, Redactor, bounded_body, classify_client_error, trim_ascii};
 use super::providers::openai_compatible::{
-    ChatConversation, ChatFinishReason, ChatMessage, ContentPartWire, ImageInput, InvalidToolCall,
-    NormalizedUsage, ProviderFailure, ToolCallAssembler,
+    ChatConversation, ChatMessage, ContentPartWire, ImageInput, InvalidToolCall, ToolCallAssembler,
 };
 use super::providers::usage::{self, reported_usage};
 use super::providers::{
@@ -19,6 +18,7 @@ use super::providers::{
     endpoint, incomplete_tool_calls, openai_compatible, rejected_failure, responses,
     unannounced_fact,
 };
+use crate::db::entities::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::db::entities::{FrozenExecutionConfig, IntermediateOutputKind, LlmParameters};
 use crate::system::http::{authorization, provider_client_for};
 

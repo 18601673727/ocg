@@ -1,5 +1,9 @@
-use super::*;
-use crate::system::data_directory::DataDirectory;
+use super::{
+    App, Arc, AtomicBool, AtomicUsize, DatabaseHandle, HttpServer, HttpServiceConfig, IoConfig,
+    Ipv4Addr, MAX_HEADERS, Ordering, SchedulerHandle, Seconds, Server, ServerConfig, Shared,
+    SharedCfg, SocketAddr, TcpListener, UI_VARIABLE, answer, assets, browser, submissions, web,
+};
+use crate::system::logger::LogStore;
 
 const STOP_TIMEOUT: Seconds = Seconds(5);
 
@@ -36,23 +40,10 @@ pub struct ApiServer {
 }
 
 impl ApiServer {
-    pub fn start(
+    pub(crate) fn start(
         config: ServerConfig,
         database: DatabaseHandle,
-        scheduler: SchedulerHandle,
-        data_directory: DataDirectory,
-    ) -> Result<Self, StartError> {
-        Self::start_with_workspace(
-            config,
-            database,
-            scheduler,
-            crate::system::executor::execution_runtime::WorkspaceTools::new(data_directory),
-        )
-    }
-
-    pub(crate) fn start_with_workspace(
-        config: ServerConfig,
-        database: DatabaseHandle,
+        logs: Arc<LogStore>,
         scheduler: SchedulerHandle,
         workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     ) -> Result<Self, StartError> {
@@ -74,6 +65,7 @@ impl ApiServer {
             })?);
         let shared = Arc::new(Shared {
             database,
+            logs,
             scheduler,
             submissions: submissions::Registry::default(),
             workspace_tools,

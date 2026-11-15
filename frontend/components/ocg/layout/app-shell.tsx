@@ -1,45 +1,46 @@
 "use client";
 
-import { ArrowLeft, PanelRight } from "lucide-react";
-import dynamic from "next/dynamic";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { FloatingIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
 import type * as Api from "@/components/ocg/contracts/api";
+
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import { useCallback, useEffect, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import { ArrowLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+import { FloatingIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
 import { cn } from "@/lib/utils";
-import {
-  ConversationErrorScope,
-  ConversationErrorsProvider,
-  useConversationErrors,
-} from "../chat/conversation-errors";
-import {
-  bindComposerContext,
-  confirmMutableComposerNavigation,
-  MUTABLE_CONTEXT_KEY,
-} from "../chat/mutable-composer";
-import { useI18n } from "../i18n";
-import { JobDetailsContext } from "../job/job-details-context";
-import { JobDetailsDialog } from "../job/job-details-dialog";
-import type { ApiClient } from "../runtime/api-client";
-import { useOcgRuntime } from "../runtime/runtime-context";
-import {
-  parseSettingsPath,
-  type SettingsSection,
-  settingsPath,
-} from "../settings/settings-sections";
 import { OcgSidebar } from "../sidebar/ocg-sidebar";
 import { OcgTopbar } from "../topbar/ocg-topbar";
+import { WorkspaceHome } from "./workspace-home";
+import { useOcgRuntime } from "../runtime/runtime-context";
+import {
+  MUTABLE_CONTEXT_KEY,
+  bindComposerContext,
+  confirmMutableComposerNavigation,
+} from "../chat/mutable-composer";
+import type { ApiClient } from "../runtime/api-client";
+import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
+import { useI18n } from "../i18n";
+import { PageTitleVisibilityContext } from "./page-title";
+import { JobDetailsContext } from "../job/job-details-context";
+import { JobDetailsDialog } from "../job/job-details-dialog";
+import {
+  ConversationErrorsProvider,
+  ConversationErrorScope,
+  useConversationErrors,
+} from "../chat/conversation-errors";
 import type { RuntimeStatus } from "../types";
 import {
   conversationAncestors,
   conversationPath,
   parseConversationPath,
 } from "./conversation-path";
-import { PageTitleVisibilityContext } from "./page-title";
-import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
-import { WorkspaceHome } from "./workspace-home";
+import {
+  parseSettingsPath,
+  settingsPath,
+  type SettingsSection,
+} from "../settings/settings-sections";
 
 function SurfaceLoading() {
   const { t } = useI18n();
@@ -224,7 +225,7 @@ function AppShellContent({
       const owner = status.sessionId ?? conversationKey;
       report?.(owner, status.detail);
     }
-  }, [runtime.snapshot.status, conversationKey, location.view, report]);
+  }, [runtime.snapshot.status, runtime.client, conversationKey, location.view, report, t]);
   const closeInspector = useCallback(() => {
     setInspectorOpen(false);
     requestAnimationFrame(() => document.getElementById("chat-inspector-toggle")?.focus());
@@ -261,11 +262,8 @@ function AppShellContent({
     return () => window.removeEventListener("popstate", pop);
   }, [runtime, sessionId, report]);
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Changing attempt explicitly retries this operation.
   useEffect(() => {
-    const job = location.job;
-    const openConversation = runtime.client.openConversation?.bind(runtime.client);
-    if (!job || location.view !== "chat" || !openConversation) return;
+    if (!location.job || location.view !== "chat" || !runtime.client.openConversation) return;
     let alive = true;
     void (async () => {
       const chain = await conversationAncestors(
@@ -273,14 +271,14 @@ function AppShellContent({
           listedConversations.current.has(id)
             ? Promise.resolve(id)
             : client.resolveConversation(id),
-        job,
+        location.job!,
       );
       if (location.chain && conversationPath(chain) !== conversationPath(location.chain))
         throw new Error(t("chat.child.invalidPath"));
       if (!alive) return;
-      const id = await openConversation(job);
+      const id = await runtime.client.openConversation!(location.job!);
       if (alive) {
-        transfer?.(job, id);
+        transfer?.(location.job!, id);
         setSessionId(id);
         setAncestors(chain);
         if (location.chain || chain.length > 1)
@@ -431,11 +429,12 @@ function AppShellContent({
       goDirect("chat");
     });
   }
-  const { retryConversations, renameSession, hideSession } = runtime.client;
   const sidebar = (
     <OcgSidebar
       conversationList={runtime.snapshot.conversationList}
-      onRetryConversations={retryConversations?.bind(runtime.client)}
+      onRetryConversations={
+        runtime.client.retryConversations ? () => runtime.client.retryConversations!() : undefined
+      }
       sessions={listedSessions}
       runningSessionIds={runningSessionIds}
       api={client}
@@ -448,7 +447,11 @@ function AppShellContent({
       onSelect={selectSession}
       onNewChat={() => void newChat()}
       onHome={goHome}
-      onRename={renameSession?.bind(runtime.client)}
+      onRename={
+        runtime.client.renameSession
+          ? (id, title) => runtime.client.renameSession!(id, title)
+          : undefined
+      }
       onRenameChild={async (conversation, title) => {
         const child = runtime.snapshot.sessions.find(
           (item) => item.conversationId === conversation,
@@ -460,10 +463,10 @@ function AppShellContent({
         }
       }}
       onHide={
-        hideSession
+        runtime.client.hideSession
           ? async (id) => {
               if (id === sessionId && !(await confirmMutableComposerNavigation())) return;
-              await hideSession.call(runtime.client, id);
+              await runtime.client.hideSession!(id);
               if (id === sessionId) {
                 setSessionId("");
                 goDirect("chat");
@@ -542,50 +545,52 @@ function AppShellContent({
                 )}
               >
                 {location.view === "chat" ? (
-                  opening ? (
-                    <p role="status" className="m-auto text-sm text-muted-foreground">
-                      {t("app.loadingConversation")}
-                    </p>
-                  ) : session ? (
-                    <div className="flex min-h-0 flex-1 flex-col">
-                      <ChatScreen
-                        key={session.id}
-                        onOpenConversation={(job) => void openNestedConversation(job)}
-                        backButton={
-                          ancestors.length > 1 ? (
-                            <FloatingIconButton
-                              type="button"
-                              tooltip={t("chat.child.back")}
-                              aria-label={t("chat.child.back")}
-                              onClick={() => {
-                                void confirmMutableComposerNavigation().then((allowed) => {
-                                  if (!allowed) return;
-                                  window.history.pushState(
-                                    null,
-                                    "",
-                                    conversationPath(ancestors.slice(0, -1)),
-                                  );
-                                  lastLocationUrl.current = window.location.href;
-                                  setSessionId("");
-                                  setLocation(currentLocation());
-                                });
-                              }}
-                            >
-                              <ArrowLeft />
-                            </FloatingIconButton>
-                          ) : undefined
-                        }
-                        session={session}
+                  <>
+                    {opening ? (
+                      <p role="status" className="m-auto text-sm text-muted-foreground">
+                        {t("app.loadingConversation")}
+                      </p>
+                    ) : session ? (
+                      <div className="flex min-h-0 flex-1 flex-col">
+                        <ChatScreen
+                          key={session.id}
+                          onOpenConversation={(job) => void openNestedConversation(job)}
+                          backButton={
+                            ancestors.length > 1 ? (
+                              <FloatingIconButton
+                                type="button"
+                                tooltip={t("chat.child.back")}
+                                aria-label={t("chat.child.back")}
+                                onClick={() => {
+                                  void confirmMutableComposerNavigation().then((allowed) => {
+                                    if (!allowed) return;
+                                    window.history.pushState(
+                                      null,
+                                      "",
+                                      conversationPath(ancestors.slice(0, -1)),
+                                    );
+                                    lastLocationUrl.current = window.location.href;
+                                    setSessionId("");
+                                    setLocation(currentLocation());
+                                  });
+                                }}
+                              >
+                                <ArrowLeft />
+                              </FloatingIconButton>
+                            ) : undefined
+                          }
+                          session={session}
+                        />
+                      </div>
+                    ) : (
+                      <WorkspaceHome
+                        sessions={listedSessions}
+                        onSelect={selectSession}
+                        onNewChat={() => void newChat()}
+                        onNavigate={go}
                       />
-                    </div>
-                  ) : (
-                    <WorkspaceHome
-                      sessions={listedSessions}
-                      onSelect={selectSession}
-                      onNewChat={() => void newChat()}
-                      onNavigate={go}
-                    />
-                  )
+                    )}
+                  </>
                 ) : null}
                 {location.view === "jobs" && (
                   <JobsSurface

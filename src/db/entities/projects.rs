@@ -1,4 +1,5 @@
-use super::*;
+use crate::db::entities::Timestamp;
+use crate::db::entities::identity::{ConfigId, JobId, ProjectId};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[serde(deny_unknown_fields)]

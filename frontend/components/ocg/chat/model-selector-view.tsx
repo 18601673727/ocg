@@ -1,8 +1,5 @@
 "use client";
 
-import { Popover } from "@base-ui/react/popover";
-import { ChevronDown, Cpu, Folder } from "lucide-react";
-import { useId } from "react";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import {
   Select,
@@ -11,6 +8,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { Popover } from "@base-ui/react/popover";
+import { ChevronDown, Cpu, Folder } from "lucide-react";
+import { useId } from "react";
 import { useI18n } from "../i18n";
 import { useConversationError } from "./conversation-errors";
 
@@ -63,11 +63,11 @@ export function ModelSelectorView({
 
   return (
     <div className="w-full min-w-0">
-      <p id={`${id}-status`} className="sr-only">
+      <p id={id + "-status"} className="sr-only">
         {status}
       </p>
       <fieldset
-        aria-describedby={`${id}-status`}
+        aria-describedby={id + "-status"}
         aria-busy={loading}
         className="flex min-w-0 items-center gap-1.5"
       >
@@ -163,7 +163,7 @@ export function ModelSelectorView({
                     </Select>
                   </label>
                   <div className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
-                    <label htmlFor={`${id}-model`}>{t("chat.model")}</label>
+                    <label htmlFor={id + "-model"}>{t("chat.model")}</label>
                     <Select
                       value={model.value}
                       items={
@@ -182,7 +182,7 @@ export function ModelSelectorView({
                       }}
                     >
                       <SelectTrigger
-                        id={`${id}-model`}
+                        id={id + "-model"}
                         aria-label={t("chat.model")}
                         className={selectClass}
                       >

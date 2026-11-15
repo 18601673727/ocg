@@ -1,5 +1,25 @@
-use super::*;
-use crate::db::entities::{ConfigId, DependencyState, OutcomeKind, ToolCallRef};
+use crate::db::derived::ActivityProjection;
+use crate::db::entities::{ConfigBody, ConfigId, DependencyState, OutcomeKind, ToolCallRef};
+use crate::db::entities::{
+    CursorPage, DependencyCondition, JobId, JobInputId, JobKind, JobLifecycle, JobOutputId,
+    JobOutputRecord, JobRecord, JobSearchPage, JobSpec, JobState, JobTree, JobUsage,
+    MutableConfiguration, MutableJobDetails, NativeJobItem, Origin, OutputKind, Recurrence,
+    RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
+};
+use crate::db::redb::approvals::approved_calls;
+use crate::db::redb::batch::Batch;
+use crate::db::redb::reads::conversations::{conversation_summary, conversation_tip};
+use crate::db::redb::reads::read;
+use crate::db::redb::rows::{ConfigRow, decode_output, decode_tool_evidence, tool_call_ref};
+use crate::db::redb::schema::{
+    ACTIVE_ALLOCATIONS, APPROVALS, CHILDREN, CONFIGS, CONVERSATIONS, JOB_OBSERVATIONS, JOB_OUTPUTS,
+    JOB_RUNTIME, JOBS, MAX_OBSERVATION_SCAN, MAX_PAGE, OPEN_APPROVALS, POOL_ALLOCATIONS,
+    RECURRENCES, REQUEST_EVENTS, RETRY_JOBS, TOOL_CALLS, TURNS,
+};
+use crate::db::redb::{StorageError, TxRead, allocations, rows, state};
+use crate::db::redb::{execution, observations};
+use ::redb::{Database, ReadTransaction, ReadableTable};
+use std::collections::BTreeMap;
 
 pub(crate) fn read_conversation_row(
     rx: &ReadTransaction,
@@ -878,4 +898,281 @@ pub(crate) fn tool_call_name(
 pub(crate) struct UsageIdentity {
     pub(crate) provider: u128,
     pub(crate) model: String,
+}
+
+pub(crate) fn read_mutable_job_details(
+    database: &Database,
+    id: JobId,
+    context: Option<crate::db::entities::ComposerContextId>,
+) -> Result<Option<MutableJobDetails>, StorageError> {
+    mutable_job_details_in(&read(database)?, id, context, true)
+}
+
+fn mutable_configuration_in(
+    rx: &ReadTransaction,
+    job: &crate::db::entities::MutableJob,
+) -> Result<Option<MutableConfiguration>, StorageError> {
+    let Some(selection) = job.input.configuration() else {
+        return Ok(None);
+    };
+    if let Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) = &job.frozen {
+        if frozen.llm.model.id.get() != selection.llm_profile.get()
+            || frozen.agent_ref.map(|agent| agent.id.get())
+                != selection.agent_profile.map(|agent| agent.get())
+        {
+            return Err(StorageError::corrupted(
+                "frozen Job configuration disagrees with input",
+            ));
+        }
+        return Ok(Some(MutableConfiguration {
+            selection,
+            model: frozen.llm.config.model.clone(),
+            context_window: frozen.llm.config.context_window,
+        }));
+    }
+    let row = rx
+        .open_table(CONFIGS)?
+        .get(selection.llm_profile.get())?
+        .map(|bytes| ConfigRow::decode_at(selection.llm_profile.get(), bytes.value()))
+        .transpose()?;
+    let Some(row) = row else {
+        if job.phase == crate::db::entities::MutableJobPhase::Unsubmitted {
+            return Ok(None);
+        }
+        return Err(StorageError::corrupted("queued Job model missing"));
+    };
+    let ConfigBody::Model(model) = row.body else {
+        if job.phase == crate::db::entities::MutableJobPhase::Unsubmitted {
+            return Ok(None);
+        }
+        return Err(StorageError::corrupted(
+            "queued Job model has the wrong kind",
+        ));
+    };
+    Ok(Some(MutableConfiguration {
+        selection,
+        model: model.model,
+        context_window: model.context_window,
+    }))
+}
+
+pub(super) fn unstarted_settlement_in(
+    rx: &ReadTransaction,
+    record: &crate::db::entities::MutableJobRecord,
+    allocation: Option<&crate::db::entities::PoolAllocation>,
+) -> Result<bool, StorageError> {
+    use crate::db::entities::MutableJobPhase;
+    if record.job.phase != MutableJobPhase::Queued
+        || allocation.is_some_and(|allocation| allocation.holds_capacity())
+    {
+        return Ok(false);
+    }
+    let invalid = || {
+        StorageError::corrupted(format!(
+            "{} has inconsistent unstarted settlement evidence",
+            record.job.id
+        ))
+    };
+    let Some(outcome) = &record.outcome else {
+        return if allocation.is_none() {
+            Ok(false)
+        } else {
+            Err(invalid())
+        };
+    };
+    match outcome.kind {
+        OutcomeKind::Unknown => return Ok(false),
+        OutcomeKind::Completed => return Err(invalid()),
+        OutcomeKind::Failed | OutcomeKind::Cancelled => {}
+    }
+    if allocation.is_none() && outcome.kind != OutcomeKind::Cancelled {
+        return Err(invalid());
+    }
+    if allocation.is_some_and(|allocation| {
+        allocation.token.job != record.job.id
+            || allocation.job_revision != record.job.revision
+            || allocation.started_at.is_some()
+    }) {
+        return Err(invalid());
+    }
+
+    let id = record.job.id.get();
+    for table in [REQUEST_EVENTS, TOOL_CALLS, APPROVALS] {
+        if rx
+            .open_table(table)?
+            .range((id, 0, 0)..=(id, u32::MAX, u32::MAX))?
+            .next()
+            .transpose()?
+            .is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    if rx
+        .open_table(JOB_OBSERVATIONS)?
+        .range((id, 0, 0)..=(id, u8::MAX, u128::MAX))?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(invalid());
+    }
+    let outputs = rx.open_table(JOB_OUTPUTS)?;
+    let mut rows = outputs.range((id, 0)..=(id, u32::MAX))?;
+    let output = rows
+        .next()
+        .transpose()?
+        .map(|(key, value)| decode_output(key.value(), value.value()))
+        .transpose()?;
+    if rows.next().transpose()?.is_some() {
+        return Err(invalid());
+    }
+    match (allocation, output) {
+        (None, None) => Ok(true),
+        (Some(_), Some(output))
+            if output.seq == 1
+                && output.kind == OutputKind::Result
+                && output.created_at == outcome.at
+                && output.goal_reached == Some(false)
+                && output.value.is_none() =>
+        {
+            Ok(true)
+        }
+        _ => Err(invalid()),
+    }
+}
+
+pub(crate) fn mutable_job_details_in(
+    rx: &ReadTransaction,
+    id: JobId,
+    context: Option<crate::db::entities::ComposerContextId>,
+    authorize: bool,
+) -> Result<Option<MutableJobDetails>, StorageError> {
+    use crate::db::entities::MutableJobPhase;
+    let Some(record) = mutable_job_record_in(rx, id)? else {
+        return Ok(None);
+    };
+    if authorize
+        && (context.is_some_and(|context| context != record.job.composer_context)
+            || (record.job.phase == MutableJobPhase::Unsubmitted && context.is_none()))
+    {
+        return Ok(None);
+    }
+    let allocation = rx
+        .open_table(POOL_ALLOCATIONS)?
+        .get(id.get())?
+        .map(|bytes| allocations::decode_pool_allocation(id.get(), bytes.value()))
+        .transpose()?;
+    let latest_output = rx
+        .open_table(JOB_OUTPUTS)?
+        .range((id.get(), 0)..=(id.get(), u32::MAX))?
+        .next_back()
+        .transpose()?
+        .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
+        .transpose()?;
+    let mut activity =
+        ActivityProjection::new_mutable(&record, allocation.as_ref(), latest_output.as_ref());
+    let result = latest_output.filter(|output| output.kind == OutputKind::Result);
+    let mut usage = JobUsage::default();
+    let mut events = Vec::new();
+    let mut scanned = 0;
+    for entry in rx
+        .open_table(REQUEST_EVENTS)?
+        .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
+        .rev()
+        .take(MAX_OBSERVATION_SCAN + 1)
+    {
+        if scanned == MAX_OBSERVATION_SCAN {
+            usage.truncated = true;
+            break;
+        }
+        let (key, bytes) = entry?;
+        let (_, request, seq) = key.value();
+        let request = RequestNumber::new(request)
+            .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?;
+        scanned += 1;
+        let event = super::rows::decode_request_event(id, request, seq, bytes.value())?;
+        activity.request_event(&event);
+        let seq = event.seq;
+        events.push(event);
+        if seq == 1 {
+            events.reverse();
+            if let Some(sample) = observations::usage_sample_of(id, request, None, &events) {
+                usage.add_sample(&sample);
+            }
+            events.clear();
+        }
+    }
+    for entry in rx
+        .open_table(TOOL_CALLS)?
+        .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
+        .rev()
+        .take(256)
+    {
+        let (key, bytes) = entry?;
+        let call = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
+        let awaiting_user = match &call.decision.fact {
+            crate::db::entities::ToolDecision::AwaitingAnswer(_)
+            | crate::db::entities::ToolDecision::AwaitingApproval(_) => rx
+                .open_table(OPEN_APPROVALS)?
+                .get((
+                    record.job.parent_id.get(),
+                    call.call.job.get(),
+                    call.call.request.get(),
+                    call.call.index,
+                ))?
+                .is_some(),
+            crate::db::entities::ToolDecision::Admitted(_)
+            | crate::db::entities::ToolDecision::Refused(_) => false,
+        };
+        activity.tool_call(call, awaiting_user);
+    }
+    let (activity, unknown_reason) = activity.finish_mutable(&record);
+    let unknown_reason = unknown_reason.or_else(|| {
+        (record
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+            && allocation
+                .as_ref()
+                .is_some_and(crate::db::entities::PoolAllocation::holds_capacity))
+        .then(|| {
+            let detail = match record.outcome.as_ref().and_then(|outcome| outcome.cause.as_ref()) {
+                Some(crate::db::entities::OutcomeCause::Uncertain(reason)) => {
+                    format!(" {}", reason.description())
+                }
+                Some(_) | None => String::new(),
+            };
+            format!(
+                "Execution outcome is uncertain. The Pool Allocation is retained and its capacity is not released until termination is confirmed.{detail}"
+            )
+        })
+    });
+    let configuration = mutable_configuration_in(rx, &record.job)?;
+    let unsupported_decision_history = if context.is_some() {
+        let job = &record.job;
+        let queued_generative = job.phase == MutableJobPhase::Queued
+            && record.outcome.is_none()
+            && matches!(
+                job.input.content,
+                crate::db::entities::MutableJobContent::Generative { .. }
+            );
+        Some(if queued_generative {
+            super::super::jobs::decision_predecessors(&rx.open_table(JOBS)?, job)?
+        } else {
+            Ok(false)
+        })
+    } else {
+        None
+    };
+    Ok(Some(MutableJobDetails {
+        record,
+        allocation,
+        result,
+        usage: (scanned != 0).then_some(usage),
+        activity,
+        unknown_reason,
+        configuration,
+        unsupported_decision_history,
+    }))
 }

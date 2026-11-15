@@ -1,4 +1,4 @@
-use super::*;
+use super::{Arc, AtomicBool, Mutex, Ordering, PoisonError, Poll, Waker, Weak};
 
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken(pub(super) Arc<Cancellation>);

@@ -1,16 +1,15 @@
 "use client";
 
+import type { ContextStatus } from "../contracts";
+
 import Link from "next/link";
+
 import { useEffect, useRef, useState } from "react";
+import { useOcgRuntime } from "../runtime/runtime-context";
+import type { DecisionAnswer, ProfilesSnapshot } from "../contracts";
+import { describeError, selectableLlmProfiles } from "../settings/settings-parts";
+import { useI18n } from "../i18n";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
   SelectContent,
@@ -18,11 +17,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ContextStatus, DecisionAnswer, ProfilesSnapshot } from "../contracts";
-import { useI18n } from "../i18n";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogDescription,
+} from "@/components/ui/dialog";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
-import { useOcgRuntime } from "../runtime/runtime-context";
-import { describeError, selectableLlmProfiles } from "../settings/settings-parts";
 
 type Status = ContextStatus;
 
@@ -108,17 +111,15 @@ export function ConversationContext({
   const [before, setBefore] = useState<string | null>(null);
   const request = useRef<{ model: string; key: string } | null>(null);
   const initialized = useRef(false);
-  // biome-ignore lint/correctness/useExhaustiveDependencies: This key explicitly refreshes the data.
   useEffect(() => {
     if (!api) return;
-    const client = api;
     const controller = new AbortController();
     let reading = false;
     async function tick() {
       if (reading) return;
       reading = true;
       try {
-        const state = await client.readContextStatus(conversation, { signal: controller.signal });
+        const state = await api!.readContextStatus(conversation, { signal: controller.signal });
         if (controller.signal.aborted) return;
         setStatus(state);
         if (!initialized.current) {
@@ -389,8 +390,7 @@ export function ConversationContext({
                           title={actionsSupported ? undefined : t("context.nativeUnsupported")}
                           onClick={() =>
                             void act(async () => {
-                              if (!api) throw new Error("API unavailable");
-                              await api.stopConversation(work.conversation);
+                              await api!.stopConversation(work.conversation);
                             })
                           }
                         >
@@ -407,8 +407,7 @@ export function ConversationContext({
                 disabled={busy}
                 onClick={() =>
                   void act(async () => {
-                    if (!api) throw new Error("API unavailable");
-                    const page = await api.readContextStatus(conversation, { before });
+                    const page = await api!.readContextStatus(conversation, { before });
                     if (page.next_before && page.next_before >= before)
                       throw new Error("Context cursor did not advance");
                     setOlder((items) => [...items, ...page.work]);

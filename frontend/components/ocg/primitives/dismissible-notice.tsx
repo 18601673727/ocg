@@ -1,10 +1,10 @@
 "use client";
 
+import { useEffect, useState, type ReactNode } from "react";
 import { X } from "lucide-react";
-import { type ReactNode, useEffect, useState } from "react";
-import { dismissNotice, isNoticeDismissed, noticeIdentity } from "@/lib/notice-dismissal";
 import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
+import { dismissNotice, isNoticeDismissed, noticeIdentity } from "@/lib/notice-dismissal";
 
 export function DismissibleNotice({
   message,

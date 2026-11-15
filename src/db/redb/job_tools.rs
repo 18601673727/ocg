@@ -1,10 +1,17 @@
-use super::*;
+use crate::db::entities::{
+    Actor, ApprovalDecision, ConfigId, ContentDigest, DependencyCondition, JobId, JobLimits,
+    Origin, ProfileId, ProjectId,
+};
 use crate::db::entities::{
     AllocationToken, ConfigBody, ConfigKind, DispatchSelection, ExecutionConfiguration,
     JobDependency, JobToolCall, MutableJob, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
     ToolEvidenceRecord, ToolOutcome, ToolPayload, Violation,
 };
+use crate::db::redb::batch::{Batch, BatchError};
+use crate::db::redb::job_tree;
+use crate::db::redb::schema::RECURRENCES;
 use serde_json::{Value, json};
+use std::collections::BTreeSet;
 
 pub(crate) struct JobToolApplied {
     pub(crate) value: Value,
@@ -656,12 +663,7 @@ impl Batch {
                             "profile": ProfileId::new(model.get()).to_string(),
                             "name": record.name,
                             "model": body.model,
-                            "declared_capabilities": body.declared_capabilities.iter().map(|capability| match capability {
-                                ModelCapability::Chat => "chat",
-                                ModelCapability::Tools => "tools",
-                                ModelCapability::Vision => "vision",
-                                ModelCapability::Reasoning => "reasoning",
-                            }).collect::<Vec<_>>(),
+                            "declared_capabilities": body.declared_capabilities.iter().map(|capability| capability.as_str()).collect::<Vec<_>>(),
                             "enabled": record.model_enabled,
                             "archived": record.archived_at.is_some(),
                         }),

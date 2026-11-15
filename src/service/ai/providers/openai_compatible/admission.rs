@@ -4,7 +4,8 @@ use jsonschema::Validator;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
 
-use super::stream::{InvalidToolCall, ToolCallRefusal};
+use super::stream::InvalidToolCall;
+use crate::db::entities::ToolCallRefusal;
 
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 const MAX_SCHEMA_DEPTH: usize = 32;

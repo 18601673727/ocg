@@ -1,17 +1,17 @@
 "use client";
 
-import type { FileMessagePartComponent } from "@assistant-ui/react";
+import { memo, type FC } from "react";
 import { cva, type VariantProps } from "class-variance-authority";
 import {
-  BracesIcon,
-  DownloadIcon,
   FileIcon,
   FileTextIcon,
   ImageIcon,
   MusicIcon,
   VideoIcon,
+  BracesIcon,
+  DownloadIcon,
 } from "lucide-react";
-import { type FC, memo } from "react";
+import type { FileMessagePartComponent } from "@assistant-ui/react";
 import { cn } from "@/lib/utils";
 import { AudioPlayer, VideoPlayer } from "./media-player";
 
@@ -353,16 +353,16 @@ File.Player = FilePlayer;
 
 export {
   File,
-  FileDownload,
+  FileRoot,
   FileIconDisplay,
   FileName,
-  FilePlayer,
-  FileRoot,
   FileSize,
+  FileDownload,
+  FilePlayer,
   fileVariants,
-  formatFileSize,
-  getBase64Size,
+  getMimeTypeIcon,
   getFileDataKind,
   getFileHref,
-  getMimeTypeIcon,
+  getBase64Size,
+  formatFileSize,
 };

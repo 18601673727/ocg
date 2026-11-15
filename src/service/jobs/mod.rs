@@ -1,8 +1,6 @@
 mod configuration;
-mod decision;
 
-pub(crate) use configuration::ConfigurationResolver;
-pub(crate) use decision::bind_prediction;
+pub(crate) use configuration::{ConfigurationResolver, bind_prediction};
 
 use crate::db::entities::{
     self, AttachmentId, DevelopmentCandidate, DevelopmentDecisionContext,

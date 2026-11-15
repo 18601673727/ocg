@@ -1,8 +1,33 @@
 "use client";
 
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useMemo, useRef, useState } from "react";
+
+import { Button } from "@/components/ui/button";
+import { TaskStatus } from "./task-status";
+import { ExecutionHistory } from "./execution-history";
+import {
+  EXECUTION_PHASE_KEYS,
+  executionDetail,
+  nativeExecutionStatus,
+  reconcileJob,
+} from "../runtime/job-status";
 import { JobTranscript } from "@/components/ocg/chat/job-transcript";
 import { jobTranscript, outputText } from "@/components/ocg/chat/job-transcript-model";
+import {
+  JOB_WATCH_RESIDENT_OUTPUTS,
+  JOB_WATCH_WINDOW_STEP,
+  hasEvictedOutputs,
+  mergeOutputWindow,
+} from "./output-window";
+import {
+  ApiError,
+  readTranscriptEvidence,
+  readOutputWindow,
+  type ApiClient,
+  type JobStreamEvent,
+  type JobStreamSubscription,
+} from "@/components/ocg/runtime/api-client";
 import {
   ContractError,
   type ExecutionPhase,
@@ -13,31 +38,7 @@ import {
   type ProviderResponse,
   type ToolCall,
 } from "@/components/ocg/contracts";
-import { type I18nKey, type TranslateFn, useI18n } from "@/components/ocg/i18n";
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import {
-  type ApiClient,
-  ApiError,
-  type JobStreamEvent,
-  type JobStreamSubscription,
-  readOutputWindow,
-  readTranscriptEvidence,
-} from "@/components/ocg/runtime/api-client";
-import { Button } from "@/components/ui/button";
-import {
-  EXECUTION_PHASE_KEYS,
-  executionDetail,
-  nativeExecutionStatus,
-  reconcileJob,
-} from "../runtime/job-status";
-import { ExecutionHistory } from "./execution-history";
-import {
-  hasEvictedOutputs,
-  JOB_WATCH_RESIDENT_OUTPUTS,
-  JOB_WATCH_WINDOW_STEP,
-  mergeOutputWindow,
-} from "./output-window";
-import { TaskStatus } from "./task-status";
+import { useI18n, type I18nKey, type TranslateFn } from "@/components/ocg/i18n";
 
 type StreamState = "loading" | "live" | "reconnecting" | "settled" | "stream_error" | "closed";
 
@@ -241,7 +242,6 @@ function JobWatchBody({
     replies: [] as ProviderResponse[],
   });
 
-  // biome-ignore lint/correctness/useExhaustiveDependencies: Changing the client or job cancels the previous requests.
   useEffect(
     () => () => {
       earlierLoad.current?.abort();

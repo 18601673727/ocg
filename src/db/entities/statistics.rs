@@ -1,4 +1,7 @@
-use super::*;
+use crate::db::entities::identity::{AvailabilityStatId, JobId, LlmProviderId, ProfileId};
+use crate::db::entities::{
+    ChatFinishReason, ConfigRef, LlmTarget, ProviderFailure, RequestNumber, RequestRef, Timestamp,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AvailabilityObservation {

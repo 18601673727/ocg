@@ -5,7 +5,8 @@ use std::collections::BTreeMap;
 
 use super::admission;
 use super::error::TransportError;
-use super::stream::{CompletedToolCall, InvalidToolCall, ToolCallRefusal};
+use super::stream::{CompletedToolCall, InvalidToolCall};
+use crate::db::entities::ToolCallRefusal;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatConversation {
@@ -28,7 +29,6 @@ pub struct ChatConversation {
 
 impl ChatConversation {
     pub fn validate(&self) -> Result<(), TransportError> {
-        const MAX_TOOLS: usize = 128;
         if self.messages.is_empty() {
             return Err(TransportError::unsupported(
                 "messages",
@@ -336,18 +336,7 @@ pub struct ToolWire {
 
 pub const MAX_TOOLS: usize = 128;
 pub const MAX_TOOL_CALLS: usize = 128;
-pub const MAX_FUNCTION_NAME_BYTES: usize = 64;
-pub const MAX_TOOL_CALL_ID_BYTES: usize = 256;
-pub const MAX_TOOL_DEFINITION_BYTES: usize = 64 * 1024;
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
-
-#[must_use]
-pub fn is_function_name(name: &str) -> bool {
-    (1..=MAX_FUNCTION_NAME_BYTES).contains(&name.len())
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

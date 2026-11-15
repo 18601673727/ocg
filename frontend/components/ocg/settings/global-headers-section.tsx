@@ -1,19 +1,19 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { GlobalOutboundHeaders } from "../contracts/api";
 import { useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
-import { type ApiClient, ApiError } from "../runtime/api-client";
+import { ApiError, type ApiClient } from "../runtime/api-client";
 import {
-  draftsToInputs,
-  globalHeaderDrafts,
   type HeaderDraft,
   type HeaderDraftError,
+  draftsToInputs,
+  globalHeaderDrafts,
 } from "./header-drafts";
 import { HeadersEditor } from "./headers-editor";
-import { describeError, Section } from "./settings-parts";
+import { Section, describeError } from "./settings-parts";
 
 export function GlobalHeadersSection({ client }: { client: ApiClient }) {
   const { t } = useI18n();
@@ -23,10 +23,10 @@ export function GlobalHeadersSection({ client }: { client: ApiClient }) {
   const [error, setError] = useState<string>();
   const [saved, setSaved] = useState(false);
   const [busy, setBusy] = useState(false);
-  const load = useCallback((value: GlobalOutboundHeaders) => {
+  const load = (value: GlobalOutboundHeaders) => {
     setSettings(value);
     setDrafts(globalHeaderDrafts(value));
-  }, []);
+  };
   useEffect(() => {
     const controller = new AbortController();
     void client.readGlobalOutboundHeaders(controller.signal).then(
@@ -38,7 +38,7 @@ export function GlobalHeadersSection({ client }: { client: ApiClient }) {
       },
     );
     return () => controller.abort();
-  }, [client, t, load]);
+  }, [client, t]);
   return (
     <Section
       id="settings-global-headers"

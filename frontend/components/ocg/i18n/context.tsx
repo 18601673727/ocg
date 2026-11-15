@@ -2,15 +2,15 @@
 
 import {
   createContext,
-  type ReactNode,
   useCallback,
   useContext,
   useEffect,
   useMemo,
   useState,
+  type ReactNode,
 } from "react";
-import { dictionaries, formatTemplate, type I18nKey } from "./dictionaries";
 import { DEFAULT_LOCALE, detectLocale, isLocale, LOCALE_STORAGE_KEY, type Locale } from "./locale";
+import { dictionaries, formatTemplate, type I18nKey } from "./dictionaries";
 
 export type TranslateVars = Record<string, string | number>;
 

@@ -1,4 +1,14 @@
-use super::*;
+use crate::db::derived::JobActivity;
+use crate::db::entities::identity::{
+    AttachmentId, ComposerContextId, ConfigId, ExecutorId, JobId, JobInputId, JobOutputId,
+    ProfileId, ProjectId,
+};
+use crate::db::entities::{
+    Actor, CompactionPolicy, ConfigRef, DecisionCapability, FrozenDecisionConfig,
+    FrozenExecutionConfig, JobLimits, JobUsage, NativeDecisionConfig, Origin, Recurrence,
+    RequestRef, StopProof, SummarizationWork, Timestamp,
+};
+use std::collections::BTreeSet;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IntermediateOutputKind {
@@ -688,14 +698,6 @@ impl JobRecord {
         self.completed_at.is_some() || self.failed_at.is_some() || self.cancelled_at.is_some()
     }
 
-    pub fn any_terminal(&self) -> bool {
-        self.confirmed_terminal() || self.unknown_at.is_some()
-    }
-
-    pub fn locally_stopped(&self) -> bool {
-        self.confirmed_terminal() || (self.unknown_at.is_some() && self.stop_confirmed_at.is_some())
-    }
-
     pub fn settled(&self) -> bool {
         self.subtree_settled
     }
@@ -721,7 +723,6 @@ pub enum OutcomeCause {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-#[allow(dead_code)]
 pub enum UncertaintyReason {
     LocalExecutionDropped,
     RequestPossiblySent,
@@ -1020,15 +1021,6 @@ pub enum JobKind {
 impl JobKind {
     pub fn is_group(&self) -> bool {
         matches!(self, Self::Group { .. })
-    }
-    pub fn is_persistent(&self) -> bool {
-        matches!(
-            self,
-            Self::Execution {
-                plan_source: PlanSource::Stored { .. },
-                ..
-            }
-        )
     }
     pub fn previous(&self) -> Option<JobId> {
         match self {

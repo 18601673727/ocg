@@ -1,4 +1,23 @@
-use super::*;
+use super::{MAX_OBSERVATION_SCAN, ObservationChange};
+use crate::db::attachments::{Reclamation, StoreError};
+use crate::db::commands::{Command, Envelope, InFlightCommand, Maintenance, Message, Reply};
+use crate::db::entities::{ContentDigest, JobId, OperationId, OperationKind};
+use crate::db::errors::{
+    CompactionOutcome, DatabaseError, DatabaseStatus, MaintenanceError, OperationStatus,
+    UnknownCause,
+};
+use crate::db::redb::QueueCounts;
+use crate::db::redb::StorageError;
+use crate::db::scheduler_wake::SchedulerWakeSubscription;
+use crate::db::shared::{Admission, Opened, ReadJob, ReadMessage, Shared, admitted};
+use crate::db::worker::{DatabaseHandle, run};
+use crate::db::{errors, redb};
+use crate::system::data_directory::DataDirectory;
+use crate::system::monitor::{ProtectionReason, ProtectionWatch};
+use crate::system::policy::SystemPolicy;
+use ::redb::Database;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, PoisonError};
 
 mod catalog;
 mod execution;
@@ -23,80 +42,6 @@ impl Drop for AttachmentPermit {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct Vitals {
-    pub database_bytes: Option<u64>,
-    pub available_bytes: Option<u64>,
-    pub durable_commits: u64,
-    pub commit_us_mean: Option<u64>,
-    pub commit_us_max: u64,
-    pub queue_pending: Option<u64>,
-    pub queue_ready: Option<u64>,
-    pub queue_delayed: Option<u64>,
-    pub queue_running: Option<u64>,
-    pub commands_waiting: u64,
-    pub rss_bytes: Option<u64>,
-    pub peak_rss_bytes: Option<u64>,
-}
-
-fn filesystem_vitals(directory: &std::path::Path) -> (Option<u64>, Option<u64>) {
-    let db_file = crate::db::redb::database_file(directory);
-    (
-        std::fs::metadata(&db_file)
-            .map(|metadata| metadata.len())
-            .ok(),
-        fs4::available_space(directory).ok(),
-    )
-}
-
-async fn filesystem_vitals_async(directory: std::path::PathBuf) -> (Option<u64>, Option<u64>) {
-    ntex::rt::spawn_blocking(move || filesystem_vitals(&directory))
-        .await
-        .unwrap_or((None, None))
-}
-
-fn process_memory() -> (Option<u64>, Option<u64>) {
-    let mut peak = None;
-    #[cfg(unix)]
-    {
-        let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut rusage) } == 0 {
-            #[cfg(target_os = "macos")]
-            {
-                peak = Some(rusage.ru_maxrss.max(0) as u64);
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                peak = Some((rusage.ru_maxrss.max(0) as u64).saturating_mul(1024));
-            }
-        }
-    }
-
-    #[allow(unused_mut)]
-    let mut current = None;
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-            for line in status.lines() {
-                if let Some(rest) = line.strip_prefix("VmRSS:") {
-                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
-                        current = Some(kb.saturating_mul(1024));
-                    }
-                }
-                if let Some(rest) = line.strip_prefix("VmHWM:") {
-                    let parts: Vec<&str> = rest.split_whitespace().collect();
-                    if let Some(kb) = parts.first().and_then(|s| s.parse::<u64>().ok()) {
-                        peak = Some(kb.saturating_mul(1024));
-                    }
-                }
-            }
-        }
-    }
-
-    (current, peak)
-}
-
 impl DatabaseHandle {
     pub(crate) fn wake_scheduler(&self) {
         self.shared.scheduler_wake.publish(false, true);
@@ -116,48 +61,22 @@ impl DatabaseHandle {
         self.shared.durable_commits.load(Ordering::SeqCst)
     }
 
-    pub async fn vitals(&self) -> Vitals {
-        let directory = self.shared.database_directory.clone();
-        let (database_bytes, available_bytes) = filesystem_vitals_async(directory).await;
-
-        let queue_counts = match self
-            .read(|database| redb::queue_counts(database, false))
-            .await
-        {
-            Ok(counts) => (
-                Some(counts.pending),
-                Some(counts.ready),
-                Some(counts.delayed),
-                Some(counts.running),
-            ),
-            Err(error) => {
-                log::debug!("failed to read database vitals queue counts: {error}");
-                (None, None, None, None)
-            }
-        };
-
-        let commands_waiting = self.sender.len() as u64;
-        let (rss_bytes, peak_rss_bytes) = process_memory();
-
+    pub fn commit_timing(&self) -> (Option<u64>, u64) {
         let durable_commits = self.shared.durable_commits.load(Ordering::Relaxed);
-        let commit_us_total = self.shared.commit_us_total.load(Ordering::Relaxed);
-        let commit_us_max = self.shared.commit_us_max.load(Ordering::Relaxed);
-        let commit_us_mean = commit_us_total.checked_div(durable_commits);
+        let total = self.shared.commit_us_total.load(Ordering::Relaxed);
+        (
+            total.checked_div(durable_commits),
+            self.shared.commit_us_max.load(Ordering::Relaxed),
+        )
+    }
 
-        Vitals {
-            database_bytes,
-            available_bytes,
-            durable_commits,
-            commit_us_mean,
-            commit_us_max,
-            queue_pending: queue_counts.0,
-            queue_ready: queue_counts.1,
-            queue_delayed: queue_counts.2,
-            queue_running: queue_counts.3,
-            commands_waiting,
-            rss_bytes,
-            peak_rss_bytes,
-        }
+    pub fn commands_waiting(&self) -> u64 {
+        self.sender.len() as u64
+    }
+
+    pub(crate) async fn queue_counts(&self) -> Result<QueueCounts, DatabaseError> {
+        self.read(|database| redb::queue_counts(database, false))
+            .await
     }
 
     pub(crate) fn take_scheduler_wake(&self) -> Option<SchedulerWakeSubscription> {
@@ -200,24 +119,8 @@ impl DatabaseHandle {
         self.shared.output_changes.subscribe(job.get())
     }
 
-    pub(crate) fn subscribe_logs(&self) -> crate::system::notification::Subscription {
-        self.shared.log_changes.subscribe()
-    }
-
-    pub(crate) fn logs_changed(&self) {
-        self.shared.log_changes.publish();
-    }
-
-    pub(crate) fn log_files(&self) -> Arc<crate::system::logger::LogFiles> {
-        self.shared.log_files.clone()
-    }
-
     pub(crate) fn data_directory(&self) -> DataDirectory {
         self.shared.data_directory.clone()
-    }
-
-    pub(crate) fn log_directory(&self) -> &std::path::Path {
-        &self.shared.log_directory
     }
 
     pub(crate) fn logging_protection_state(&self) -> (bool, u64) {

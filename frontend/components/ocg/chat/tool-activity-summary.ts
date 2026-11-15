@@ -121,10 +121,9 @@ export function toolActivitySummary(tools: readonly ToolActivity[]) {
     }
   }
   return {
-    categories: categories.flatMap((category) => {
-      const count = counts.get(category);
-      return count === undefined ? [] : [{ category, count }];
-    }),
+    categories: categories.flatMap((category) =>
+      counts.has(category) ? [{ category, count: counts.get(category)! }] : [],
+    ),
     tokens: Math.ceil(bytes / 3),
     truncated: tools.some((tool) => tool.truncated),
     durationMs: timed ? durationMs : null,

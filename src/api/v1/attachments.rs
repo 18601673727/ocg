@@ -1,4 +1,4 @@
-use super::contracts::*;
+use super::contracts::envelope;
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use ntex::http::StatusCode;

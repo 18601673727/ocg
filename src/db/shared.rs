@@ -1,4 +1,18 @@
-use super::*;
+use super::ObservationChange;
+use crate::db::attachments::{AttachmentStore, Reclamation, StoreError};
+use crate::db::commands::{Maintenance, Message};
+use crate::db::entities::{ContentDigest, OperationId};
+use crate::db::errors::{DatabaseError, MaintenanceError};
+use crate::db::redb;
+use crate::db::redb::{Probe, StorageError};
+use crate::db::scheduler_wake::{SchedulerWake, SchedulerWakeSubscription};
+use crate::system::data_directory::DataDirectory;
+use crate::system::monitor::{ProtectionCell, ProtectionLock};
+use crate::system::policy::SystemPolicy;
+use ::redb::Database;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, PoisonError, RwLock, RwLockWriteGuard};
 
 pub(super) type ReadJob = Box<dyn FnOnce(Result<&Opened, DatabaseError>) + Send>;
 
@@ -55,13 +69,10 @@ pub(super) struct Shared {
     pub(super) output_changes: crate::system::notification::KeyedNotifications<u128>,
     pub(super) catalog_changes: crate::system::notification::Notifications,
     pub(super) observation_changes: crate::system::notification::Journal<ObservationChange>,
-    pub(super) log_changes: crate::system::notification::Notifications,
     pub(super) scheduler_wake: SchedulerWake,
     pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
     pub(super) active_policy: SystemPolicy,
     pub(super) database_directory: PathBuf,
-    pub(super) log_directory: PathBuf,
-    pub(super) log_files: Arc<crate::system::logger::LogFiles>,
     pub(super) admission: RwLock<Admission>,
     pub(super) update_paused: AtomicBool,
     pub(super) database: RwLock<Option<Opened>>,

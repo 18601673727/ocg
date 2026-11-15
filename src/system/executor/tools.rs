@@ -8,11 +8,13 @@ use std::time::{Duration, Instant};
 use jsonschema::Validator;
 use serde_json::Value;
 
-use crate::db::entities::{JobId, ToolCallRef, ToolEffect, is_handler_version};
+use crate::db::entities::{
+    JobId, MAX_TOOL_DEFINITION_BYTES, ToolCallRef, ToolCallRefusal, ToolEffect, is_function_name,
+    is_handler_version,
+};
 use crate::service::ai::providers::openai_compatible::admission;
 use crate::service::ai::providers::openai_compatible::{
-    CompletedToolCall, FunctionDefinitionWire, InvalidToolCall, MAX_TOOL_DEFINITION_BYTES,
-    ToolCallRefusal, ToolWire, is_function_name,
+    CompletedToolCall, FunctionDefinitionWire, InvalidToolCall, ToolWire,
 };
 
 pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolFailure>> + 'a>>;

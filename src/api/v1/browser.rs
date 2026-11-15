@@ -1,4 +1,4 @@
-use super::contracts::*;
+use super::contracts::envelope;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};

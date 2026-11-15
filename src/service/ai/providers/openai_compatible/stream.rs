@@ -1,66 +1,12 @@
 use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 
-use super::request::{
-    MAX_FUNCTION_NAME_BYTES, MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_CALLS,
-    is_function_name,
+use crate::db::entities::{
+    ChatFinishReason, MAX_FUNCTION_NAME_BYTES, MAX_TOOL_CALL_ID_BYTES, NormalizedUsage,
+    ToolCallRefusal, is_function_name,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChatFinishReason {
-    Stop,
-    Length,
-    ToolCalls,
-    ContentFilter,
-    Error,
-    Other,
-}
-
-impl ChatFinishReason {
-    #[must_use]
-    pub fn as_openai_str(self) -> &'static str {
-        match self {
-            Self::Stop => "stop",
-            Self::Length => "length",
-            Self::ToolCalls => "tool_calls",
-            Self::ContentFilter => "content_filter",
-            Self::Error => "error",
-            Self::Other => "other",
-        }
-    }
-
-    #[must_use]
-    pub fn from_openai_str(raw: &str) -> Self {
-        match raw {
-            "stop" => Self::Stop,
-            "length" => Self::Length,
-            "tool_calls" => Self::ToolCalls,
-            "content_filter" => Self::ContentFilter,
-            "error" => Self::Error,
-            _ => Self::Other,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct NormalizedUsage {
-    pub input_tokens: Option<u32>,
-    pub output_tokens: Option<u32>,
-    pub cache_read_tokens: Option<u32>,
-    pub cache_write_tokens: Option<u32>,
-    pub reasoning_tokens: Option<u32>,
-    pub raw: Option<Value>,
-}
-
-impl NormalizedUsage {
-    #[must_use]
-    pub fn total_tokens(&self) -> Option<u32> {
-        match (self.input_tokens, self.output_tokens) {
-            (Some(input), Some(output)) => Some(input.saturating_add(output)),
-            _ => None,
-        }
-    }
-}
+use super::request::{MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALLS};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatStreamEvent {
@@ -110,44 +56,6 @@ pub struct CompletedToolCall {
     pub id: String,
     pub name: String,
     pub arguments: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolCallRefusal {
-    Malformed,
-    ConflictingIdentity,
-    AmbiguousIdentity,
-    LimitExceeded,
-    Incomplete,
-    Unauthorized,
-    MissingSchema,
-    UnsupportedSchema,
-    InvalidArguments,
-    NoDecider,
-}
-
-impl ToolCallRefusal {
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Malformed => "malformed",
-            Self::ConflictingIdentity => "conflicting identity",
-            Self::AmbiguousIdentity => "ambiguous identity",
-            Self::LimitExceeded => "limit exceeded",
-            Self::Incomplete => "incomplete",
-            Self::Unauthorized => "unauthorized",
-            Self::MissingSchema => "missing parameter schema",
-            Self::UnsupportedSchema => "unsupported parameter schema",
-            Self::InvalidArguments => "invalid arguments",
-            Self::NoDecider => "no decider",
-        }
-    }
-}
-
-impl std::fmt::Display for ToolCallRefusal {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

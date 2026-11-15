@@ -1,8 +1,26 @@
 use super::codec::TAG_APPROVAL;
-use super::*;
+use super::{StorageError, approvals};
+use crate::db::entities::{
+    Actor, Appended, ApprovalDecision, ApprovalRecord, JobId, Origin, OutcomeKind, RequestNumber,
+    ToolCallRefusal, ToolEffect, ToolEvidenceRecord,
+};
 use crate::db::entities::{
     ExecutionEventKind, MessageBody, Recorded, ToolCallRef, ToolDecision, ToolOutcome, Violation,
 };
+use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
+use crate::db::redb::codec::{Dec, DecodeResult, Enc};
+use crate::db::redb::reads::jobs::{read_conversation_row, read_state};
+use crate::db::redb::reads::read;
+use crate::db::redb::rows::{
+    decode_output, decode_project, decode_submission, decode_tool_evidence, encode_tool_evidence,
+    tool_call_key, tool_call_ref,
+};
+use crate::db::redb::schema::{
+    APPROVAL_CALLS, APPROVALS, JOB_OUTPUTS, LIVE_CHILDREN, OPEN_APPROVALS, PROJECTS, SUBMISSIONS,
+    TOOL_CALL_IDS, TOOL_CALLS, TOOL_STATS,
+};
+use ::redb::{Database, ReadTransaction, ReadableTable};
+use std::collections::BTreeSet;
 
 pub(super) fn open_key(conversation: JobId, call: ToolCallRef) -> (u128, u128, u32, u32) {
     (
@@ -246,7 +264,10 @@ impl Batch {
         call: &crate::db::entities::ToolEvidenceRecord,
         project: &crate::db::entities::ProjectRecord,
     ) -> Result<Option<crate::db::entities::CommandGrantInput>, BatchError> {
-        use crate::db::entities::*;
+        use crate::db::entities::{
+            CommandGrantInput, CommandOwner, CommandStatus, ProjectCommand,
+            validate_project_commands,
+        };
         let Some(admission) = call.decision.fact.stored_admission() else {
             return Ok(None);
         };
@@ -320,7 +341,7 @@ impl Batch {
         call: &crate::db::entities::ToolEvidenceRecord,
         conversation: JobId,
     ) -> Result<(), BatchError> {
-        use crate::db::entities::*;
+        use crate::db::entities::{CommandOwner, Violation, validate_project_commands};
         let Some(mut project) = self.command_project(conversation)? else {
             return Ok(());
         };
@@ -676,4 +697,179 @@ impl Batch {
         self.probe = Some(Probe::ToolOutcome(call));
         Ok(())
     }
+}
+
+pub(crate) fn approved_calls(
+    rx: &ReadTransaction,
+    conversation: JobId,
+) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
+    let mut calls = Vec::new();
+    let table = rx.open_table(TOOL_CALLS)?;
+    for entry in rx.open_table(OPEN_APPROVALS)?.range(
+        (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
+    )? {
+        let (key, state) = entry?;
+        if state.value() != 1 {
+            continue;
+        }
+        let (_, turn, request, index) = key.value();
+        let call = tool_call_ref((turn, request, index))?;
+        let bytes = table
+            .get(tool_call_key(call))?
+            .ok_or_else(|| StorageError::corrupted("approved call missing"))?;
+        calls.push(decode_tool_evidence(call, bytes.value())?);
+    }
+    Ok(calls)
+}
+
+fn question(arguments: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(arguments)
+        .ok()
+        .and_then(|v| {
+            v.get("question")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+fn approval_assessment(
+    rx: &ReadTransaction,
+    call: ToolCallRef,
+    project: Option<crate::db::entities::ProjectId>,
+) -> Result<Option<serde_json::Value>, StorageError> {
+    use crate::db::entities::{DecisionAnswer, DecisionOutcome, DecisionResult};
+    let Some(project) = project else {
+        return Ok(None);
+    };
+    let policy = rx
+        .open_table(PROJECTS)?
+        .get(project.get())?
+        .map(|bytes| decode_project(project.get(), bytes.value()))
+        .transpose()?
+        .ok_or_else(|| StorageError::corrupted("approval project missing"))?
+        .decision_policy();
+    if !policy.enabled {
+        return Ok(None);
+    }
+    let mut assessment = serde_json::json!({
+        "state": "unavailable", "confidence": null,
+        "minimum_confidence": f64::from(policy.minimum_confidence_millis) / 1000.0
+    });
+    let identity = approvals::command_assessment_identity(call)
+        .map_err(|_| StorageError::corrupted("invalid command assessment identity"))?;
+    let digest = identity.digest();
+    let Some(submission) = rx
+        .open_table(SUBMISSIONS)?
+        .get(digest.as_bytes().as_slice())?
+        .map(|bytes| decode_submission(digest.as_bytes(), bytes.value()))
+        .transpose()?
+    else {
+        return Ok(Some(assessment));
+    };
+    let state = read_state(rx, submission.job)?;
+    assessment["state"] = serde_json::json!(match state.outcome {
+        None => "pending",
+        Some(ref outcome) if outcome.kind == OutcomeKind::Completed => "completed",
+        Some(_) => "failed",
+    });
+    if let Some((key, bytes)) = rx
+        .open_table(JOB_OUTPUTS)?
+        .range((submission.job.get(), 0)..=(submission.job.get(), u32::MAX))?
+        .next_back()
+        .transpose()?
+    {
+        let output = decode_output(key.value(), bytes.value())?;
+        if let Some(result) = output
+            .value
+            .as_ref()
+            .and_then(|value| value.get("decision"))
+        {
+            let result: DecisionResult = serde_json::from_value(result.clone())
+                .map_err(|_| StorageError::corrupted("invalid command assessment result"))?;
+            if let DecisionOutcome::Answer {
+                answer: DecisionAnswer::Choice { confidence, .. },
+            } = result.outcome
+            {
+                assessment["confidence"] = confidence
+                    .map_or(serde_json::Value::Null, |confidence| {
+                        serde_json::json!(confidence.value)
+                    });
+            }
+        }
+    }
+    Ok(Some(assessment))
+}
+
+pub(crate) fn read_cards(
+    database: &Database,
+    root: JobId,
+) -> Result<Vec<serde_json::Value>, StorageError> {
+    use serde_json::json;
+    let rx = read(database)?;
+    let mut cards = Vec::new();
+    let mut pending = vec![root];
+    let mut seen = BTreeSet::new();
+    while let Some(conversation) = pending.pop() {
+        if !seen.insert(conversation) || seen.len() > 65 {
+            return Err(StorageError::corrupted(
+                "live conversation tree exceeds its bound",
+            ));
+        }
+        let row = read_conversation_row(&rx, conversation)?
+            .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
+        let (origin, project) = (row.origin, row.project);
+        let parent = row.parent_id.map(|id| id.to_string());
+        if origin != Origin::System {
+            for entry in rx.open_table(OPEN_APPROVALS)?.range(
+                (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
+            )? {
+                let (key, state) = entry?;
+                if state.value() != 0 {
+                    continue;
+                }
+                let (_, turn, request, index) = key.value();
+                let call = tool_call_ref((turn, request, index))?;
+                let table = rx.open_table(TOOL_CALLS)?;
+                let bytes = table
+                    .get(tool_call_key(call))?
+                    .ok_or_else(|| StorageError::corrupted("awaiting call missing"))?;
+                let call = decode_tool_evidence(call, bytes.value())?;
+                let arguments = call
+                    .decision
+                    .fact
+                    .stored_admission()
+                    .ok_or_else(|| StorageError::corrupted("awaiting admission missing"))?
+                    .arguments
+                    .as_str();
+                let mut card = json!({"kind": if matches!(call.decision.fact, crate::db::entities::ToolDecision::AwaitingAnswer(_)) { "question" } else { "approval" }, "conversation": conversation.to_string(), "parent":parent, "approval":[JobId::new(turn).to_string(),request,index], "tool":call.name});
+                if call.name == "job_dispatch" {
+                    card["kind"] = json!("dispatch");
+                    card["arguments"] = json!(arguments);
+                } else if matches!(
+                    call.decision.fact,
+                    crate::db::entities::ToolDecision::AwaitingAnswer(_)
+                ) {
+                    card["question"] = json!(question(arguments));
+                } else {
+                    card["arguments"] = json!(arguments);
+                    if matches!(
+                        call.name.as_str(),
+                        "workspace_request_command" | "workspace_run_command"
+                    ) && let Some(assessment) = approval_assessment(&rx, call.call, project)?
+                    {
+                        card["assessment"] = assessment;
+                    }
+                }
+                cards.push(card);
+            }
+        }
+        for entry in rx
+            .open_table(LIVE_CHILDREN)?
+            .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
+        {
+            pending.push(JobId::new(entry?.0.value().1));
+        }
+    }
+    Ok(cards)
 }

@@ -2,8 +2,8 @@ import type { Metadata, Viewport } from "next";
 import type { ReactNode } from "react";
 import "./globals.css";
 import "katex/dist/katex.min.css";
-import { THEME_BOOTSTRAP_SCRIPT } from "@/components/ocg/appearance/theme-bootstrap";
 import { ThemeProvider } from "@/components/ocg/appearance/theme-provider";
+import { THEME_BOOTSTRAP_SCRIPT } from "@/components/ocg/appearance/theme-bootstrap";
 import { I18nProvider, LOCALE_BOOTSTRAP_SCRIPT } from "@/components/ocg/i18n";
 
 export const metadata: Metadata = {
@@ -22,14 +22,8 @@ export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html lang="en-US" suppressHydrationWarning className="h-full font-sans antialiased">
       <head>
-        <script
-          // biome-ignore lint/security/noDangerouslySetInnerHtml: This script is a static application constant.
-          dangerouslySetInnerHTML={{ __html: THEME_BOOTSTRAP_SCRIPT }}
-        />
-        <script
-          // biome-ignore lint/security/noDangerouslySetInnerHtml: This script is a static application constant.
-          dangerouslySetInnerHTML={{ __html: LOCALE_BOOTSTRAP_SCRIPT }}
-        />
+        <script dangerouslySetInnerHTML={{ __html: THEME_BOOTSTRAP_SCRIPT }} />
+        <script dangerouslySetInnerHTML={{ __html: LOCALE_BOOTSTRAP_SCRIPT }} />
       </head>
       <body className="flex min-h-full flex-col">
         <ThemeProvider>

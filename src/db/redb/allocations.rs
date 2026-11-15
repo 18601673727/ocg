@@ -1,11 +1,26 @@
-use super::*;
-use crate::db::entities::*;
+use super::{StorageError, StorageErrorKind, TxRead};
+use crate::db::entities::{
+    AllocationExecutor, AllocationPhase, AllocationPool, ConfigBody, CursorPage,
+    ExecutionOperation, ExecutionPoolId, ExecutorId, JobId, LlmTransport, OutcomeKind,
+    PoolAllocationPage, PoolOccupancy, ProfileId, RecordRef, StopProof, UncertainAllocation,
+    Violation,
+};
+use crate::db::redb::batch::{Batch, BatchError, Failure, NativeResourceDelta};
+use crate::db::redb::codec::{Code, Dec, DecodeResult, Enc};
+use crate::db::redb::reads::jobs::mutable_job_record_in;
+use crate::db::redb::reads::read;
+use crate::db::redb::rows::ConfigRow;
+use crate::db::redb::schema::{
+    ACTIVE_ALLOCATIONS, CONFIGS, EXECUTORS, MAX_PAGE, POOL_ALLOCATIONS, POOL_EXECUTORS, POOLS,
+    SEQUENCES,
+};
+use ::redb::{Database, ReadableTable};
+use std::collections::BTreeSet;
 use std::ops::Bound;
 
 pub(super) const TAG_ALLOCATION_POOL: u8 = 40;
 pub(super) const TAG_ALLOCATION_EXECUTOR: u8 = 41;
 
-#[allow(dead_code)]
 pub(super) fn encode_allocation_pool(pool: &crate::db::entities::AllocationPool) -> Vec<u8> {
     let mut e = Enc::new(TAG_ALLOCATION_POOL);
     e.u128(pool.id.get());
@@ -17,7 +32,6 @@ pub(super) fn encode_allocation_pool(pool: &crate::db::entities::AllocationPool)
     e.0
 }
 
-#[allow(dead_code)]
 pub(super) fn decode_allocation_pool(
     key: u128,
     bytes: &[u8],
@@ -44,7 +58,6 @@ pub(super) fn decode_allocation_pool(
     })
 }
 
-#[allow(dead_code)]
 pub(super) fn encode_allocation_executor(
     executor: &crate::db::entities::AllocationExecutor,
 ) -> Vec<u8> {
@@ -63,7 +76,6 @@ pub(super) fn encode_allocation_executor(
     e.0
 }
 
-#[allow(dead_code)]
 pub(super) fn decode_allocation_executor(
     key: u128,
     bytes: &[u8],
@@ -107,7 +119,6 @@ pub(super) fn decode_allocation_executor(
     })
 }
 
-#[allow(dead_code)]
 pub(super) fn encode_pool_allocation(allocation: &crate::db::entities::PoolAllocation) -> Vec<u8> {
     use crate::db::entities::AllocationPhase;
     let mut e = Enc::new(42);
@@ -144,7 +155,6 @@ pub(super) fn encode_pool_allocation(allocation: &crate::db::entities::PoolAlloc
     e.0
 }
 
-#[allow(dead_code)]
 pub(super) fn decode_pool_allocation(
     key: u128,
     bytes: &[u8],
@@ -273,7 +283,6 @@ pub(super) fn active_allocations(
         .collect()
 }
 
-#[allow(dead_code)]
 pub(super) const STOPPED_BEFORE_START_CODE: &str = "stopped_before_start";
 pub(super) const STOPPED_BEFORE_START_SUMMARY: &str =
     "Stopped before it started. Nothing was sent to the Provider.";

@@ -1,32 +1,9 @@
 "use client";
 
-import { Monitor, Moon, Sun } from "lucide-react";
-import { type FormEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
-import type {
-  AgentCapability,
-  Capability,
-  LlmProfile,
-  ManagedAgentProfile,
-  ProfilesSnapshot,
-} from "@/components/ocg/contracts";
-import type { DecisionLimits } from "@/components/ocg/contracts/api";
-import { PageSurface, Pill, SELECTED_OPTION } from "@/components/ocg/primitives";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import {
-  type ApiClient,
-  ApiError,
-  isProfileConflict,
-  type ProfileWriteRequest,
-} from "@/components/ocg/runtime/api-client";
+import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { Monitor, Moon, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -36,28 +13,51 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import { PageSurface, Pill, SELECTED_OPTION } from "@/components/ocg/primitives";
+import type {
+  AgentCapability,
+  Capability,
+  LlmProfile,
+  ManagedAgentProfile,
+  ProfilesSnapshot,
+} from "@/components/ocg/contracts";
+import type { DecisionLimits as DecisionLimits } from "@/components/ocg/contracts/api";
+import {
+  ApiError,
+  isProfileConflict,
+  type ProfileWriteRequest,
+  type ApiClient,
+} from "@/components/ocg/runtime/api-client";
 import { cn } from "@/lib/utils";
-import { useTheme } from "../appearance/theme-provider";
-import { type I18nKey, LanguageSwitcher, useI18n } from "../i18n";
-import { ContentHeader } from "../layout/content-container";
-import { DecisionProfilesSection } from "./decision-profiles-section";
+import { Section, describeError } from "./settings-parts";
+import { ProjectsSection } from "./projects-section";
+import { ProviderModelImport } from "./provider-model-import";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { GlobalCompactionSection } from "./global-compaction-section";
 import { GlobalHeadersSection } from "./global-headers-section";
+import { HeadersEditor } from "./headers-editor";
 import {
-  draftsToInputs,
   type HeaderDraft,
   type HeaderDraftError,
+  draftsToInputs,
   headersToDrafts,
 } from "./header-drafts";
-import { HeadersEditor } from "./headers-editor";
-import { PoolsSection } from "./pools-section";
-import { ProjectsSection } from "./projects-section";
-import { type LlmProtocol, ProtocolSelect } from "./protocol-select";
-import { ProviderModelImport } from "./provider-model-import";
-import { SettingsNavigation } from "./settings-navigation";
-import { describeError, Section } from "./settings-parts";
-import type { SettingsSection } from "./settings-sections";
 import { UpdatesSection } from "./updates-section";
+import { DecisionProfilesSection } from "./decision-profiles-section";
+import { PoolsSection } from "./pools-section";
+import { useTheme } from "../appearance/theme-provider";
+import { LanguageSwitcher, useI18n, type I18nKey } from "../i18n";
+import { ContentHeader } from "../layout/content-container";
+import { SettingsNavigation } from "./settings-navigation";
+import type { SettingsSection } from "./settings-sections";
 
 const ALL_CAPABILITIES: readonly { value: Capability; labelKey: I18nKey }[] = [
   { value: "chat", labelKey: "settings.llm.capabilityChat" },
@@ -87,7 +87,7 @@ function ChoiceGroup<T extends string>({
   onChange: (value: T) => void;
 }) {
   return (
-    <fieldset className="flex flex-wrap gap-2" aria-label={label}>
+    <div className="flex flex-wrap gap-2" role="group" aria-label={label}>
       {options.map((option) => (
         <button
           key={option.value}
@@ -105,7 +105,7 @@ function ChoiceGroup<T extends string>({
           {option.label}
         </button>
       ))}
-    </fieldset>
+    </div>
   );
 }
 
@@ -1353,8 +1353,7 @@ export function SettingsSurface({
                           <div className="ocg-subtle-scrollbar max-h-80 min-w-0 overflow-y-auto overscroll-contain">
                             <ol className="p-2">
                               {assignedModels.map((id, index) => {
-                                const model = eligibleModels.find((model) => model.id === id);
-                                if (!model) return null;
+                                const model = eligibleModels.find((model) => model.id === id)!;
                                 return (
                                   <li
                                     key={id}

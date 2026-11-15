@@ -1,5 +1,10 @@
-use super::*;
+use crate::db::entities::identity::{JobId, RequestEventId};
+use crate::db::entities::{
+    AvailabilityStat, Measurements, RequestEligibility, RequestNumber, Timestamp, UsageFinality,
+    output_filter,
+};
 use serde_json::Value;
+use std::fmt;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -70,7 +75,14 @@ pub struct ContentDigest([u8; 32]);
 impl ContentDigest {
     #[must_use]
     pub fn of(bytes: &[u8]) -> Self {
-        let digest = aws_lc_rs::digest::digest(&aws_lc_rs::digest::SHA256, bytes);
+        let mut context = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+        context.update(bytes);
+        Self::finish(context)
+    }
+
+    #[must_use]
+    pub fn finish(context: aws_lc_rs::digest::Context) -> Self {
+        let digest = context.finish();
         Self(digest.as_ref().try_into().expect("SHA-256 has 32 bytes"))
     }
 
@@ -228,3 +240,81 @@ pub(crate) fn escaped_json_char_cost(character: char) -> usize {
         c => c.len_utf8(),
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatFinishReason {
+    Stop,
+    Length,
+    ToolCalls,
+    ContentFilter,
+    Error,
+    Other,
+}
+
+impl ChatFinishReason {
+    #[must_use]
+    pub fn as_openai_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::ToolCalls => "tool_calls",
+            Self::ContentFilter => "content_filter",
+            Self::Error => "error",
+            Self::Other => "other",
+        }
+    }
+
+    #[must_use]
+    pub fn from_openai_str(raw: &str) -> Self {
+        match raw {
+            "stop" => Self::Stop,
+            "length" => Self::Length,
+            "tool_calls" => Self::ToolCalls,
+            "content_filter" => Self::ContentFilter,
+            "error" => Self::Error,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct NormalizedUsage {
+    pub input_tokens: Option<u32>,
+    pub output_tokens: Option<u32>,
+    pub cache_read_tokens: Option<u32>,
+    pub cache_write_tokens: Option<u32>,
+    pub reasoning_tokens: Option<u32>,
+    pub raw: Option<Value>,
+}
+
+impl NormalizedUsage {
+    #[must_use]
+    pub fn total_tokens(&self) -> Option<u32> {
+        match (self.input_tokens, self.output_tokens) {
+            (Some(input), Some(output)) => Some(input.saturating_add(output)),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProviderFailure {
+    pub message: String,
+    pub status_code: Option<u16>,
+    pub provider_code: Option<String>,
+    pub response_body: Option<String>,
+    pub request_id: Option<String>,
+    pub retry_after_ms: Option<u64>,
+    pub retryable: bool,
+}
+
+impl fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.status_code {
+            Some(status) => write!(f, "HTTP {status}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+impl std::error::Error for ProviderFailure {}

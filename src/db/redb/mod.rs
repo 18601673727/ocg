@@ -1,67 +1,32 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
-
 use ::redb::{
-    CommitError, Database, Durability, Key, ReadOnlyTable, ReadTransaction, ReadableDatabase,
-    ReadableTable, Table, TableDefinition, TableError, Value, WriteTransaction,
+    CommitError, Key, ReadOnlyTable, ReadTransaction, ReadableTable, Table, TableDefinition,
+    TableError, Value, WriteTransaction,
 };
 
-use crate::db::entities::{
-    Actor, Appended, ApprovalDecision, ApprovalRecord, Entry, JobKind, JobLimits, Origin,
-    OutcomeKind, Recurrence, RecurrenceHalt, RecurrencePhase, StopProof,
-};
-use crate::db::entities::{
-    AgentCapability, AgentConfig, AttachmentId, AttachmentOrigin, AttachmentRecord,
-    AuthorizationBasis, CleanupKind, ConfigId, ConfigRef, ContentDigest, DependencyCondition,
-    EffectConclusion, ExecutionOperation, ExecutionPoolId, ExecutorId, FrozenExecutionConfig,
-    FrozenLlmConfig, JobId, JobInputId, JobOutputId, JobOutputRecord, JobRecord, LlmConfig,
-    LlmParameters, LlmProviderId, LlmTarget, LlmTransport, Measurements, MetricsId,
-    ModelCapability, OutputKind, ProfileId, ProjectId, ProjectRecord, ProviderSnapshot, RecordRef,
-    RequestEligibility, RequestNumber, SubmissionKey, SubmissionRecord, Timestamp, ToolEffect,
-    ToolEvidenceRecord, UncertainCause, WithheldReason,
-};
-use crate::service::ai::providers::openai_compatible::{
-    ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
-};
-
-use crate::db::entities::{
-    AgentModelConfig, ChildConversationEntry, ContextState, ContextWorkDetails, ContextWorkState,
-    ConversationEntry, ConversationsPage, CredentialSecret, CursorPage, DevelopmentCandidate,
-    DevelopmentContextTurn, DevelopmentDecisionContext, DevelopmentExecutionContext,
-    DevelopmentRetainedInput, ExecutionHistoryItem, ExecutionHistoryPage, JobSearchPage, JobTree,
-    MutableConfiguration, MutableConversationPage, MutableConversationTurn, MutableJobDetails,
-    NativeJobItem, ProfilePageRecord, ProfilePageRecords, ProviderResponse, ProviderResponsesPage,
-    TreeFacts, TreeNode, UsageRetriesPage, VerifiedNativeSummary, escaped_json_char_cost,
-    valid_credential_ref,
-};
-
-mod approvals;
+pub(crate) mod approvals;
+pub(crate) use approvals::read_cards;
 mod codec;
 pub(crate) mod execution;
 mod indexes;
 mod job_records;
 mod job_tools;
 pub(crate) use job_tools::JobToolApplied;
-mod job_tree;
-mod observations;
-mod reads;
-mod recovery;
-mod recurrences;
-mod rows;
-mod schema;
-mod state;
-use state::JobRuntime;
 mod allocations;
 mod batch;
 mod configs;
 mod execution_writes;
+mod job_tree;
 mod jobs;
+mod observations;
+pub(crate) mod reads;
+mod recovery;
 mod reservations;
+mod rows;
 mod scheduled_external;
+mod schema;
 mod settlement;
+mod state;
 
-use crate::db::entities::AvailabilityStatId;
-use allocations::*;
 pub(crate) use allocations::{
     NativeResourceCatalog, read_executors, read_native_resource_catalog, read_pool,
     read_pool_allocations, read_pools, read_uncertain_allocations,
@@ -71,20 +36,42 @@ pub(crate) use batch::{
     NativeResourceDelta, Probe, allocated_bytes, compact, persist_staged, probe_committed,
     run_batch_declinable, run_batch_with,
 };
-use codec::{
-    Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_GLOBAL_COMPACTION,
-    TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME, TAG_OUTPUT, TAG_PROJECT, TAG_REQUEST_EVENT,
-    TAG_SUBMISSION, TAG_TOOL_CALL, decode_scheduled_external_binding,
-    decode_scheduled_external_policy, encode_scheduled_external_binding,
-    encode_scheduled_external_policy,
+pub(crate) use reads::catalog::{
+    StoredCredential, credential_count, read_agent_model_configs, read_attachment,
+    read_attachments, read_config, read_configs, read_credential, read_credential_ref_in_use,
+    read_global_compaction_settings, read_global_outbound_headers, read_handoff_credential,
+    read_profile_page, read_project, read_projects, read_submission,
 };
-use jobs::*;
-pub(crate) use reservations::queue_counts;
-use reservations::*;
+pub(crate) use reads::check_readable;
+pub(crate) use reads::conversations::{
+    read_context_state, read_conversation_children, read_conversation_limits,
+    read_conversation_search, read_conversations, read_mutable_conversation_turn_page,
+};
+pub(crate) use reads::execution_context::{read_development_execution_context, read_trial_job};
+pub(crate) use reads::jobs::{
+    read_children, read_job, read_job_search, read_job_tree, read_latest_output,
+    read_mutable_job_details, read_native_job, read_output_job_is_decision, read_outputs,
+    read_retries, read_tool_evidence,
+};
+pub(crate) use reads::usage::{
+    read_tool_stats, read_usage_buckets, read_usage_retries, read_usage_summary,
+};
+pub(crate) use recovery::held::{
+    reconcile_held_apply, reconcile_held_preflight, verify_held_publication_delta,
+};
+pub(crate) use recovery::offline::{
+    inspect_held_allocations_offline, verify_offline, verify_publication,
+};
+pub(crate) use recovery::reserved::{
+    ReservedRefusal, reconcile_reserved_apply, reconcile_reserved_preflight,
+    verify_reserved_publication_delta,
+};
+pub(crate) use recovery::{
+    OpenedFile, database_file, open, reclaim_pending, record_clean_shutdown,
+};
+pub(crate) use reservations::{QueueCounts, queue_counts};
 
 pub(crate) use execution::{read_execution_history, read_execution_snapshot};
-pub(crate) use reads::*;
-pub(crate) use recovery::*;
 pub(crate) use scheduled_external::{
     read_scheduled_external_binding_with_policy, read_scheduled_external_policies,
     read_scheduled_external_policy,
@@ -94,19 +81,9 @@ pub(crate) use observations::{
     read_availability_stats, read_job_availability, read_job_metrics, read_metrics,
     read_provider_request, read_provider_responses,
 };
-use reads::read;
 
-pub(crate) use crate::db::entities::{JobLifecycle, JobSpec, JobState};
-pub(crate) use rows::{ConfigRow, CredentialKey, create_credential_key, load_credential_key};
-use rows::{
-    decode_attachment, decode_credential, decode_output, decode_project, decode_project_root,
-    decode_submission, decode_tool_evidence, encode_attachment, encode_output, encode_project,
-    encode_submission, encode_tool_evidence, tool_call_key, tool_call_ref,
-};
-use schema::*;
-pub(crate) use schema::{
-    CACHE_BYTES, CREDENTIAL_KEY_FILE_NAME, DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN, MAX_PAGE,
-};
+pub(crate) use rows::{CredentialKey, create_credential_key, load_credential_key};
+pub(crate) use schema::{DATABASE_FILE_NAME, MAX_OBSERVATION_SCAN};
 
 pub(crate) const fn storage_format_versions() -> (u64, u8) {
     (schema::FORMAT_VERSION, schema::record_version_byte())
@@ -188,27 +165,6 @@ impl TxRead for WriteTransaction {
     }
 }
 
-pub(crate) fn record_clean_shutdown(database: &Database) -> Result<(), StorageError> {
-    let tx = database.begin_write()?;
-    {
-        let mut unknown = false;
-        for entry in tx.open_table(schema::JOB_RUNTIME)?.iter()? {
-            let (key, value) = entry?;
-            if state::decode_state(key.value(), value.value())?
-                .outcome
-                .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-            {
-                unknown = true;
-                break;
-            }
-        }
-        tx.open_table(schema::META)?
-            .insert("clean_shutdown", [u8::from(!unknown)].as_slice())?;
-    }
-    tx.commit()?;
-    Ok(())
-}
-
 macro_rules! storage_from {
     ($($t:ty),*) => {$(
         impl From<$t> for StorageError {
@@ -224,5 +180,3 @@ storage_from!(
     ::redb::SetDurabilityError,
     CommitError
 );
-
-use crate::db::entities::JobUsage;
