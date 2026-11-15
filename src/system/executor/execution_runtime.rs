@@ -107,8 +107,8 @@ pub(crate) async fn supervise_development_generative(
             cancellation: &config.cancellation,
             output_seq,
             sent: false,
-            observations: Vec::new(),
-            observation_overflow: false,
+            evidence_incomplete: false,
+            persisted_usage: false,
             streamed: String::new(),
         };
         let result = crate::service::ai::generative_model::execute_conversation(
@@ -120,8 +120,7 @@ pub(crate) async fn supervise_development_generative(
         )
         .await;
         output_seq = sink.output_seq;
-        let observations = std::mem::take(&mut sink.observations);
-        let (sent, overflow) = (sink.sent, sink.observation_overflow);
+        let (sent, incomplete) = (sink.sent, sink.evidence_incomplete);
         let result = match result {
             Ok(result) if tools.is_none() => result.admitted(),
             other => other,
@@ -135,27 +134,25 @@ pub(crate) async fn supervise_development_generative(
                 )));
             }
             Err(error) => {
+                if incomplete {
+                    return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                        "execution",
+                        "incomplete execution evidence; ownership remains held",
+                    )));
+                }
                 return settle_development_error(
                     database, &handoff, request, output_seq, config, sent, error,
                 )
                 .await;
             }
         };
-        if !sent || overflow {
+        if !sent || incomplete {
             return Err(DatabaseError::Rejected(Violation::InvalidValue(
                 "execution",
                 "incomplete execution evidence; ownership remains held",
             )));
         }
-        record_answered_request(
-            database,
-            &handoff,
-            token.job,
-            request,
-            &result,
-            &observations,
-        )
-        .await?;
+        record_answered_request(database, &handoff, token.job, request, &result).await?;
         let Some(tools) = tools.as_ref().filter(|_| result.requests_tools()) else {
             let mut value = providers::result_value(&result);
             #[cfg(unix)]
@@ -518,7 +515,6 @@ async fn record_answered_request(
     job: crate::db::entities::JobId,
     request: RequestNumber,
     result: &ProviderExecutionResult,
-    observations: &[ProviderObservation],
 ) -> Result<(), DatabaseError> {
     let message = assistant_message(result);
     let response = MessageBody::new(&serde_json::to_value(message).map_err(|_| {
@@ -533,31 +529,6 @@ async fn record_answered_request(
             "response cannot be recorded",
         ))
     })?;
-    let mut usage_seq = 5u32;
-    let mut usages = Vec::new();
-    for observation in observations {
-        if let ProviderFact::Usage { usage, finality } = &observation.fact {
-            if !has_usage_counts(usage) {
-                continue;
-            }
-            usages.push((
-                usage_seq,
-                Metrics {
-                    job,
-                    request,
-                    observed_at: observation.observed_at,
-                    measurements: Measurements {
-                        usage: usage.clone(),
-                        ..Measurements::default()
-                    },
-                    token: Some(TokenAnnotation::eligible(*finality)),
-                },
-            ));
-            usage_seq = usage_seq
-                .checked_add(2)
-                .ok_or(DatabaseError::Rejected(Violation::ValueOutOfRange("usage")))?;
-        }
-    }
     database
         .record_development_provider_answer(
             handoff,
@@ -571,7 +542,7 @@ async fn record_answered_request(
                 measurements: providers::metrics(result),
                 response,
             },
-            usages,
+            Vec::new(),
         )
         .await
 }
@@ -668,8 +639,8 @@ pub(crate) async fn supervise_development_decision(
         cancellation: &effective_config.cancellation,
         output_seq: 1,
         sent: false,
-        observations: Vec::new(),
-        observation_overflow: false,
+        evidence_incomplete: false,
+        persisted_usage: false,
         streamed: String::new(),
     };
     let result = crate::service::ai::decisive_model::execute_decision_with_sink(
@@ -688,6 +659,12 @@ pub(crate) async fn supervise_development_decision(
     let result = match result {
         Ok(result) => result,
         Err(error) => {
+            if sink.evidence_incomplete {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "execution",
+                    "incomplete execution evidence; ownership remains held",
+                )));
+            }
             return settle_development_error(
                 database,
                 &handoff,
@@ -700,10 +677,10 @@ pub(crate) async fn supervise_development_decision(
             .await;
         }
     };
-    if !sink.sent {
+    if !sink.sent || sink.evidence_incomplete {
         return Err(DatabaseError::Rejected(Violation::InvalidValue(
             "execution",
-            "Decision request evidence missing; ownership remains held",
+            "Decision request evidence incomplete; ownership remains held",
         )));
     }
     let response = MessageBody::new(&result.raw).map_err(|_| {
@@ -712,7 +689,7 @@ pub(crate) async fn supervise_development_decision(
             "Decision response cannot be recorded",
         ))
     })?;
-    let usages = if has_usage_counts(&result.usage) {
+    let usages = if !sink.persisted_usage && has_usage_counts(&result.usage) {
         vec![(
             5,
             Metrics {
@@ -943,8 +920,8 @@ struct DevelopmentLoopbackSink<'a> {
     cancellation: &'a CancellationToken,
     output_seq: u32,
     sent: bool,
-    observations: Vec<ProviderObservation>,
-    observation_overflow: bool,
+    evidence_incomplete: bool,
+    persisted_usage: bool,
     streamed: String,
 }
 
@@ -1022,11 +999,33 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
         observation: ProviderObservation,
     ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
         Box::pin(async move {
-            if self.observations.len() >= 1024 {
-                self.observation_overflow = true;
-            } else {
-                self.observations.push(observation);
+            let ProviderFact::Usage { usage, finality } = &observation.fact else {
+                return;
+            };
+            if !has_usage_counts(usage) {
+                return;
             }
+            let metrics = Metrics {
+                job: self.handoff.job(),
+                request: self.request,
+                observed_at: observation.observed_at,
+                measurements: Measurements {
+                    usage: usage.clone(),
+                    ..Measurements::default()
+                },
+                token: Some(TokenAnnotation::eligible(*finality)),
+            };
+            if self
+                .database
+                .record_development_partial_usage(self.handoff, self.request, vec![metrics])
+                .await
+                .is_err()
+            {
+                self.evidence_incomplete = true;
+                self.cancellation.cancel();
+                return;
+            }
+            self.persisted_usage = true;
         })
     }
 }

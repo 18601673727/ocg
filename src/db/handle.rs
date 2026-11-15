@@ -284,6 +284,7 @@ impl crate::service::ai::providers::CredentialResolver for DevelopmentHandoff {
 pub(super) struct DevelopmentUsageCheckpoint {
     request: Option<entities::RequestNumber>,
     evidence: entities::TokenEvidence,
+    last_sequence: u32,
 }
 
 impl DevelopmentUsageCheckpoint {
@@ -291,11 +292,16 @@ impl DevelopmentUsageCheckpoint {
         self.evidence.clone()
     }
 
-    pub(super) fn advanced(_last_sequence: u32, evidence: entities::TokenEvidence) -> Self {
+    pub(super) fn advanced(last_sequence: u32, evidence: entities::TokenEvidence) -> Self {
         Self {
             request: None,
             evidence,
+            last_sequence,
         }
+    }
+
+    pub(super) fn last_sequence(&self) -> u32 {
+        self.last_sequence.max(1)
     }
 
     fn for_request(self, request: entities::RequestNumber) -> Self {
@@ -1909,6 +1915,87 @@ impl DatabaseHandle {
                 .remember_sent(state);
         }
         result
+    }
+
+    pub(crate) async fn record_development_partial_usage(
+        &self,
+        handoff: &DevelopmentHandoff,
+        request: entities::RequestNumber,
+        usages: Vec<Metrics>,
+    ) -> Result<(), DatabaseError> {
+        if usages.is_empty() {
+            return Ok(());
+        }
+        if let Some(secret) = &handoff.prepared.credentials.spellings
+            && usages.iter().any(|metrics| {
+                metrics
+                    .measurements
+                    .usage
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| development_contains_secret(raw, secret))
+            })
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "usage",
+                "usage evidence contains credential material",
+            )));
+        }
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let checkpoint = handoff
+            .usage_checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .for_request(request);
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, request, usages, checkpoint),
+                    reply,
+                    |(_, _, usages, _)| {
+                        usages.iter().fold(0u64, |size, metrics| {
+                            size.saturating_add(json_bytes(metrics.measurements.usage.raw.as_ref()))
+                        })
+                    },
+                    |(proof, request, usages, checkpoint), reply, database, operation, commit| {
+                        let ids = std::cell::Cell::new(None);
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::ConsumeTokenUsage,
+                            reply,
+                            |batch| {
+                                let (usage_ids, next_checkpoint) = batch
+                                    .record_development_partial_usage(
+                                        &proof, request, usages, checkpoint,
+                                    )?;
+                                ids.set(Some(usage_ids));
+                                Ok(next_checkpoint)
+                            },
+                        );
+                        if result.committed
+                            && let Some(usage_ids) = ids.take()
+                        {
+                            for id in usage_ids {
+                                result
+                                    .observations
+                                    .push(ObservationChange::Metrics(proof.token.job, id));
+                            }
+                        }
+                        result
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result.map(|next_checkpoint| {
+            *handoff
+                .usage_checkpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = next_checkpoint.of_request(request);
+        })
     }
 
     #[allow(dead_code)]
