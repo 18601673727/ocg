@@ -9,25 +9,13 @@ use crate::system::logger::{LoggerConfig, LoggerConfigError};
 use crate::system::monitor::{self, FilesystemConfig, FilesystemConfigError, ProtectionReason};
 
 pub const SYSTEM_POLICY_FILE_NAME: &str = "ocg.conf";
-pub const SYSTEM_POLICY_FORMAT_VERSION: u32 = 1;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SystemPolicy {
-    pub format_version: u32,
     pub filesystem_config: FilesystemConfig,
     #[serde(default)]
     pub logger_config: LoggerConfig,
-}
-
-impl Default for SystemPolicy {
-    fn default() -> Self {
-        Self {
-            format_version: SYSTEM_POLICY_FORMAT_VERSION,
-            filesystem_config: FilesystemConfig::default(),
-            logger_config: LoggerConfig::default(),
-        }
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -45,8 +33,6 @@ pub enum SystemPolicyError {
         line: usize,
         detail: &'static str,
     },
-    #[error("system policy {}: unsupported format_version {found}; supported version is {SYSTEM_POLICY_FORMAT_VERSION}", path.display())]
-    UnsupportedFormat { path: PathBuf, found: u32 },
     #[error("system policy {}: invalid filesystem_config: {source}", path.display())]
     Configuration {
         path: PathBuf,
@@ -111,12 +97,6 @@ impl SystemPolicy {
     }
 
     pub(crate) fn validate(&self, path: &Path) -> Result<(), SystemPolicyError> {
-        if self.format_version != SYSTEM_POLICY_FORMAT_VERSION {
-            return Err(SystemPolicyError::UnsupportedFormat {
-                path: path.to_path_buf(),
-                found: self.format_version,
-            });
-        }
         self.filesystem_config
             .validate()
             .map_err(|source| SystemPolicyError::Configuration {
@@ -255,8 +235,7 @@ impl SystemPolicy {
             crate::system::logger::LoggerLevel::Trace => "trace",
         };
         format!(
-            "format_version = {}\n\n[filesystem]\ndisk_lock_threshold_bytes = {}\ndisk_resume_threshold_bytes = {}\ndisk_check_interval_ms = {}\n\n[cleanup]\nmax_log_files_per_run = {}\n\n[logger]\nlevel = {level}\nretention_days = {}\nmax_file_size_bytes = {}\nflush_interval_ms = {}\n",
-            self.format_version,
+            "[filesystem]\ndisk_lock_threshold_bytes = {}\ndisk_resume_threshold_bytes = {}\ndisk_check_interval_ms = {}\n\n[cleanup]\nmax_log_files_per_run = {}\n\n[logger]\nlevel = {level}\nretention_days = {}\nmax_file_size_bytes = {}\nflush_interval_ms = {}\n",
             filesystem.disk_lock_threshold_bytes,
             filesystem.disk_resume_threshold_bytes,
             filesystem.disk_check_interval_ms,
@@ -311,7 +290,6 @@ impl SystemPolicy {
                 })
             };
             match (section, key) {
-                ("", "format_version") => policy.format_version = small()?,
                 ("filesystem", "disk_lock_threshold_bytes") => {
                     policy.filesystem_config.disk_lock_threshold_bytes = integer()?
                 }
@@ -348,8 +326,11 @@ impl SystemPolicy {
                 _ => return Err(invalid(number, "unknown configuration key")),
             }
         }
-        if !seen.contains(&("", "format_version")) {
-            return Err(invalid(0, "format_version is required"));
+        if seen.is_empty() {
+            return Err(invalid(
+                0,
+                "configuration must contain at least one setting",
+            ));
         }
         policy.validate(path)?;
         Ok(policy)

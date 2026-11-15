@@ -22,6 +22,7 @@ pub(super) struct Executed {
     pub(super) committed: bool,
     capacity_released: bool,
     probe: Option<Probe>,
+    resource_deltas: Vec<redb::NativeResourceDelta>,
     answer: Answer,
     failure: Option<StorageFailure>,
 }
@@ -89,6 +90,11 @@ pub(super) fn settle<T: Send + 'static>(
         committed,
         capacity_released,
         probe: outcome.probe,
+        resource_deltas: if committed {
+            outcome.resource_deltas
+        } else {
+            Vec::new()
+        },
         answer,
         failure: outcome.storage_failure.map(|error| StorageFailure {
             error,
@@ -219,6 +225,13 @@ impl DatabaseWorker {
                 if let Some(key) = credential_key {
                     let _ = credential_key_cell.set(key);
                 }
+                let native_resources = match redb::read_native_resource_catalog(&database) {
+                    Ok(catalog) => Arc::new(RwLock::new(catalog)),
+                    Err(error) => {
+                        ready_sender.send(Err(DatabaseError::Open(error))).ok();
+                        return Ok(());
+                    }
+                };
                 let attachment_slots = flume::bounded(4);
                 for _ in 0..4 {
                     let _ = attachment_slots.0.try_send(());
@@ -261,6 +274,7 @@ impl DatabaseWorker {
                     credential_key_writer: std::sync::Mutex::new(()),
                     undecryptable_credentials_at_open,
                     open_warnings_logged: AtomicBool::new(false),
+                    native_resources,
                 });
                 let _release = ReleaseOnPanic {
                     shared: shared.clone(),
@@ -624,6 +638,15 @@ impl WriteWorker {
                 started.store(true, Ordering::SeqCst);
                 let mut ran = command.execute(&opened.database, operation, commit);
                 drop(in_flight);
+                if ran.committed && !ran.resource_deltas.is_empty() {
+                    let mut catalog = shared
+                        .native_resources
+                        .write()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    for delta in ran.resource_deltas.drain(..) {
+                        catalog.apply(delta);
+                    }
+                }
                 if let Some(commit_us) = ran.durable_commit_us {
                     shared.record_durable_commit(commit_us);
                 }
@@ -988,6 +1011,13 @@ impl WriteWorker {
                 )),
             )));
         }
+        let native_resources = redb::read_native_resource_catalog(&database)
+            .map_err(|error| RecoveryError::Reopen(ReopenFailure::Storage(error)))?;
+        *self
+            .shared
+            .native_resources
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = native_resources;
         *self
             .shared
             .database

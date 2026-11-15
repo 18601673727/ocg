@@ -34,7 +34,7 @@ export function readModelPreference(
       effort: typeof record.effort === "string" && record.effort ? record.effort : null,
     };
     const uuidV7 = "[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}";
-    for (const key of ["agentProfile", "llmProfile", "executor", "project"] as const) {
+    for (const key of ["agentProfile", "llmProfile", "project"] as const) {
       const id = record[key];
       if (id !== undefined) {
         if (typeof id !== "string" || !new RegExp(`^${uuidV7}$`).test(id)) return undefined;
@@ -62,7 +62,6 @@ export function writeModelPreference(
         effort: selection.effort ?? null,
         agentProfile: selection.agentProfile,
         llmProfile: selection.llmProfile,
-        executor: selection.executor,
         project: selection.project,
       }),
     );

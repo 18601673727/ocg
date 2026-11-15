@@ -55,6 +55,9 @@ pub(crate) struct JobView {
     kind: JobKindView,
     conversation: Option<String>,
     assigned_executor: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    last_executor: Option<String>,
     created_at_us: i64,
     updated_at_us: i64,
     started_at_us: Option<i64>,
@@ -241,7 +244,12 @@ pub(super) fn mutable_job_view(
         previous: job.previous.map(|id| id.to_string()),
         kind: JobKindView::Turn,
         conversation: Some(job.parent_id.to_string()),
-        assigned_executor: None,
+        assigned_executor: allocation
+            .filter(|allocation| allocation.holds_capacity())
+            .map(|allocation| allocation.token.executor.to_string()),
+        last_executor: allocation
+            .filter(|allocation| !allocation.holds_capacity())
+            .map(|allocation| allocation.token.executor.to_string()),
         created_at_us: job.created_at.as_unix_micros(),
         updated_at_us,
         started_at_us: allocation

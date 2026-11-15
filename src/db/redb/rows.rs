@@ -128,30 +128,7 @@ impl JobSpec {
                 allocation,
             });
         }
-        if bytes.get(1).copied().map(u64::from) == Some(FORMAT_VERSION) {
-            return Err(StorageError::corrupted(
-                "mutable Job requires the new-model reader",
-            ));
-        }
-        let mut d = Dec::new(bytes, TAG_JOB)?;
-        let id = JobId::new(d.u128()?);
-        let kind = d.job_kind()?;
-        let created_at = d.ts()?;
-        let parent_id = d.ou128()?.map(JobId::new);
-        let allocation = d.opt(|d| {
-            Ok(crate::db::entities::JobAllocation {
-                owner: JobId::new(d.u128()?),
-                synthesis: d.bool()?,
-            })
-        })?;
-        d.end()?;
-        Ok(JobSpec {
-            id,
-            created_at,
-            parent_id,
-            allocation,
-            kind,
-        })
+        Err(StorageError::corrupted("expected a conversation record"))
     }
 
     pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {

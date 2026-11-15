@@ -283,7 +283,6 @@ impl Batch {
             }
             Ok(Some((
                 NativeSummaryManifest {
-                    schema_version: 2,
                     conversation,
                     through_job: through,
                     sources: boundaries,
@@ -460,7 +459,6 @@ impl Batch {
                 if let SummarizationStage::Chunk { start, end, .. } = *stage {
                     let chunk_slice = &source_text[start as usize..end as usize];
                     let chunk_msg = MessageBody::new(&serde_json::json!({
-                        "schema_version": 1,
                         "source": source_digest,
                         "chunk_index": idx,
                         "text": chunk_slice,
@@ -471,7 +469,7 @@ impl Batch {
                     self.put_message(&chunk_msg)?;
                     let chunk_id = JobId::new(self.next_id()?);
                     let chunk_prompt = format!(
-                        "Summarize chunk {} (digest {}) for source {} into a JSON object matching {{\"schema_version\":1,\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens.\n\n{}",
+                        "Summarize chunk {} (digest {}) for source {} into a JSON object matching {{\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens.\n\n{}",
                         idx + 1,
                         chunk_msg.digest(),
                         source_digest,
@@ -511,7 +509,7 @@ impl Batch {
         }
         let producer_prompt = if chunked {
             format!(
-                "Merge {} chunk summaries for source {} into a single JSON object matching {{\"schema_version\":1,\"source\":\"{}\",\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens.",
+                "Merge {} chunk summaries for source {} into a single JSON object matching {{\"source\":\"{}\",\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens.",
                 dependency_ids.len(),
                 source_digest,
                 source_digest,
@@ -519,7 +517,7 @@ impl Batch {
             )
         } else {
             format!(
-                "Summarize conversation source {} into a single JSON object matching {{\"schema_version\":1,\"source\":\"{}\",\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens. Output ONLY valid JSON.",
+                "Summarize conversation source {} into a single JSON object matching {{\"source\":\"{}\",\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens. Output ONLY valid JSON.",
                 source_digest, source_digest, target
             )
         };

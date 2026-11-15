@@ -9,7 +9,6 @@ type StepResult = Result<(), Box<dyn std::error::Error>>;
 
 pub(super) struct Step {
     pub(super) from: u64,
-    pub(super) fingerprint: &'static [u8],
     pub(super) check: fn(&ReadTransaction, &BTreeSet<String>) -> StepResult,
     pub(super) apply: fn(&::redb::WriteTransaction) -> StepResult,
 }
@@ -72,16 +71,7 @@ fn inspect_database(
     let names = table_names(&tx)?;
     let meta = tx.open_table(META)?;
     let format = read_format(&meta)?;
-    let fingerprint = read_fingerprint(&meta)?;
     if format == FORMAT_VERSION {
-        if fingerprint.as_slice() != SCHEMA_FINGERPRINT {
-            return Err(format!(
-                "database format {} has an unexpected schema fingerprint; this build opens only `{}`",
-                format,
-                String::from_utf8_lossy(SCHEMA_FINGERPRINT)
-            )
-            .into());
-        }
         check_metadata(&meta)?;
         require_tables(&names)?;
         return Ok(MigrationInspection::Current);
@@ -92,12 +82,6 @@ fn inspect_database(
         )
         .into());
     };
-    if fingerprint.as_slice() != step.fingerprint {
-        return Err(format!(
-            "database format {format} has an unexpected schema fingerprint; this build migrates only the format {format} database it wrote itself"
-        )
-        .into());
-    }
     (step.check)(&tx, &names)?;
     let digest = digest_tables(&tx, &names)?;
     Ok(MigrationInspection::Upgrade(MigrationPlan {
@@ -127,7 +111,6 @@ pub(crate) fn apply(path: &Path, plan: &MigrationPlan) -> Result<(), Box<dyn std
     {
         let mut table = tx.open_table(META)?;
         table.insert(DATABASE_FORMAT_KEY, FORMAT_VERSION.to_le_bytes().as_slice())?;
-        table.insert(SCHEMA_FINGERPRINT_KEY, SCHEMA_FINGERPRINT)?;
     }
     tx.commit()?;
     {
@@ -167,15 +150,6 @@ fn read_format(
         None => {
             Err(format!("unmarked database; this build opens only format {FORMAT_VERSION}").into())
         }
-    }
-}
-
-fn read_fingerprint(
-    meta: &impl ::redb::ReadableTable<&'static str, &'static [u8]>,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    match meta.get(SCHEMA_FINGERPRINT_KEY)? {
-        Some(value) => Ok(value.value().to_vec()),
-        None => Err("database has no schema fingerprint".into()),
     }
 }
 
@@ -554,7 +528,7 @@ fn hash_meta(tx: &ReadTransaction, hash: &mut Context) -> Result<u64, Box<dyn st
     for entry in table.iter()? {
         let (key, value) = entry?;
         let key = key.value();
-        if key == DATABASE_FORMAT_KEY || key == SCHEMA_FINGERPRINT_KEY {
+        if key == DATABASE_FORMAT_KEY {
             continue;
         }
         frame(hash, META_KEY, key.as_bytes());

@@ -642,7 +642,6 @@ fn inspect_held_in(
     Ok(json!({
         "database": {
             "format": FORMAT_VERSION,
-            "schema_fingerprint": String::from_utf8_lossy(SCHEMA_FINGERPRINT),
             "open_epoch": open_epoch,
             "clean_shutdown": clean_shutdown,
             "access": access,
@@ -3702,68 +3701,85 @@ fn pools_offering_capability(
     }
 }
 
-pub(super) fn candidate_compatible(
-    rx: &impl TxRead,
-    candidate: crate::db::AdmissionCandidate,
-) -> Result<Option<bool>, StorageError> {
-    let (executor, model, decision) = match candidate {
-        crate::db::AdmissionCandidate::Decision(executor, model) => (executor, model, true),
-    };
-    let configs = rx.table(CONFIGS)?;
-    let Some(bytes) = configs.get(executor.get())? else {
-        return Ok(None);
-    };
-    if bytes.value().first() != Some(&transactions::TAG_ALLOCATION_EXECUTOR) {
-        ConfigRow::scan_at(executor.get(), bytes.value())?;
-        return Ok(None);
-    }
-    let executor = transactions::decode_allocation_executor(executor.get(), bytes.value())?;
-    let pool = configs
-        .get(executor.pool.get())?
-        .ok_or_else(|| StorageError::corrupted("Executor references a missing Pool"))?;
-    let pool = transactions::decode_allocation_pool(executor.pool.get(), pool.value())?;
-    let Some(model_row) = configs
-        .get(model.get())?
-        .map(|bytes| ConfigRow::scan_at(model.get(), bytes.value()))
-        .transpose()?
-        .flatten()
-    else {
-        return Ok(Some(false));
-    };
-    let capability = match model_row.body {
-        ConfigBody::DecisionModel(_) if decision => Some((ExecutionOperation::Decision, None)),
-        ConfigBody::Model(model) => {
-            let connection = configs
-                .get(model.connection_id.get())?
-                .map(|bytes| ConfigRow::decode_at(model.connection_id.get(), bytes.value()))
-                .transpose()?;
-            match connection.map(|row| row.body) {
-                Some(ConfigBody::Connection(connection)) => {
-                    Some((ExecutionOperation::LlmRequest, Some(connection.protocol)))
-                }
-                Some(
-                    ConfigBody::Model(_)
-                    | ConfigBody::Agent(_)
-                    | ConfigBody::Pool(_)
-                    | ConfigBody::DecisionModel(_)
-                    | ConfigBody::DecisionAgent(_),
-                )
-                | None => None,
+#[derive(Clone, Debug)]
+struct NativeExecutorEntry {
+    pool: ExecutionPoolId,
+    archived: bool,
+    capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(crate) struct NativeResourceCatalog {
+    pools: std::collections::HashMap<ExecutionPoolId, bool>,
+    executors: std::collections::HashMap<ExecutorId, NativeExecutorEntry>,
+}
+
+impl NativeResourceCatalog {
+    pub(crate) fn apply(&mut self, delta: super::NativeResourceDelta) {
+        match delta {
+            super::NativeResourceDelta::Pool(pool) => {
+                self.pools.insert(pool.id, pool.archived);
+            }
+            super::NativeResourceDelta::Executor(executor) => {
+                self.executors.insert(
+                    executor.id,
+                    NativeExecutorEntry {
+                        pool: executor.pool,
+                        archived: executor.archived,
+                        capabilities: executor.capabilities,
+                    },
+                );
             }
         }
-        ConfigBody::Connection(_)
-        | ConfigBody::Agent(_)
-        | ConfigBody::Pool(_)
-        | ConfigBody::DecisionModel(_)
-        | ConfigBody::DecisionAgent(_) => None,
-    };
-    Ok(Some(
-        executor.enabled
-            && !executor.archived
-            && pool.enabled
-            && !pool.archived
-            && capability.is_some_and(|capability| executor.capabilities.contains(&capability)),
-    ))
+    }
+
+    pub(crate) fn has_unarchived_capability(
+        &self,
+        operation: ExecutionOperation,
+        protocol: Option<LlmTransport>,
+    ) -> bool {
+        self.executors.values().any(|entry| {
+            !entry.archived
+                && entry.capabilities.contains(&(operation, protocol))
+                && self
+                    .pools
+                    .get(&entry.pool)
+                    .is_some_and(|pool_archived| !pool_archived)
+        })
+    }
+}
+
+pub(crate) fn read_native_resource_catalog(
+    database: &Database,
+) -> Result<NativeResourceCatalog, StorageError> {
+    let rx = read(database)?;
+    let configs = rx.open_table(CONFIGS)?;
+    let mut catalog = NativeResourceCatalog::default();
+    for entry in configs.iter()? {
+        let (key, bytes) = entry?;
+        match bytes.value().first() {
+            Some(&transactions::TAG_ALLOCATION_POOL) => {
+                let pool = transactions::decode_allocation_pool(key.value(), bytes.value())?;
+                catalog.apply(super::NativeResourceDelta::Pool(pool));
+            }
+            Some(&transactions::TAG_ALLOCATION_EXECUTOR) => {
+                let executor =
+                    transactions::decode_allocation_executor(key.value(), bytes.value())?;
+                catalog.apply(super::NativeResourceDelta::Executor(executor));
+            }
+            _ => {
+                ConfigRow::scan_at(key.value(), bytes.value())?;
+            }
+        }
+    }
+    for entry in catalog.executors.values() {
+        if !catalog.pools.contains_key(&entry.pool) {
+            return Err(StorageError::corrupted(
+                "Executor references a missing Pool",
+            ));
+        }
+    }
+    Ok(catalog)
 }
 
 pub(super) fn compatible_executors(

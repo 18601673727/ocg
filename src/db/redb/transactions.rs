@@ -395,7 +395,6 @@ fn encode_mutable_input(e: &mut Enc, input: &crate::db::entities::MutableJobInpu
             for reference in references {
                 e.config_ref(reference);
             }
-            e.u32(request.schema_version);
             e.str(&request.state.to_string());
             match &request.question {
                 DecisionQuestion::Choice { prompt, options } => {
@@ -502,7 +501,6 @@ fn decode_mutable_input(d: &mut Dec<'_>) -> DecodeResult<crate::db::entities::Mu
                     "invalid Decision configuration references",
                 ));
             }
-            let schema_version = d.u32()?;
             let state = serde_json::from_str(&d.str()?)
                 .map_err(|_| StorageError::corrupted("invalid Decision state"))?;
             let kind = d.u8()?;
@@ -539,11 +537,7 @@ fn decode_mutable_input(d: &mut Dec<'_>) -> DecodeResult<crate::db::entities::Mu
                 }
                 _ => return Err(StorageError::corrupted("invalid Decision question")),
             };
-            let request = DecisionRequest {
-                schema_version,
-                state,
-                question,
-            };
+            let request = DecisionRequest { state, question };
             let capabilities = BTreeSet::from([
                 DecisionCapability::Choice,
                 DecisionCapability::BinaryProbability,
@@ -733,6 +727,24 @@ fn encode_mutable_input_revision(
     e.u32(revision);
     encode_mutable_input(&mut e, input);
     e.0
+}
+
+pub(super) fn decode_mutable_input_revision(
+    id: JobId,
+    revision: u32,
+    bytes: &[u8],
+) -> DecodeResult<crate::db::entities::MutableJobInput> {
+    let mut d = Dec::new(bytes, 52)?;
+    let stored_id = d.u128()?;
+    let stored_revision = d.u32()?;
+    let input = decode_mutable_input(&mut d)?;
+    d.end()?;
+    if stored_id != id.get() || stored_revision != revision {
+        return Err(StorageError::corrupted(
+            "mutable job input key does not match record payload",
+        ));
+    }
+    Ok(input)
 }
 
 #[allow(dead_code)]
@@ -1033,6 +1045,16 @@ impl Batch {
             let frozen = self.freeze_decision_profile(*profile)?;
             if let Err(reason) = request.validate(&frozen.capabilities()) {
                 return self.reject(Violation::InvalidValue("decision", reason));
+            }
+            if matches!(
+                &frozen,
+                FrozenDecisionConfig::Generative(generative, _)
+                    if generative.llm.provider.transport != LlmTransport::OpenAiChatCompletions
+            ) {
+                return self.reject(Violation::InvalidValue(
+                    "decision",
+                    "generative decision execution requires the OpenAI Chat Completions protocol",
+                ));
             }
             if frozen.references().collect::<Vec<_>>() != *references {
                 return self.reject(Violation::InvalidValue(
@@ -1769,10 +1791,11 @@ impl Batch {
         configuration: ExecutionConfiguration,
         request: crate::db::entities::DecisionRequest,
         submission: Option<crate::db::entities::Submission>,
+        has_capability: impl FnOnce(ExecutionOperation, Option<LlmTransport>) -> bool,
     ) -> Result<(JobId, Appended), BatchError> {
         use crate::db::entities::{
-            ComposerContextId, JobQueuePriority, MutableContextSelection, MutableJob,
-            MutableJobContent, MutableJobInput, MutableJobPhase,
+            AgentCapability, ComposerContextId, JobQueuePriority, MutableContextSelection,
+            MutableJob, MutableJobContent, MutableJobInput, MutableJobPhase,
         };
         self.require_allocation_durability()?;
         if let Some(sub) = submission
@@ -1783,17 +1806,51 @@ impl Batch {
                 same_request: record.fingerprint == sub.fingerprint,
             });
         }
-        let frozen = match self.freeze_configuration(configuration)? {
-            FrozenConfiguration::Decision(frozen) => frozen,
-            FrozenConfiguration::Generative(frozen) => {
-                FrozenDecisionConfig::Generative(frozen, None)
-            }
-        };
+        let frozen =
+            match self.freeze_configuration(configuration)? {
+                FrozenConfiguration::Decision(frozen) => frozen,
+                FrozenConfiguration::Generative(frozen) => {
+                    if frozen.agent.as_ref().is_some_and(|agent| {
+                        !agent.capabilities.contains(&AgentCapability::Decision)
+                    }) {
+                        return self.reject(Violation::InvalidValue(
+                            "capabilities",
+                            "the Agent must support decision work with this model",
+                        ));
+                    }
+                    FrozenDecisionConfig::Generative(frozen, None)
+                }
+            };
         if let Err(reason) = frozen.validate() {
             return self.reject(Violation::InvalidValue("decision", reason));
         }
+        if matches!(
+            &frozen,
+            FrozenDecisionConfig::Generative(generative, _)
+                if generative.llm.provider.transport != LlmTransport::OpenAiChatCompletions
+        ) {
+            return self.reject(Violation::InvalidValue(
+                "decision",
+                "generative decision execution requires the OpenAI Chat Completions protocol",
+            ));
+        }
         if let Err(reason) = request.validate(&frozen.capabilities()) {
             return self.reject(Violation::InvalidValue("decision", reason));
+        }
+        let (operation, protocol) = match &frozen {
+            FrozenDecisionConfig::Native(_) => (ExecutionOperation::Decision, None),
+            FrozenDecisionConfig::Generative(generative, _) => (
+                ExecutionOperation::LlmRequest,
+                Some(generative.llm.provider.transport),
+            ),
+        };
+        if !has_capability(operation, protocol)
+            && !self.has_native_capability(operation, protocol)?
+        {
+            return self.reject(Violation::InvalidValue(
+                "capability_unsatisfiable",
+                "no Pool Executor supports this Decision capability",
+            ));
         }
         let storable = self.storable_frozen(&FrozenConfiguration::Decision(frozen.clone()))?;
         let conversation_id = JobId::new(self.next_id()?);
@@ -1923,7 +1980,9 @@ impl Batch {
             CONFIGS,
             pool.id.get(),
             encode_allocation_pool(&pool).as_slice(),
-        )
+        )?;
+        self.resource_deltas.push(NativeResourceDelta::Pool(pool));
+        Ok(())
     }
 
     pub(crate) fn register_allocation_executor(
@@ -1983,7 +2042,10 @@ impl Batch {
             CONFIGS,
             executor.id.get(),
             encode_allocation_executor(&executor).as_slice(),
-        )
+        )?;
+        self.resource_deltas
+            .push(NativeResourceDelta::Executor(executor));
+        Ok(())
     }
 
     fn observe_configuration_id(&mut self, id: u128) -> Result<(), BatchError> {
@@ -2037,6 +2099,8 @@ impl Batch {
                 "revision",
             ))))?;
         self.insert(CONFIGS, id.get(), encode_allocation_pool(&pool).as_slice())?;
+        self.resource_deltas
+            .push(NativeResourceDelta::Pool(pool.clone()));
         Ok(pool)
     }
 
@@ -2096,6 +2160,8 @@ impl Batch {
             id.get(),
             encode_allocation_executor(&executor).as_slice(),
         )?;
+        self.resource_deltas
+            .push(NativeResourceDelta::Executor(executor.clone()));
         Ok(executor)
     }
 
@@ -2274,7 +2340,21 @@ impl Batch {
         operation: ExecutionOperation,
         protocol: Option<LlmTransport>,
     ) -> Result<(), BatchError> {
-        let available = self.step(|tx| {
+        if !self.has_native_capability(operation, protocol)? {
+            return self.reject(Violation::InvalidValue(
+                "executor",
+                "no unarchived native Executor supports this operation and protocol",
+            ));
+        }
+        Ok(())
+    }
+
+    fn has_native_capability(
+        &mut self,
+        operation: ExecutionOperation,
+        protocol: Option<LlmTransport>,
+    ) -> Result<bool, BatchError> {
+        self.step(|tx| {
             let configs = tx.open_table(CONFIGS)?;
             let mut available = false;
             for entry in configs.iter()? {
@@ -2286,9 +2366,7 @@ impl Batch {
                             StorageError::corrupted("Executor references a missing Pool")
                         })?;
                         let pool = decode_allocation_pool(executor.pool.get(), pool_bytes.value())?;
-                        if pool.enabled
-                            && !pool.archived
-                            && executor.enabled
+                        if !pool.archived
                             && !executor.archived
                             && executor.capabilities.contains(&(operation, protocol))
                         {
@@ -2304,14 +2382,7 @@ impl Batch {
                 }
             }
             Ok(available)
-        })?;
-        if !available {
-            return self.reject(Violation::InvalidValue(
-                "executor",
-                "no enabled native Executor supports this operation and protocol",
-            ));
-        }
-        Ok(())
+        })
     }
 
     pub(crate) fn reserve_next_development_job(
@@ -2767,9 +2838,6 @@ impl Batch {
             Ok(meta
                 .get(DATABASE_FORMAT_KEY)?
                 .is_some_and(|value| value.value() == FORMAT_VERSION.to_le_bytes())
-                && meta
-                    .get(SCHEMA_FINGERPRINT_KEY)?
-                    .is_some_and(|value| value.value() == SCHEMA_FINGERPRINT)
                 && meta
                     .get("open_epoch")?
                     .is_some_and(|value| value.value() == token.epoch.to_le_bytes()))
@@ -3720,7 +3788,6 @@ impl Batch {
             && total_tokens >= (trigger as usize).saturating_mul(3) / 4
         {
             let decision_request = crate::db::entities::DecisionRequest {
-                schema_version: 1,
                 question: crate::db::entities::DecisionQuestion::BinaryProbability {
                     prompt: "Predict whether context compaction should be prepared before the next turn."
                         .to_owned(),
@@ -4044,7 +4111,6 @@ impl Batch {
         let wrapped = FrozenConfiguration::Decision(frozen_decision.clone());
         let storable = self.storable_frozen(&wrapped)?;
         let request = DecisionRequest {
-            schema_version: 1,
             question: DecisionQuestion::Choice {
                 prompt: format!(
                     "Decide whether the task below can run directly or requires structured job_plan planning before side-effecting tools.\nTask: {}",
@@ -4811,41 +4877,6 @@ pub(super) fn decision_requirement() -> u16 {
 }
 
 impl Batch {
-    pub(crate) fn with_admission_candidate<T>(
-        &mut self,
-        candidate: Option<crate::db::AdmissionCandidate>,
-        submission: Option<crate::db::entities::Submission>,
-        create: impl FnOnce(&mut Self) -> Result<T, BatchError>,
-    ) -> Result<T, BatchError> {
-        let replay = match (candidate, submission) {
-            (Some(_), Some(submission)) => match self.submission(submission.key)? {
-                Some(record) if record.fingerprint != submission.fingerprint => {
-                    return self.reject(Violation::SubmissionKeyUsed {
-                        job: record.job,
-                        same_request: false,
-                    });
-                }
-                Some(_) => true,
-                None => false,
-            },
-            (Some(_), None) | (None, _) => false,
-        };
-        if !replay && let Some(candidate) = candidate {
-            let crate::db::AdmissionCandidate::Decision(executor, _) = candidate;
-            match self.step(|tx| reader::candidate_compatible(tx, candidate))? {
-                None => return self.reject(Violation::NotFound(RecordRef::Executor(executor))),
-                Some(false) => {
-                    return self.reject(Violation::InvalidValue(
-                        "executor_incompatible",
-                        "the Executor cannot run this request",
-                    ));
-                }
-                Some(true) => {}
-            }
-        }
-        create(self)
-    }
-
     pub(crate) fn global_headers(
         &mut self,
     ) -> Result<crate::db::entities::GlobalHeaders, BatchError> {

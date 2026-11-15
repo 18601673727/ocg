@@ -9,11 +9,11 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::{DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN, Shared};
+use crate::db::DatabaseError;
 use crate::db::entities::{
-    ConfigId, ExecutionConfiguration, ExecutorId, JobExecution, JobId, JobKind, ProfileId,
-    RecordRef, RequestFingerprint, Submission, SubmissionKey, SubmissionRecord, Violation,
+    ConfigId, ExecutionConfiguration, JobExecution, JobId, JobKind, ProfileId, RequestFingerprint,
+    Submission, SubmissionKey, SubmissionRecord, Violation,
 };
-use crate::db::{AdmissionCandidate, DatabaseError};
 
 pub(super) const IDEMPOTENCY_KEY: &str = "idempotency-key";
 pub(super) const MIN_KEY_CHARS: usize = 16;
@@ -22,7 +22,7 @@ pub(super) const MAX_NAME_BYTES: usize = 128;
 const MAX_UNRESOLVED: usize = 256;
 
 const KEY_DOMAIN: &[u8] = b"ocg.control-plane.idempotency-key.v1\n";
-const DECISION_REQUEST_DOMAIN: &[u8] = b"ocg.control-plane.decision-submission.v1\n";
+const DECISION_REQUEST_DOMAIN: &[u8] = b"ocg.control-plane.decision-submission.v2\n";
 
 pub(super) const KEY_REQUIRED: Refusal = Refusal::new(
     StatusCode::BAD_REQUEST,
@@ -621,15 +621,10 @@ async fn admit(
     admit_decision(&shared, key, generation, fingerprint, request, finish).await
 }
 
-const DECISION_EXECUTOR_NOT_FOUND: Refusal = Refusal::new(
-    StatusCode::NOT_FOUND,
-    "executor_not_found",
-    "no such Executor; nothing was submitted",
-);
-const DECISION_EXECUTOR_INCOMPATIBLE: Refusal = Refusal::new(
+const DECISION_CAPABILITY_UNSATISFIABLE: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
-    "decision_executor_incompatible",
-    "the Executor does not offer decision work; nothing was submitted",
+    "decision_capability_unsatisfiable",
+    "no Pool Executor supports this Decision capability; nothing was submitted",
 );
 const INVALID_DECISION_REQUEST: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
@@ -642,7 +637,6 @@ pub(super) struct DecisionJobRequest {
     reasoning_effort: Option<crate::db::entities::ReasoningEffort>,
     decision_agent: ProfileId,
     decision_model: ProfileId,
-    executor: ExecutorId,
     request: crate::db::entities::DecisionRequest,
     name: Option<String>,
 }
@@ -653,7 +647,6 @@ struct DecisionSubmissionInput {
     reasoning_effort: Option<String>,
     decision_agent: String,
     decision_model: String,
-    executor: String,
     request: DecisionRequestInput,
     #[serde(default)]
     name: Option<String>,
@@ -662,8 +655,6 @@ struct DecisionSubmissionInput {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DecisionRequestInput {
-    #[serde(default)]
-    schema_version: Option<u32>,
     state: serde_json::Value,
     question: DecisionQuestionInput,
 }
@@ -708,7 +699,6 @@ impl DecisionJobRequest {
         let decision_model = identity(&wire.decision_model, "profile:")
             .map(ProfileId::new)
             .ok_or(INVALID_DECISION_REQUEST)?;
-        let executor = identity(&wire.executor, "executor:").ok_or(INVALID_DECISION_REQUEST)?;
         if wire
             .name
             .as_deref()
@@ -717,10 +707,6 @@ impl DecisionJobRequest {
             return Err(INVALID_DECISION_REQUEST);
         }
         let request = crate::db::entities::DecisionRequest {
-            schema_version: wire
-                .request
-                .schema_version
-                .unwrap_or(crate::db::entities::DECISION_SCHEMA_VERSION),
             state: wire.request.state,
             question: match wire.request.question {
                 DecisionQuestionInput::Choice { prompt, options } => {
@@ -752,10 +738,9 @@ impl DecisionJobRequest {
                 }
             },
         };
-        if request.schema_version != crate::db::entities::DECISION_SCHEMA_VERSION
-            || serde_json::to_vec(&request)
-                .map(|bytes| bytes.len() > crate::db::entities::MAX_DECISION_REQUEST_BYTES)
-                .unwrap_or(true)
+        if serde_json::to_vec(&request)
+            .map(|bytes| bytes.len() > crate::db::entities::MAX_DECISION_REQUEST_BYTES)
+            .unwrap_or(true)
         {
             return Err(INVALID_DECISION_REQUEST);
         }
@@ -770,7 +755,6 @@ impl DecisionJobRequest {
             reasoning_effort,
             decision_agent,
             decision_model,
-            executor: ExecutorId::new(executor),
             request,
             name: wire.name,
         })
@@ -781,7 +765,6 @@ impl DecisionJobRequest {
         context.update(DECISION_REQUEST_DOMAIN);
         context.update(&self.decision_agent.get().to_le_bytes());
         context.update(&self.decision_model.get().to_le_bytes());
-        context.update(&self.executor.get().to_le_bytes());
         match &self.name {
             None => context.update(&[0]),
             Some(name) => {
@@ -838,7 +821,6 @@ async fn admit_decision(
             configuration,
             request.request.clone(),
             submission,
-            AdmissionCandidate::Decision(request.executor, request.decision_model),
         )
         .await;
     match admitted {
@@ -856,11 +838,8 @@ async fn admit_decision(
                 Outcome::Conflict
             })
         }
-        Err(DatabaseError::Rejected(Violation::NotFound(RecordRef::Executor(_)))) => {
-            finish(Outcome::Refused(DECISION_EXECUTOR_NOT_FOUND))
-        }
-        Err(DatabaseError::Rejected(Violation::InvalidValue("executor_incompatible", _))) => {
-            finish(Outcome::Refused(DECISION_EXECUTOR_INCOMPATIBLE))
+        Err(DatabaseError::Rejected(Violation::InvalidValue("capability_unsatisfiable", _))) => {
+            finish(Outcome::Refused(DECISION_CAPABILITY_UNSATISFIABLE))
         }
         Err(DatabaseError::OutcomeUnknown { operation, .. }) => {
             shared

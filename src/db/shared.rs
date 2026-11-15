@@ -88,6 +88,7 @@ pub(super) struct Shared {
     pub(super) credential_key_writer: std::sync::Mutex<()>,
     pub(super) undecryptable_credentials_at_open: u64,
     pub(super) open_warnings_logged: AtomicBool,
+    pub(super) native_resources: Arc<RwLock<redb::NativeResourceCatalog>>,
 }
 
 pub(super) fn flush_staged(_shared: &Shared, database: &Database) -> Result<u64, StorageError> {

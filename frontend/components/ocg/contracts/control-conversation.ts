@@ -5,7 +5,6 @@ import type { ControlDecisionAnswer } from "./control-settings";
 export type NativeDecisionTurn = {
   kind: "decision";
   request: {
-    schema_version: number;
     state: unknown;
     question: {
       kind: "choice" | "binary_probability" | "ordinal_score";
@@ -30,7 +29,6 @@ function nativeDecision(value: unknown): NativeDecisionTurn | undefined {
     !object(value) ||
     value.kind !== "decision" ||
     !object(value.request) ||
-    value.request.schema_version !== 1 ||
     !object(value.request.question)
   )
     throw new Error("Invalid Decision history record.");

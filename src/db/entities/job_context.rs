@@ -396,7 +396,6 @@ pub struct SourceBoundary {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContextSourceManifest {
-    pub schema_version: u32,
     pub conversation: JobId,
     pub through_turn: JobId,
     pub turns: Vec<SourceBoundary>,
@@ -405,8 +404,7 @@ pub struct ContextSourceManifest {
 
 impl ContextSourceManifest {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != 1
-            || self.turns.is_empty()
+        if self.turns.is_empty()
             || self.turns.len() > 4096
             || self.turns.last().map(|source| source.turn) != Some(self.through_turn)
             || self.turns.iter().any(|source| source.input_through == 0)
@@ -433,7 +431,6 @@ pub struct NativeSummaryBoundary {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NativeSummaryManifest {
-    pub schema_version: u32,
     pub conversation: JobId,
     pub through_job: JobId,
     pub sources: Vec<NativeSummaryBoundary>,
@@ -449,8 +446,7 @@ pub struct NativeSummaryResultLink {
 
 impl NativeSummaryManifest {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.schema_version != 2
-            || self.sources.is_empty()
+        if self.sources.is_empty()
             || self.sources.len() > 4096
             || self.sources.last().map(|source| source.job) != Some(self.through_job)
             || self
@@ -540,7 +536,6 @@ where
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummarizationResult {
-    pub schema_version: u32,
     #[serde(deserialize_with = "deserialize_content_digest")]
     pub source: ContentDigest,
     pub summary: String,
@@ -553,9 +548,8 @@ fn summary_context_text(summary: &str, omissions: &[String]) -> String {
         omissions.join("; ")
     )
 }
-fn validate_summary(version: u32, summary: &str, omissions: &[String]) -> Result<(), &'static str> {
-    if version != 1
-        || summary.trim().is_empty()
+fn validate_summary(summary: &str, omissions: &[String]) -> Result<(), &'static str> {
+    if summary.trim().is_empty()
         || summary.len() > 1024 * 1024
         || omissions.len() > 256
         || omissions.iter().any(|detail| detail.len() > 4096)
@@ -569,13 +563,12 @@ impl SummarizationResult {
         summary_context_text(&self.summary, &self.omitted_details)
     }
     pub fn validate(&self) -> Result<(), &'static str> {
-        validate_summary(self.schema_version, &self.summary, &self.omitted_details)
+        validate_summary(&self.summary, &self.omitted_details)
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SummaryFragment {
-    pub schema_version: u32,
     pub summary: String,
     pub omitted_details: Vec<String>,
 }
@@ -584,7 +577,7 @@ impl SummaryFragment {
         summary_context_text(&self.summary, &self.omitted_details)
     }
     pub fn validate(&self) -> Result<(), &'static str> {
-        validate_summary(self.schema_version, &self.summary, &self.omitted_details)
+        validate_summary(&self.summary, &self.omitted_details)
     }
 }
 

@@ -459,7 +459,7 @@ fn prepare_development_handoff(
             if is_summary {
                 let mut messages = vec![
                     crate::service::ai::providers::openai_compatible::ChatMessage::system(
-                        "You are a context summarizer. Return ONLY valid JSON matching {\"schema_version\":1,\"source\":\"...\",\"summary\":\"...\",\"omitted_details\":[...]}. Do not use tools, Markdown fences, or extra prose.",
+                        "You are a context summarizer. Return ONLY valid JSON matching {\"source\":\"...\",\"summary\":\"...\",\"omitted_details\":[...]}. Do not use tools, Markdown fences, or extra prose.",
                     ),
                 ];
                 let mut combined = String::new();
@@ -1520,6 +1520,7 @@ impl DatabaseHandle {
                             capacity_freed: outcome.capacity_freed,
                             catalog_changed: outcome.catalog_changed,
                             probe: outcome.probe,
+                            resource_deltas: outcome.resource_deltas,
                         };
                         settle(
                             operation,
@@ -1589,6 +1590,7 @@ impl DatabaseHandle {
                         capacity_freed: outcome.capacity_freed,
                         catalog_changed: outcome.catalog_changed,
                         probe: outcome.probe,
+                        resource_deltas: outcome.resource_deltas,
                     };
                     settle(
                         operation,
@@ -3001,26 +3003,26 @@ impl DatabaseHandle {
         configuration: ExecutionConfiguration,
         request: entities::DecisionRequest,
         submission: Option<Submission>,
-        candidate: AdmissionCandidate,
     ) -> Result<(JobId, Appended), DatabaseError> {
+        let capabilities = self.shared.native_resources.clone();
         self.write_sized(
-            (
-                parent,
-                spec,
-                first,
-                configuration,
-                request,
-                submission,
-                candidate,
-            ),
-            |(_, _, first, _, request, _, _)| {
-                debug_bytes(first).saturating_add(debug_bytes(request))
-            },
+            (parent, spec, first, configuration, request, submission),
+            |(_, _, first, _, request, _)| debug_bytes(first).saturating_add(debug_bytes(request)),
             OperationKind::Open,
-            |batch, (parent, spec, _first, configuration, request, submission, candidate)| {
-                batch.with_admission_candidate(Some(candidate), submission, |batch| {
-                    batch.submit_native_decision(parent, spec, configuration, request, submission)
-                })
+            move |batch, (parent, spec, _first, configuration, request, submission)| {
+                batch.submit_native_decision(
+                    parent,
+                    spec,
+                    configuration,
+                    request,
+                    submission,
+                    |operation, protocol| {
+                        capabilities
+                            .read()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .has_unarchived_capability(operation, protocol)
+                    },
+                )
             },
         )
         .await

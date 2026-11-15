@@ -56,8 +56,8 @@ use codec::{
 };
 pub(crate) use writer::Failure;
 pub(crate) use writer::{
-    Batch, BatchError, BatchFailure, BatchOutcome, Commit, CompactFailure, Probe, allocated_bytes,
-    compact, persist_staged, run_batch_declinable, run_batch_with,
+    Batch, BatchError, BatchFailure, BatchOutcome, Commit, CompactFailure, NativeResourceDelta,
+    Probe, allocated_bytes, compact, persist_staged, run_batch_declinable, run_batch_with,
 };
 
 pub(crate) use reader::{
@@ -65,8 +65,8 @@ pub(crate) use reader::{
     read_development_execution_context,
 };
 pub(crate) use reader::{
-    NativeResource, NativeResourceKind, PoolAllocationPage, read_native_resources,
-    read_pool_allocations,
+    NativeResource, NativeResourceCatalog, NativeResourceKind, PoolAllocationPage,
+    read_native_resource_catalog, read_native_resources, read_pool_allocations,
 };
 pub(crate) use reader::{OfflineVerification, inspect_held_allocations_offline, verify_offline};
 pub(crate) use reader::{ProfilePageRecord, read_global_compaction_settings};

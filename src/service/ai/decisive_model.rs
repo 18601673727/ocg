@@ -498,7 +498,6 @@ fn decode_response(
     }
     Ok((
         DecisionResult {
-            schema_version: crate::db::entities::DECISION_SCHEMA_VERSION,
             outcome: DecisionOutcome::Answer { answer: decoded },
             requested_model: frozen.model.model.clone(),
             reported_model: Some(reported_model),
@@ -680,7 +679,6 @@ pub(crate) async fn execute_decision_with_sink(
                 confidence.semantics = frozen.confidence_semantics().into();
             }
             let result = DecisionResult {
-                schema_version: crate::db::entities::DECISION_SCHEMA_VERSION,
                 outcome,
                 requested_model: frozen.model_name().into(),
                 reported_model: None,

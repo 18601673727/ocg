@@ -89,22 +89,14 @@ export function ModelSelector({
   const agents = (catalog?.agents ?? []).filter(
     (agent) =>
       (agent.capabilities.includes("chat") || agent.capabilities.includes("coding")) &&
-      agent.llm_targets.some(
-        (target) => target.declared_capabilities.includes("chat") && target.executors.length,
-      ),
+      agent.llm_targets.some((target) => target.declared_capabilities.includes("chat")),
   );
   const agent =
     agents.find((agent) => agent.id === (fixedAgent ?? selection?.agentProfile)) ??
     (!fixedAgent ? agents[0] : undefined);
   const targets =
-    agent?.llm_targets.filter(
-      (target) => target.declared_capabilities.includes("chat") && target.executors.length,
-    ) ?? [];
+    agent?.llm_targets.filter((target) => target.declared_capabilities.includes("chat")) ?? [];
   const llm = targets.find((target) => target.id === selection?.llmProfile) ?? targets[0];
-  const executor =
-    selection?.executor && llm?.executors.includes(selection.executor)
-      ? selection.executor
-      : llm?.executors[0];
   const agentId = agent?.id;
   const llmId = llm?.id;
   const supportsImages = llm?.declared_capabilities.includes("vision") ?? false;
@@ -122,7 +114,7 @@ export function ModelSelector({
     efforts.includes(selection.effort)
       ? selection.effort
       : null;
-  const disabled = busy || !catalog || !llm || !executor;
+  const disabled = busy || !catalog || !llm;
   const needsSetup = Boolean(
     session && !session.conversationId && !fixedAgent && !busy && catalog && !error && !agent,
   );
@@ -138,33 +130,29 @@ export function ModelSelector({
     : projects.find((project) => project.id === selection?.project)?.id;
 
   useEffect(() => {
-    if (!agentId || !llmId || !executor || !model) return;
+    if (!agentId || !llmId || !model) return;
     const next = {
       model,
       effort,
       agentProfile: agentId,
       llmProfile: llmId,
-      executor,
       ...(projectId ? { project: projectId } : {}),
     };
     if (
       selection?.agentProfile !== agentId ||
       selection?.llmProfile !== llmId ||
-      selection?.executor !== executor ||
       selection?.model !== model ||
       selection?.project !== projectId ||
       (selection?.effort ?? null) !== effort
     )
       onChange(next);
     if (sessionId) client.setChatSelection?.(sessionId, next);
-  }, [agentId, llmId, executor, model, projectId, effort, selection, onChange, client, sessionId]);
+  }, [agentId, llmId, model, projectId, effort, selection, onChange, client, sessionId]);
 
   function choose(agentProfile: string, llmProfile?: string) {
     const agent = agents.find((agent) => agent.id === agentProfile);
     const choices =
-      agent?.llm_targets.filter(
-        (target) => target.declared_capabilities.includes("chat") && target.executors.length,
-      ) ?? [];
+      agent?.llm_targets.filter((target) => target.declared_capabilities.includes("chat")) ?? [];
     const llm = choices.find((target) => target.id === llmProfile) ?? choices[0];
     if (!agent || !llm) return;
     const next = {
@@ -172,10 +160,6 @@ export function ModelSelector({
       effort: llm.id === selection?.llmProfile ? effort : null,
       agentProfile,
       llmProfile: llm.id,
-      executor:
-        selection?.executor && llm.executors.includes(selection.executor)
-          ? selection.executor
-          : llm.executors[0],
       ...(selection?.project ? { project: selection.project } : {}),
     };
     onChange(next);
@@ -229,23 +213,6 @@ export function ModelSelector({
           })),
           onChange: (value) => {
             if (agentId) choose(agentId, value);
-          },
-        }}
-        executor={{
-          value: executor ?? "",
-          options: (llm?.executors ?? []).map((value) => ({ value, label: value })),
-          onChange: (value) => {
-            if (!agentId || !llmId || !model || !llm?.executors.includes(value)) return;
-            const next = {
-              model,
-              effort,
-              agentProfile: agentId,
-              llmProfile: llmId,
-              executor: value,
-              ...(projectId ? { project: projectId } : {}),
-            };
-            onChange(next);
-            onPreference?.(next);
           },
         }}
         effort={{

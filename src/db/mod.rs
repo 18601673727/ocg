@@ -41,11 +41,6 @@ use crate::system::monitor::{
 };
 use crate::system::policy::{SystemPolicy, SystemPolicyError};
 
-#[derive(Clone, Copy)]
-pub(crate) enum AdmissionCandidate {
-    Decision(ExecutorId, entities::ProfileId),
-}
-
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
 
 #[allow(dead_code)]

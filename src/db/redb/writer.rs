@@ -33,6 +33,12 @@ pub(crate) enum Probe {
     Outcome(JobId),
 }
 
+#[derive(Clone, Debug)]
+pub(crate) enum NativeResourceDelta {
+    Pool(crate::db::entities::AllocationPool),
+    Executor(crate::db::entities::AllocationExecutor),
+}
+
 pub(crate) struct BatchOutcome<T> {
     pub(crate) result: Result<T, BatchFailure>,
     pub(crate) storage_failure: Option<StorageError>,
@@ -41,6 +47,7 @@ pub(crate) struct BatchOutcome<T> {
     pub(crate) capacity_freed: bool,
     pub(crate) catalog_changed: bool,
     pub(crate) probe: Option<Probe>,
+    pub(crate) resource_deltas: Vec<NativeResourceDelta>,
 }
 
 impl<T> BatchOutcome<T> {
@@ -57,6 +64,7 @@ impl<T> BatchOutcome<T> {
             capacity_freed: false,
             catalog_changed: false,
             probe: None,
+            resource_deltas: Vec::new(),
         }
     }
 }
@@ -73,6 +81,7 @@ pub(crate) struct Batch {
     pub(super) changed_pool: bool,
     pub(super) catalog_changed: bool,
     pub(super) probe: Option<Probe>,
+    pub(super) resource_deltas: Vec<NativeResourceDelta>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -137,6 +146,7 @@ pub(crate) fn run_batch_declinable<T>(
                     capacity_freed: false,
                     catalog_changed: false,
                     probe: None,
+                    resource_deltas: Vec::new(),
                 },
                 Err(error) => {
                     let error = StorageError::from(error);
@@ -157,10 +167,12 @@ fn commit_batch<T>(batch: Batch, value: T, commit: Commit) -> BatchOutcome<T> {
         batch.freed_capacity,
         batch.probe,
         batch.catalog_changed,
+        batch.resource_deltas,
         commit,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn commit_transaction<T>(
     tx: WriteTransaction,
     value: T,
@@ -168,6 +180,7 @@ pub(super) fn commit_transaction<T>(
     freed: bool,
     probe: Option<Probe>,
     catalog_changed: bool,
+    resource_deltas: Vec<NativeResourceDelta>,
     commit: Commit,
 ) -> BatchOutcome<T> {
     let started = (commit == Commit::Durable).then(Instant::now);
@@ -182,6 +195,7 @@ pub(super) fn commit_transaction<T>(
             capacity_freed: freed,
             catalog_changed,
             probe,
+            resource_deltas,
         },
         Err(CommitError::TransactionPoisoned) => {
             let error = StorageError::from(CommitError::TransactionPoisoned);
@@ -261,6 +275,7 @@ impl Batch {
             changed_pool: false,
             catalog_changed: false,
             probe: None,
+            resource_deltas: Vec::new(),
         }
     }
 

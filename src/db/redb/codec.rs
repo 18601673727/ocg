@@ -232,7 +232,6 @@ impl Enc {
             encoder.u128(assignment.project.get());
             encoder.u64(assignment.revision);
         });
-        self.u32(work.request.schema_version);
         self.str(&work.request.state.to_string());
         match &work.request.question {
             DecisionQuestion::Choice { prompt, options } => {
@@ -618,7 +617,6 @@ impl<'a> Dec<'a> {
                 revision: decoder.u64()?,
             })
         })?;
-        let schema_version = self.u32()?;
         let state = serde_json::from_str(&self.str()?)
             .map_err(|_| StorageError::corrupted("invalid decision state"))?;
         let kind = self.u8()?;
@@ -683,11 +681,7 @@ impl<'a> Dec<'a> {
             commands,
             frozen,
             prediction,
-            request: DecisionRequest {
-                schema_version,
-                state,
-                question,
-            },
+            request: DecisionRequest { state, question },
         };
         work.validate().map_err(StorageError::corrupted)?;
         Ok(work)

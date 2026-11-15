@@ -51,6 +51,24 @@ impl ApprovalRecord {
         e.ts(self.at);
         e.0
     }
+
+    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
+        let mut d = Dec::new(bytes, TAG_APPROVAL)?;
+        let decision = match d.u8()? {
+            1 => ApprovalDecision::Approved,
+            2 => ApprovalDecision::Rejected,
+            3 => ApprovalDecision::Answered { text: d.str()? },
+            4 => ApprovalDecision::Voided,
+            _ => return Err(StorageError::corrupted("invalid approval decision")),
+        };
+        let row = Self {
+            decision,
+            by: d.actor()?,
+            at: d.ts()?,
+        };
+        d.end()?;
+        Ok(row)
+    }
 }
 
 impl Batch {

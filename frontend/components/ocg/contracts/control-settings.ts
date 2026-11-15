@@ -16,7 +16,6 @@ export type ControlDecisionAnswer =
       confidence?: Confidence | null;
     };
 export type ControlPredictionResult = {
-  schema_version: number;
   outcome:
     | { kind: "answer"; answer: ControlDecisionAnswer }
     | { kind: "uncertain" | "unusable"; reason: string };

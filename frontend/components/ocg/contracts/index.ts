@@ -42,6 +42,5 @@ export { CONTROL_API_VERSION } from "./generated";
 export type ChatModelSelection = import("./view-models").ChatModelSelection & {
   agentProfile?: string;
   llmProfile?: string;
-  executor?: string;
   project?: string;
 };

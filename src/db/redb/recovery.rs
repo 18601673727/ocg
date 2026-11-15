@@ -226,14 +226,6 @@ pub(super) fn check_identity(
             "database format {found} is not supported; this build opens only format {FORMAT_VERSION}; no migration is available"
         )));
     }
-    if !meta
-        .get(SCHEMA_FINGERPRINT_KEY)?
-        .is_some_and(|value| value.value() == SCHEMA_FINGERPRINT)
-    {
-        return Err(unsupported_format(&format!(
-            "database format {found} has a different schema fingerprint"
-        )));
-    }
     Ok(())
 }
 
@@ -492,15 +484,66 @@ pub(crate) fn verify_reserved_residual(
 
 fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
     use ::redb::TableHandle;
-    let present: Vec<String> = tx
+    let present: std::collections::BTreeSet<String> = tx
         .list_tables()?
         .map(|table| table.name().to_owned())
         .collect();
     for required in [
+        META.name(),
+        SEQUENCES.name(),
+        CONFIGS.name(),
+        CREDENTIALS.name(),
+        JOBS.name(),
+        JOB_STATES.name(),
+        POOL_ALLOCATIONS.name(),
+        JOB_OUTPUTS.name(),
+        SUBMISSIONS.name(),
+        ATTACHMENTS.name(),
+        TOOL_CALLS.name(),
+        MESSAGES.name(),
+        REQUEST_EVENTS.name(),
+        PROJECTS.name(),
+        JOB_CONTROLS.name(),
+        JOB_INPUTS.name(),
+        NOTICES.name(),
+        APPROVALS.name(),
+        RECURRENCES.name(),
         SCHEDULED_EXTERNAL_POLICY.name(),
         SCHEDULED_EXTERNAL_BINDING.name(),
+        JOB_OBSERVATIONS.name(),
+        CONTENT_REFERENCES.name(),
+        CONTENT_RECLAIM.name(),
+        ACTIVE_ALLOCATIONS.name(),
+        ALLOCATION_REQUESTS.name(),
+        DRAFT_CONTEXTS.name(),
+        JOB_ALLOCATIONS.name(),
+        CONVERSATIONS.name(),
+        TURNS.name(),
+        PENDING.name(),
+        MUTABLE_READY.name(),
+        DELAYED.name(),
+        DEPENDENCY_WAITERS.name(),
+        UNSETTLED.name(),
+        CHILDREN.name(),
+        SUCCESSORS.name(),
+        CONVERSATION_SEARCH.name(),
+        CHILD_GROUPS.name(),
+        LIVE_CHILDREN.name(),
+        USER_INPUT_AT.name(),
+        ACTIVE_JOBS.name(),
+        GROUP_RESULTS.name(),
+        NOTICE_READ.name(),
+        TOOL_CALL_IDS.name(),
+        TOOL_STATS.name(),
+        USAGE_TOTALS.name(),
+        RETRIES.name(),
+        USAGE_MODEL.name(),
+        REQUEST_TIMELINE.name(),
+        OPEN_APPROVALS.name(),
+        APPROVAL_CALLS.name(),
+        RECURRENCE_DUE.name(),
     ] {
-        if !present.iter().any(|table| table == required) {
+        if !present.contains(required) {
             return Err(StorageError::corrupted(format!(
                 "database is marked format {FORMAT_VERSION} but lacks the {required} table; it is not a complete database"
             )));
@@ -525,7 +568,7 @@ fn check_record_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
     check_preflight_table(tx, CREDENTIALS, &[16])?;
     check_preflight_table(tx, SCHEDULED_EXTERNAL_POLICY, &[18])?;
     check_preflight_table(tx, SCHEDULED_EXTERNAL_BINDING, &[19])?;
-    Ok(())
+    check_record_payloads(tx)
 }
 
 pub(super) fn verify_migrated(
@@ -667,10 +710,15 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
             ));
         }
     }
-    if let Ok(states) = tx.open_table(JOB_STATES) {
-        for entry in states.iter()? {
-            let (key, value) = entry?;
-            JobState::decode_at(key.value(), value.value())?;
+    let states = tx.open_table(JOB_STATES)?;
+    let jobs = tx.open_table(JOBS)?;
+    for entry in states.iter()? {
+        let (key, value) = entry?;
+        let state = JobState::decode_at(key.value(), value.value())?;
+        if jobs.get(state.job_id.get())?.is_none() {
+            return Err(StorageError::corrupted(
+                "job_state row has no matching job record",
+            ));
         }
     }
     Ok(())
@@ -806,14 +854,270 @@ fn check_preflight_table<K: Key + 'static>(
     definition: TableDefinition<K, &'static [u8]>,
     tags: &[u8],
 ) -> Result<(), StorageError> {
-    let table = match tx.open_table(definition) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return Ok(()),
-        Err(error) => return Err(error.into()),
-    };
+    let table = tx.open_table(definition)?;
     for row in table.iter()? {
         let (_, value) = row?;
         check_preflight_header(value.value(), tags)?;
+    }
+    Ok(())
+}
+
+fn require_job_exists(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    job_id: u128,
+    context: &str,
+) -> Result<(), StorageError> {
+    if jobs.get(job_id)?.is_none() {
+        return Err(StorageError::corrupted(format!(
+            "{context} references missing job {job_id}"
+        )));
+    }
+    Ok(())
+}
+
+fn check_pair_job_refs(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    tx: &ReadTransaction,
+    definition: TableDefinition<(u128, u128), ()>,
+    context: &str,
+) -> Result<(), StorageError> {
+    for entry in tx.open_table(definition)?.iter()? {
+        let (key, _) = entry?;
+        let (first, second) = key.value();
+        require_job_exists(jobs, first, context)?;
+        require_job_exists(jobs, second, context)?;
+    }
+    Ok(())
+}
+
+fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
+    let jobs = tx.open_table(JOBS)?;
+    let states = tx.open_table(JOB_STATES)?;
+    let configs = tx.open_table(CONFIGS)?;
+    for entry in configs.iter()? {
+        let (key, value) = entry?;
+        match value.value().first() {
+            Some(&codec::TAG_CONFIG) => {
+                ConfigRow::decode_at(key.value(), value.value())?;
+            }
+            Some(&40) => {
+                transactions::decode_allocation_pool(key.value(), value.value())?;
+            }
+            Some(&41) => {
+                transactions::decode_allocation_executor(key.value(), value.value())?;
+            }
+            _ => {
+                return Err(StorageError::corrupted("unexpected config record tag"));
+            }
+        }
+    }
+    for entry in jobs.iter()? {
+        let (key, value) = entry?;
+        let job_id = key.value();
+        match value.value().first() {
+            Some(&JobSpec::MUTABLE_CONVERSATION_TAG) => {
+                JobSpec::decode_at(job_id, value.value())?;
+            }
+            Some(&codec::TAG_JOB) => {
+                transactions::decode_mutable_job(job_id, value.value())
+                    .map(|_| ())
+                    .or_else(|err| {
+                        JobSpec::decode_at(job_id, value.value())
+                            .map(|_| ())
+                            .map_err(|_| err)
+                    })?;
+            }
+            _ => {
+                return Err(StorageError::corrupted("unexpected job record tag"));
+            }
+        }
+        if states.get(job_id)?.is_none() {
+            return Err(StorageError::corrupted(format!(
+                "job {job_id} has no matching job_state record"
+            )));
+        }
+    }
+    for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
+        let (key, value) = entry?;
+        let allocation = transactions::decode_pool_allocation(key.value(), value.value())?;
+        let Some(job_row) = jobs.get(allocation.token.job.get())? else {
+            return Err(StorageError::corrupted(format!(
+                "pool_allocation references missing job {}",
+                allocation.token.job
+            )));
+        };
+        transactions::decode_mutable_job(allocation.token.job.get(), job_row.value())?;
+        if configs.get(allocation.token.pool.get())?.is_none() {
+            return Err(StorageError::corrupted(
+                "pool_allocation references missing pool config",
+            ));
+        }
+        if configs.get(allocation.token.executor.get())?.is_none() {
+            return Err(StorageError::corrupted(
+                "pool_allocation references missing executor config",
+            ));
+        }
+    }
+    for entry in tx.open_table(SUBMISSIONS)?.iter()? {
+        let (key, value) = entry?;
+        let submission = rows::decode_submission(key.value(), value.value())?;
+        require_job_exists(&jobs, submission.job.get(), "submission")?;
+    }
+    for entry in tx.open_table(JOB_OUTPUTS)?.iter()? {
+        let (key, value) = entry?;
+        let output_key = key.value();
+        let output = rows::decode_output(output_key, value.value())?;
+        require_job_exists(&jobs, output_key.0, "job_output")?;
+        if output.kind == OutputKind::Result {
+            let state = states
+                .get(output_key.0)?
+                .ok_or_else(|| StorageError::corrupted("result Job state is missing"))?;
+            let state = JobState::decode_at(output_key.0, state.value())?;
+            if !state
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.kind != OutcomeKind::Unknown)
+            {
+                return Err(StorageError::corrupted(
+                    "result output has no confirmed Job outcome",
+                ));
+            }
+        }
+    }
+    for entry in tx.open_table(ATTACHMENTS)?.iter()? {
+        let (key, value) = entry?;
+        rows::decode_attachment(key.value(), value.value())?;
+    }
+    let tool_calls = tx.open_table(TOOL_CALLS)?;
+    for entry in tool_calls.iter()? {
+        let (key, value) = entry?;
+        let call = rows::tool_call_ref(key.value())?;
+        rows::decode_tool_evidence(call, value.value())?;
+        require_job_exists(&jobs, call.job.get(), "tool_call")?;
+    }
+    let request_events = tx.open_table(REQUEST_EVENTS)?;
+    for entry in request_events.iter()? {
+        let (key, value) = entry?;
+        let (job_u128, request_u32, seq) = key.value();
+        let request = crate::db::entities::RequestNumber::new(request_u32)
+            .ok_or_else(|| StorageError::corrupted("invalid request number in request_event"))?;
+        rows::decode_request_event(JobId::new(job_u128), request, seq, value.value())?;
+        require_job_exists(&jobs, job_u128, "request_event")?;
+    }
+    for entry in tx.open_table(REQUEST_TIMELINE)?.iter()? {
+        let (key, _) = entry?;
+        let (_, job_u128, request_u32, seq) = key.value();
+        if request_events.get((job_u128, request_u32, seq))?.is_none() {
+            return Err(StorageError::corrupted(
+                "request_timeline references missing request_event",
+            ));
+        }
+    }
+    for entry in tx.open_table(PROJECTS)?.iter()? {
+        let (key, value) = entry?;
+        rows::decode_project(key.value(), value.value())?;
+    }
+    for entry in tx.open_table(JOB_CONTROLS)?.iter()? {
+        let (key, value) = entry?;
+        super::JobControl::decode(value.value())?;
+        require_job_exists(&jobs, key.value(), "job_control")?;
+    }
+    for entry in tx.open_table(JOB_INPUTS)?.iter()? {
+        let (key, value) = entry?;
+        let (job_u128, second) = key.value();
+        require_job_exists(&jobs, job_u128, "job_input")?;
+        match value.value().first() {
+            Some(&codec::TAG_JOB_INPUT) => {
+                super::JobInputEntry::decode(value.value())?;
+            }
+            Some(&52) => {
+                transactions::decode_mutable_input_revision(
+                    JobId::new(job_u128),
+                    second,
+                    value.value(),
+                )?;
+            }
+            _ => {
+                return Err(StorageError::corrupted("unexpected job_input record tag"));
+            }
+        }
+    }
+    for entry in tx.open_table(NOTICES)?.iter()? {
+        let (key, value) = entry?;
+        super::Notice::decode(value.value())?;
+        require_job_exists(&jobs, key.value().0, "notice")?;
+    }
+    for entry in tx.open_table(RECURRENCES)?.iter()? {
+        let (key, value) = entry?;
+        let recurrence = Recurrence::decode(value.value())?;
+        require_job_exists(&jobs, key.value(), "recurrence conversation")?;
+        require_job_exists(&jobs, recurrence.current_turn.get(), "recurrence turn")?;
+    }
+    for entry in tx.open_table(APPROVALS)?.iter()? {
+        let (key, value) = entry?;
+        ApprovalRecord::decode(value.value())?;
+        let approval_key = key.value();
+        require_job_exists(&jobs, approval_key.0, "approval")?;
+        if tool_calls.get(approval_key)?.is_none() {
+            return Err(StorageError::corrupted(
+                "approval references missing tool_call",
+            ));
+        }
+    }
+    for entry in tx.open_table(CREDENTIALS)?.iter()? {
+        let (key, value) = entry?;
+        rows::decode_credential(key.value(), value.value())?;
+    }
+    let policies = tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
+    for entry in policies.iter()? {
+        let (key, value) = entry?;
+        codec::decode_scheduled_external_policy(key.value(), value.value())?;
+    }
+    for entry in tx.open_table(SCHEDULED_EXTERNAL_BINDING)?.iter()? {
+        let (key, value) = entry?;
+        let binding = codec::decode_scheduled_external_binding(key.value(), value.value())?;
+        require_job_exists(&jobs, binding.job.get(), "scheduled_external_binding")?;
+        if policies.get(binding.policy.get())?.is_none() {
+            return Err(StorageError::corrupted(
+                "scheduled_external_binding references missing policy",
+            ));
+        }
+    }
+    let conversations = tx.open_table(CONVERSATIONS)?;
+    for entry in conversations.iter()? {
+        let (key, _) = entry?;
+        require_job_exists(&jobs, key.value(), "conversation")?;
+    }
+    for entry in tx.open_table(TURNS)?.iter()? {
+        let (key, _) = entry?;
+        let (conv, turn) = key.value();
+        if conversations.get(conv)?.is_none() {
+            return Err(StorageError::corrupted(
+                "turn references missing conversation",
+            ));
+        }
+        require_job_exists(&jobs, turn, "turn")?;
+    }
+    for entry in tx.open_table(ACTIVE_JOBS)?.iter()? {
+        let (conv, turn) = entry?;
+        require_job_exists(&jobs, conv.value(), "active_job conversation")?;
+        require_job_exists(&jobs, turn.value(), "active_job turn")?;
+    }
+    check_pair_job_refs(&jobs, tx, CHILD_GROUPS, "child_group")?;
+    check_pair_job_refs(&jobs, tx, LIVE_CHILDREN, "live_child")?;
+    for entry in tx.open_table(CHILDREN)?.iter()? {
+        let (key, _) = entry?;
+        let (parent, child) = key.value();
+        if parent != 0 {
+            require_job_exists(&jobs, parent, "children parent")?;
+        }
+        require_job_exists(&jobs, child, "children child")?;
+    }
+    for entry in tx.open_table(DEPENDENCY_WAITERS)?.iter()? {
+        let (key, _) = entry?;
+        let (dep, waiter) = key.value();
+        require_job_exists(&jobs, dep, "dependency_waiter dependency")?;
+        require_job_exists(&jobs, waiter, "dependency_waiter waiter")?;
     }
     Ok(())
 }
@@ -938,7 +1242,6 @@ pub(super) fn initialize(
         let mut meta = tx.open_table(META).map_err(StorageError::from)?;
         if empty {
             meta.insert(DATABASE_FORMAT_KEY, FORMAT_VERSION.to_le_bytes().as_slice())?;
-            meta.insert(SCHEMA_FINGERPRINT_KEY, SCHEMA_FINGERPRINT)?;
             let settings = crate::db::entities::GlobalCompactionSettings::default();
             let mut encoded = Enc::new(TAG_GLOBAL_COMPACTION);
             encoded.u64(settings.revision);
