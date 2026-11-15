@@ -37,6 +37,7 @@ mod migrate;
 pub(crate) use migrate::{HeldSource, MigrationInspection, apply, inspect};
 mod notices;
 mod observations;
+pub(crate) use observations::read_multistep_resume;
 mod reader;
 mod recovery;
 pub(crate) use recovery::reclaim_pending;
@@ -95,6 +96,7 @@ pub(crate) use recovery::{OpenedFile, database_file, open};
 pub(crate) use reader::read_global_outbound_headers;
 pub(crate) use reader::read_handoff_credential;
 pub(crate) use reader::read_trial_job;
+pub(crate) use reader::read_unstarted_retry;
 pub(crate) use reader::{
     AgentModelConfig, ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage,
     NativeJobItem, read_cards, read_conversation_children,
@@ -108,6 +110,9 @@ pub(crate) use reader::{
     read_latest_output, read_native_job, read_outputs, read_profile_page, read_project,
     read_projects, read_retries, read_submission, read_tool_evidence, read_tool_stats,
     read_uncertain_allocations, read_usage_buckets, read_usage_retries, read_usage_summary,
+};
+pub(crate) use reader::{
+    JobReplay, JobReplayPhase, JobTimelinePage, read_job_replay, read_job_timeline,
 };
 pub(crate) use reader::{
     MutableConversationPage, MutableJobDetails, MutableJobDetailsLookup, read_conversation_limits,

@@ -26,7 +26,7 @@ import {
   ControlTransportError,
   isProfileConflict,
   type ControlProfileWriteRequest,
-  type HttpCanonicalControlClient,
+  type HttpControlClient,
 } from "@/components/ocg/runtime/control-client";
 import { cn } from "@/lib/utils";
 import { Section, describeError } from "./settings-parts";
@@ -147,7 +147,7 @@ export function SettingsSurface({
   section,
   onNavigate,
 }: {
-  client?: HttpCanonicalControlClient;
+  client?: HttpControlClient;
   sessionExpiresAtUs: number | null;
   signingOut: boolean;
   onSignOut: () => void;

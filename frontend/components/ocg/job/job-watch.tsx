@@ -23,7 +23,7 @@ import {
   ControlTransportError,
   readTranscriptEvidence,
   readOutputWindow,
-  type HttpCanonicalControlClient,
+  type HttpControlClient,
   type JobStreamEvent,
   type JobStreamSubscription,
 } from "@/components/ocg/runtime/control-client";
@@ -163,7 +163,7 @@ const PHASE_BADGE = {
 } as const satisfies Record<ControlExecutionPhase, string>;
 
 export function JobWatch(props: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   jobId: string;
   presentation?: "inspector" | "chat";
   bare?: boolean;
@@ -190,7 +190,7 @@ function JobWatchBody({
   onStateChange,
   onRetry,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   jobId: string;
   presentation?: "inspector" | "chat";
   bare?: boolean;
@@ -904,7 +904,11 @@ function JobWatchBody({
         <p className="break-all text-xs text-muted-foreground">
           <code className="font-mono">{jobId}</code>
           {job ? ` · ${job.execution_mode}` : ""}
-          {job?.assigned_executor ? ` · ${job.assigned_executor}` : ""}
+          {job?.assigned_executor
+            ? ` · ${t("job.currentExecutor", { executor: job.assigned_executor })}`
+            : job?.last_executor
+              ? ` · ${t("job.lastExecutor", { executor: job.last_executor })}`
+              : ""}
         </p>
         <TaskStatus plan={details?.task_plan} />
         {statusFailure && (

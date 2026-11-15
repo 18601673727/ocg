@@ -1,3 +1,4 @@
+use crate::system::data_directory::resolve_path;
 use std::ops::Bound;
 
 use ::redb::ReadableTableMetadata;
@@ -255,7 +256,7 @@ fn verify_publication_with_exclusive_lock(
         options.open(path).map_err(io)
     }
 
-    let directory = std::fs::canonicalize(directory).map_err(io)?;
+    let directory = resolve_path(directory).map_err(io)?;
     let named_lock =
         open_named(&directory.join(crate::system::data_directory::DATABASE_LOCK_FILE))?;
     if !same_file(
@@ -561,7 +562,7 @@ fn inspect_held_in(
             }
             Some(_) => {
                 established.push(
-                    "A Sent row is stored: the runtime recorded that it began transmitting the request."
+                    "A Sent row is stored: sending was authorized; it does not prove whether transmission began."
                         .to_owned(),
                 );
                 inferred.push(
@@ -625,9 +626,16 @@ fn inspect_held_in(
         tx.open_table(CONFIGS),
         tx.open_table(ACTIVE_ALLOCATIONS),
         tx.open_table(ALLOCATION_REQUESTS),
+        tx.open_table(EXECUTION_EVENTS),
     ) {
-        (Ok(configs), Ok(active), Ok(requests)) => {
-            match indexes::allocation_indexes_agree(&allocations, &configs, &active, &requests) {
+        (Ok(configs), Ok(active), Ok(requests), Ok(events)) => {
+            match indexes::allocation_indexes_agree(
+                &allocations,
+                &configs,
+                &active,
+                &requests,
+                &events,
+            ) {
                 Ok(true) => "consistent".to_owned(),
                 Ok(false) => "the stored indexes differ from their source rows".to_owned(),
                 Err(error) => format!("inconsistent: {error}"),
@@ -856,6 +864,56 @@ pub(super) fn mutable_job_record_in(
         return Err(StorageError::corrupted("invalid mutable Job state version"));
     }
     let state = JobState::decode_at(id.get(), state.value())?;
+    let history = replay_mutable_job(rx, id, None)?
+        .ok_or_else(|| StorageError::corrupted("mutable Job has no lifecycle history"))?;
+    if history.submitted != job.submitted_at.is_some() || history.outcome != state.outcome {
+        return Err(StorageError::corrupted(
+            "mutable Job projection disagrees with its history",
+        ));
+    }
+    if state
+        .outcome
+        .as_ref()
+        .is_some_and(|outcome| matches!(outcome.kind, OutcomeKind::Completed | OutcomeKind::Failed))
+    {
+        let outputs = rx.open_table(JOB_OUTPUTS)?;
+        let mut results = 0usize;
+        for entry in outputs.range((id.get(), 0)..=(id.get(), u32::MAX))? {
+            let (_, value) = entry?;
+            if rows::output_kind(value.value())? == OutputKind::Result {
+                results += 1;
+            }
+        }
+        if results != 1 {
+            return Err(StorageError::corrupted(
+                "settled Job does not have exactly one result",
+            ));
+        }
+    }
+    if state.outcome.is_none() {
+        let expected = match history.phase {
+            JobReplayPhase::Unsubmitted => crate::db::entities::MutableJobPhase::Unsubmitted,
+            JobReplayPhase::Queued | JobReplayPhase::Waiting | JobReplayPhase::Reserved => {
+                crate::db::entities::MutableJobPhase::Queued
+            }
+            JobReplayPhase::Running | JobReplayPhase::StopRequested => {
+                crate::db::entities::MutableJobPhase::Executing
+            }
+            JobReplayPhase::Unknown
+            | JobReplayPhase::Completed
+            | JobReplayPhase::Failed
+            | JobReplayPhase::Cancelled => {
+                return Err(StorageError::corrupted(
+                    "unsettled Job has an invalid historical phase",
+                ));
+            }
+        };
+        if job.phase != expected {
+            return Err(StorageError::corrupted(
+                "mutable Job phase disagrees with its history",
+            ));
+        }
+    }
     if state.stop_confirmed_at.is_some() || state.stop_confirmed_by.is_some() {
         return Err(StorageError::corrupted(
             "mutable Job has legacy ownership evidence",
@@ -872,6 +930,427 @@ pub(super) fn mutable_job_record_in(
         job,
         outcome: state.outcome,
         project,
+    }))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum JobReplayPhase {
+    Unsubmitted,
+    Waiting,
+    Queued,
+    Reserved,
+    Running,
+    StopRequested,
+    Unknown,
+    Completed,
+    Failed,
+    Cancelled,
+}
+impl JobReplayPhase {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsubmitted => "unsubmitted",
+            Self::Waiting => "waiting",
+            Self::Queued => "queued",
+            Self::Reserved => "reserved",
+            Self::Running => "running",
+            Self::StopRequested => "stop_requested",
+            Self::Unknown => "unknown",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+pub(crate) struct JobReplay {
+    pub submitted: bool,
+    pub phase: JobReplayPhase,
+    pub outcome: Option<crate::db::entities::OutcomeRecord>,
+    pub current_allocation_generation: Option<u32>,
+    pub current_executor: Option<ExecutorId>,
+    pub last_executor: Option<ExecutorId>,
+    pub sequence: u128,
+}
+
+fn replay_mutable_job(
+    rx: &ReadTransaction,
+    job: JobId,
+    at: Option<u128>,
+) -> Result<Option<JobReplay>, StorageError> {
+    use crate::db::entities::AllocationPhase;
+    use transactions::JobLifecycle;
+    let cutoff = at.unwrap_or(u128::MAX);
+    let lifecycle = rx.open_table(JOB_LIFECYCLE_EVENTS)?;
+    let allocations = rx.open_table(JOB_EXECUTION_EVENTS)?;
+    let events = rx.open_table(EXECUTION_EVENTS)?;
+    let mut sequences = Vec::new();
+    for entry in lifecycle.range((job.get(), 0)..=(job.get(), cutoff))? {
+        sequences.push((entry?.0.value().1, true));
+    }
+    for entry in allocations.range((job.get(), 0)..=(job.get(), cutoff))? {
+        sequences.push((entry?.0.value().1, false));
+    }
+    sequences.sort_unstable_by_key(|entry| entry.0);
+    let mut replay: Option<JobReplay> = None;
+    let mut generation = 0u32;
+    let mut previous_phase = None;
+    let mut request_sequences = std::collections::BTreeMap::<u32, u32>::new();
+    let mut tool_decisions = std::collections::BTreeSet::new();
+    let mut tool_outcomes = std::collections::BTreeSet::new();
+    for (sequence, is_lifecycle) in sequences {
+        let event = events
+            .get(sequence)?
+            .ok_or_else(|| StorageError::corrupted("Job history event is missing"))?;
+        if is_lifecycle {
+            let (owner, _, event) = transactions::decode_job_lifecycle(sequence, event.value())?;
+            if owner != job {
+                return Err(StorageError::corrupted("Job history has the wrong owner"));
+            }
+            match event {
+                JobLifecycle::Created | JobLifecycle::Submitted if replay.is_none() => {
+                    let submitted = matches!(event, JobLifecycle::Submitted);
+                    replay = Some(JobReplay {
+                        submitted,
+                        phase: if submitted {
+                            JobReplayPhase::Queued
+                        } else {
+                            JobReplayPhase::Unsubmitted
+                        },
+                        outcome: None,
+                        current_allocation_generation: None,
+                        current_executor: None,
+                        last_executor: None,
+                        sequence,
+                    });
+                }
+                JobLifecycle::Submitted => {
+                    let Some(state) = replay.as_mut() else {
+                        return Err(StorageError::corrupted("submission has no Job"));
+                    };
+                    if state.submitted || state.outcome.is_some() {
+                        return Err(StorageError::corrupted("invalid Job submission history"));
+                    }
+                    state.submitted = true;
+                    state.phase = JobReplayPhase::Queued;
+                    state.sequence = sequence;
+                }
+                JobLifecycle::Waiting | JobLifecycle::Eligible => {
+                    let Some(state) = replay.as_mut() else {
+                        return Err(StorageError::corrupted(
+                            "scheduling eligibility predates Job",
+                        ));
+                    };
+                    if !state.submitted
+                        || state.outcome.is_some()
+                        || state.current_allocation_generation.is_some()
+                    {
+                        return Err(StorageError::corrupted(
+                            "invalid scheduling eligibility transition",
+                        ));
+                    }
+                    state.phase = if matches!(event, JobLifecycle::Waiting) {
+                        JobReplayPhase::Waiting
+                    } else {
+                        JobReplayPhase::Queued
+                    };
+                    state.sequence = sequence;
+                }
+                JobLifecycle::Outcome(outcome) => {
+                    let Some(state) = replay.as_mut() else {
+                        return Err(StorageError::corrupted("outcome has no Job"));
+                    };
+                    if state
+                        .outcome
+                        .as_ref()
+                        .is_some_and(|old| old.kind != OutcomeKind::Unknown)
+                    {
+                        return Err(StorageError::corrupted("terminal Job outcome changed"));
+                    }
+                    let outcome = outcome
+                        .outcome
+                        .ok_or_else(|| StorageError::corrupted("outcome event has no outcome"))?;
+                    state.phase = match outcome.kind {
+                        OutcomeKind::Completed => JobReplayPhase::Completed,
+                        OutcomeKind::Failed => JobReplayPhase::Failed,
+                        OutcomeKind::Cancelled => JobReplayPhase::Cancelled,
+                        OutcomeKind::Unknown => JobReplayPhase::Unknown,
+                    };
+                    state.outcome = Some(outcome);
+                    state.sequence = sequence;
+                }
+                JobLifecycle::RequestEvidence { request, seq } => {
+                    let Some(state) = replay.as_mut() else {
+                        return Err(StorageError::corrupted("request predates Job submission"));
+                    };
+                    let table = rx.open_table(REQUEST_EVENTS)?;
+                    let evidence = table
+                        .get((job.get(), request.get(), seq))?
+                        .ok_or_else(|| StorageError::corrupted("request evidence is missing"))?;
+                    rows::decode_request_event(job, request, seq, evidence.value())?;
+                    let sent = table.get((job.get(), request.get(), 1))?.ok_or_else(|| {
+                        StorageError::corrupted("request authorization is missing")
+                    })?;
+                    let previous = request_sequences.get(&request.get()).copied().unwrap_or(0);
+                    if previous.checked_add(1) != Some(seq)
+                        || !matches!(rows::decode_request_event(job, request, 1, sent.value())?.payload,
+                        crate::db::entities::RequestPayload::Sent { allocation_generation, .. } if Some(allocation_generation.get()) == state.current_allocation_generation)
+                        || state.outcome.is_some()
+                    {
+                        return Err(StorageError::corrupted(
+                            "request belongs to an inactive Allocation",
+                        ));
+                    }
+                    request_sequences.insert(request.get(), seq);
+                    state.sequence = sequence;
+                }
+                JobLifecycle::ToolEvidence {
+                    request,
+                    index,
+                    outcome,
+                } => {
+                    let Some(state) = replay.as_mut() else {
+                        return Err(StorageError::corrupted(
+                            "tool operation predates Job submission",
+                        ));
+                    };
+                    let table = rx.open_table(TOOL_CALLS)?;
+                    let row = table
+                        .get((job.get(), request.get(), index))?
+                        .ok_or_else(|| {
+                            StorageError::corrupted("tool operation evidence is missing")
+                        })?;
+                    let call = crate::db::entities::ToolCallRef {
+                        job,
+                        request,
+                        index,
+                    };
+                    let evidence = rows::decode_tool_evidence(call, row.value())?;
+                    let key = (request.get(), index);
+                    let valid = if outcome {
+                        tool_decisions.contains(&key)
+                            && tool_outcomes.insert(key)
+                            && evidence.outcome.is_some()
+                    } else {
+                        request_sequences.contains_key(&request.get()) && tool_decisions.insert(key)
+                    };
+                    if !valid || state.outcome.is_some() {
+                        return Err(StorageError::corrupted("invalid tool operation history"));
+                    }
+                    state.sequence = sequence;
+                }
+                JobLifecycle::Output { seq } => {
+                    let Some(state) = replay.as_mut() else {
+                        return Err(StorageError::corrupted("output predates Job"));
+                    };
+                    let table = rx.open_table(JOB_OUTPUTS)?;
+                    let value = table.get((job.get(), seq))?.ok_or_else(|| {
+                        StorageError::corrupted("output event references missing evidence")
+                    })?;
+                    let output = decode_output((job.get(), seq), value.value())?;
+                    if state.outcome.is_some() && output.kind != OutputKind::Result {
+                        return Err(StorageError::corrupted(
+                            "non-result output follows settlement",
+                        ));
+                    }
+                    state.sequence = sequence;
+                }
+                JobLifecycle::DependencySettled { prerequisite } => {
+                    let Some(state) = replay.as_mut() else {
+                        return Err(StorageError::corrupted("dependency event predates Job"));
+                    };
+                    if !state.submitted
+                        || state.outcome.is_some()
+                        || rx.open_table(JOBS)?.get(prerequisite.get())?.is_none()
+                    {
+                        return Err(StorageError::corrupted("invalid dependency event"));
+                    }
+                    state.sequence = sequence;
+                }
+                JobLifecycle::Created => {
+                    return Err(StorageError::corrupted("duplicate Job creation event"));
+                }
+            }
+        } else {
+            let (owner, next_generation, phase, _, retry, origin) =
+                transactions::decode_execution_event(sequence, event.value())?;
+            let Some(state) = replay.as_mut() else {
+                return Err(StorageError::corrupted(
+                    "Allocation predates Job submission",
+                ));
+            };
+            if owner != job || !state.submitted {
+                return Err(StorageError::corrupted("Allocation has invalid Job"));
+            }
+            if phase == AllocationPhase::Reserved {
+                if state.outcome.is_some()
+                    || next_generation != generation.saturating_add(1)
+                    || generation != 0 && previous_phase != Some(AllocationPhase::Released)
+                {
+                    return Err(StorageError::corrupted(
+                        "invalid Allocation creation history",
+                    ));
+                }
+                generation = next_generation;
+                let created = origin
+                    .ok_or_else(|| StorageError::corrupted("Allocation creation is missing"))?;
+                state.current_allocation_generation = Some(generation);
+                state.current_executor = Some(created.token.executor);
+            } else if generation != next_generation {
+                return Err(StorageError::corrupted(
+                    "Allocation history is out of order",
+                ));
+            }
+            if state.outcome.is_none() {
+                state.phase = match phase {
+                    AllocationPhase::Reserved => JobReplayPhase::Reserved,
+                    AllocationPhase::Running => JobReplayPhase::Running,
+                    AllocationPhase::StopRequested => JobReplayPhase::StopRequested,
+                    AllocationPhase::Uncertain => JobReplayPhase::Unknown,
+                    AllocationPhase::Released if retry.is_some() => JobReplayPhase::Queued,
+                    AllocationPhase::Released => {
+                        return Err(StorageError::corrupted(
+                            "released unsettled Allocation has no retry",
+                        ));
+                    }
+                };
+            }
+            if phase == AllocationPhase::Running {
+                state.last_executor = state.current_executor;
+            }
+            if phase == AllocationPhase::Released {
+                state.current_allocation_generation = None;
+                state.current_executor = None;
+            }
+            previous_phase = Some(phase);
+            state.sequence = sequence;
+        }
+    }
+    Ok(replay)
+}
+
+pub(crate) fn read_job_replay(
+    database: &Database,
+    job: JobId,
+    at: Option<u128>,
+) -> Result<Option<JobReplay>, StorageError> {
+    let rx = read(database)?;
+    let Some(record) = mutable_job_record_in(&rx, job)? else {
+        return Ok(None);
+    };
+    if record.job.submitted_at.is_none() {
+        return Ok(None);
+    }
+    replay_mutable_job(&rx, job, at)
+}
+
+pub(crate) struct JobTimelinePage {
+    pub events: Vec<serde_json::Value>,
+    pub next_after: Option<u128>,
+}
+
+pub(crate) fn read_job_timeline(
+    database: &Database,
+    job: JobId,
+    after: Option<u128>,
+    limit: usize,
+) -> Result<Option<JobTimelinePage>, StorageError> {
+    let rx = read(database)?;
+    let Some(record) = mutable_job_record_in(&rx, job)? else {
+        return Ok(None);
+    };
+    if record.job.submitted_at.is_none() {
+        return Ok(None);
+    }
+    let limit = limit.clamp(1, MAX_PAGE);
+    let lower = after.map_or(Bound::Included((job.get(), 0)), |seq| {
+        Bound::Excluded((job.get(), seq))
+    });
+    let upper = Bound::Included((job.get(), u128::MAX));
+    let mut keys = Vec::new();
+    for entry in rx
+        .open_table(JOB_LIFECYCLE_EVENTS)?
+        .range((lower, upper))?
+        .take(limit + 1)
+    {
+        keys.push((entry?.0.value().1, true));
+    }
+    for entry in rx
+        .open_table(JOB_EXECUTION_EVENTS)?
+        .range((lower, upper))?
+        .take(limit + 1)
+    {
+        keys.push((entry?.0.value().1, false));
+    }
+    keys.sort_unstable_by_key(|entry| entry.0);
+    let has_more = keys.len() > limit;
+    keys.truncate(limit);
+    let next_after = has_more.then(|| keys.last().map(|entry| entry.0)).flatten();
+    let table = rx.open_table(EXECUTION_EVENTS)?;
+    let allocations = rx.open_table(JOB_EXECUTION_EVENTS)?;
+    let mut result = Vec::with_capacity(keys.len());
+    for (sequence, lifecycle) in keys {
+        let row = table
+            .get(sequence)?
+            .ok_or_else(|| StorageError::corrupted("timeline event is missing"))?;
+        let value = if lifecycle {
+            let (owner, at, event) = transactions::decode_job_lifecycle(sequence, row.value())?;
+            if owner != job {
+                return Err(StorageError::corrupted("timeline event has wrong Job"));
+            }
+            let data = match event {
+                transactions::JobLifecycle::Created => serde_json::json!({"kind":"created"}),
+                transactions::JobLifecycle::Submitted => serde_json::json!({"kind":"submitted"}),
+                transactions::JobLifecycle::Waiting => serde_json::json!({"kind":"waiting"}),
+                transactions::JobLifecycle::Eligible => serde_json::json!({"kind":"eligible"}),
+                transactions::JobLifecycle::Outcome(state) => {
+                    serde_json::json!({"kind":"outcome", "outcome": state.outcome.map(|o| match o.kind { OutcomeKind::Completed => "completed", OutcomeKind::Failed => "failed", OutcomeKind::Cancelled => "cancelled", OutcomeKind::Unknown => "unknown" })})
+                }
+                transactions::JobLifecycle::RequestEvidence { request, seq } => {
+                    serde_json::json!({"kind":"request_evidence", "request":request.get(), "request_sequence":seq})
+                }
+                transactions::JobLifecycle::ToolEvidence {
+                    request,
+                    index,
+                    outcome,
+                } => {
+                    serde_json::json!({"kind": if outcome {"tool_outcome"} else {"tool_decision"}, "request":request.get(), "tool_index":index})
+                }
+                transactions::JobLifecycle::Output { seq } => {
+                    serde_json::json!({"kind":"output", "output_sequence":seq})
+                }
+                transactions::JobLifecycle::DependencySettled { prerequisite } => {
+                    serde_json::json!({"kind":"dependency_settled", "prerequisite":prerequisite.to_string()})
+                }
+            };
+            serde_json::json!({"sequence":sequence.to_string(), "at_us":at.as_unix_micros(), "event":data})
+        } else {
+            let (owner, generation, phase, at, retry, origin) =
+                transactions::decode_execution_event(sequence, row.value())?;
+            if owner != job {
+                return Err(StorageError::corrupted("timeline event has wrong Job"));
+            }
+            let allocation = match origin {
+                Some(allocation) => allocation,
+                None => {
+                    transactions::allocation_origin(&allocations, &table, (job.get(), generation))?
+                        .ok_or_else(|| StorageError::corrupted("allocation creation is missing"))?
+                }
+            };
+            let phase = match phase {
+                AllocationPhase::Reserved => "reserved",
+                AllocationPhase::Running => "running",
+                AllocationPhase::StopRequested => "stop_requested",
+                AllocationPhase::Uncertain => "uncertain",
+                AllocationPhase::Released => "released",
+            };
+            serde_json::json!({"sequence":sequence.to_string(), "at_us":at.as_unix_micros(), "event":{"kind":"allocation", "generation":generation, "pool":allocation.token.pool.to_string(), "executor":allocation.token.executor.to_string(), "phase":phase, "retry":retry.map(|plan|serde_json::json!({"cause":plan.cause.code(), "eligible_at_us":plan.eligible_at.as_unix_micros()}))}})
+        };
+        result.push(value);
+    }
+    Ok(Some(JobTimelinePage {
+        events: result,
+        next_after,
     }))
 }
 
@@ -1814,6 +2293,8 @@ pub(crate) struct MutableJobDetails {
     pub activity: JobActivity,
     pub unknown_reason: Option<String>,
     pub configuration: Option<MutableConfiguration>,
+    pub last_executor: Option<ExecutorId>,
+    pub phase: JobReplayPhase,
 }
 
 pub(crate) struct MutableConfiguration {
@@ -1907,6 +2388,9 @@ pub(super) fn unstarted_settlement_in(
     }) else {
         return Ok(None);
     };
+    if record.outcome.is_none() && unstarted_retry_in(rx, allocation.token)? {
+        return Ok(None);
+    }
     if record.outcome.is_none() || allocation.started_at.is_some() {
         return Err(StorageError::corrupted(format!(
             "{} was released before its start without an exact unstarted settlement",
@@ -1920,6 +2404,102 @@ pub(super) fn unstarted_settlement_in(
         .transpose()?
         .map(|(key, value)| decode_output(key.value(), value.value()))
         .transpose()
+}
+
+fn unstarted_retry_in(
+    rx: &ReadTransaction,
+    token: crate::db::entities::AllocationToken,
+) -> Result<bool, StorageError> {
+    let index = rx.open_table(JOB_EXECUTION_EVENTS)?;
+    let events = rx.open_table(EXECUTION_EVENTS)?;
+    let Some(origin) = transactions::allocation_origin(
+        &index,
+        &events,
+        (token.job.get(), token.generation.get()),
+    )?
+    else {
+        return Ok(false);
+    };
+    if origin.token != token {
+        return Err(StorageError::corrupted(
+            "retry Allocation token disagrees with its creation",
+        ));
+    }
+    for entry in index
+        .range((token.job.get(), 0)..=(token.job.get(), u128::MAX))?
+        .rev()
+    {
+        let (key, _) = entry?;
+        let sequence = key.value().1;
+        let event = events
+            .get(sequence)?
+            .ok_or_else(|| StorageError::corrupted("retry event is missing"))?;
+        let (job, generation, phase, _, retry, _) =
+            transactions::decode_execution_event(sequence, event.value())?;
+        if job != token.job {
+            return Err(StorageError::corrupted(
+                "retry event belongs to another Job",
+            ));
+        }
+        if generation == token.generation.get() {
+            return Ok(phase == AllocationPhase::Released && retry.is_some());
+        }
+    }
+    Err(StorageError::corrupted("retry Allocation has no event"))
+}
+
+pub(crate) fn read_unstarted_retry(
+    database: &Database,
+    token: crate::db::entities::AllocationToken,
+) -> Result<bool, StorageError> {
+    unstarted_retry_in(&read(database)?, token)
+}
+
+fn validate_allocation_projection(
+    rx: &ReadTransaction,
+    id: JobId,
+    allocation: Option<&crate::db::entities::PoolAllocation>,
+) -> Result<(), StorageError> {
+    let events = rx.open_table(EXECUTION_EVENTS)?;
+    let index = rx.open_table(JOB_EXECUTION_EVENTS)?;
+    let latest = index
+        .range((id.get(), 0)..=(id.get(), u128::MAX))?
+        .next_back()
+        .transpose()?
+        .map(|(key, _)| key.value().1);
+    match (allocation, latest) {
+        (None, None) => {}
+        (Some(allocation), Some(sequence)) => {
+            let event = events
+                .get(sequence)?
+                .ok_or_else(|| StorageError::corrupted("Job execution event is missing"))?;
+            let (job, generation, phase, _, _, _) =
+                transactions::decode_execution_event(sequence, event.value())?;
+            let key = (id.get(), allocation.token.generation.get());
+            let created = transactions::allocation_origin(&index, &events, key)?
+                .ok_or_else(|| StorageError::corrupted("Job Allocation is missing"))?;
+            let mut projection = allocation.clone();
+            projection.phase = AllocationPhase::Reserved;
+            projection.started_at = None;
+            projection.stop_confirmed_at = None;
+            projection.stop_proof = None;
+            if job != id
+                || generation != allocation.token.generation.get()
+                || phase != allocation.phase
+                || created != projection
+            {
+                return Err(StorageError::corrupted(
+                    "Allocation projection disagrees with execution facts",
+                ));
+            }
+        }
+        _ => {
+            return Err(StorageError::corrupted(
+                "Allocation projection has incomplete execution facts",
+            ));
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn mutable_job_details_in(
@@ -1943,6 +2523,7 @@ pub(super) fn mutable_job_details_in(
         .get(id.get())?
         .map(|bytes| transactions::decode_pool_allocation(id.get(), bytes.value()))
         .transpose()?;
+    validate_allocation_projection(rx, id, allocation.as_ref())?;
     let latest_output = rx
         .open_table(JOB_OUTPUTS)?
         .range((id.get(), 0)..=(id.get(), u32::MAX))?
@@ -2009,13 +2590,10 @@ pub(super) fn mutable_job_details_in(
     }
     let (activity, unknown_reason) = activity.finish_mutable(&record);
     let unknown_reason = unknown_reason.or_else(|| {
-        (record
+        record
             .outcome
             .as_ref()
             .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-            && allocation
-                .as_ref()
-                .is_some_and(crate::db::entities::PoolAllocation::holds_capacity))
         .then(|| {
             let detail = match record.outcome.as_ref().and_then(|outcome| outcome.cause.as_ref()) {
                 Some(crate::db::entities::OutcomeCause::Uncertain(reason)) => {
@@ -2023,12 +2601,16 @@ pub(super) fn mutable_job_details_in(
                 }
                 Some(_) | None => String::new(),
             };
-            format!(
-                "Execution outcome is uncertain. The Pool Allocation is retained and its capacity is not released until termination is confirmed.{detail}"
-            )
+            if allocation.as_ref().is_some_and(crate::db::entities::PoolAllocation::holds_capacity) {
+                format!("Execution outcome is uncertain. The Pool Allocation is retained and its capacity is not released until termination is confirmed.{detail}")
+            } else {
+                format!("Execution outcome is uncertain. Automatic retry was stopped; an earlier request may still have taken effect.{detail}")
+            }
         })
     });
     let configuration = mutable_configuration_in(rx, &record.job)?;
+    let replay = replay_mutable_job(rx, id, None)?
+        .ok_or_else(|| StorageError::corrupted("Job history is missing"))?;
     Ok(Some(MutableJobDetails {
         record,
         allocation,
@@ -2037,6 +2619,8 @@ pub(super) fn mutable_job_details_in(
         activity,
         unknown_reason,
         configuration,
+        last_executor: replay.last_executor,
+        phase: replay.phase,
     }))
 }
 
@@ -2160,6 +2744,8 @@ pub(crate) struct NativeJobItem {
     pub record: crate::db::entities::MutableJobRecord,
     pub allocation: Option<crate::db::entities::PoolAllocation>,
     pub updated_at_us: i64,
+    pub last_executor: Option<ExecutorId>,
+    pub phase: JobReplayPhase,
 }
 
 pub(crate) struct JobSearchPage {
@@ -2178,6 +2764,7 @@ fn native_job_item(
         .get(id.get())?
         .map(|bytes| transactions::decode_pool_allocation(id.get(), bytes.value()))
         .transpose()?;
+    validate_allocation_projection(rx, id, allocation.as_ref())?;
     if allocation
         .as_ref()
         .is_some_and(|allocation| allocation.job_revision != record.job.revision)
@@ -2195,7 +2782,11 @@ fn native_job_item(
     .flatten()
     .max()
     .unwrap_or(record.job.created_at);
+    let replay = replay_mutable_job(rx, id, None)?
+        .ok_or_else(|| StorageError::corrupted("Job history is missing"))?;
     Ok(NativeJobItem {
+        last_executor: replay.last_executor,
+        phase: replay.phase,
         record,
         allocation,
         updated_at_us: updated_at.as_unix_micros(),
@@ -2843,19 +3434,13 @@ fn conversation_result(
         summary = output.summary.unwrap_or_default();
         value = output.value;
     }
-    let after = rx
-        .open_table(NOTICE_READ)?
-        .get(conversation.get())?
-        .map_or(0, |seq| seq.value());
-    if after < u32::MAX {
-        for entry in rx
-            .open_table(NOTICES)?
-            .range((conversation.get(), after + 1)..=(conversation.get(), u32::MAX))?
-        {
-            let notice = Notice::decode(entry?.1.value())?;
-            if matches!(notice.class, NoticeClass::Attention | NoticeClass::Progress) {
-                summary.push_str(&format!("\nUnread notice: {:?}", notice.body));
-            }
+    for entry in rx
+        .open_table(NOTICES)?
+        .range((conversation.get(), 1)..=(conversation.get(), u32::MAX))?
+    {
+        let notice = Notice::decode(entry?.1.value())?;
+        if matches!(notice.class, NoticeClass::Attention | NoticeClass::Progress) {
+            summary.push_str(&format!("\nUnread notice: {:?}", notice.body));
         }
     }
     for call in approved_calls(rx, conversation)? {
@@ -4309,7 +4894,6 @@ pub(crate) fn queue_counts(
 fn queue_counts_in(rx: &ReadTransaction, for_update: bool) -> Result<QueueCounts, StorageError> {
     use crate::db::entities::AllocationPhase;
     let pending_table = rx.open_table(PENDING)?;
-    let delayed_table = rx.open_table(DELAYED)?;
     let (pending, delayed) = if for_update {
         let clock = recovery::promotion_clock();
         let jobs = rx.open_table(JOBS)?;
@@ -4322,10 +4906,6 @@ fn queue_counts_in(rx: &ReadTransaction, for_update: bool) -> Result<QueueCounts
             pending += 1;
         }
         let mut delayed = 0;
-        for entry in delayed_table.range(..=(clock, u128::MAX))? {
-            entry?;
-            delayed += 1;
-        }
         if rx
             .open_table(RECURRENCE_DUE)?
             .first()?
@@ -4335,7 +4915,7 @@ fn queue_counts_in(rx: &ReadTransaction, for_update: bool) -> Result<QueueCounts
         }
         (pending, delayed)
     } else {
-        (pending_table.len()?, delayed_table.len()?)
+        (pending_table.len()?, 0)
     };
     let ready = rx.open_table(MUTABLE_READY)?.len()?;
     let allocations = rx.open_table(POOL_ALLOCATIONS)?;

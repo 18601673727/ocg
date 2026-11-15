@@ -734,6 +734,193 @@ pub(crate) fn read_provider_responses(
     })
 }
 
+pub(crate) fn read_multistep_resume(
+    database: &Database,
+    token: crate::db::entities::AllocationToken,
+) -> Result<Option<Option<crate::db::entities::ProviderRequestRecord>>, StorageError> {
+    let rx = read(database)?;
+    let allocations = rx.open_table(POOL_ALLOCATIONS)?;
+    let Some(row) = allocations.get(token.job.get())? else {
+        return Ok(None);
+    };
+    let allocation = transactions::decode_pool_allocation(token.job.get(), row.value())?;
+    if allocation.token != token {
+        return Ok(None);
+    }
+    let request = transactions::recoverable_multistep_request(&rx, &allocation)?;
+    drop(row);
+    drop(allocations);
+    drop(rx);
+    let Some(request) = request else {
+        return Ok(None);
+    };
+    let Some(mut resume) = read_provider_request(database, token.job, request)? else {
+        return Ok(Some(None));
+    };
+    let rx = read(database)?;
+    let requests = rx.open_table(REQUEST_EVENTS)?;
+    let completed_response = resume.response.take();
+    if let Some(response) = &completed_response {
+        let Some(calls) = response
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Ok(Some(None));
+        };
+        if calls.is_empty() {
+            return Ok(Some(None));
+        }
+        let tools = rx.open_table(TOOL_CALLS)?;
+        let mut answers = Vec::with_capacity(calls.len());
+        for call in calls {
+            let Some(id) = call.get("id").and_then(serde_json::Value::as_str) else {
+                return Ok(Some(None));
+            };
+            let mut found = None;
+            for entry in tools.range(
+                (token.job.get(), request.get(), 0)..=(token.job.get(), request.get(), u32::MAX),
+            )? {
+                let (key, value) = entry?;
+                let reference = rows::tool_call_ref(key.value())?;
+                let evidence = rows::decode_tool_evidence(reference, value.value())?;
+                if evidence.tool_call_id == id {
+                    if found.is_some() {
+                        return Ok(Some(None));
+                    }
+                    if let Some(crate::db::entities::ToolOutcome::Completed { result }) =
+                        evidence.outcome.as_ref().map(|outcome| &outcome.fact)
+                    {
+                        found = Some(result.as_str().to_owned());
+                    } else {
+                        return Ok(Some(None));
+                    }
+                }
+            }
+            let Some(content) = found else {
+                return Ok(Some(None));
+            };
+            answers.push(serde_json::json!({"role":"tool", "tool_call_id":id, "content":content}));
+        }
+        resume.messages.push(response.clone());
+        resume.messages.extend(answers);
+    }
+    let mut last_response = None;
+    for entry in requests.range((token.job.get(), 0, 0)..(token.job.get(), request.get(), 0))? {
+        let (key, value) = entry?;
+        let number = RequestNumber::new(key.value().1)
+            .ok_or_else(|| StorageError::corrupted("zero request identity"))?;
+        if let RequestPayload::Received { digest } =
+            decode_request_event(token.job, number, key.value().2, value.value())?.payload
+        {
+            last_response = Some((number, digest));
+        }
+    }
+    if completed_response.is_some() {
+        for entry in requests.range(
+            (token.job.get(), request.get(), 0)..=(token.job.get(), request.get(), u32::MAX),
+        )? {
+            let (key, value) = entry?;
+            if let RequestPayload::Received { digest } =
+                decode_request_event(token.job, request, key.value().2, value.value())?.payload
+            {
+                last_response = Some((request, digest));
+            }
+        }
+    }
+    let Some((response_request, digest)) = last_response else {
+        return Ok(Some(None));
+    };
+    let messages = rx.open_table(MESSAGES)?;
+    let Some(row) = messages.get(digest.as_bytes().as_slice())? else {
+        return Err(StorageError::corrupted("resume response missing"));
+    };
+    let response: serde_json::Value = serde_json::from_slice(row.value())
+        .map_err(|_| StorageError::corrupted("invalid resume response"))?;
+    if !resume.messages.contains(&response) {
+        return Ok(Some(None));
+    }
+    let Some(response_calls) = response
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Ok(Some(None));
+    };
+    let mut tool_count = 0;
+    let mut latest_tool_count = 0;
+    for entry in rx
+        .open_table(TOOL_CALLS)?
+        .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, value) = entry?;
+        let call = rows::tool_call_ref(key.value())?;
+        let evidence = rows::decode_tool_evidence(call, value.value())?;
+        if call.request == response_request {
+            if response_calls
+                .iter()
+                .filter(|item| {
+                    item.get("id").and_then(serde_json::Value::as_str)
+                        == Some(evidence.tool_call_id.as_str())
+                        && item
+                            .get("function")
+                            .and_then(|function| function.get("name"))
+                            .and_then(serde_json::Value::as_str)
+                            == Some(evidence.name.as_str())
+                        && item
+                            .get("function")
+                            .and_then(|function| function.get("arguments"))
+                            .and_then(serde_json::Value::as_str)
+                            == evidence
+                                .admission()
+                                .map(|admission| admission.arguments.as_str())
+                })
+                .count()
+                != 1
+            {
+                return Ok(Some(None));
+            }
+            latest_tool_count += 1;
+        }
+        let Some(content) = resume
+            .messages
+            .iter()
+            .find(|message| {
+                message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                    && message
+                        .get("tool_call_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(evidence.tool_call_id.as_str())
+            })
+            .and_then(|message| message.get("content"))
+            .and_then(serde_json::Value::as_str)
+        else {
+            return Ok(Some(None));
+        };
+        let valid = match evidence.outcome.as_ref().map(|outcome| &outcome.fact) {
+            Some(crate::db::entities::ToolOutcome::Completed { result }) => {
+                result.as_str() == content
+            }
+            Some(crate::db::entities::ToolOutcome::CompletedElided { bytes, digest }) => {
+                *bytes == content.len() as u64 && *digest == ContentDigest::of(content.as_bytes())
+            }
+            Some(
+                crate::db::entities::ToolOutcome::CompletedWithheld { .. }
+                | crate::db::entities::ToolOutcome::NotApplied { .. }
+                | crate::db::entities::ToolOutcome::NotInvoked { .. }
+                | crate::db::entities::ToolOutcome::Uncertain { .. },
+            )
+            | None => false,
+        };
+        if !valid {
+            return Ok(Some(None));
+        }
+        tool_count += 1;
+    }
+    Ok(Some(
+        (tool_count > 0 && latest_tool_count == response_calls.len() && latest_tool_count > 0)
+            .then_some(resume),
+    ))
+}
+
 pub(crate) fn read_provider_request(
     database: &Database,
     job: JobId,
@@ -759,10 +946,12 @@ pub(crate) fn read_provider_request(
         let event = decode_request_event(job, request, key.value().2, bytes.value())?;
         match event.payload {
             RequestPayload::Sent {
+                allocation_generation,
                 messages,
                 tools,
                 parameters,
                 dropped_turns: dropped,
+                ..
             } => {
                 if sent.is_some() {
                     return Err(StorageError::corrupted("request has multiple Sent events"));
@@ -774,7 +963,12 @@ pub(crate) fn read_provider_request(
                     .map(&value)
                     .collect::<Result<Vec<_>, _>>()?;
                 let request_tools = tools.map(value).transpose()?;
-                sent = Some((request_messages, request_tools, request_parameters));
+                sent = Some((
+                    allocation_generation.get(),
+                    request_messages,
+                    request_tools,
+                    request_parameters,
+                ));
             }
             RequestPayload::Received { digest } => response = Some(value(digest)?),
             RequestPayload::ApprovedCalls
@@ -783,7 +977,7 @@ pub(crate) fn read_provider_request(
             | RequestPayload::Token { .. } => {}
         }
     }
-    let Some((messages, tools, parameters)) = sent else {
+    let Some((allocation_generation, messages, tools, parameters)) = sent else {
         return Ok(None);
     };
     for entry in events.range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))? {
@@ -801,6 +995,7 @@ pub(crate) fn read_provider_request(
         }
     }
     Ok(Some(crate::db::entities::ProviderRequestRecord {
+        allocation_generation,
         messages,
         tools,
         parameters,

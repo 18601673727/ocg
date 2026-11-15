@@ -1,7 +1,7 @@
 import type { ChatMessage, ChatSession, OcgRuntimeEvent, RuntimeStatus } from "../types";
 import type { JobExecution } from "../execution/domain";
 
-export type RuntimeAuthority = "canonical";
+export type RuntimeAuthority = "control";
 
 export type RuntimeSnapshot = {
   status: RuntimeStatus;

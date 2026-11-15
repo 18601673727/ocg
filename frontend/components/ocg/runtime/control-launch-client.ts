@@ -15,7 +15,7 @@ import type { CreateSessionInput } from "./runtime-types";
 import {
   readTranscriptEvidence,
   readOutputWindow,
-  type HttpCanonicalControlClient,
+  type HttpControlClient,
   type JobStreamSubscription,
 } from "./control-client";
 import {
@@ -91,7 +91,7 @@ function rememberToolTime(times: Map<number, number>, request: number, at: numbe
 }
 
 async function readMissingOutputs(
-  control: HttpCanonicalControlClient,
+  control: HttpControlClient,
   job: string,
   after: number,
   through: number,
@@ -114,7 +114,7 @@ async function readMissingOutputs(
 }
 
 async function readPartialToolBoundaries(
-  control: HttpCanonicalControlClient,
+  control: HttpControlClient,
   job: string,
   tools: readonly ControlToolCall[],
   outputs: OutputSequence,
@@ -215,7 +215,7 @@ type StreamEntry = {
   stop: () => void;
 };
 
-export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
+export class ControlRuntimeClient extends RuntimeClientBase {
   private started = false;
   private disposed = false;
   private readonly lifetime = new AbortController();
@@ -248,7 +248,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private conversationListLoaded = false;
   private unsubscribeConversations: (() => void) | null = null;
 
-  constructor(readonly control: HttpCanonicalControlClient) {
+  constructor(readonly control: HttpControlClient) {
     super();
   }
 
@@ -300,7 +300,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private async applyConversations(
-    page: Awaited<ReturnType<HttpCanonicalControlClient["readConversations"]>>,
+    page: Awaited<ReturnType<HttpControlClient["readConversations"]>>,
   ) {
     if (this.disposed) return;
     const updates: Promise<string>[] = [];

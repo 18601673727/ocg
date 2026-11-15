@@ -286,11 +286,12 @@ pub(crate) async fn run_with(
 }
 
 pub(crate) enum ExecutorPass {
-    Reserved(Box<PoolAllocation>),
+    Reserved(Box<PoolAllocation>, bool),
     Nothing,
     BudgetSpent,
     Rescan,
     IndexExhausted,
+    Deferred(Duration),
     Halted,
 }
 
@@ -457,6 +458,7 @@ impl NativeScheduler {
         let mut rotating = false;
         let mut revisit = false;
         let mut wait_for_blocking = false;
+        let mut retry_due: Option<Duration> = None;
         let mut exhausted = 0u8;
         for (pool, executor, capabilities) in executors {
             if self.halted.get() || self.shutdown.is_cancelled() {
@@ -473,7 +475,9 @@ impl NativeScheduler {
                 .reserve_for(pool, executor, workspace_permit, scan)
                 .await
             {
-                ExecutorPass::Reserved(allocation) => grants.push((*allocation, permit)),
+                ExecutorPass::Reserved(allocation, requires_workspace) => {
+                    grants.push((*allocation, permit.filter(|_| requires_workspace)));
+                }
                 ExecutorPass::Nothing => {}
                 ExecutorPass::BudgetSpent => rotating = true,
                 ExecutorPass::Rescan => {
@@ -481,6 +485,10 @@ impl NativeScheduler {
                     revisit = true;
                 }
                 ExecutorPass::IndexExhausted => exhausted |= 1 << scan,
+                ExecutorPass::Deferred(due) => {
+                    exhausted |= 1 << scan;
+                    retry_due = Some(retry_due.map_or(due, |current| current.min(due)));
+                }
                 ExecutorPass::Halted => break,
             }
         }
@@ -494,6 +502,10 @@ impl NativeScheduler {
             || discovery.sweep.is_some())
             && !self.halted.get())
         .then_some(Duration::ZERO);
+        let dispatch_due = match (dispatch_due, retry_due) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let next_due = match (dispatch_due, recurrence_due) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -514,6 +526,7 @@ impl NativeScheduler {
     ) -> ExecutorPass {
         let resume = self.resume.get()[scan];
         let mut after: Option<DevelopmentReadyCursor> = None;
+        let mut retry_due: Option<Duration> = None;
         for page in 0..MAX_READY_PAGES {
             if page == HEAD_PAGES
                 && let Some(resume) = resume
@@ -533,15 +546,23 @@ impl NativeScheduler {
                 .await
                 .map(|ScheduledReservation::Pass(passed)| *passed);
             match passed {
-                Ok(DevelopmentReservation::Reserved(allocation)) => {
+                Ok(DevelopmentReservation::Reserved(allocation, requires_workspace)) => {
                     if allocation.token.executor != executor || allocation.token.pool != pool {
                         self.halt("a reservation names another Executor");
                         return ExecutorPass::Halted;
                     }
-                    return ExecutorPass::Reserved(Box::new(allocation));
+                    return ExecutorPass::Reserved(Box::new(allocation), requires_workspace);
                 }
-                Ok(DevelopmentReservation::Continue(cursor)) => after = Some(cursor),
-                Ok(DevelopmentReservation::Exhausted) => {
+                Ok(DevelopmentReservation::Continue(cursor, due)) => {
+                    after = Some(cursor);
+                    if let Some(due) = due {
+                        retry_due = Some(retry_due.map_or(due, |current| current.min(due)));
+                    }
+                }
+                Ok(DevelopmentReservation::Exhausted(due)) => {
+                    if let Some(due) = due {
+                        retry_due = Some(retry_due.map_or(due, |current| current.min(due)));
+                    }
                     let mut cursors = self.resume.get();
                     cursors[scan] = None;
                     self.resume.set(cursors);
@@ -549,6 +570,8 @@ impl NativeScheduler {
                     self.rescan.set(rescan & !(1 << scan));
                     return if rescan & (1 << scan) != 0 {
                         ExecutorPass::Rescan
+                    } else if let Some(due) = retry_due {
+                        ExecutorPass::Deferred(due)
                     } else {
                         ExecutorPass::IndexExhausted
                     };
@@ -628,12 +651,13 @@ pub(crate) struct Dispatched {
     pub(crate) started: bool,
     pub(crate) outcome: Option<OutcomeKind>,
     pub(crate) detail: String,
+    retry_scheduled: bool,
 }
 
 impl Dispatched {
     pub(crate) fn resolved(&self) -> bool {
         match self.allocation_phase {
-            Some(AllocationPhase::Released) => self.outcome.is_some(),
+            Some(AllocationPhase::Released) => self.outcome.is_some() || self.retry_scheduled,
             Some(AllocationPhase::Uncertain) => true,
             Some(
                 AllocationPhase::Reserved
@@ -942,6 +966,22 @@ async fn start_and_exchange(
             }
         }
         Err(DevelopmentHandoffError::NotStarted { cause, error }) => {
+            match database
+                .retry_unstarted_development_reservation(token, cause)
+                .await
+            {
+                Ok(true) => {
+                    return format!(
+                        "the start was refused before any request ({error}); a retry was scheduled"
+                    );
+                }
+                Ok(false) => {}
+                Err(retry) => {
+                    return format!(
+                        "the start was refused before any request ({error}); retry could not be recorded ({retry})"
+                    );
+                }
+            }
             let settled = loop {
                 match database
                     .fail_unstarted_development_reservation(token, cause)
@@ -956,8 +996,11 @@ async fn start_and_exchange(
                 }
             };
             match settled {
-                Ok(_) => format!(
+                Ok(Some(_)) => format!(
                     "the start was refused before any request ({error}); the reservation was ended"
+                ),
+                Ok(None) => format!(
+                    "the start was refused ({error}); an earlier request remains uncertain and the Job is held"
                 ),
                 Err(settle) => format!(
                     "the start was refused before any request ({error}); the reservation was not ended here ({settle})"
@@ -969,6 +1012,10 @@ async fn start_and_exchange(
 }
 
 async fn reported(database: &DatabaseHandle, token: AllocationToken, detail: String) -> Dispatched {
+    let retry_scheduled = database
+        .unstarted_retry_recorded(token)
+        .await
+        .unwrap_or(false);
     match database.development_trial_job(token.job).await {
         Ok(Some((record, Some(allocation)))) if allocation.token == token => {
             if allocation.phase == AllocationPhase::Released {
@@ -980,14 +1027,24 @@ async fn reported(database: &DatabaseHandle, token: AllocationToken, detail: Str
                 started: allocation.started_at.is_some(),
                 outcome: record.outcome.as_ref().map(|outcome| outcome.kind),
                 detail,
+                retry_scheduled,
             }
         }
+        Ok(Some((record, _))) if retry_scheduled => Dispatched {
+            job: token.job,
+            allocation_phase: Some(AllocationPhase::Released),
+            started: false,
+            outcome: record.outcome.as_ref().map(|outcome| outcome.kind),
+            detail,
+            retry_scheduled,
+        },
         Ok(_) => Dispatched {
             job: token.job,
             allocation_phase: None,
             started: false,
             outcome: None,
             detail: format!("{detail}; the Allocation could not be found afterwards"),
+            retry_scheduled: false,
         },
         Err(error) => Dispatched {
             job: token.job,
@@ -995,6 +1052,7 @@ async fn reported(database: &DatabaseHandle, token: AllocationToken, detail: Str
             started: false,
             outcome: None,
             detail: format!("{detail}; the result could not be read ({error})"),
+            retry_scheduled: false,
         },
     }
 }

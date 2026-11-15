@@ -14,7 +14,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { ControlExecutionPhase } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { SELECTED_ROW } from "../primitives/selection";
@@ -30,7 +30,7 @@ export function JobsSurface({
   onJob,
   onOpenChat,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   job: string | null;
   active: boolean;
   onJob: (job: string | null) => void;

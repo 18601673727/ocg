@@ -189,6 +189,9 @@ fn require_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Er
         "job",
         "job_state",
         "pool_allocation",
+        "execution_event",
+        "job_execution_event",
+        "job_lifecycle_event",
         "job_output",
         "submission",
         "attachment",
@@ -207,12 +210,10 @@ fn require_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Er
         "active_allocation",
         "allocation_request",
         "draft_context",
-        "job_allocation",
         "conversation",
         "turn",
         "pending",
         "ready",
-        "delayed",
         "dependency_waiter",
         "unsettled",
         "children",
@@ -220,10 +221,8 @@ fn require_tables(names: &BTreeSet<String>) -> Result<(), Box<dyn std::error::Er
         "conversation_search",
         "child_group",
         "live_child",
-        "user_input_at",
         "active_job",
         "group_result",
-        "notice_read",
         "tool_call_id",
         "tool_stat",
         "usage_total",
@@ -291,6 +290,18 @@ fn digest_tables(
             "pool_allocation" => {
                 tables_count += 1;
                 hash_table(tx, POOL_ALLOCATIONS, &mut tables)?
+            }
+            "execution_event" => {
+                tables_count += 1;
+                hash_table(tx, EXECUTION_EVENTS, &mut tables)?
+            }
+            "job_execution_event" => {
+                tables_count += 1;
+                hash_table(tx, JOB_EXECUTION_EVENTS, &mut tables)?
+            }
+            "job_lifecycle_event" => {
+                tables_count += 1;
+                hash_table(tx, JOB_LIFECYCLE_EVENTS, &mut tables)?
             }
             "job_output" => {
                 tables_count += 1;
@@ -364,10 +375,6 @@ fn digest_tables(
                 tables_count += 1;
                 hash_table(tx, DRAFT_CONTEXTS, &mut tables)?
             }
-            "job_allocation" => {
-                tables_count += 1;
-                hash_table(tx, JOB_ALLOCATIONS, &mut tables)?
-            }
             "conversation" => {
                 tables_count += 1;
                 hash_table(tx, CONVERSATIONS, &mut tables)?
@@ -383,10 +390,6 @@ fn digest_tables(
             "ready" => {
                 tables_count += 1;
                 hash_table(tx, MUTABLE_READY, &mut tables)?
-            }
-            "delayed" => {
-                tables_count += 1;
-                hash_table(tx, DELAYED, &mut tables)?
             }
             "dependency_waiter" => {
                 tables_count += 1;
@@ -416,10 +419,6 @@ fn digest_tables(
                 tables_count += 1;
                 hash_table(tx, LIVE_CHILDREN, &mut tables)?
             }
-            "user_input_at" => {
-                tables_count += 1;
-                hash_table(tx, USER_INPUT_AT, &mut tables)?
-            }
             "active_job" => {
                 tables_count += 1;
                 hash_table(tx, ACTIVE_JOBS, &mut tables)?
@@ -427,10 +426,6 @@ fn digest_tables(
             "group_result" => {
                 tables_count += 1;
                 hash_table(tx, GROUP_RESULTS, &mut tables)?
-            }
-            "notice_read" => {
-                tables_count += 1;
-                hash_table(tx, NOTICE_READ, &mut tables)?
             }
             "tool_call_id" => {
                 tables_count += 1;

@@ -695,6 +695,8 @@ pub(super) async fn conversation_turns(
                         turn,
                         item.details.allocation.as_ref(),
                         item.details.activity.last_activity_at_us(),
+                        item.details.last_executor,
+                        item.details.phase,
                     ),
                     entries: if decision.is_some() { Vec::new() } else { vec![entry] },
                     configuration: item.details.configuration.map(|configuration| {

@@ -4,10 +4,7 @@ import { useState, type FormEvent } from "react";
 import Link from "next/link";
 import type { ControlProfilesSnapshot } from "../contracts";
 import type { DecisionLimits as ControlDecisionLimits } from "../contracts/api";
-import type {
-  HttpCanonicalControlClient,
-  ControlProfileWriteRequest,
-} from "../runtime/control-client";
+import type { HttpControlClient, ControlProfileWriteRequest } from "../runtime/control-client";
 import { isProfileConflict } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { Section, describeError, selectableLlmProfiles } from "./settings-parts";
@@ -45,7 +42,7 @@ const emptyLimits: ControlDecisionLimits = {
   max_output_tokens_per_question: null,
 };
 type ProfileEditorProps = {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   profiles: ControlProfilesSnapshot;
   onSaved(profiles: ControlProfilesSnapshot): void;
   onManageModels?(): void;

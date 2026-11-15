@@ -600,6 +600,15 @@ impl Batch {
             transactions::encode_mutable_job(job).as_slice(),
         )?;
         self.put_job_state(job.id, &JobState::new(job.id))?;
+        self.append_job_lifecycle(job.id, transactions::JobLifecycle::Submitted)?;
+        self.append_job_lifecycle(
+            job.id,
+            if ready_now {
+                transactions::JobLifecycle::Eligible
+            } else {
+                transactions::JobLifecycle::Waiting
+            },
+        )?;
         Ok(())
     }
 

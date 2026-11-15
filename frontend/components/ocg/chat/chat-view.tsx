@@ -7,7 +7,7 @@ import { useI18n } from "../i18n";
 import type { RuntimeStatus } from "../types";
 import { ModelSelector, type ModelImageSupport } from "./model-selector";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
+import { ControlTransportError, type HttpControlClient } from "../runtime/control-client";
 import type { ControlConversationCard } from "../contracts";
 import type { ChatModelSelection } from "../contracts";
 import type { ControlChildConversation, ControlTaskPlan } from "../contracts";
@@ -482,7 +482,7 @@ function ChildConversationCard({
 }: {
   child: ControlChildConversation;
   agentName?: string;
-  control: HttpCanonicalControlClient;
+  control: HttpControlClient;
   pending: boolean;
   onOpen: (conversation: string) => void;
   onAct: (
@@ -492,7 +492,7 @@ function ChildConversationCard({
 }) {
   const { t, locale } = useI18n();
   const [detail, setDetail] = useState<Awaited<
-    ReturnType<HttpCanonicalControlClient["readJobDetails"]>
+    ReturnType<HttpControlClient["readJobDetails"]>
   > | null>(null);
   const [model, setModel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);

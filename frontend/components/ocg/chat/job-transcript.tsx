@@ -12,7 +12,7 @@ import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
 import { ToolActivityLabel } from "./tool-activity-label";
 import { formatToolJson, jobPlanTitles } from "./tool-activity-summary";
 import { MarkdownBody } from "../markdown/markdown-body";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { WorkspaceTool } from "./workspace-tool";
 import {
   ReasoningRoot,
@@ -37,7 +37,7 @@ function TurnRow({
   client,
 }: {
   jobId?: string;
-  client?: HttpCanonicalControlClient;
+  client?: HttpControlClient;
   turn: TranscriptTurn;
   userLabel: string;
   attachmentContentUrl?: (id: string) => string;
@@ -247,7 +247,7 @@ function TurnToolCalls({
   tools: readonly ControlToolCall[];
   isLive: boolean;
   jobId?: string;
-  client?: HttpCanonicalControlClient;
+  client?: HttpControlClient;
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -377,7 +377,7 @@ export function JobTranscript({
 }: {
   turns: readonly TranscriptTurn[];
   jobId?: string;
-  client?: HttpCanonicalControlClient;
+  client?: HttpControlClient;
   userLabel?: string;
   attachmentContentUrl?: (id: string) => string;
 }) {

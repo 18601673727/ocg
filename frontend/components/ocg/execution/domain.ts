@@ -1,7 +1,6 @@
 import type {
-  CanonicalAttempt,
-  CanonicalEffectKind,
-  CanonicalJobState,
+  EffectKind,
+  ExecutionJobState,
   Failure,
   JobOrigin,
   RecursiveLimits,
@@ -13,13 +12,11 @@ export type CallStatus = "queued" | "running" | "completed" | "failed" | "unreco
 export type ExecutionCall = {
   id: string;
   callId: string;
-  attemptId: string;
-  attemptGeneration: number;
   executorId: string | null;
   generation: number;
   status: CallStatus;
   rawState: string;
-  effectKind: CanonicalEffectKind;
+  effectKind: EffectKind;
   sideEffect: boolean;
   request: string;
   response: string | null;
@@ -29,24 +26,11 @@ export type ExecutionCall = {
   reason: string | undefined;
 };
 
-export type ExecutionAttempt = {
-  id: string;
-  attemptId: string;
-  generation: number;
-  state: CanonicalAttempt["state"];
-  authoritative: boolean;
-  createdAt: number;
-  finishedAt: number | null;
-  callCount: number;
-  settledCallCount: number;
-};
-
 export type ExecutorStatus = "running" | "queued" | "settled" | "unrecognized";
 
 export type ExecutionExecutor = {
   id: string;
   executorId: string;
-  attemptId: string;
   kind: string;
   status: ExecutorStatus;
   rawState: string;
@@ -67,12 +51,11 @@ export type ExecutionDispatchIntent = {
   id: string;
   dispatchIntentId: string;
   callId: string;
-  attemptId: string;
   executorId: string | null;
   generation: number;
   status: DispatchIntentStatus;
   rawState: string;
-  effectKind: CanonicalEffectKind;
+  effectKind: EffectKind;
   effectState: string;
   request: string;
   budgetAdmitted: boolean;
@@ -90,7 +73,6 @@ export type CallActivityItem = {
   jobId: string;
   callId: string;
   executorId: string | undefined;
-  attemptGeneration: number;
   status: CallStatus;
   at: number;
   timestamp: string;
@@ -120,16 +102,13 @@ export type RequestedExecutionTarget = {
 
 export type JobRecoveryEvent = {
   id: string;
-  attemptId: string | null;
   generation: number | null;
   callId: string | null;
   executorId: string | null;
   classification: string;
   action: string;
   outcome: string;
-  replacementAttemptId: string | null;
   createdAt: number;
-  supersededAttempt: boolean;
 };
 
 export type JobExecution = {
@@ -155,12 +134,10 @@ export type JobExecution = {
   canRetry: boolean;
   terminationReason: Failure | null;
   cursor: number;
-  state: CanonicalJobState;
+  state: ExecutionJobState;
   generation: number;
-  authoritativeAttemptId: string | null;
   createdAt: number;
   updatedAt: number;
-  attempts: ExecutionAttempt[];
   calls: ExecutionCall[];
   authoritativeCalls: ExecutionCall[];
   executors: ExecutionExecutor[];

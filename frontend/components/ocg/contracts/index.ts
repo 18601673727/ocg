@@ -12,9 +12,8 @@ export type {
 export { ContractError } from "./decode";
 
 export type {
-  CanonicalAttempt,
-  CanonicalEffectKind,
-  CanonicalJobState,
+  EffectKind,
+  ExecutionJobState,
 } from "./view-models";
 
 export type {

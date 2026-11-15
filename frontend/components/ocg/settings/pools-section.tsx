@@ -17,10 +17,7 @@ import {
   type NativeExecutorChange,
   type NativePoolAllocations,
 } from "@/components/ocg/runtime/control-client";
-import type {
-  ControlPoolUpdate,
-  HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/control-client";
+import type { ControlPoolUpdate, HttpControlClient } from "@/components/ocg/runtime/control-client";
 import { Section, describeError, refusalText } from "./settings-parts";
 import { useI18n, type I18nKey } from "../i18n";
 
@@ -679,13 +676,7 @@ function PoolRow({
   );
 }
 
-function PoolAllocations({
-  client,
-  pool,
-}: {
-  client: HttpCanonicalControlClient;
-  pool: ControlPool;
-}) {
+function PoolAllocations({ client, pool }: { client: HttpControlClient; pool: ControlPool }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const [snapshot, setSnapshot] = useState<NativePoolAllocations | null>(null);
@@ -889,7 +880,7 @@ function PoolAllocations({
   );
 }
 
-export function PoolsSection({ client }: { client: HttpCanonicalControlClient }) {
+export function PoolsSection({ client }: { client: HttpControlClient }) {
   const { t } = useI18n();
   const [pools, setPools] = useState<ControlPool[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);

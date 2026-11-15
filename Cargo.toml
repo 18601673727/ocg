@@ -46,7 +46,7 @@ webpki-roots = "=1.0.9"
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs4 = { version = "=1.1.0", default-features = false, features = ["sync"] }
 serde_json = "1"
-# Image content parts: canonical base64 data URLs; the version the tree
+# Image content parts: standard base64 data URLs; the version the tree
 # already builds.
 base64 = "0.22"
 # Tool-call argument admission; no remote or file schema resolution.

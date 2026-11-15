@@ -28,6 +28,15 @@ pub(super) enum Route {
     Logs(dashboard::LogQuery),
     Subscription(subscriptions::Topic),
     Job(JobId),
+    JobState {
+        job: JobId,
+        at: Option<u128>,
+    },
+    JobTimeline {
+        job: JobId,
+        after: Option<u128>,
+        limit: usize,
+    },
     JobInput(JobId),
     ConversationChildren {
         conversation: JobId,
@@ -179,6 +188,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Logs(_)
             | Route::Subscription(_)
             | Route::Job(_)
+            | Route::JobState { .. }
+            | Route::JobTimeline { .. }
             | Route::JobInput(_)
             | Route::ConversationChildren { .. }
             | Route::ConversationTurns { .. }
@@ -405,6 +416,41 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
         }
+        ["jobs", job, "execution-state"] => {
+            let job = job_id(job)?;
+            let at = if query.is_empty() {
+                None
+            } else {
+                let value = query.strip_prefix("at=").ok_or(INVALID_REQUEST)?;
+                Some(decimal::<u128>(value).ok_or(INVALID_REQUEST)?)
+            };
+            Ok(Route::JobState { job, at })
+        }
+        ["jobs", job, "timeline"] => {
+            let job = job_id(job)?;
+            let (mut after, mut limit) = (None, None);
+            for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+                let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
+                match key {
+                    "after" if after.is_none() => {
+                        after = Some(decimal::<u128>(value).ok_or(INVALID_REQUEST)?)
+                    }
+                    "limit" if limit.is_none() => {
+                        limit = Some(
+                            decimal::<usize>(value)
+                                .filter(|n| (1..=100).contains(n))
+                                .ok_or(INVALID_REQUEST)?,
+                        )
+                    }
+                    _ => return Err(INVALID_REQUEST),
+                }
+            }
+            Ok(Route::JobTimeline {
+                job,
+                after,
+                limit: limit.unwrap_or(20),
+            })
+        }
         ["jobs", job, "requests", number] => {
             let job = job_id(job)?;
             let request = decimal::<u32>(number)
@@ -527,10 +573,10 @@ fn no_query(query: &str) -> Result<(), Refusal> {
 }
 
 pub(super) fn decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
-    let canonical = !text.is_empty()
+    let normalized = !text.is_empty()
         && text.bytes().all(|byte| byte.is_ascii_digit())
         && (text == "0" || !text.starts_with('0'));
-    canonical.then(|| text.parse().ok()).flatten()
+    normalized.then(|| text.parse().ok()).flatten()
 }
 
 pub(super) fn job_id(text: &str) -> Result<JobId, Refusal> {
@@ -614,6 +660,8 @@ pub(super) async fn respond(
                         &details.record,
                         details.allocation.as_ref(),
                         details.activity.last_activity_at_us(),
+                        details.last_executor,
+                        details.phase,
                     );
                     let mut body = envelope(serde_json::json!(jobs::JobDetailsView {
                         job: job_view,
@@ -636,6 +684,29 @@ pub(super) async fn respond(
                 crate::db::redb::MutableJobDetailsLookup::Inaccessible
                 | crate::db::redb::MutableJobDetailsLookup::NotMutable => Err(JOB_NOT_FOUND),
             }
+        }
+        Route::JobState { job, at } => {
+            let replay = database.job_replay(job, at).await?.ok_or(NOT_FOUND)?;
+            Ok(Reply::ok(envelope(serde_json::json!({
+                "job": job.to_string(), "at": at.map(|sequence| sequence.to_string()),
+                "sequence": replay.sequence.to_string(), "phase": replay.phase.as_str(),
+                "allocation_generation": replay.current_allocation_generation,
+                "current_executor": replay.current_executor.map(|id| id.to_string()),
+                "last_executor": replay.last_executor.map(|id| id.to_string()),
+                "settled_at_us": replay.outcome.as_ref().map(|outcome| outcome.at.as_unix_micros()),
+            }))))
+        }
+        Route::JobTimeline { job, after, limit } => {
+            let page = database
+                .job_timeline(job, after, limit)
+                .await?
+                .ok_or(NOT_FOUND)?;
+            dashboard::bounded(
+                shared,
+                envelope(
+                    serde_json::json!({"job":job.to_string(), "events":page.events, "next_after":page.next_after.map(|sequence|sequence.to_string())}),
+                ),
+            )
         }
         Route::JobInput(job) => catalog::job_input(database, job, request).await,
         Route::ConversationChildren {
@@ -670,6 +741,7 @@ pub(super) async fn respond(
             Ok(Reply::ok(envelope(serde_json::json!({
                 "job": job.to_string(),
                 "request": request.get(),
+                "allocation_generation": record.allocation_generation,
                 "messages": record.messages,
                 "tools": record.tools,
                 "parameters": record.parameters,

@@ -22,6 +22,12 @@ pub(super) const JOBS: TableDefinition<u128, &[u8]> = TableDefinition::new("job"
 pub(super) const JOB_STATES: TableDefinition<u128, &[u8]> = TableDefinition::new("job_state");
 pub(super) const POOL_ALLOCATIONS: TableDefinition<u128, &[u8]> =
     TableDefinition::new("pool_allocation");
+pub(super) const EXECUTION_EVENTS: TableDefinition<u128, &[u8]> =
+    TableDefinition::new("execution_event");
+pub(super) const JOB_EXECUTION_EVENTS: TableDefinition<(u128, u128), ()> =
+    TableDefinition::new("job_execution_event");
+pub(super) const JOB_LIFECYCLE_EVENTS: TableDefinition<(u128, u128), ()> =
+    TableDefinition::new("job_lifecycle_event");
 pub(super) const JOB_OUTPUTS: TableDefinition<(u128, u32), &[u8]> =
     TableDefinition::new("job_output");
 pub(super) const SUBMISSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("submission");
@@ -53,20 +59,17 @@ pub(super) const CONTENT_RECLAIM: TableDefinition<&[u8], u64> =
 
 pub(super) const ACTIVE_ALLOCATIONS: TableDefinition<(u128, u128, u128), ()> =
     TableDefinition::new("active_allocation");
-pub(super) const ALLOCATION_REQUESTS: TableDefinition<u128, u128> =
+pub(super) const ALLOCATION_REQUESTS: TableDefinition<u128, (u128, u32)> =
     TableDefinition::new("allocation_request");
 pub(super) const DRAFT_CONTEXTS: TableDefinition<u128, u128> =
     TableDefinition::new("draft_context");
 
-pub(super) const JOB_ALLOCATIONS: TableDefinition<(u128, u128), ()> =
-    TableDefinition::new("job_allocation");
 pub(super) const CONVERSATIONS: TableDefinition<u128, ()> = TableDefinition::new("conversation");
 pub(super) const TURNS: TableDefinition<(u128, u128), ()> = TableDefinition::new("turn");
 
 pub(super) const PENDING: TableDefinition<u128, ()> = TableDefinition::new("pending");
 pub(super) const MUTABLE_READY: TableDefinition<(u8, i64, u128, u16), ()> =
     TableDefinition::new("ready");
-pub(super) const DELAYED: TableDefinition<(i64, u128), ()> = TableDefinition::new("delayed");
 pub(super) const DEPENDENCY_WAITERS: TableDefinition<(u128, u128), u8> =
     TableDefinition::new("dependency_waiter");
 pub(super) const UNSETTLED: TableDefinition<u128, (u32, u32)> = TableDefinition::new("unsettled");
@@ -79,11 +82,9 @@ pub(super) const CHILD_GROUPS: TableDefinition<(u128, u128), ()> =
     TableDefinition::new("child_group");
 pub(super) const LIVE_CHILDREN: TableDefinition<(u128, u128), ()> =
     TableDefinition::new("live_child");
-pub(super) const USER_INPUT_AT: TableDefinition<u128, ()> = TableDefinition::new("user_input_at");
 pub(super) const ACTIVE_JOBS: TableDefinition<u128, u128> = TableDefinition::new("active_job");
 pub(super) const GROUP_RESULTS: TableDefinition<u128, (u128, u128)> =
     TableDefinition::new("group_result");
-pub(super) const NOTICE_READ: TableDefinition<u128, u32> = TableDefinition::new("notice_read");
 pub(super) const TOOL_CALL_IDS: TableDefinition<(u128, &str), (u32, u32)> =
     TableDefinition::new("tool_call_id");
 pub(crate) type ToolStatValue = (u64, u64, u64, u64, u64, u64);

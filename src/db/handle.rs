@@ -179,6 +179,8 @@ impl PreparedDevelopmentHandoff {
 pub(crate) struct DevelopmentHandoff {
     prepared: PreparedDevelopmentHandoff,
     started: entities::MutableJob,
+    first_request: entities::RequestNumber,
+    first_output_seq: u32,
     owner: Arc<Shared>,
     output_busy: AtomicBool,
     output_uncertain: AtomicBool,
@@ -187,6 +189,13 @@ pub(crate) struct DevelopmentHandoff {
 }
 
 impl DevelopmentHandoff {
+    pub(crate) fn first_request(&self) -> entities::RequestNumber {
+        self.first_request
+    }
+
+    pub(crate) fn first_output_seq(&self) -> u32 {
+        self.first_output_seq
+    }
     pub(crate) fn job(&self) -> entities::JobId {
         match &self.prepared.candidate {
             redb::DevelopmentCandidate::Generative(context) => context.allocation.token.job,
@@ -284,6 +293,7 @@ impl crate::service::ai::providers::CredentialResolver for DevelopmentHandoff {
 pub(super) struct DevelopmentUsageCheckpoint {
     request: Option<entities::RequestNumber>,
     evidence: entities::TokenEvidence,
+    last_sequence: u32,
 }
 
 impl DevelopmentUsageCheckpoint {
@@ -291,11 +301,16 @@ impl DevelopmentUsageCheckpoint {
         self.evidence.clone()
     }
 
-    pub(super) fn advanced(_last_sequence: u32, evidence: entities::TokenEvidence) -> Self {
+    pub(super) fn advanced(last_sequence: u32, evidence: entities::TokenEvidence) -> Self {
         Self {
             request: None,
             evidence,
+            last_sequence,
         }
+    }
+
+    pub(super) fn last_sequence(&self) -> u32 {
+        self.last_sequence.max(1)
     }
 
     fn for_request(self, request: entities::RequestNumber) -> Self {
@@ -1483,7 +1498,7 @@ impl DatabaseHandle {
                      operation,
                      commit| {
                         let mut passed = ScheduledReservation::Pass(Box::new(
-                            entities::DevelopmentReservation::Exhausted,
+                            entities::DevelopmentReservation::Exhausted(None),
                         ));
                         let outcome = redb::run_batch_declinable(
                             database,
@@ -1498,7 +1513,7 @@ impl DatabaseHandle {
                                     workspace_permit,
                                 },
                             ) {
-                                Ok(reserved @ entities::DevelopmentReservation::Reserved(_)) => {
+                                Ok(reserved @ entities::DevelopmentReservation::Reserved(..)) => {
                                     Ok(Some(ScheduledReservation::Pass(Box::new(reserved))))
                                 }
                                 Ok(other) => {
@@ -1616,6 +1631,33 @@ impl DatabaseHandle {
             .await
     }
 
+    pub(crate) async fn unstarted_retry_recorded(
+        &self,
+        token: entities::AllocationToken,
+    ) -> Result<bool, DatabaseError> {
+        self.read(move |database| redb::read_unstarted_retry(database, token))
+            .await
+    }
+
+    pub(crate) async fn job_replay(
+        &self,
+        job: JobId,
+        at: Option<u128>,
+    ) -> Result<Option<redb::JobReplay>, DatabaseError> {
+        self.read(move |database| redb::read_job_replay(database, job, at))
+            .await
+    }
+
+    pub(crate) async fn job_timeline(
+        &self,
+        job: JobId,
+        after: Option<u128>,
+        limit: usize,
+    ) -> Result<Option<redb::JobTimelinePage>, DatabaseError> {
+        self.read(move |database| redb::read_job_timeline(database, job, after, limit))
+            .await
+    }
+
     async fn prepare_with_credentials(
         &self,
         resolved: redb::DevelopmentResolvedCandidate,
@@ -1704,9 +1746,75 @@ impl DatabaseHandle {
             redb::DevelopmentResolvedCandidate::Generative(_)
             | redb::DevelopmentResolvedCandidate::Decision(_) => None,
         };
-        let prepared = self
+        let mut prepared = self
             .prepare_with_credentials(resolved, offer.as_ref())
             .await?;
+        if token.generation.get() > 1 {
+            let resume = self
+                .read(move |database| redb::read_multistep_resume(database, token))
+                .await
+                .map_err(classify_unstarted)?;
+            if let Some(resume) = resume {
+                let reject = || {
+                    classify_unstarted(DatabaseError::Rejected(Violation::InvalidValue(
+                        "handoff",
+                        "persisted execution progress cannot be safely resumed",
+                    )))
+                };
+                let Some(resume) = resume else {
+                    return Err(reject());
+                };
+                let Some(conversation) = prepared.conversation.as_mut() else {
+                    return Err(reject());
+                };
+                if conversation
+                    .image_attachments
+                    .values()
+                    .any(|attachments| !attachments.is_empty())
+                    || resume.response.is_some()
+                    || resume.dropped_turns != 0
+                {
+                    return Err(reject());
+                }
+                let original = prepared.request.as_object().ok_or_else(reject)?;
+                let parameters: serde_json::Map<String, serde_json::Value> = original
+                    .iter()
+                    .filter(|(key, _)| !matches!(key.as_str(), "messages" | "input" | "tools"))
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect();
+                if serde_json::Value::Object(parameters) != resume.parameters
+                    || original.get("tools") != resume.tools.as_ref()
+                    || resume.messages.iter().any(|message| {
+                        message
+                            .get("content")
+                            .and_then(serde_json::Value::as_array)
+                            .is_some_and(|parts| {
+                                parts.iter().any(|part| {
+                                    part.get("type").and_then(serde_json::Value::as_str)
+                                        == Some("image_url")
+                                })
+                            })
+                    })
+                {
+                    return Err(reject());
+                }
+                conversation.messages = resume
+                    .messages
+                    .into_iter()
+                    .map(serde_json::from_value)
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| reject())?;
+                let redb::DevelopmentCandidate::Generative(context) = &prepared.candidate else {
+                    return Err(reject());
+                };
+                prepared.request = crate::service::ai::generative_model::request_body(
+                    &context.configuration.llm.config.model,
+                    &context.configuration.llm.config.parameters,
+                    conversation,
+                )
+                .map_err(|_| reject())?;
+            }
+        }
         if let Err(reason) = guard(&prepared) {
             return Err(classify_unstarted(DatabaseError::Rejected(
                 Violation::InvalidValue("handoff", reason),
@@ -1723,9 +1831,13 @@ impl DatabaseHandle {
                 OperationKind::ClaimExecution,
                 |batch, (prepared, owner)| {
                     let started = batch.start_mutable_job(&prepared)?;
+                    let (first_request, first_output_seq) =
+                        batch.next_execution_positions(started.id)?;
                     Ok(DevelopmentHandoff {
                         prepared,
                         started,
+                        first_request,
+                        first_output_seq,
                         owner,
                         output_busy: AtomicBool::new(false),
                         output_uncertain: AtomicBool::new(false),
@@ -1804,7 +1916,7 @@ impl DatabaseHandle {
     ) -> Result<(), DatabaseError> {
         self.record_development_request(
             handoff,
-            entities::RequestNumber::FIRST,
+            handoff.first_request,
             &handoff.prepared.request,
             observed_at,
         )
@@ -1867,7 +1979,7 @@ impl DatabaseHandle {
                 .recorder
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if request_number == entities::RequestNumber::FIRST {
+            if request_number == handoff.first_request {
                 recorder.image_attachments = handoff
                     .prepared
                     .conversation
@@ -1933,6 +2045,66 @@ impl DatabaseHandle {
                 .remember_sent(state);
         }
         result
+    }
+
+    pub(crate) async fn record_development_partial_usage(
+        &self,
+        handoff: &DevelopmentHandoff,
+        request: entities::RequestNumber,
+        usages: Vec<Metrics>,
+    ) -> Result<(), DatabaseError> {
+        if usages.is_empty() {
+            return Ok(());
+        }
+        if handoff
+            .prepared
+            .credentials
+            .spellings
+            .as_ref()
+            .is_some_and(|secret| {
+                usages.iter().any(|metrics| {
+                    metrics
+                        .measurements
+                        .usage
+                        .raw
+                        .as_ref()
+                        .is_some_and(|raw| development_contains_secret(raw, secret))
+                })
+            })
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "usage",
+                "usage evidence contains credential material",
+            )));
+        }
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let checkpoint = handoff
+            .usage_checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .for_request(request);
+        let result = self
+            .write_sized(
+                (proof, request, usages, checkpoint),
+                |(_, _, usages, _)| {
+                    usages.iter().fold(0u64, |size, metrics| {
+                        size.saturating_add(json_bytes(metrics.measurements.usage.raw.as_ref()))
+                    })
+                },
+                OperationKind::ConsumeTokenUsage,
+                |batch, (proof, request, usages, checkpoint)| {
+                    batch.record_development_partial_usage(&proof, request, usages, checkpoint)
+                },
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result.map(|checkpoint| {
+            *handoff
+                .usage_checkpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = checkpoint.of_request(request);
+        })
     }
 
     #[allow(dead_code)]
@@ -2278,15 +2450,44 @@ impl DatabaseHandle {
         &self,
         token: entities::AllocationToken,
         cause: entities::UnstartedCause,
-    ) -> Result<AppendedOutput, DatabaseError> {
+    ) -> Result<Option<AppendedOutput>, DatabaseError> {
         self.write_output(
             token.job,
             (token, cause),
             |(_, cause)| output_bytes(Some(cause.summary()), Some(cause.code()), None),
             OperationKind::FinalizeJob,
-            |batch, (token, cause)| batch.fail_unstarted_reservation(token, cause),
+            |batch, (token, cause)| batch.finish_or_hold_unstarted_reservation(token, cause),
         )
         .await
+    }
+
+    pub(crate) async fn retry_unstarted_development_reservation(
+        &self,
+        token: entities::AllocationToken,
+        cause: entities::UnstartedCause,
+    ) -> Result<bool, DatabaseError> {
+        self.write(
+            4096,
+            OperationKind::FinalizeJob,
+            (token, cause),
+            |batch, (token, cause)| batch.retry_unstarted_reservation(token, cause),
+        )
+        .await
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn retry_uncertain_execution(
+        &self,
+        handoff: &DevelopmentHandoff,
+    ) -> Result<bool, DatabaseError> {
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .write(4096, OperationKind::FinalizeJob, proof, |batch, proof| {
+                batch.retry_uncertain_execution(&proof)
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
     }
 
     #[allow(dead_code)]

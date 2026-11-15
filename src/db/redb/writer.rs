@@ -1492,7 +1492,7 @@ impl Batch {
 
     pub(crate) fn put_job_state(&mut self, job: JobId, state: &JobState) -> Result<(), BatchError> {
         self.catalog_changed = true;
-        self.insert(JOB_STATES, job.get(), state.encode().as_slice())
+        self.put_mutable_job_state(job, state)
     }
 
     pub(crate) fn append_development_output(
@@ -1540,6 +1540,34 @@ impl Batch {
         })
     }
 
+    pub(crate) fn next_execution_positions(
+        &mut self,
+        job: JobId,
+    ) -> Result<(RequestNumber, u32), BatchError> {
+        self.step(|tx| {
+            let requests = tx.open_table(REQUEST_EVENTS)?;
+            let request = requests
+                .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map(|(key, _)| key.value().1)
+                .unwrap_or(0)
+                .checked_add(1)
+                .and_then(RequestNumber::new)
+                .ok_or_else(|| StorageError::corrupted("request identity exhausted"))?;
+            let outputs = tx.open_table(JOB_OUTPUTS)?;
+            let output = outputs
+                .range((job.get(), 0)..=(job.get(), u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map(|(key, _)| key.value().1)
+                .unwrap_or(0)
+                .checked_add(1)
+                .ok_or_else(|| StorageError::corrupted("output sequence exhausted"))?;
+            Ok((request, output))
+        })
+    }
+
     pub(crate) fn record_development_sent_request(
         &mut self,
         proof: &crate::db::handle::DevelopmentWriteProof,
@@ -1574,7 +1602,7 @@ impl Batch {
                 ));
             }
         }
-        if !self.development_request_slot_is_next(sent.job, sent.request)? {
+        if !self.development_request_slot_is_next(proof.token(), sent.request)? {
             return self.reject(Violation::InvalidValue(
                 "request",
                 "the request is not the next one, or its evidence already exists",
@@ -1598,6 +1626,7 @@ impl Batch {
             observed_at: sent.observed_at,
             recorded_at: self.now,
             payload: RequestPayload::Sent {
+                allocation_generation: proof.token().generation,
                 messages: sent.messages,
                 tools: sent.tools,
                 parameters: sent.parameters,
@@ -1609,6 +1638,31 @@ impl Batch {
             (event.job_id.get(), event.request.get(), event.seq),
             encode_request_event(&event).as_slice(),
         )?;
+        self.append_job_lifecycle(
+            event.job_id,
+            transactions::JobLifecycle::RequestEvidence {
+                request: event.request,
+                seq: event.seq,
+            },
+        )?;
+        Ok(())
+    }
+
+    pub(super) fn require_allocation_request(
+        &mut self,
+        token: crate::db::entities::AllocationToken,
+        request: RequestNumber,
+    ) -> Result<(), BatchError> {
+        let authorized = self.get(
+            REQUEST_EVENTS,
+            (token.job.get(), request.get(), 1),
+            |bytes| decode_request_event(token.job, request, 1, bytes),
+        )?;
+        if !authorized.is_some_and(|event| matches!(event.payload,
+            RequestPayload::Sent { allocation_generation, .. } if allocation_generation == token.generation))
+        {
+            return self.reject(Violation::InvalidValue("request", "request belongs to another Allocation or has no send authorization"));
+        }
         Ok(())
     }
 
@@ -1666,6 +1720,7 @@ impl Batch {
                 "wrong Job or request identity",
             ));
         }
+        self.require_allocation_request(proof.token(), stat.request)?;
         if answer.measurements.is_empty() || stat.observation.is_empty() {
             return self.reject(Violation::InvalidValue(
                 "answer",
@@ -1678,8 +1733,8 @@ impl Batch {
         {
             return self.reject(Violation::ValueOutOfRange("usage"));
         }
-        let only_sent = self.development_only_sent(job, stat.request)?;
-        if !only_sent {
+        let prefix = self.development_usage_prefix(job, stat.request)?;
+        if prefix != Some(checkpoint.last_sequence()) {
             return self.reject(Violation::InvalidValue(
                 "response",
                 "request missing or answer already recorded",
@@ -1689,14 +1744,20 @@ impl Batch {
         let old = evidence.sample();
         let ids = [self.next_id()?, self.next_id()?, self.next_id()?];
         let mut prepared_usages = Vec::with_capacity(usages.len());
-        let mut next_seq = 5u32;
+        let first_answer_seq =
+            checkpoint
+                .last_sequence()
+                .checked_add(1)
+                .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
+                    "seq",
+                ))))?;
+        let mut next_seq = first_answer_seq
+            .checked_add(3)
+            .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
+                "seq",
+            ))))?;
         for (expected_seq, metrics) in usages {
-            if metrics.job != job
-                || metrics.request != stat.request
-                || expected_seq != next_seq
-                || expected_seq < 5
-                || expected_seq.is_multiple_of(2)
-            {
+            if metrics.job != job || metrics.request != stat.request || expected_seq != next_seq {
                 return self.reject(Violation::InvalidValue(
                     "usage",
                     "wrong Job, request or event sequence",
@@ -1753,7 +1814,12 @@ impl Batch {
             ));
         }
         let new = evidence.sample();
-        self.step(|_| indexes::validate_native_sample(new.as_ref()))?;
+        indexes::validate_native_sample(new.as_ref()).map_err(|_| {
+            BatchError(Failure::Rejected(Violation::InvalidValue(
+                "usage",
+                "inconsistent Token evidence",
+            )))
+        })?;
         let identity = self.development_usage_identity(job)?;
         self.put_message(&answer.response)?;
         let observed_at = stat.observed_at;
@@ -1771,7 +1837,12 @@ impl Batch {
                 failure: stat.observation.failure,
             },
         ];
-        for ((seq, payload), id) in [2u32, 3, 4].into_iter().zip(payloads).zip(ids) {
+        for ((offset, payload), id) in [0u32, 1, 2].into_iter().zip(payloads).zip(ids) {
+            let seq = first_answer_seq
+                .checked_add(offset)
+                .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
+                    "seq",
+                ))))?;
             self.insert_development_request_event_with_id(
                 &identity,
                 job,
@@ -1824,6 +1895,143 @@ impl Batch {
             usage_ids,
             next_checkpoint,
         ))
+    }
+
+    pub(in crate::db) fn record_development_partial_usage(
+        &mut self,
+        proof: &crate::db::handle::DevelopmentWriteProof,
+        request: RequestNumber,
+        usages: Vec<crate::db::entities::Metrics>,
+        checkpoint: crate::db::handle::DevelopmentUsageCheckpoint,
+    ) -> Result<crate::db::handle::DevelopmentUsageCheckpoint, BatchError> {
+        self.require_development_write_any(proof)?;
+        let job = proof.token().job;
+        self.require_allocation_request(proof.token(), request)?;
+        if self.development_usage_prefix(job, request)? != Some(checkpoint.last_sequence()) {
+            return self.reject(Violation::InvalidValue(
+                "usage",
+                "request already has evidence",
+            ));
+        }
+        let identity = self.development_usage_identity(job)?;
+        let mut evidence = checkpoint.evidence();
+        let old = evidence.sample();
+        let mut seq =
+            checkpoint
+                .last_sequence()
+                .checked_add(1)
+                .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
+                    "seq",
+                ))))?;
+        for metrics in usages {
+            if metrics.job != job || metrics.request != request {
+                return self.reject(Violation::InvalidValue(
+                    "usage",
+                    "wrong Job or request identity",
+                ));
+            }
+            let token =
+                metrics
+                    .token
+                    .ok_or(BatchError(Failure::Rejected(Violation::InvalidValue(
+                        "usage",
+                        "Token annotation required",
+                    ))))?;
+            let first_id = self.next_id()?;
+            let record = crate::db::entities::MetricsRecord {
+                id: MetricsId::new(first_id),
+                job,
+                request,
+                target: None,
+                decision_target: None,
+                observed_at: metrics.observed_at,
+                measurements: metrics.measurements.clone(),
+                token: Some(token),
+                recorded_at: self.now,
+            };
+            let observation = crate::db::entities::TokenObservation::from_record(&record).ok_or(
+                BatchError(Failure::Rejected(Violation::InvalidValue(
+                    "usage",
+                    "Token annotation required",
+                ))),
+            )?;
+            if evidence.add(observation).is_err() {
+                return self.reject(Violation::InvalidValue(
+                    "usage",
+                    "inconsistent Token evidence",
+                ));
+            }
+            let token_seq = seq.checked_add(1).ok_or(BatchError(Failure::Rejected(
+                Violation::ValueOutOfRange("seq"),
+            )))?;
+            self.insert_development_request_event_with_id(
+                &identity,
+                job,
+                request,
+                first_id,
+                seq,
+                metrics.observed_at,
+                RequestPayload::Measurement {
+                    measurements: metrics.measurements,
+                },
+            )?;
+            self.insert_development_request_event(
+                &identity,
+                job,
+                request,
+                token_seq,
+                metrics.observed_at,
+                RequestPayload::Token {
+                    eligibility: token.eligibility,
+                    finality: token.finality,
+                },
+            )?;
+            seq = token_seq
+                .checked_add(1)
+                .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
+                    "seq",
+                ))))?;
+        }
+        let sample = evidence.sample();
+        indexes::validate_native_sample(sample.as_ref()).map_err(|_| {
+            BatchError(Failure::Rejected(Violation::InvalidValue(
+                "usage",
+                "inconsistent Token evidence",
+            )))
+        })?;
+        self.replace_development_usage_total(job, old, sample)?;
+        Ok(crate::db::handle::DevelopmentUsageCheckpoint::advanced(
+            seq - 1,
+            evidence,
+        ))
+    }
+
+    fn development_usage_prefix(
+        &mut self,
+        job: JobId,
+        request: RequestNumber,
+    ) -> Result<Option<u32>, BatchError> {
+        self.step(|tx| {
+            let events = tx.open_table(REQUEST_EVENTS)?;
+            let mut last = 0u32;
+            for entry in events
+                .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
+            {
+                let (key, bytes) = entry?;
+                let seq = key.value().2;
+                if seq != last.saturating_add(1) {
+                    return Ok(None);
+                }
+                match decode_request_event(job, request, seq, bytes.value())?.payload {
+                    RequestPayload::Sent { .. } if seq == 1 => {}
+                    RequestPayload::Measurement { .. } if seq.is_multiple_of(2) => {}
+                    RequestPayload::Token { .. } if seq > 1 && !seq.is_multiple_of(2) => {}
+                    _ => return Ok(None),
+                }
+                last = seq;
+            }
+            Ok((last > 0 && !last.is_multiple_of(2)).then_some(last))
+        })
     }
 
     fn insert_development_request_event(
@@ -1888,7 +2096,11 @@ impl Batch {
                 indexes::record_usage_model(tx, key, job)?;
             }
             Ok(())
-        })
+        })?;
+        self.append_job_lifecycle(
+            job,
+            transactions::JobLifecycle::RequestEvidence { request, seq },
+        )
     }
 
     fn development_only_sent(
@@ -1917,9 +2129,10 @@ impl Batch {
 
     fn development_request_slot_is_next(
         &mut self,
-        job: JobId,
+        token: crate::db::entities::AllocationToken,
         request: RequestNumber,
     ) -> Result<bool, BatchError> {
+        let job = token.job;
         self.step(|tx| {
             let events = tx.open_table(REQUEST_EVENTS)?;
             if events
@@ -1933,19 +2146,24 @@ impl Batch {
             let Some(previous) = request.get().checked_sub(1).and_then(RequestNumber::new) else {
                 return Ok(true);
             };
-            let (mut sent, mut answered) = (false, false);
+            let (mut sent, mut answered) = (None, false);
             for entry in events
                 .range((job.get(), previous.get(), 0)..=(job.get(), previous.get(), u32::MAX))?
             {
                 let (key, bytes) = entry?;
                 let (_, _, seq) = key.value();
                 match decode_request_event(job, previous, seq, bytes.value())?.payload {
-                    RequestPayload::Sent { .. } => sent = true,
+                    RequestPayload::Sent {
+                        allocation_generation,
+                        ..
+                    } => sent = Some(allocation_generation),
                     RequestPayload::Availability { .. } => answered = true,
                     _ => {}
                 }
             }
-            Ok(sent && answered)
+            Ok(sent.is_some_and(|generation| {
+                (generation == token.generation && answered) || generation < token.generation
+            }))
         })
     }
 
@@ -1962,6 +2180,7 @@ impl Batch {
                 "wrong Job or request identity",
             ));
         }
+        self.require_allocation_request(proof.token(), stat.request)?;
         let observation = stat.observation;
         if observation.status_code.is_none() || observation.failure.is_none() {
             return self.reject(Violation::InvalidValue(
@@ -2158,6 +2377,17 @@ impl Batch {
             }
             Ok(())
         })?;
+        let native = self.step(|tx| {
+            Ok(tx
+                .open_table(JOB_LIFECYCLE_EVENTS)?
+                .range((job.get(), 0)..=(job.get(), u128::MAX))?
+                .next()
+                .transpose()?
+                .is_some())
+        })?;
+        if native {
+            self.append_job_lifecycle(job, transactions::JobLifecycle::Output { seq })?;
+        }
         Ok((seq, id))
     }
 
@@ -2445,6 +2675,10 @@ impl Batch {
             }
             Ok(())
         })?;
+        self.append_job_lifecycle(
+            job,
+            transactions::JobLifecycle::RequestEvidence { request, seq },
+        )?;
         Ok(event)
     }
 }

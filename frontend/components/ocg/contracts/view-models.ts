@@ -10,7 +10,6 @@ export type Actor =
   | { kind: "user"; user_id: string }
   | { kind: "client"; client_kind: ClientKind; client_id: string | null }
   | { kind: "core" }
-  | { kind: "attempt"; attempt_ref: EntityRef }
   | { kind: "call"; call_ref: EntityRef }
   | { kind: "system"; policy_ref: string | null }
   | { kind: "external"; source_kind: ExternalSourceKind; source_ref: string };
@@ -39,7 +38,6 @@ export type EntityId = string;
 
 export type EntityKind =
   | "job"
-  | "attempt"
   | "call"
   | "command"
   | "approval"
@@ -87,7 +85,6 @@ export type FailureClass =
 
 export type JobOrigin = {
   parent_job_id: string;
-  attempt_id: string;
   generation: number;
   spawn_key: string | null;
   spawn_fingerprint: string | null;
@@ -114,11 +111,11 @@ export type UsageCost = {
   unavailable_calls: number;
 };
 
-export type UsageCostSource = "canonical_settlement";
+export type UsageCostSource = "job_settlement";
 
 export type UsageCurrencyCost = { currency: string; actual_micros: number };
 
-export type CanonicalJobState =
+export type ExecutionJobState =
   | "pending"
   | "eligible"
   | "running"
@@ -129,24 +126,4 @@ export type CanonicalJobState =
   | "unknown"
   | "orphaned";
 
-export type CanonicalAttemptState =
-  | "queued"
-  | "running"
-  | "cancelling"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "unknown"
-  | "orphaned";
-
-export type CanonicalEffectKind = "idempotent" | "strict_fenced" | "reconcilable" | "non_retryable";
-
-export type CanonicalAttempt = {
-  id: string;
-  job_id: string;
-  generation: number;
-  state: CanonicalAttemptState;
-  authoritative: boolean;
-  created_at: number;
-  finished_at: number | null;
-};
+export type EffectKind = "idempotent" | "strict_fenced" | "reconcilable" | "non_retryable";

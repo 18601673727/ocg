@@ -10,7 +10,7 @@ export type WorkspaceView =
   | "health"
   | "logs"
   | "settings"
-  | "canonical";
+  | "control";
 
 export function isJobIdentity(value: unknown): value is string {
   return (

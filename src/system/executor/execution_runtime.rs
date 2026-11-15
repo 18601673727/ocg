@@ -1,3 +1,4 @@
+use crate::system::data_directory::resolve_path;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -82,8 +83,8 @@ pub(crate) async fn supervise_development_generative(
         return settle_development_unsent(
             database,
             &handoff,
-            RequestNumber::FIRST,
-            1,
+            handoff.first_request(),
+            handoff.first_output_seq(),
             config,
             NOT_SENT,
             message,
@@ -96,8 +97,8 @@ pub(crate) async fn supervise_development_generative(
         .map_or(1, |tools| tools.limits.max_provider_requests);
     let mut conversation = first_conversation.clone();
     let mut body = prepared.clone();
-    let mut request = RequestNumber::FIRST;
-    let mut output_seq = 1u32;
+    let mut request = handoff.first_request();
+    let mut output_seq = handoff.first_output_seq();
     loop {
         let mut sink = DevelopmentLoopbackSink {
             database,
@@ -109,6 +110,8 @@ pub(crate) async fn supervise_development_generative(
             sent: false,
             observations: Vec::new(),
             observation_overflow: false,
+            persist_usage: true,
+            persisted_usage: false,
             streamed: String::new(),
         };
         let result = crate::service::ai::generative_model::execute_conversation(
@@ -120,7 +123,6 @@ pub(crate) async fn supervise_development_generative(
         )
         .await;
         output_seq = sink.output_seq;
-        let observations = std::mem::take(&mut sink.observations);
         let (sent, overflow) = (sink.sent, sink.observation_overflow);
         let result = match result {
             Ok(result) if tools.is_none() => result.admitted(),
@@ -135,6 +137,12 @@ pub(crate) async fn supervise_development_generative(
                 )));
             }
             Err(error) => {
+                if overflow {
+                    return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                        "execution",
+                        "incomplete execution evidence; ownership remains held",
+                    )));
+                }
                 return settle_development_error(
                     database, &handoff, request, output_seq, config, sent, error,
                 )
@@ -147,15 +155,7 @@ pub(crate) async fn supervise_development_generative(
                 "incomplete execution evidence; ownership remains held",
             )));
         }
-        record_answered_request(
-            database,
-            &handoff,
-            token.job,
-            request,
-            &result,
-            &observations,
-        )
-        .await?;
+        record_answered_request(database, &handoff, token.job, request, &result).await?;
         let Some(tools) = tools.as_ref().filter(|_| result.requests_tools()) else {
             let mut value = providers::result_value(&result);
             #[cfg(unix)]
@@ -213,7 +213,7 @@ pub(crate) async fn supervise_development_generative(
         }
         let next = request
             .next()
-            .filter(|next| next.get() <= max_requests)
+            .filter(|next| next.get().saturating_sub(handoff.first_request().get()) < max_requests)
             .ok_or(ToolLoopStop::RequestLimit {
                 limit: max_requests,
             });
@@ -354,8 +354,8 @@ async fn capture_file_snapshots(
             let rel_path = if path_obj.is_absolute() {
                 if let Ok(relative) = path_obj.strip_prefix(workspace.root()) {
                     relative
-                } else if let Ok(canonical) = path_obj.canonicalize() {
-                    let Ok(relative) = canonical.strip_prefix(workspace.root()) else {
+                } else if let Ok(normalized) = resolve_path(path_obj) {
+                    let Ok(relative) = normalized.strip_prefix(workspace.root()) else {
                         continue;
                     };
                     relative_owned = relative.to_path_buf();
@@ -518,7 +518,6 @@ async fn record_answered_request(
     job: crate::db::entities::JobId,
     request: RequestNumber,
     result: &ProviderExecutionResult,
-    observations: &[ProviderObservation],
 ) -> Result<(), DatabaseError> {
     let message = assistant_message(result);
     let response = MessageBody::new(&serde_json::to_value(message).map_err(|_| {
@@ -533,31 +532,6 @@ async fn record_answered_request(
             "response cannot be recorded",
         ))
     })?;
-    let mut usage_seq = 5u32;
-    let mut usages = Vec::new();
-    for observation in observations {
-        if let ProviderFact::Usage { usage, finality } = &observation.fact {
-            if !has_usage_counts(usage) {
-                continue;
-            }
-            usages.push((
-                usage_seq,
-                Metrics {
-                    job,
-                    request,
-                    observed_at: observation.observed_at,
-                    measurements: Measurements {
-                        usage: usage.clone(),
-                        ..Measurements::default()
-                    },
-                    token: Some(TokenAnnotation::eligible(*finality)),
-                },
-            ));
-            usage_seq = usage_seq
-                .checked_add(2)
-                .ok_or(DatabaseError::Rejected(Violation::ValueOutOfRange("usage")))?;
-        }
-    }
     database
         .record_development_provider_answer(
             handoff,
@@ -571,7 +545,7 @@ async fn record_answered_request(
                 measurements: providers::metrics(result),
                 response,
             },
-            usages,
+            Vec::new(),
         )
         .await
 }
@@ -584,6 +558,14 @@ async fn settle_tool_stop(
     stop: ToolLoopStop,
 ) -> Result<AppendedOutput, DatabaseError> {
     if stop.is_unknown() {
+        if !matches!(stop, ToolLoopStop::Cancelled)
+            && database.retry_uncertain_execution(handoff).await?
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "the tool outcome is unknown; a retry was scheduled",
+            )));
+        }
         database
             .record_development_uncertain(
                 DevelopmentExecutionReturn { handoff },
@@ -652,8 +634,8 @@ pub(crate) async fn supervise_development_decision(
         return settle_development_unsent(
             database,
             &handoff,
-            RequestNumber::FIRST,
-            1,
+            handoff.first_request(),
+            handoff.first_output_seq(),
             &effective_config,
             code,
             message,
@@ -663,13 +645,15 @@ pub(crate) async fn supervise_development_decision(
     let mut sink = DevelopmentLoopbackSink {
         database,
         handoff: &handoff,
-        request: RequestNumber::FIRST,
+        request: handoff.first_request(),
         prepared: body,
         cancellation: &effective_config.cancellation,
-        output_seq: 1,
+        output_seq: handoff.first_output_seq(),
         sent: false,
         observations: Vec::new(),
         observation_overflow: false,
+        persist_usage: true,
+        persisted_usage: false,
         streamed: String::new(),
     };
     let result = crate::service::ai::decisive_model::execute_decision_with_sink(
@@ -680,7 +664,7 @@ pub(crate) async fn supervise_development_decision(
         &effective_config,
         crate::db::entities::RequestRef {
             job: token.job,
-            request: RequestNumber::FIRST,
+            request: handoff.first_request(),
         },
         &mut sink,
     )
@@ -688,10 +672,16 @@ pub(crate) async fn supervise_development_decision(
     let result = match result {
         Ok(result) => result,
         Err(error) => {
+            if sink.observation_overflow {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "execution",
+                    "incomplete execution evidence; ownership remains held",
+                )));
+            }
             return settle_development_error(
                 database,
                 &handoff,
-                RequestNumber::FIRST,
+                handoff.first_request(),
                 sink.output_seq,
                 &effective_config,
                 sink.sent,
@@ -700,10 +690,10 @@ pub(crate) async fn supervise_development_decision(
             .await;
         }
     };
-    if !sink.sent {
+    if !sink.sent || sink.observation_overflow {
         return Err(DatabaseError::Rejected(Violation::InvalidValue(
             "execution",
-            "Decision request evidence missing; ownership remains held",
+            "Decision request evidence incomplete; ownership remains held",
         )));
     }
     let response = MessageBody::new(&result.raw).map_err(|_| {
@@ -712,12 +702,12 @@ pub(crate) async fn supervise_development_decision(
             "Decision response cannot be recorded",
         ))
     })?;
-    let usages = if has_usage_counts(&result.usage) {
+    let usages = if !sink.persisted_usage && has_usage_counts(&result.usage) {
         vec![(
             5,
             Metrics {
                 job: token.job,
-                request: RequestNumber::FIRST,
+                request: handoff.first_request(),
                 observed_at: Timestamp::now(),
                 measurements: Measurements {
                     usage: result.usage.clone(),
@@ -737,7 +727,7 @@ pub(crate) async fn supervise_development_decision(
             crate::db::entities::ProviderAnswer {
                 stat: AvailabilityStat {
                     job: token.job,
-                    request: RequestNumber::FIRST,
+                    request: handoff.first_request(),
                     observed_at: Timestamp::now(),
                     observation: crate::db::entities::AvailabilityObservation {
                         status_code: Some(result.status_code),
@@ -877,6 +867,14 @@ async fn settle_development_error(
                 .await
         }
         DevelopmentSettlement::Held(reason) => {
+            if !config.cancellation.is_cancelled()
+                && database.retry_uncertain_execution(handoff).await?
+            {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "execution",
+                    "provider outcome is unknown; a retry was scheduled",
+                )));
+            }
             database
                 .record_development_uncertain(DevelopmentExecutionReturn { handoff }, reason)
                 .await?;
@@ -898,7 +896,7 @@ async fn settle_development_unsent(
     message: &str,
 ) -> Result<AppendedOutput, DatabaseError> {
     let cancelled = config.cancellation.is_cancelled();
-    if cancelled && request != RequestNumber::FIRST {
+    if cancelled && request != handoff.first_request() {
         database
             .record_development_uncertain(
                 DevelopmentExecutionReturn { handoff },
@@ -945,6 +943,8 @@ struct DevelopmentLoopbackSink<'a> {
     sent: bool,
     observations: Vec<ProviderObservation>,
     observation_overflow: bool,
+    persist_usage: bool,
+    persisted_usage: bool,
     streamed: String,
 }
 
@@ -1022,6 +1022,32 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
         observation: ProviderObservation,
     ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
         Box::pin(async move {
+            if self.persist_usage
+                && let ProviderFact::Usage { usage, finality } = &observation.fact
+                && has_usage_counts(usage)
+            {
+                let metrics = Metrics {
+                    job: self.handoff.job(),
+                    request: self.request,
+                    observed_at: observation.observed_at,
+                    measurements: Measurements {
+                        usage: usage.clone(),
+                        ..Measurements::default()
+                    },
+                    token: Some(TokenAnnotation::eligible(*finality)),
+                };
+                if self
+                    .database
+                    .record_development_partial_usage(self.handoff, self.request, vec![metrics])
+                    .await
+                    .is_err()
+                {
+                    self.observation_overflow = true;
+                    self.cancellation.cancel();
+                    return;
+                }
+                self.persisted_usage = true;
+            }
             if self.observations.len() >= 1024 {
                 self.observation_overflow = true;
             } else {

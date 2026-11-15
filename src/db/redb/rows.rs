@@ -931,12 +931,14 @@ pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
     match &r.payload {
         RequestPayload::ApprovedCalls => e.u8(6),
         RequestPayload::Sent {
+            allocation_generation,
             messages,
             tools,
             parameters,
             dropped_turns,
         } => {
             e.u8(4);
+            e.u32(allocation_generation.get());
             e.u32(u32::try_from(messages.len()).expect("request messages fit u32"));
             for digest in messages {
                 e.0.extend_from_slice(digest.as_bytes());
@@ -1000,6 +1002,8 @@ pub(super) fn decode_request_event(
     let payload = match d.u8()? {
         6 => RequestPayload::ApprovedCalls,
         4 => {
+            let allocation_generation = std::num::NonZeroU32::new(d.u32()?)
+                .ok_or_else(|| StorageError::corrupted("zero request Allocation generation"))?;
             let mut messages = Vec::new();
             for _ in 0..d.u32()? {
                 messages.push(ContentDigest::from_bytes(d.take_array()?));
@@ -1008,6 +1012,7 @@ pub(super) fn decode_request_event(
             let parameters = ContentDigest::from_bytes(d.take_array()?);
             let dropped_turns = d.ou32()?;
             RequestPayload::Sent {
+                allocation_generation,
                 messages,
                 tools,
                 parameters,

@@ -189,7 +189,7 @@ pub fn emit_begin(parameters: &WorkloadParameters) {
     );
 }
 
-pub fn canonical_metric(section: &str) -> &str {
+pub fn metric_name(section: &str) -> &str {
     match section {
         "startup" => "startup.ready",
         "memory" => "memory.footprint",
@@ -216,7 +216,7 @@ pub fn emit_trial_result(
     let mut parameters = parameters.clone().with_trial(trial);
     parameters.concurrency = concurrency;
     let record = MeasurementRecord {
-        name: canonical_metric(&parameters.case_name).to_owned(),
+        name: metric_name(&parameters.case_name).to_owned(),
         parameters,
         metadata: metadata.clone(),
         samples,

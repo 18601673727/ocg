@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
   ControlTransportError,
-  type HttpCanonicalControlClient,
+  type HttpControlClient,
 } from "@/components/ocg/runtime/control-client";
 import { ContractError } from "@/components/ocg/contracts";
 import { useI18n, type I18nKey } from "../i18n";
@@ -22,7 +22,7 @@ export function OperatorLogin({
   client,
   onSignedIn,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   onSignedIn: (session: OperatorSession) => void;
 }) {
   const { t } = useI18n();

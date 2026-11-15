@@ -1,3 +1,4 @@
+use crate::system::data_directory::resolve_path;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -906,8 +907,8 @@ fn private_copy(original: &mut File, source_sha256: &str) -> Result<File, Refuse
 }
 
 fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
-    let directory = std::fs::canonicalize(directory)
-        .map_err(|error| io("resolve the data directory", error))?;
+    let directory =
+        resolve_path(directory).map_err(|error| io("resolve the data directory", error))?;
     let database_path = directory.join(DATABASE_FILE_NAME);
     let lock = acquire_lock(&directory)?;
 
@@ -967,7 +968,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 return Ok(json!({
                     "outcome": "planned",
                     "state": if supersedes.is_some() { json!(PREPARED_NOT_PUBLISHED) } else { Value::Null },
-                    "plan": plan.canonical,
+                    "plan": plan.normalized,
                     "plan_digest": plan.digest,
                     "original": {"sha256": source_sha256, "bytes": source_length},
                     "source_unchanged": true,
@@ -1397,8 +1398,8 @@ fn confirm_final_published(database_path: &Path, expected: &FileFact) -> Result<
 }
 
 fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
-    let directory = std::fs::canonicalize(directory)
-        .map_err(|error| io("resolve the data directory", error))?;
+    let directory =
+        resolve_path(directory).map_err(|error| io("resolve the data directory", error))?;
     let database_path = directory.join(DATABASE_FILE_NAME);
     let lock = acquire_lock(&directory)?;
     let chain = load_audit_chain(&directory)?;

@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { TONE_CLASS, type Tone } from "../primitives/tone";
 import type { ControlTreeNode, ControlTreeState } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { runtimeStateLabel, useI18n, type TranslateFn } from "../i18n";
 
 const STATE_TONE: Record<ControlTreeState, Tone> = {
@@ -82,7 +82,7 @@ export function JobTree({
   onReroot,
   onOpenChat,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   root: string;
   selected: string | null;
   onSelect: (job: string) => void;

@@ -12,7 +12,7 @@ import type {
   ControlProjectCommand,
   ControlProjectCreate,
   ControlProjectUpdate,
-  HttpCanonicalControlClient,
+  HttpControlClient,
 } from "@/components/ocg/runtime/control-client";
 import { Section, describeError, refusalText } from "./settings-parts";
 import { useI18n, type I18nKey } from "../i18n";
@@ -54,7 +54,7 @@ function CopyRootButton({ project }: { project: ControlProject }) {
   );
 }
 
-export function ProjectsSection({ client }: { client: HttpCanonicalControlClient }) {
+export function ProjectsSection({ client }: { client: HttpControlClient }) {
   const { t, locale } = useI18n();
   const [projects, setProjects] = useState<ControlProject[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);

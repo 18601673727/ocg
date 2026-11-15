@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import type { ChatSession } from "../types";
 import { useI18n } from "../i18n";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import {
   appendSearchResults,
   conversationSearchMatches,
@@ -34,7 +34,7 @@ export type ConversationSearchProps = {
   activeSessionId: string;
   onSelect: (id: string) => void;
   onOpenConversation?: (conversation: string) => void;
-  control?: HttpCanonicalControlClient;
+  control?: HttpControlClient;
   conversationList?: "loading" | "loaded" | "failed";
   onRetryConversations?: () => void;
 };

@@ -290,12 +290,13 @@ pub(super) fn content_reference(
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct AllocationIndexes {
     pub(super) active: BTreeSet<(u128, u128, u128)>,
-    pub(super) requests: std::collections::BTreeMap<u128, u128>,
+    pub(super) requests: std::collections::BTreeMap<u128, (u128, u32)>,
 }
 
 pub(super) fn compute_allocation_indexes(
     allocations: &impl ReadableTable<u128, &'static [u8]>,
     configs: &impl ReadableTable<u128, &'static [u8]>,
+    events: &impl ReadableTable<u128, &'static [u8]>,
 ) -> Result<AllocationIndexes, StorageError> {
     let mut indexes = AllocationIndexes {
         active: BTreeSet::new(),
@@ -311,15 +312,6 @@ pub(super) fn compute_allocation_indexes(
                 "Allocation is stored under another Job",
             ));
         }
-        if indexes
-            .requests
-            .insert(allocation.request_id.get(), key.value())
-            .is_some()
-        {
-            return Err(StorageError::corrupted(
-                "duplicate reservation request identity",
-            ));
-        }
         if allocation.holds_capacity() {
             let (pool, executor) = (allocation.token.pool.get(), allocation.token.executor.get());
             if !executors.insert(executor) {
@@ -329,6 +321,23 @@ pub(super) fn compute_allocation_indexes(
             }
             indexes.active.insert((pool, executor, key.value()));
             pools.insert(pool);
+        }
+    }
+    for entry in events.iter()? {
+        let (key, value) = entry?;
+        if value.value().first() == Some(&44) {
+            let (job, generation, _, _, _, origin) =
+                transactions::decode_execution_event(key.value(), value.value())?;
+            if let Some(created) = origin
+                && indexes
+                    .requests
+                    .insert(created.request_id.get(), (job.get(), generation))
+                    .is_some()
+            {
+                return Err(StorageError::corrupted(
+                    "duplicate reservation request identity",
+                ));
+            }
         }
     }
     for pool in pools {
@@ -344,7 +353,7 @@ pub(super) fn compute_allocation_indexes(
 
 pub(super) fn stored_allocation_indexes(
     active: &impl ReadableTable<(u128, u128, u128), ()>,
-    requests: &impl ReadableTable<u128, u128>,
+    requests: &impl ReadableTable<u128, (u128, u32)>,
 ) -> Result<AllocationIndexes, StorageError> {
     let mut stored = AllocationIndexes {
         active: BTreeSet::new(),
@@ -361,8 +370,11 @@ pub(super) fn stored_allocation_indexes(
 }
 
 pub(super) fn rebuild_allocation_indexes(tx: &WriteTransaction) -> Result<(), StorageError> {
-    let computed =
-        compute_allocation_indexes(&tx.open_table(POOL_ALLOCATIONS)?, &tx.open_table(CONFIGS)?)?;
+    let computed = compute_allocation_indexes(
+        &tx.open_table(POOL_ALLOCATIONS)?,
+        &tx.open_table(CONFIGS)?,
+        &tx.open_table(EXECUTION_EVENTS)?,
+    )?;
     tx.delete_table(ACTIVE_ALLOCATIONS)?;
     tx.delete_table(ALLOCATION_REQUESTS)?;
     let mut active = tx.open_table(ACTIVE_ALLOCATIONS)?;
@@ -376,12 +388,38 @@ pub(super) fn rebuild_allocation_indexes(tx: &WriteTransaction) -> Result<(), St
     Ok(())
 }
 
+pub(super) fn rebuild_execution_event_indexes(tx: &WriteTransaction) -> Result<(), StorageError> {
+    tx.delete_table(JOB_EXECUTION_EVENTS)?;
+    tx.delete_table(JOB_LIFECYCLE_EVENTS)?;
+    let events = tx.open_table(EXECUTION_EVENTS)?;
+    let mut allocations = tx.open_table(JOB_EXECUTION_EVENTS)?;
+    let mut lifecycle = tx.open_table(JOB_LIFECYCLE_EVENTS)?;
+    for entry in events.iter()? {
+        let (key, value) = entry?;
+        let sequence = key.value();
+        match value.value().first() {
+            Some(&44) => {
+                let (job, _, _, _, _, _) =
+                    transactions::decode_execution_event(sequence, value.value())?;
+                allocations.insert((job.get(), sequence), ())?;
+            }
+            Some(&45) => {
+                let (job, _, _) = transactions::decode_job_lifecycle(sequence, value.value())?;
+                lifecycle.insert((job.get(), sequence), ())?;
+            }
+            _ => return Err(StorageError::corrupted("invalid execution event type")),
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn allocation_indexes_agree(
     allocations: &impl ReadableTable<u128, &'static [u8]>,
     configs: &impl ReadableTable<u128, &'static [u8]>,
     active: &impl ReadableTable<(u128, u128, u128), ()>,
-    requests: &impl ReadableTable<u128, u128>,
+    requests: &impl ReadableTable<u128, (u128, u32)>,
+    events: &impl ReadableTable<u128, &'static [u8]>,
 ) -> Result<bool, StorageError> {
-    Ok(compute_allocation_indexes(allocations, configs)?
+    Ok(compute_allocation_indexes(allocations, configs, events)?
         == stored_allocation_indexes(active, requests)?)
 }

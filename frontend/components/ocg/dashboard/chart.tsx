@@ -4,7 +4,7 @@ import type * as Api from "@/components/ocg/contracts/api";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useId, useState } from "react";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { summarize, type RankedUsage } from "./usage-chart-data";
 import { summarizeReliability, type ReliabilitySummary } from "./reliability-chart-data";
@@ -317,7 +317,7 @@ export function UsageChart({
   client,
   reloadKey,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   reloadKey: number;
 }) {
   const [days, setDays] = useState(90);
@@ -358,7 +358,7 @@ function UsageChartData({
   bucket,
   reloadKey,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   days: number;
   bucket: Bucket;
   reloadKey: number;
@@ -523,7 +523,7 @@ export function ReliabilityChart({
   client,
   reloadKey,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   reloadKey: number;
 }) {
   const [days, setDays] = useState(30);
@@ -567,7 +567,7 @@ function ReliabilityChartData({
   bucket,
   reloadKey,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   days: number;
   bucket: Bucket;
   reloadKey: number;
@@ -940,7 +940,7 @@ export function HealthChart({
   fromUs,
   untilUs,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   fromUs: number;
   untilUs: number;
 }) {

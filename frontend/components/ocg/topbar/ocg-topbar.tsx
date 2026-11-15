@@ -44,7 +44,7 @@ export function OcgTopbar({
       health: t("nav.health"),
       logs: t("logs.title"),
       settings: t("settings.title"),
-      canonical: t("nav.canonical"),
+      control: t("nav.control"),
     };
     return viewTitleMap[view];
   };

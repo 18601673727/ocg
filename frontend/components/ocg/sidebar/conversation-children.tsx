@@ -7,7 +7,7 @@ import { HoverMarquee } from "./hover-marquee";
 import { LoaderCircle } from "lucide-react";
 import { runtimeStateLabel, useI18n } from "../i18n";
 import type { ControlChildConversation } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 
 export function SidebarConversationChildren({
   conversation,
@@ -20,7 +20,7 @@ export function SidebarConversationChildren({
   onRename,
 }: {
   conversation: string;
-  control: HttpCanonicalControlClient;
+  control: HttpControlClient;
   activeChild?: string;
   expanded: boolean;
   sessionId: string;

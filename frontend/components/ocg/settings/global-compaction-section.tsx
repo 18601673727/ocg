@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useEffect, useState } from "react";
 import type { ControlProfilesSnapshot } from "../contracts";
 import type { GlobalCompactionSettings as ControlGlobalCompactionSettings } from "../contracts/api";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { Section, describeError } from "./settings-parts";
 import { Button } from "@/components/ui/button";
@@ -16,13 +16,13 @@ export function GlobalCompactionSection({
   client,
   profiles,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   profiles: ControlProfilesSnapshot | null;
 }) {
   const { t } = useI18n();
   const [draft, setDraft] = useState<ControlGlobalCompactionSettings>();
   const [active, setActive] =
-    useState<Awaited<ReturnType<HttpCanonicalControlClient["readActiveSystemSettings"]>>>();
+    useState<Awaited<ReturnType<HttpControlClient["readActiveSystemSettings"]>>>();
   const [configError, setConfigError] = useState<string>();
   const [error, setError] = useState<string>();
   const [saved, setSaved] = useState(false);

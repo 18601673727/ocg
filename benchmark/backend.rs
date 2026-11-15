@@ -1,3 +1,4 @@
+use ocg::system::data_directory::resolve_path;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -191,7 +192,7 @@ impl Options {
             return Err("--page-size must not exceed the production maximum of 100".into());
         }
         std::fs::create_dir_all(&options.directory)?;
-        options.directory = options.directory.canonicalize()?;
+        options.directory = resolve_path(&options.directory)?;
         Ok(Some(options))
     }
 }

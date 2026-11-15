@@ -70,7 +70,15 @@ pub enum UnstartedCause {
     FrozenSecretUnavailable,
     InputUnavailable,
     StartRefused,
+    ExternalOutcomeUnknown,
+    HostRestarted,
     OfflineReconciled,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct UnstartedRetry {
+    pub cause: UnstartedCause,
+    pub eligible_at: Timestamp,
 }
 
 impl UnstartedCause {
@@ -79,6 +87,8 @@ impl UnstartedCause {
             Self::FrozenSecretUnavailable => "frozen_secret_unavailable",
             Self::InputUnavailable => "input_unavailable",
             Self::StartRefused => "start_refused",
+            Self::ExternalOutcomeUnknown => "external_outcome_unknown",
+            Self::HostRestarted => "host_restarted",
             Self::OfflineReconciled => "reconciled_unstarted_reservation",
         }
     }
@@ -94,6 +104,8 @@ impl UnstartedCause {
             Self::StartRefused => {
                 "This Job could not be started safely. Nothing was sent to the Provider."
             }
+            Self::ExternalOutcomeUnknown => "An external operation outcome is unknown.",
+            Self::HostRestarted => "The host stopped while this allocation was active.",
             Self::OfflineReconciled => {
                 "OCG stopped after reserving capacity for this Job and before it started; an offline reconciliation ended it. Nothing was sent to the Provider."
             }
@@ -179,18 +191,18 @@ pub enum NativeStopRequest {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum DevelopmentReservationAttempt {
+pub enum DevelopmentReservationResult {
     New(DevelopmentFreshReservation),
     Replay,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DevelopmentReservation {
-    Reserved(PoolAllocation),
+    Reserved(PoolAllocation, bool),
     Replayed(PoolAllocation),
     Unresolved,
-    Continue(DevelopmentReadyCursor),
-    Exhausted,
+    Continue(DevelopmentReadyCursor, Option<std::time::Duration>),
+    Exhausted(Option<std::time::Duration>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

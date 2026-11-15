@@ -404,12 +404,13 @@ impl Batch {
             match allocation.phase {
                 AllocationPhase::Reserved
                 | AllocationPhase::Running
-                | AllocationPhase::StopRequested => match self.request_native_stop(turn)? {
+                | AllocationPhase::StopRequested
+                | AllocationPhase::Released => match self.request_native_stop(turn)? {
                     NativeStopRequest::EndedBeforeStart(token)
                     | NativeStopRequest::Requested(token)
                     | NativeStopRequest::AlreadyRequested(token) => running.push(token),
                 },
-                AllocationPhase::Uncertain | AllocationPhase::Released => {}
+                AllocationPhase::Uncertain => {}
             }
         }
         Ok((running, ended))

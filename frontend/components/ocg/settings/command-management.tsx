@@ -23,7 +23,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import type { ControlProfilesSnapshot, ControlProject } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { describeError, selectableLlmProfiles } from "./settings-parts";
 
@@ -33,7 +33,7 @@ export function ProjectDecisionConfigButton({
   disabled,
   onChanged,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   project: ControlProject | null;
   disabled: boolean;
   onChanged(project: ControlProject): void;

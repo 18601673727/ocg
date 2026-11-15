@@ -34,7 +34,7 @@ impl Batch {
             Some(id) => Ok(id),
             None => self.reject(Violation::InvalidValue(
                 "invalid_target",
-                "expected a canonical UUID",
+                "expected a standard UUID",
             )),
         }
     }

@@ -44,7 +44,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus } from "../types";
 import type { RuntimeAuthority } from "../runtime/runtime-types";
-import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
+import { ControlTransportError, type HttpControlClient } from "../runtime/control-client";
 import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
 import { AccountMenu } from "./account-menu";
 import { ConversationSearch } from "./conversation-search";
@@ -90,7 +90,7 @@ const WORKSPACE_NAV: {
     | "nav.jobExecution"
     | "nav.health"
     | "nav.logs"
-    | "nav.canonical";
+    | "nav.control";
   icon: typeof Search;
 }[] = [
   { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
@@ -108,7 +108,7 @@ type OcgSidebarProps = {
   drawer?: boolean;
   onToggle: () => void;
   onSelect: (id: string) => void;
-  control?: HttpCanonicalControlClient;
+  control?: HttpControlClient;
   activeAncestors?: string[];
   onOpenConversation?: (conversation: string) => void;
   onNewChat: () => void;
@@ -340,9 +340,9 @@ export function OcgSidebar({
       setHiding(false);
     }
   };
-  const canonicalMode = runtimeAuthority === "canonical";
+  const controlMode = runtimeAuthority === "control";
   const workspaceNav = WORKSPACE_NAV;
-  const workbenchNav = canonicalMode ? workspaceNav.filter((item) => item.target !== "chat") : [];
+  const workbenchNav = controlMode ? workspaceNav.filter((item) => item.target !== "chat") : [];
   const hasNav = Boolean(onNavigate);
   const navLabel = (item: (typeof WORKSPACE_NAV)[number]) =>
     item.target === "jobs" ? t("nav.jobExecution") : t(item.labelKey);
@@ -618,7 +618,7 @@ export function OcgSidebar({
               </details>
             </div>
           )}
-          {hasNav && !canonicalMode && (
+          {hasNav && !controlMode && (
             <div className="px-2 pb-2">
               <ul className="flex flex-col gap-px">
                 {workspaceNav.slice(0, 4).map(renderWorkspaceItem)}

@@ -1,18 +1,9 @@
 "use client";
 
-import type * as Api from "@/components/ocg/contracts/api";
-
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Clock, FileText } from "lucide-react";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import { useI18n } from "../i18n";
-import { ContentContainer, ContentHeader } from "../layout/content-container";
-import { LoadMore } from "../primitives/load-more";
-import { ListStatus } from "../primitives/list-status";
-import { StatusDot } from "../primitives/status-dot";
-import { Pill } from "../primitives/pill";
-import type { Tone } from "../primitives/tone";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type * as Api from "@/components/ocg/contracts/api";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import {
   Select,
   SelectContent,
@@ -20,13 +11,21 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useI18n } from "../i18n";
+import { ContentContainer, ContentHeader } from "../layout/content-container";
+import { ListStatus } from "../primitives/list-status";
+import { LoadMore } from "../primitives/load-more";
+import { Pill } from "../primitives/pill";
+import { StatusDot } from "../primitives/status-dot";
+import type { Tone } from "../primitives/tone";
+import type { HttpControlClient } from "../runtime/control-client";
 
 const levelTone: Record<string, Tone> = {
   ERROR: "red",
   WARN: "amber",
 };
 
-export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) {
+export function LogsSurface({ client }: { client: HttpControlClient }) {
   const { t, locale } = useI18n();
   const [file, setFile] = useState("");
   const [timeZone, setTimeZone] = useState(() =>

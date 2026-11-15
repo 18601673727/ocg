@@ -4,7 +4,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import type { Update, UpdateState } from "../contracts/api";
 import { useI18n } from "../i18n";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { Section, describeError } from "./settings-parts";
 
 const seenKey = "ocg-settings-update";
@@ -12,7 +12,7 @@ const active = (state: UpdateState | null) =>
   state?.phase === "waiting" || state?.phase === "installing";
 const identity = (state: UpdateState) => `${state.started_at}:${state.to}`;
 
-export function UpdatesSection({ client }: { client: HttpCanonicalControlClient }) {
+export function UpdatesSection({ client }: { client: HttpControlClient }) {
   const { t } = useI18n();
   const [view, setView] = useState<Update | null>(null);
   const [error, setError] = useState<unknown>();

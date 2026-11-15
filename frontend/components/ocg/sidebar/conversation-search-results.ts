@@ -1,8 +1,8 @@
 import type { ChatSession } from "../types";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 
 export type SearchConversation = Awaited<
-  ReturnType<HttpCanonicalControlClient["searchConversations"]>
+  ReturnType<HttpControlClient["searchConversations"]>
 >["conversations"][number];
 export type SearchMatch = { id: string; title: string; conversation?: string };
 

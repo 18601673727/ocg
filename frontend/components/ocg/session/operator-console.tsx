@@ -10,8 +10,8 @@ import { AccessScreen } from "../login/access-screen";
 import { Button } from "@/components/ui/button";
 import {
   ControlTransportError,
-  createHttpCanonicalControlClient,
-  type HttpCanonicalControlClient,
+  createHttpControlClient,
+  type HttpControlClient,
 } from "@/components/ocg/runtime/control-client";
 import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/operator-login";
 import { OcgRuntimeProvider } from "../runtime/runtime-context";
@@ -25,7 +25,7 @@ type Health = Api.Health;
 
 export function OperatorConsole() {
   const { t } = useI18n();
-  const [client, setClient] = useState<HttpCanonicalControlClient | null>(null);
+  const [client, setClient] = useState<HttpControlClient | null>(null);
   const [phase, setPhase] = useState<Phase>("checking");
   const [session, setSession] = useState<OperatorSession | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
@@ -34,7 +34,7 @@ export function OperatorConsole() {
   const csrf = useRef("");
 
   useEffect(() => {
-    const created = createHttpCanonicalControlClient({
+    const created = createHttpControlClient({
       baseUrl: window.location.origin,
       fetch: window.fetch.bind(window),
       csrfToken: () => csrf.current,

@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import type { GlobalOutboundHeaders } from "../contracts/api";
 import { useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
-import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
+import { ControlTransportError, type HttpControlClient } from "../runtime/control-client";
 import {
   type HeaderDraft,
   type HeaderDraftError,
@@ -15,7 +15,7 @@ import {
 import { HeadersEditor } from "./headers-editor";
 import { Section, describeError } from "./settings-parts";
 
-export function GlobalHeadersSection({ client }: { client: HttpCanonicalControlClient }) {
+export function GlobalHeadersSection({ client }: { client: HttpControlClient }) {
   const { t } = useI18n();
   const [settings, setSettings] = useState<GlobalOutboundHeaders>();
   const [drafts, setDrafts] = useState<HeaderDraft[]>([]);

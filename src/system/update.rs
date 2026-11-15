@@ -1,3 +1,4 @@
+use crate::system::data_directory::resolve_path;
 use std::cmp::Ordering;
 use std::error::Error;
 use std::fs;
@@ -34,13 +35,13 @@ fn setting<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 
 pub(crate) fn install() -> Result<Install> {
     fn find() -> Option<Install> {
-        let exe = fs::canonicalize(std::env::current_exe().ok()?).ok()?;
+        let exe = resolve_path(&std::env::current_exe().ok()?).ok()?;
         let settings = exe.parent()?.parent()?.parent()?.join("ocg.env");
         let text = fs::read_to_string(settings).ok()?;
         let ui = setting(&text, "OCG_UI_DIR")?;
         let prefix = PathBuf::from(ui.strip_suffix("/current/ui")?);
         if !prefix.is_absolute()
-            || fs::canonicalize(prefix.join("current/ocg")).ok()? != fs::canonicalize(exe).ok()?
+            || resolve_path(&prefix.join("current/ocg")).ok()? != resolve_path(&exe).ok()?
         {
             return None;
         }

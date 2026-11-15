@@ -189,7 +189,7 @@ pub(crate) fn parse_trusted_proxy(text: &str) -> Result<LoopbackProxy, ApprovalR
         invalid("the proxy must be a literal loopback address with a port, such as http://127.0.0.1:6152")
     })?;
     if address.to_string() != authority {
-        return Err(invalid("the proxy address must be written canonically"));
+        return Err(invalid("the proxy address must use the standard form"));
     }
     LoopbackProxy::new(address).ok_or_else(|| {
         invalid("only a literal loopback proxy address with a nonzero port is eligible")

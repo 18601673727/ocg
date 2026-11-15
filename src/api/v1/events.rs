@@ -341,6 +341,8 @@ impl Feed {
             &self.record.record,
             self.record.allocation.as_ref(),
             self.record.updated_at_us,
+            self.record.last_executor,
+            self.record.phase,
         )
     }
 

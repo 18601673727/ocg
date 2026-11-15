@@ -14,7 +14,7 @@ import type { ControlToolCall } from "../contracts";
 import { useI18n } from "../i18n";
 import { highlightCode } from "../markdown/markdown-pipeline";
 import { sourceLanguage } from "../markdown/source-snapshot";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { artifactTitle, fileArtifact, toolObject } from "./artifact-model";
 import { CommandTool } from "./command-tool";
@@ -119,7 +119,7 @@ export function WorkspaceTool({
 }: {
   call: ControlToolCall;
   jobId?: string;
-  client?: Pick<HttpCanonicalControlClient, "readJobTool">;
+  client?: Pick<HttpControlClient, "readJobTool">;
   children: ReactNode;
 }) {
   const { t } = useI18n();

@@ -1,3 +1,4 @@
+use crate::system::data_directory::resolve_path;
 use std::error::Error;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -27,7 +28,7 @@ pub(super) fn run(arguments: Vec<String>) -> Result<(), Box<dyn Error>> {
     let source = std::env::var_os(DATA_DIRECTORY_VARIABLE)
         .filter(|value| !value.is_empty())
         .ok_or("OCG_DATA_DIR must name an existing data directory")?;
-    let source = fs::canonicalize(source)?;
+    let source = resolve_path(Path::new(&source))?;
     if !source.is_dir() {
         return Err("source is not a directory".into());
     }
@@ -146,7 +147,7 @@ fn destination_path(source: &Path, path: &Path) -> Result<PathBuf, Box<dyn Error
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    let parent = fs::canonicalize(parent)?;
+    let parent = resolve_path(parent)?;
     let destination = parent.join(name);
     if destination.starts_with(source) || source.starts_with(&destination) {
         return Err("source and destination must not overlap".into());

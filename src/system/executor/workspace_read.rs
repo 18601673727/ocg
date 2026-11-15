@@ -1,3 +1,4 @@
+use crate::system::data_directory::resolve_path;
 use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
@@ -146,7 +147,7 @@ impl Workspace {
         if !root.is_absolute() {
             return Err(WorkspaceError::NotAbsolute);
         }
-        let root = root.canonicalize().map_err(WorkspaceError::Unresolved)?;
+        let root = resolve_path(root).map_err(WorkspaceError::Unresolved)?;
         let directory = open_directory(&root).map_err(WorkspaceError::Unresolved)?;
         let metadata = directory.metadata().map_err(WorkspaceError::Unresolved)?;
         if !metadata.is_dir() {
@@ -307,7 +308,7 @@ pub fn account_home() -> Result<PathBuf, HomeError> {
     if !user.dir.is_absolute() {
         return Err(HomeError::NotAbsolute);
     }
-    user.dir.canonicalize().map_err(HomeError::Unresolved)
+    resolve_path(&user.dir).map_err(HomeError::Unresolved)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]

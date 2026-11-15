@@ -13,7 +13,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { ControlProfilesSnapshot, ControlProject } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 
 type Selection = { agent: string | null; model: string; projects: string[] };
@@ -24,7 +24,7 @@ export function DispatchSelectionCard({
   disabled,
   onSelect,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   arguments: string;
   disabled: boolean;
   onSelect: (selection: Selection) => void;

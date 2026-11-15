@@ -206,7 +206,7 @@ export function isProfileConflict(error: unknown): boolean {
   );
 }
 
-export type HttpCanonicalControlClientOptions = {
+export type HttpControlClientOptions = {
   streamIdleMs?: number;
   baseUrl: string;
   fetch: typeof fetch;
@@ -438,13 +438,13 @@ function sequence(value: number): number {
 
 function jobIdentity(value: string): string {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value))
-    throw new ContractError("job", "a canonical Job UUID");
+    throw new ContractError("job", "a standard Job UUID");
   return value;
 }
 
 function identity(value: string, path: string): string {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
-    throw new ContractError(path, "a canonical UUIDv7 identity");
+    throw new ContractError(path, "a standard UUIDv7 identity");
   }
   return value;
 }
@@ -502,10 +502,10 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export type HttpCanonicalControlClient = ReturnType<typeof createHttpCanonicalControlClient>;
+export type HttpControlClient = ReturnType<typeof createHttpControlClient>;
 
 export async function readTranscriptEvidence(
-  client: Pick<HttpCanonicalControlClient, "readAllJobTools" | "readAllProviderResponses">,
+  client: Pick<HttpControlClient, "readAllJobTools" | "readAllProviderResponses">,
   job: string,
   {
     signal = new AbortController().signal,
@@ -566,7 +566,7 @@ export async function readTranscriptEvidence(
 }
 
 export async function readOutputWindow(
-  client: Pick<HttpCanonicalControlClient, "readOutputs" | "readLatestOutput">,
+  client: Pick<HttpControlClient, "readOutputs" | "readLatestOutput">,
   job: string,
   {
     beforeSeq,
@@ -630,7 +630,7 @@ function observationQuery(settings: ObservationSettings): string {
   return query.length ? `?${query.join("&")}` : "";
 }
 
-export function createHttpCanonicalControlClient(options: HttpCanonicalControlClientOptions) {
+export function createHttpControlClient(options: HttpControlClientOptions) {
   const programmatic = options.bearerToken !== undefined;
   const base = controlOrigin(options.baseUrl, !programmatic);
   const fetchImpl = options.fetch.bind(globalThis);

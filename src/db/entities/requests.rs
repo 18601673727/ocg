@@ -54,6 +54,7 @@ pub struct ProviderAnswer {
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct ProviderRequestRecord {
+    pub allocation_generation: u32,
     pub messages: Vec<Value>,
     pub tools: Option<Value>,
     pub parameters: Value,
@@ -174,6 +175,7 @@ pub struct SubmissionRecord {
 pub enum RequestPayload {
     ApprovedCalls,
     Sent {
+        allocation_generation: NonZeroU32,
         messages: Vec<ContentDigest>,
         tools: Option<ContentDigest>,
         parameters: ContentDigest,

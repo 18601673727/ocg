@@ -316,7 +316,7 @@ fn set_once<T: Copy>(
 fn parse_id(value: String) -> Result<ScheduledExternalPolicyId, Box<dyn std::error::Error>> {
     value
         .parse()
-        .map_err(|_| "policy id must be a canonical UUID".into())
+        .map_err(|_| "policy id must be a standard UUID".into())
 }
 
 fn parse_revision(value: String) -> Result<u32, Box<dyn std::error::Error>> {

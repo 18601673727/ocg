@@ -169,6 +169,818 @@ fn encode_pool_allocation(allocation: &crate::db::entities::PoolAllocation) -> V
     e.0
 }
 
+fn encode_allocation_origin(allocation: &crate::db::entities::PoolAllocation) -> Vec<u8> {
+    let mut e = Enc::new(43);
+    e.u128(allocation.token.job.get());
+    e.u32(allocation.token.generation.get());
+    e.u128(allocation.token.pool.get());
+    e.u128(allocation.token.executor.get());
+    e.u64(allocation.token.epoch);
+    e.u128(allocation.request_id.get());
+    e.ts(allocation.claimed_at);
+    e.u64(allocation.job_revision);
+    e.ostr(allocation.host_id.as_deref());
+    e.ostr(allocation.boot_id.as_deref());
+    e.u32(allocation.pool_revision);
+    e.u32(allocation.executor_revision);
+    e.u8(allocation.operation.code());
+    e.opt(allocation.protocol.as_ref(), |e, protocol| {
+        e.u8(protocol.code())
+    });
+    e.opt(allocation.request_after.as_ref(), |e, cursor| {
+        e.u8(cursor.0.0);
+        e.i64(cursor.0.1);
+        e.u128(cursor.0.2);
+        e.u16(cursor.0.3);
+    });
+    e.0
+}
+
+pub(super) fn decode_allocation_origin(
+    key: (u128, u32),
+    bytes: &[u8],
+) -> DecodeResult<crate::db::entities::PoolAllocation> {
+    use crate::db::entities::{
+        AllocationPhase, AllocationToken, PoolAllocation, ReservationRequestId,
+    };
+    let mut d = Dec::new(bytes, 43)?;
+    let job = JobId::new(d.u128()?);
+    let generation = std::num::NonZeroU32::new(d.u32()?)
+        .ok_or_else(|| StorageError::corrupted("zero Allocation generation"))?;
+    let pool = ExecutionPoolId::new(d.u128()?);
+    let executor = ExecutorId::new(d.u128()?);
+    let epoch = d.u64()?;
+    let request = ReservationRequestId::new(d.u128()?);
+    let claimed_at = d.ts()?;
+    let job_revision = d.u64()?;
+    let host_id = d.ostr()?;
+    let boot_id = d.ostr()?;
+    let pool_revision = d.u32()?;
+    let executor_revision = d.u32()?;
+    let operation = d.code(ExecutionOperation::from_code)?;
+    let protocol = d.opt(|d| d.code(LlmTransport::from_code))?;
+    let request_after = d.opt(|d| {
+        Ok(crate::db::entities::DevelopmentReadyCursor((
+            d.u8()?,
+            d.i64()?,
+            d.u128()?,
+            d.u16()?,
+        )))
+    })?;
+    d.end()?;
+    if (job.get(), generation.get()) != key
+        || epoch == 0
+        || pool == executor.into()
+        || !valid_reservation_request_id(request)
+        || job_revision == 0
+        || pool_revision == 0
+        || executor_revision == 0
+        || request_after.is_some_and(|cursor| cursor.0.0 > 2)
+    {
+        return Err(StorageError::corrupted("invalid Allocation creation"));
+    }
+    Ok(PoolAllocation {
+        token: AllocationToken {
+            job,
+            pool,
+            executor,
+            generation,
+            epoch,
+        },
+        request_id: request,
+        request_after,
+        job_revision,
+        phase: AllocationPhase::Reserved,
+        claimed_at,
+        started_at: None,
+        host_id,
+        boot_id,
+        pool_revision,
+        executor_revision,
+        operation,
+        protocol,
+        stop_confirmed_at: None,
+        stop_proof: None,
+    })
+}
+
+#[allow(clippy::type_complexity)]
+pub(super) fn decode_execution_event(
+    seq: u128,
+    bytes: &[u8],
+) -> DecodeResult<(
+    JobId,
+    u32,
+    crate::db::entities::AllocationPhase,
+    Timestamp,
+    Option<crate::db::entities::UnstartedRetry>,
+    Option<crate::db::entities::PoolAllocation>,
+)> {
+    use crate::db::entities::{AllocationPhase, UnstartedCause, UnstartedRetry};
+    let mut d = Dec::new(bytes, 44)?;
+    if d.u128()? != seq || seq == 0 {
+        return Err(StorageError::corrupted("invalid execution event sequence"));
+    }
+    let job = JobId::new(d.u128()?);
+    let generation = d.u32()?;
+    let phase = match d.u8()? {
+        1 => AllocationPhase::Reserved,
+        2 => AllocationPhase::Running,
+        3 => AllocationPhase::StopRequested,
+        4 => AllocationPhase::Uncertain,
+        5 => AllocationPhase::Released,
+        _ => return Err(StorageError::corrupted("invalid execution event phase")),
+    };
+    let at = d.ts()?;
+    let retry = d.opt(|d| {
+        let cause = match d.u8()? {
+            1 => UnstartedCause::FrozenSecretUnavailable,
+            2 => UnstartedCause::InputUnavailable,
+            3 => UnstartedCause::StartRefused,
+            4 => UnstartedCause::ExternalOutcomeUnknown,
+            5 => UnstartedCause::HostRestarted,
+            6 => UnstartedCause::OfflineReconciled,
+            _ => return Err(StorageError::corrupted("invalid retry cause")),
+        };
+        Ok(UnstartedRetry {
+            cause,
+            eligible_at: d.ts()?,
+        })
+    })?;
+    let origin = if phase == AllocationPhase::Reserved {
+        let size = d.u32()? as usize;
+        Some(decode_allocation_origin(
+            (job.get(), generation),
+            d.take(size)?,
+        )?)
+    } else {
+        None
+    };
+    d.end()?;
+    if generation == 0 {
+        return Err(StorageError::corrupted("zero execution event generation"));
+    }
+    if retry.is_some_and(|retry| phase != AllocationPhase::Released || retry.eligible_at <= at) {
+        return Err(StorageError::corrupted("invalid execution retry plan"));
+    }
+    if origin
+        .as_ref()
+        .is_some_and(|origin| origin.claimed_at != at)
+    {
+        return Err(StorageError::corrupted(
+            "reservation time disagrees with its event",
+        ));
+    }
+    Ok((job, generation, phase, at, retry, origin))
+}
+
+pub(super) fn allocation_origin(
+    index: &impl ReadableTable<(u128, u128), ()>,
+    events: &impl ReadableTable<u128, &'static [u8]>,
+    key: (u128, u32),
+) -> Result<Option<crate::db::entities::PoolAllocation>, StorageError> {
+    for entry in index.range((key.0, 0)..=(key.0, u128::MAX))?.rev() {
+        let sequence = entry?.0.value().1;
+        let row = events
+            .get(sequence)?
+            .ok_or_else(|| StorageError::corrupted("Allocation event is missing"))?;
+        let (job, generation, _, _, _, origin) = decode_execution_event(sequence, row.value())?;
+        if job.get() != key.0 {
+            return Err(StorageError::corrupted(
+                "Allocation event belongs to another Job",
+            ));
+        }
+        if generation == key.1
+            && let Some(origin) = origin
+        {
+            return Ok(Some(origin));
+        }
+    }
+    Ok(None)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum JobLifecycle {
+    Created,
+    Submitted,
+    Waiting,
+    Eligible,
+    Outcome(JobState),
+    RequestEvidence {
+        request: RequestNumber,
+        seq: u32,
+    },
+    ToolEvidence {
+        request: RequestNumber,
+        index: u32,
+        outcome: bool,
+    },
+    Output {
+        seq: u32,
+    },
+    DependencySettled {
+        prerequisite: JobId,
+    },
+}
+
+pub(super) fn decode_job_lifecycle(
+    sequence: u128,
+    bytes: &[u8],
+) -> DecodeResult<(JobId, Timestamp, JobLifecycle)> {
+    let mut d = Dec::new(bytes, 45)?;
+    if sequence == 0 || d.u128()? != sequence {
+        return Err(StorageError::corrupted(
+            "invalid Job lifecycle event sequence",
+        ));
+    }
+    let job = JobId::new(d.u128()?);
+    let at = d.ts()?;
+    let event = match d.u8()? {
+        1 => JobLifecycle::Created,
+        2 => JobLifecycle::Submitted,
+        3 => {
+            let length = d.u32()? as usize;
+            let state = JobState::decode_at(job.get(), d.take(length)?)?;
+            if state.outcome.is_none()
+                || state.stop_confirmed_at.is_some()
+                || state.stop_confirmed_by.is_some()
+            {
+                return Err(StorageError::corrupted("invalid Job lifecycle outcome"));
+            }
+            JobLifecycle::Outcome(state)
+        }
+        4 => {
+            let request = RequestNumber::new(d.u32()?)
+                .ok_or_else(|| StorageError::corrupted("zero request identity in Job event"))?;
+            let seq = d.u32()?;
+            if seq == 0 {
+                return Err(StorageError::corrupted("zero request event sequence"));
+            }
+            JobLifecycle::RequestEvidence { request, seq }
+        }
+        5 => {
+            let request = RequestNumber::new(d.u32()?).ok_or_else(|| {
+                StorageError::corrupted("zero tool request identity in Job event")
+            })?;
+            JobLifecycle::ToolEvidence {
+                request,
+                index: d.u32()?,
+                outcome: d.bool()?,
+            }
+        }
+        6 => {
+            let seq = d.u32()?;
+            if seq == 0 {
+                return Err(StorageError::corrupted("zero output sequence in Job event"));
+            }
+            JobLifecycle::Output { seq }
+        }
+        7 => JobLifecycle::Waiting,
+        8 => JobLifecycle::Eligible,
+        9 => JobLifecycle::DependencySettled {
+            prerequisite: JobId::new(d.u128()?),
+        },
+        _ => return Err(StorageError::corrupted("invalid Job lifecycle event")),
+    };
+    d.end()?;
+    Ok((job, at, event))
+}
+
+pub(super) fn recoverable_multistep_request(
+    tx: &impl TxRead,
+    allocation: &crate::db::entities::PoolAllocation,
+) -> Result<Option<RequestNumber>, StorageError> {
+    use crate::db::entities::{AllocationPhase, RequestPayload};
+    let job = allocation.token.job;
+    let requests = tx.table(REQUEST_EVENTS)?;
+    let Some((key, _)) = requests
+        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+        .next_back()
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let number = key.value().1;
+    let Some(request) = RequestNumber::new(number) else {
+        return Ok(None);
+    };
+    let mut generation = None;
+    let mut received = false;
+    let mut response_digest = None;
+    let mut tool_response = false;
+    for entry in requests.range((job.get(), number, 0)..=(job.get(), number, u32::MAX))? {
+        let (key, value) = entry?;
+        let seq = key.value().2;
+        match rows::decode_request_event(job, request, seq, value.value())?.payload {
+            RequestPayload::Sent {
+                allocation_generation,
+                ..
+            } if seq == 1 => generation = Some(allocation_generation),
+            RequestPayload::Measurement { .. } | RequestPayload::Token { .. } if seq > 1 => {}
+            RequestPayload::Received { digest } if !received => {
+                received = true;
+                response_digest = Some(digest);
+            }
+            RequestPayload::Availability {
+                status_code: Some(status),
+                finish_reason: Some(ChatFinishReason::ToolCalls),
+                failure: None,
+                ..
+            } if (200..300).contains(&status) && !tool_response => tool_response = true,
+            _ => return Ok(None),
+        }
+    }
+    if received != tool_response || (!received && number == 1) {
+        return Ok(None);
+    }
+    let Some(generation) = generation else {
+        return Ok(None);
+    };
+    if match allocation.phase {
+        AllocationPhase::Running => generation != allocation.token.generation,
+        AllocationPhase::Reserved => generation >= allocation.token.generation,
+        AllocationPhase::Released => generation != allocation.token.generation,
+        AllocationPhase::StopRequested | AllocationPhase::Uncertain => true,
+    } {
+        return Ok(None);
+    }
+    let mut prior_answer = false;
+    for entry in requests.range((job.get(), 0, 0)..(job.get(), number, 0))? {
+        let (key, value) = entry?;
+        let previous = RequestNumber::new(key.value().1)
+            .ok_or_else(|| StorageError::corrupted("zero request identity"))?;
+        if matches!(
+            rows::decode_request_event(job, previous, key.value().2, value.value())?.payload,
+            RequestPayload::Received { .. }
+        ) {
+            prior_answer = true;
+        }
+    }
+    if !prior_answer && !received {
+        return Ok(None);
+    }
+    if tx.table(UNSETTLED)?.get(job.get())?.map(|row| row.value()) != Some((0, 0)) {
+        return Ok(None);
+    }
+    let mut current_tools = 0usize;
+    for entry in tx
+        .table(TOOL_CALLS)?
+        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, value) = entry?;
+        let call = rows::tool_call_ref(key.value())?;
+        let outcome = rows::decode_tool_evidence(call, value.value())?.outcome;
+        if call.request > request
+            || (!received && call.request == request)
+            || !outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.fact.is_definite())
+        {
+            return Ok(None);
+        }
+        if call.request == request {
+            if !outcome.as_ref().is_some_and(|outcome| {
+                matches!(
+                    outcome.fact,
+                    crate::db::entities::ToolOutcome::Completed { .. }
+                )
+            }) {
+                return Ok(None);
+            }
+            current_tools += 1;
+        }
+    }
+    if received && current_tools == 0 {
+        return Ok(None);
+    }
+    if let Some(digest) = response_digest {
+        let messages = tx.table(MESSAGES)?;
+        let row = messages
+            .get(digest.as_bytes().as_slice())?
+            .ok_or_else(|| StorageError::corrupted("resume response missing"))?;
+        let response: serde_json::Value = serde_json::from_slice(row.value())
+            .map_err(|_| StorageError::corrupted("invalid resume response"))?;
+        let Some(calls) = response
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+        else {
+            return Ok(None);
+        };
+        if calls.len() != current_tools {
+            return Ok(None);
+        }
+        let tools = tx.table(TOOL_CALLS)?;
+        let mut seen = std::collections::BTreeSet::new();
+        for call in calls {
+            let Some(id) = call.get("id").and_then(serde_json::Value::as_str) else {
+                return Ok(None);
+            };
+            if !seen.insert(id) {
+                return Ok(None);
+            }
+            let mut matches = 0usize;
+            for entry in
+                tools.range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
+            {
+                let (key, row) = entry?;
+                let reference = rows::tool_call_ref(key.value())?;
+                let evidence = rows::decode_tool_evidence(reference, row.value())?;
+                if call.get("id").and_then(serde_json::Value::as_str)
+                    == Some(evidence.tool_call_id.as_str())
+                    && call
+                        .get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(evidence.name.as_str())
+                    && call
+                        .get("function")
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(serde_json::Value::as_str)
+                        == evidence
+                            .admission()
+                            .map(|admission| admission.arguments.as_str())
+                {
+                    matches += 1;
+                }
+            }
+            if matches != 1 {
+                return Ok(None);
+            }
+        }
+    }
+    let index = tx.table(JOB_LIFECYCLE_EVENTS)?;
+    let events = tx.table(EXECUTION_EVENTS)?;
+    let mut sent = false;
+    for entry in index.range((job.get(), 0)..=(job.get(), u128::MAX))? {
+        let sequence = entry?.0.value().1;
+        let row = events
+            .get(sequence)?
+            .ok_or_else(|| StorageError::corrupted("Job lifecycle event missing"))?;
+        match decode_job_lifecycle(sequence, row.value())?.2 {
+            JobLifecycle::RequestEvidence {
+                request: found,
+                seq: 1,
+            } if found == request => sent = true,
+            JobLifecycle::Output { .. } | JobLifecycle::ToolEvidence { .. }
+                if sent && !received =>
+            {
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
+    Ok(sent.then_some(request))
+}
+
+fn uncertain_tool_retry(
+    tx: &impl TxRead,
+    allocation: &crate::db::entities::PoolAllocation,
+) -> Result<bool, StorageError> {
+    use crate::db::entities::{AllocationPhase, RequestPayload};
+    if !matches!(
+        allocation.phase,
+        AllocationPhase::Reserved | AllocationPhase::Running | AllocationPhase::Released
+    ) {
+        return Ok(false);
+    }
+    let job = allocation.token.job;
+    let mut latest = None;
+    let mut uncertain = false;
+    for entry in tx
+        .table(TOOL_CALLS)?
+        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, value) = entry?;
+        let call = rows::tool_call_ref(key.value())?;
+        if latest != Some(call.request) {
+            latest = Some(call.request);
+            uncertain = false;
+        }
+        let evidence = rows::decode_tool_evidence(call, value.value())?;
+        uncertain |= evidence
+            .outcome
+            .as_ref()
+            .is_none_or(|outcome| !outcome.fact.is_definite());
+    }
+    let Some(request) = latest.filter(|_| uncertain) else {
+        return Ok(false);
+    };
+    let sent = tx
+        .table(REQUEST_EVENTS)?
+        .get((job.get(), request.get(), 1))?
+        .map(|row| rows::decode_request_event(job, request, 1, row.value()))
+        .transpose()?;
+    Ok(matches!(
+        sent.map(|event| event.payload),
+        Some(RequestPayload::Sent { allocation_generation, .. })
+            if allocation_generation <= allocation.token.generation
+    ))
+}
+
+fn resumable_partial_outputs(tx: &impl TxRead, job: JobId) -> Result<bool, StorageError> {
+    for entry in tx
+        .table(JOB_OUTPUTS)?
+        .range((job.get(), 0)..=(job.get(), u32::MAX))?
+    {
+        let (key, value) = entry?;
+        if !matches!(
+            decode_output(key.value(), value.value())?.kind,
+            crate::db::entities::OutputKind::Progress
+                | crate::db::entities::OutputKind::Evaluation
+                | crate::db::entities::OutputKind::Reasoning
+        ) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+pub(super) fn recoverable_interrupted_allocation(
+    tx: &impl TxRead,
+    allocation: &crate::db::entities::PoolAllocation,
+) -> Result<bool, StorageError> {
+    use crate::db::entities::{AllocationPhase, MutableJobPhase, RequestPayload};
+    let token = allocation.token;
+    if token.generation.get() >= 3
+        || !matches!(
+            allocation.phase,
+            AllocationPhase::Reserved | AllocationPhase::Running
+        )
+        || allocation.stop_confirmed_at.is_some()
+        || allocation.stop_proof.is_some()
+    {
+        return Ok(false);
+    }
+    let jobs = tx.table(JOBS)?;
+    let Some(row) = jobs.get(token.job.get())? else {
+        return Ok(false);
+    };
+    let job = decode_mutable_job(token.job.get(), row.value())?;
+    let expected_phase = match allocation.phase {
+        AllocationPhase::Reserved => MutableJobPhase::Queued,
+        AllocationPhase::Running => MutableJobPhase::Executing,
+        AllocationPhase::StopRequested | AllocationPhase::Uncertain | AllocationPhase::Released => {
+            return Ok(false);
+        }
+    };
+    if job.phase != expected_phase
+        || job.revision != allocation.job_revision
+        || job.frozen.is_none()
+    {
+        return Ok(false);
+    }
+    let states = tx.table(JOB_STATES)?;
+    let Some(state) = states.get(token.job.get())? else {
+        return Ok(false);
+    };
+    if JobState::decode_at(token.job.get(), state.value())?
+        .outcome
+        .is_some()
+    {
+        return Ok(false);
+    }
+    if recoverable_multistep_request(tx, allocation)?.is_some()
+        || uncertain_tool_retry(tx, allocation)?
+    {
+        return Ok(true);
+    }
+    if !resumable_partial_outputs(tx, token.job)?
+        || tx
+            .table(TOOL_CALLS)?
+            .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
+            .next()
+            .transpose()?
+            .is_some()
+    {
+        return Ok(false);
+    }
+    let mut current_sent = 0;
+    for entry in tx
+        .table(REQUEST_EVENTS)?
+        .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, value) = entry?;
+        let (_, number, seq) = key.value();
+        let request = RequestNumber::new(number)
+            .ok_or_else(|| StorageError::corrupted("zero request identity"))?;
+        match rows::decode_request_event(token.job, request, seq, value.value())?.payload {
+            RequestPayload::Sent {
+                allocation_generation,
+                ..
+            } if seq == 1 && allocation_generation <= token.generation => {
+                if allocation_generation == token.generation {
+                    current_sent += 1;
+                }
+            }
+            RequestPayload::Measurement { .. } | RequestPayload::Token { .. } if seq > 1 => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(current_sent <= 1 && (allocation.phase != AllocationPhase::Reserved || current_sent == 0))
+}
+
+pub(super) fn recoverable_confirmed_answer(
+    tx: &impl TxRead,
+    allocation: &crate::db::entities::PoolAllocation,
+) -> Result<Option<crate::db::entities::FinalResult>, StorageError> {
+    use crate::db::entities::{
+        AllocationPhase, MutableFrozenConfiguration, MutableJobPhase, RequestPayload,
+    };
+    use crate::service::ai::providers::openai_compatible::ChatFinishReason;
+    let token = allocation.token;
+    if allocation.phase != AllocationPhase::Running
+        || allocation.operation != ExecutionOperation::LlmRequest
+    {
+        return Ok(None);
+    }
+    let job = {
+        let jobs = tx.table(JOBS)?;
+        let Some(row) = jobs.get(token.job.get())? else {
+            return Ok(None);
+        };
+        decode_mutable_job(token.job.get(), row.value())?
+    };
+    if job.phase != MutableJobPhase::Executing || job.revision != allocation.job_revision {
+        return Ok(None);
+    }
+    let Some(MutableFrozenConfiguration::Generative(_)) = &job.frozen else {
+        return Ok(None);
+    };
+    {
+        let states = tx.table(JOB_STATES)?;
+        let Some(state) = states.get(job.id.get())? else {
+            return Ok(None);
+        };
+        if JobState::decode_at(job.id.get(), state.value())?
+            .outcome
+            .is_some()
+        {
+            return Ok(None);
+        }
+    }
+    for entry in tx
+        .table(TOOL_CALLS)?
+        .range((job.id.get(), 0, 0)..=(job.id.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, value) = entry?;
+        let call = rows::tool_call_ref(key.value())?;
+        let evidence = rows::decode_tool_evidence(call, value.value())?;
+        if !evidence
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.fact.is_definite())
+        {
+            return Ok(None);
+        }
+    }
+    if tx
+        .table(UNSETTLED)?
+        .get(job.id.get())?
+        .map(|row| row.value())
+        != Some((0, 0))
+    {
+        return Ok(None);
+    }
+    for entry in tx
+        .table(JOB_OUTPUTS)?
+        .range((job.id.get(), 0)..=(job.id.get(), u32::MAX))?
+    {
+        let (_, value) = entry?;
+        if rows::output_kind(value.value())? == OutputKind::Result {
+            return Ok(None);
+        }
+    }
+    let events = tx.table(REQUEST_EVENTS)?;
+    let Some(last) = events
+        .range((job.id.get(), 0, 0)..=(job.id.get(), u32::MAX, u32::MAX))?
+        .next_back()
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let last_request = last.0.value().1;
+    let mut digest = None;
+    let mut finish = None;
+    let mut current_sent = false;
+    let mut prior_request = None;
+    let mut prior_received = false;
+    let mut prior_success = false;
+    let mut prior_generation = None;
+    for entry in events.range((job.id.get(), 0, 0)..=(job.id.get(), u32::MAX, u32::MAX))? {
+        let (key, value) = entry?;
+        let (_, number, seq) = key.value();
+        let request = RequestNumber::new(number)
+            .ok_or_else(|| StorageError::corrupted("zero request identity"))?;
+        let event = rows::decode_request_event(job.id, request, seq, value.value())?;
+        match event.payload {
+            RequestPayload::Sent {
+                allocation_generation,
+                ..
+            } if seq == 1
+                && number == last_request
+                && allocation_generation == token.generation =>
+            {
+                current_sent = true
+            }
+            RequestPayload::Sent {
+                allocation_generation,
+                ..
+            } if seq == 1 && number < last_request && allocation_generation <= token.generation => {
+                if prior_generation == Some(token.generation) && (!prior_received || !prior_success)
+                {
+                    return Ok(None);
+                }
+                prior_request = Some(number);
+                prior_generation = Some(allocation_generation);
+                prior_received = false;
+                prior_success = false;
+            }
+            RequestPayload::Received { .. }
+                if number < last_request && prior_request == Some(number) && !prior_received =>
+            {
+                prior_received = true
+            }
+            RequestPayload::Availability {
+                status_code: Some(status),
+                failure: None,
+                ..
+            } if number < last_request
+                && prior_request == Some(number)
+                && !prior_success
+                && (200..300).contains(&status) =>
+            {
+                prior_success = true
+            }
+            RequestPayload::Measurement { .. } | RequestPayload::Token { .. }
+                if number < last_request => {}
+            RequestPayload::Received { digest: value }
+                if number == last_request && digest.is_none() =>
+            {
+                digest = Some(value)
+            }
+            RequestPayload::Availability {
+                status_code: Some(status),
+                finish_reason: Some(ChatFinishReason::Stop),
+                raw_finish_reason,
+                failure: None,
+            } if number == last_request && (200..300).contains(&status) && finish.is_none() => {
+                finish = Some(raw_finish_reason)
+            }
+            RequestPayload::Measurement { .. } | RequestPayload::Token { .. }
+                if number == last_request => {}
+            _ => return Ok(None),
+        }
+    }
+    if prior_generation == Some(token.generation) && (!prior_received || !prior_success) {
+        return Ok(None);
+    }
+    let (Some(digest), Some(raw_finish)) = (digest, finish) else {
+        return Ok(None);
+    };
+    if !current_sent {
+        return Ok(None);
+    }
+    let messages = tx.table(MESSAGES)?;
+    let Some(body) = messages.get(digest.as_bytes().as_slice())? else {
+        return Err(StorageError::corrupted(
+            "confirmed Provider response is missing",
+        ));
+    };
+    let value: serde_json::Value = serde_json::from_slice(body.value())
+        .map_err(|_| StorageError::corrupted("invalid confirmed Provider response"))?;
+    if value.get("role").and_then(serde_json::Value::as_str) != Some("assistant")
+        || value.get("tool_calls").is_some_and(|calls| {
+            !calls.is_null() && calls.as_array().is_none_or(|calls| !calls.is_empty())
+        })
+    {
+        return Ok(None);
+    }
+    let text = match value.get("content") {
+        None | Some(serde_json::Value::Null) => "".to_owned(),
+        Some(serde_json::Value::String(text)) => text.clone(),
+        _ => return Ok(None),
+    };
+    if let Some(source) = job.summary_source {
+        let Ok(summary) = serde_json::from_str::<crate::db::entities::SummarizationResult>(&text)
+        else {
+            return Ok(None);
+        };
+        if summary.validate().is_err() || summary.source != source {
+            return Ok(None);
+        }
+    }
+    let mut result = serde_json::json!({"text": text});
+    if let Some(reason) = raw_finish {
+        result["finish_reason"] = serde_json::Value::String(reason);
+    }
+    Ok(Some(crate::db::entities::FinalResult {
+        summary: Some(text),
+        code: None,
+        goal_reached: None,
+        value: Some(result),
+    }))
+}
+
 #[allow(dead_code)]
 pub(super) fn decode_pool_allocation(
     key: u128,
@@ -258,19 +1070,29 @@ pub(crate) fn valid_reservation_request_id(id: crate::db::entities::ReservationR
 }
 
 pub(super) fn allocation_by_request(
-    requests: &impl ReadableTable<u128, u128>,
+    requests: &impl ReadableTable<u128, (u128, u32)>,
     allocations: &impl ReadableTable<u128, &'static [u8]>,
+    index: &impl ReadableTable<(u128, u128), ()>,
+    events: &impl ReadableTable<u128, &'static [u8]>,
     id: crate::db::entities::ReservationRequestId,
 ) -> Result<Option<crate::db::entities::PoolAllocation>, StorageError> {
-    let Some(job) = requests.get(id.get())?.map(|job| job.value()) else {
+    let Some(origin_key) = requests.get(id.get())?.map(|origin| origin.value()) else {
         return Ok(None);
     };
-    let Some(bytes) = allocations.get(job)? else {
-        return Err(StorageError::corrupted(
-            "reservation request index references a missing Allocation",
-        ));
+    let created = allocation_origin(index, events, origin_key)?.ok_or_else(|| {
+        StorageError::corrupted("reservation request index references a missing Allocation")
+    })?;
+    let allocation = match allocations.get(origin_key.0)? {
+        Some(bytes) => {
+            let current = decode_pool_allocation(origin_key.0, bytes.value())?;
+            if current.token.generation.get() == origin_key.1 {
+                current
+            } else {
+                created
+            }
+        }
+        None => created,
     };
-    let allocation = decode_pool_allocation(job, bytes.value())?;
     if allocation.request_id != id {
         return Err(StorageError::corrupted(
             "reservation request index disagrees with its Allocation",
@@ -830,9 +1652,25 @@ impl Batch {
         }
         self.step(|tx| {
             let tools = tx.open_table(TOOL_CALLS)?;
+            let mut own_tools = false;
             for id in &context {
                 let range = (id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX);
                 if *id == job.id && tools.range(range)?.next().transpose()?.is_some() {
+                    own_tools = true;
+                }
+            }
+            drop(tools);
+            if own_tools {
+                let allocation = {
+                    let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+                    let Some(row) = allocations.get(job.id.get())? else {
+                        return Ok(Some(UNSUPPORTED));
+                    };
+                    decode_pool_allocation(job.id.get(), row.value())?
+                };
+                if recoverable_multistep_request(tx, &allocation)?.is_none()
+                    && !uncertain_tool_retry(tx, &allocation)?
+                {
                     return Ok(Some(UNSUPPORTED));
                 }
             }
@@ -910,7 +1748,99 @@ impl Batch {
         })
     }
 
-    fn put_mutable_job_state(&mut self, id: JobId, state: &JobState) -> Result<(), BatchError> {
+    pub(super) fn append_job_lifecycle(
+        &mut self,
+        id: JobId,
+        event: JobLifecycle,
+    ) -> Result<(), BatchError> {
+        let now = self.now;
+        self.step(|tx| {
+            let mut sequences = tx.open_table(SEQUENCES)?;
+            let sequence = sequences
+                .get("execution_event")?
+                .map_or(0, |value| value.value())
+                .checked_add(1)
+                .ok_or_else(|| StorageError::corrupted("execution event sequence exhausted"))?;
+            sequences.insert("execution_event", sequence)?;
+            let mut encoded = Enc::new(45);
+            encoded.u128(sequence);
+            encoded.u128(id.get());
+            encoded.ts(now);
+            match &event {
+                JobLifecycle::Created => encoded.u8(1),
+                JobLifecycle::Submitted => encoded.u8(2),
+                JobLifecycle::Waiting => encoded.u8(7),
+                JobLifecycle::Eligible => encoded.u8(8),
+                JobLifecycle::Outcome(state) => {
+                    let bytes = state.encode();
+                    encoded.u8(3);
+                    encoded.u32(
+                        u32::try_from(bytes.len())
+                            .map_err(|_| StorageError::corrupted("Job outcome too large"))?,
+                    );
+                    encoded.0.extend_from_slice(&bytes);
+                }
+                JobLifecycle::RequestEvidence { request, seq } => {
+                    encoded.u8(4);
+                    encoded.u32(request.get());
+                    encoded.u32(*seq);
+                }
+                JobLifecycle::ToolEvidence {
+                    request,
+                    index,
+                    outcome,
+                } => {
+                    encoded.u8(5);
+                    encoded.u32(request.get());
+                    encoded.u32(*index);
+                    encoded.bool(*outcome);
+                }
+                JobLifecycle::Output { seq } => {
+                    encoded.u8(6);
+                    encoded.u32(*seq);
+                }
+                JobLifecycle::DependencySettled { prerequisite } => {
+                    encoded.u8(9);
+                    encoded.u128(prerequisite.get());
+                }
+            }
+            if tx
+                .open_table(EXECUTION_EVENTS)?
+                .insert(sequence, encoded.0.as_slice())?
+                .is_some()
+                || tx
+                    .open_table(JOB_LIFECYCLE_EVENTS)?
+                    .insert((id.get(), sequence), ())?
+                    .is_some()
+            {
+                return Err(StorageError::corrupted(
+                    "Job lifecycle event identity already exists",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    pub(super) fn put_mutable_job_state(
+        &mut self,
+        id: JobId,
+        state: &JobState,
+    ) -> Result<(), BatchError> {
+        let previous = self.job_state(id)?;
+        if previous.is_none() {
+            self.append_job_lifecycle(id, JobLifecycle::Created)?;
+        }
+        if state.outcome != previous.as_ref().and_then(|row| row.outcome.clone()) {
+            if let Some(previous) = previous.as_ref().and_then(|row| row.outcome.as_ref())
+                && previous.kind != OutcomeKind::Unknown
+            {
+                return self.corrupted("terminal Job outcome cannot change".to_owned());
+            }
+            if state.outcome.is_none() {
+                return self.corrupted("Job outcome cannot be removed".to_owned());
+            }
+            self.append_job_lifecycle(id, JobLifecycle::Outcome(state.clone()))?;
+        }
         let encoded = state.encode();
         self.insert(JOB_STATES, id.get(), encoded.as_slice())
     }
@@ -1662,6 +2592,15 @@ impl Batch {
         if create_state {
             self.put_job_state(job.id, &JobState::new(job.id))?;
         }
+        self.append_job_lifecycle(job.id, JobLifecycle::Submitted)?;
+        self.append_job_lifecycle(
+            job.id,
+            if planning_wait {
+                JobLifecycle::Waiting
+            } else {
+                JobLifecycle::Eligible
+            },
+        )?;
         Ok(())
     }
 
@@ -2408,6 +3347,8 @@ impl Batch {
             allocation_by_request(
                 &tx.open_table(ALLOCATION_REQUESTS)?,
                 &tx.open_table(POOL_ALLOCATIONS)?,
+                &tx.open_table(JOB_EXECUTION_EVENTS)?,
+                &tx.open_table(EXECUTION_EVENTS)?,
                 request.id,
             )
         })?;
@@ -2479,6 +3420,7 @@ impl Batch {
                 .map(|entry| Ok(entry?.0.value()))
                 .collect::<Result<Vec<_>, StorageError>>()
         })?;
+        let mut deferred: Option<std::time::Duration> = None;
         for key in &keys {
             let id = JobId::new(key.2);
             if let ReadySelection::Only(only) = selection
@@ -2505,9 +3447,48 @@ impl Batch {
                     .get(POOL_ALLOCATIONS, id.get(), |bytes| {
                         decode_pool_allocation(id.get(), bytes)
                     })?
-                    .is_some()
+                    .is_some_and(|allocation| allocation.holds_capacity())
             {
                 return self.corrupted("invalid mutable ready entry".to_owned());
+            }
+            if let Some(allocation) = self.pool_allocation(id)? {
+                let retry = self.step(|tx| {
+                    let index = tx.open_table(JOB_EXECUTION_EVENTS)?;
+                    let events = tx.open_table(EXECUTION_EVENTS)?;
+                    let ((_, sequence), _) = index
+                        .range((id.get(), 0)..=(id.get(), u128::MAX))?
+                        .next_back()
+                        .transpose()?
+                        .map(|(key, value)| (key.value(), value.value()))
+                        .ok_or_else(|| {
+                            StorageError::corrupted("released Allocation has no event")
+                        })?;
+                    let event = events
+                        .get(sequence)?
+                        .ok_or_else(|| StorageError::corrupted("retry event is missing"))?;
+                    let (job, generation, phase, _, retry, _) =
+                        decode_execution_event(sequence, event.value())?;
+                    if job != id
+                        || generation != allocation.token.generation.get()
+                        || phase != crate::db::entities::AllocationPhase::Released
+                    {
+                        return Err(StorageError::corrupted(
+                            "retry event disagrees with Allocation",
+                        ));
+                    }
+                    retry.ok_or_else(|| {
+                        StorageError::corrupted("released queued Job has no retry plan")
+                    })
+                })?;
+                let remaining = retry
+                    .eligible_at
+                    .as_unix_micros()
+                    .saturating_sub(self.now.as_unix_micros());
+                if remaining > 0 {
+                    let wait = std::time::Duration::from_micros(remaining as u64);
+                    deferred = Some(deferred.map_or(wait, |current| current.min(wait)));
+                    continue;
+                }
             }
             if matches!(selection, ReadySelection::Scheduled { .. })
                 && (!self.mutable_predecessor_ready(&job)? || self.mutable_job_blocked(&job)?)
@@ -2579,6 +3560,12 @@ impl Batch {
                 continue;
             }
             let frozen = self.frozen_configuration(&job)?;
+            let requires_workspace = !summary_work
+                && matches!(
+                    &frozen,
+                    FrozenConfiguration::Generative(frozen)
+                        if frozen.agent.as_ref().is_some_and(|agent| agent.workspace_grant().is_some())
+                );
             let mut scheduled_external = None;
             if let ReadySelection::Scheduled {
                 generative_policy,
@@ -2591,13 +3578,7 @@ impl Batch {
                 }
                 let ext_target = match &frozen {
                     FrozenConfiguration::Generative(frozen) => {
-                        if !workspace_permit
-                            && !summary_work
-                            && frozen
-                                .agent
-                                .as_ref()
-                                .is_some_and(|agent| agent.workspace_grant().is_some())
-                        {
+                        if !workspace_permit && requires_workspace {
                             continue;
                         }
                         let refusal = if summary_work {
@@ -2680,16 +3661,19 @@ impl Batch {
                     protocol,
                     scheduled_external,
                 )
-                .map(DevelopmentReservation::Reserved);
+                .map(|allocation| {
+                    DevelopmentReservation::Reserved(allocation, requires_workspace)
+                });
         }
         if keys.len() == SCAN_BUDGET
             && let Some(key) = keys.last()
         {
-            return Ok(DevelopmentReservation::Continue(DevelopmentReadyCursor(
-                *key,
-            )));
+            return Ok(DevelopmentReservation::Continue(
+                DevelopmentReadyCursor(*key),
+                deferred,
+            ));
         }
-        Ok(DevelopmentReservation::Exhausted)
+        Ok(DevelopmentReservation::Exhausted(deferred))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2718,6 +3702,22 @@ impl Batch {
                 "Executor or Pool capacity is unavailable",
             ));
         }
+        let previous = self.pool_allocation(row.id)?;
+        let generation = match &previous {
+            None => std::num::NonZeroU32::MIN,
+            Some(previous) if previous.phase == AllocationPhase::Released => previous
+                .token
+                .generation
+                .get()
+                .checked_add(1)
+                .and_then(std::num::NonZeroU32::new)
+                .ok_or_else(|| {
+                    BatchError(Failure::Storage(StorageError::corrupted(
+                        "Allocation generation exhausted",
+                    )))
+                })?,
+            Some(_) => return self.corrupted("Job already has an active Allocation".to_owned()),
+        };
         let allocation = PoolAllocation {
             request_id: request.id,
             request_after: request.after,
@@ -2725,7 +3725,7 @@ impl Batch {
                 job: row.id,
                 pool: pool.id,
                 executor: executor.id,
-                generation: std::num::NonZeroU32::MIN,
+                generation,
                 epoch: self.epoch,
             },
             job_revision: row.revision,
@@ -2741,7 +3741,7 @@ impl Batch {
             stop_confirmed_at: None,
             stop_proof: None,
         };
-        self.put_pool_allocation(&allocation, None)?;
+        self.put_pool_allocation(&allocation, previous.as_ref())?;
         self.step(|tx| {
             tx.open_table(MUTABLE_READY)?.remove(ready_key)?;
             tx.open_table(PENDING)?.remove(row.id.get())?;
@@ -2930,26 +3930,49 @@ impl Batch {
             return Err(stale());
         }
         let no_execution_evidence = self.step(|tx| {
-            Ok(tx
-                .open_table(JOB_OUTPUTS)?
-                .range((job.id.get(), 0)..=(job.id.get(), u32::MAX))?
-                .next()
-                .transpose()?
-                .is_none()
-                && tx
-                    .open_table(REQUEST_EVENTS)?
-                    .range((job.id.get(), 0, 0)..=(job.id.get(), u32::MAX, u32::MAX))?
-                    .next()
-                    .transpose()?
-                    .is_none()
+            if !(resumable_partial_outputs(tx, job.id)?
                 && tx
                     .open_table(TOOL_CALLS)?
                     .range((job.id.get(), 0, 0)..=(job.id.get(), u32::MAX, u32::MAX))?
                     .next()
                     .transpose()?
                     .is_none())
+            {
+                return Ok(false);
+            }
+            let mut previous_request = None;
+            for entry in tx
+                .open_table(REQUEST_EVENTS)?
+                .range((job.id.get(), 0, 0)..=(job.id.get(), u32::MAX, u32::MAX))?
+            {
+                let (key, value) = entry?;
+                let (_, number, seq) = key.value();
+                let request = RequestNumber::new(number)
+                    .ok_or_else(|| StorageError::corrupted("zero request identity"))?;
+                match rows::decode_request_event(job.id, request, seq, value.value())?.payload {
+                    crate::db::entities::RequestPayload::Sent {
+                        allocation_generation,
+                        ..
+                    } if seq == 1 && allocation_generation < token.generation => {
+                        previous_request = Some(number)
+                    }
+                    crate::db::entities::RequestPayload::Measurement { .. }
+                    | crate::db::entities::RequestPayload::Token { .. }
+                        if seq > 1 && previous_request == Some(number) => {}
+                    _ => return Ok(false),
+                }
+            }
+            Ok(true)
         })?;
-        if !no_execution_evidence {
+        let resumable = if no_execution_evidence {
+            false
+        } else {
+            self.step(|tx| {
+                Ok(recoverable_multistep_request(tx, allocation)?.is_some()
+                    || uncertain_tool_retry(tx, allocation)?)
+            })?
+        };
+        if !no_execution_evidence && !resumable {
             return Err(stale());
         }
         let frozen = self.frozen_configuration(job)?;
@@ -3310,9 +4333,19 @@ impl Batch {
         self.require_development_write(proof)?;
         let job_id = proof.token().job;
         if let Some(job) = self.mutable_job(job_id)?
-            && let Some(source) = job.summary_source
             && let crate::db::entities::JobFinalization::Completed(ref mut output) = finalization
         {
+            self.normalize_summary_output(&job, output)?;
+        }
+        self.finish_development_job(proof, expected_seq, finalization)
+    }
+
+    fn normalize_summary_output(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+        output: &mut crate::db::entities::FinalResult,
+    ) -> Result<(), BatchError> {
+        if let Some(source) = job.summary_source {
             let raw = output
                 .summary
                 .as_deref()
@@ -3345,7 +4378,7 @@ impl Batch {
                 )))
             })?;
             self.put_message(&body)?;
-            let producer_job = ContentDigest::of(&encode_mutable_job(&job));
+            let producer_job = ContentDigest::of(&encode_mutable_job(job));
             let link = crate::db::entities::NativeSummaryResultLink {
                 source,
                 producer_job,
@@ -3358,7 +4391,7 @@ impl Batch {
             })?);
             output.summary = Some(summary.summary);
         }
-        self.finish_development_job(proof, expected_seq, finalization)
+        Ok(())
     }
 
     pub(crate) fn record_development_uncertain(
@@ -3804,7 +4837,7 @@ impl Batch {
                 agent_profile: None,
                 llm_profile: ProfileId::new(pred.decision_agent.get()),
             };
-            if let Ok(frozen_cfg) = self.freeze_configuration(cfg) {
+            if let Ok(frozen_cfg) = self.freeze_system_configuration(cfg) {
                 let decision_frozen = match frozen_cfg {
                     FrozenConfiguration::Decision(d) => d,
                     FrozenConfiguration::Generative(g) => FrozenDecisionConfig::Generative(g, None),
@@ -3974,6 +5007,7 @@ impl Batch {
             Ok(true)
         })?;
         if inserted {
+            self.append_job_lifecycle(job.id, JobLifecycle::Eligible)?;
             self.wake_scheduler();
         }
         Ok(())
@@ -4006,6 +5040,7 @@ impl Batch {
             if waiter_job.phase != MutableJobPhase::Queued || waiter_state.outcome.is_some() {
                 continue;
             }
+            self.append_job_lifecycle(waiter_id, JobLifecycle::DependencySettled { prerequisite })?;
             match Self::dependency_outcome_kind_state(kind, condition) {
                 DependencyState::Waiting => {}
                 DependencyState::Impossible => {
@@ -4103,7 +5138,7 @@ impl Batch {
             agent_profile: None,
             llm_profile,
         };
-        let frozen_decision = match self.freeze_configuration(cfg) {
+        let frozen_decision = match self.freeze_system_configuration(cfg) {
             Ok(FrozenConfiguration::Decision(d)) => d,
             Ok(FrozenConfiguration::Generative(g)) => FrozenDecisionConfig::Generative(g, None),
             Err(_) => FrozenDecisionConfig::Generative(generative.clone(), None),
@@ -4510,6 +5545,204 @@ impl Batch {
         Ok(output)
     }
 
+    pub(crate) fn finish_or_hold_unstarted_reservation(
+        &mut self,
+        token: crate::db::entities::AllocationToken,
+        cause: crate::db::entities::UnstartedCause,
+    ) -> Result<Option<crate::db::entities::AppendedOutput>, BatchError> {
+        let has_prior_request = self.step(|tx| {
+            Ok(tx
+                .open_table(REQUEST_EVENTS)?
+                .range((token.job.get(), 0, 0)..=(token.job.get(), u32::MAX, u32::MAX))?
+                .next()
+                .transpose()?
+                .is_some())
+        })?;
+        if has_prior_request {
+            self.transition_pool_allocation(
+                token,
+                crate::db::entities::AllocationPhase::Uncertain,
+                Some(crate::db::entities::UncertaintyReason::RequestPossiblySent),
+            )?;
+            self.probe = Some(Probe::Outcome(token.job));
+            Ok(None)
+        } else {
+            self.fail_unstarted_reservation(token, cause).map(Some)
+        }
+    }
+
+    pub(crate) fn retry_unstarted_reservation(
+        &mut self,
+        token: crate::db::entities::AllocationToken,
+        cause: crate::db::entities::UnstartedCause,
+    ) -> Result<bool, BatchError> {
+        use crate::db::entities::{AllocationPhase, MutableJobPhase, UnstartedCause};
+        self.require_allocation_durability()?;
+        if token.generation.get() >= 3 || cause == UnstartedCause::OfflineReconciled {
+            return Ok(false);
+        }
+        let allocation = self.allocation_for_token(token)?;
+        if token.epoch != self.epoch
+            || allocation.phase != AllocationPhase::Reserved
+            || allocation.stop_confirmed_at.is_some()
+            || allocation.stop_proof.is_some()
+        {
+            return self.reject(Violation::InvalidValue(
+                "reservation",
+                "the Allocation is not an untouched reservation",
+            ));
+        }
+        let Some(job) = self.mutable_job(token.job)? else {
+            return self.corrupted("reserved Job is missing".to_owned());
+        };
+        if job.phase != MutableJobPhase::Queued
+            || job.revision != allocation.job_revision
+            || job.frozen.is_none()
+            || self.require_job_state(token.job)?.outcome.is_some()
+        {
+            return self.reject(Violation::InvalidValue(
+                "reservation",
+                "the Job is no longer eligible for retry",
+            ));
+        }
+        self.enqueue_retry(allocation, job, cause)?;
+        Ok(true)
+    }
+
+    pub(crate) fn retry_uncertain_execution(
+        &mut self,
+        proof: &crate::db::handle::DevelopmentWriteProof,
+    ) -> Result<bool, BatchError> {
+        use crate::db::entities::{AllocationPhase, MutableJobPhase, UnstartedCause};
+        self.require_allocation_durability()?;
+        let token = proof.token();
+        if token.generation.get() >= 3 {
+            return Ok(false);
+        }
+        self.require_development_write_any(proof)?;
+        let allocation = self.allocation_for_token(token)?;
+        if allocation.phase != AllocationPhase::Running {
+            return Ok(false);
+        }
+        let Some(mut job) = self.mutable_job(token.job)? else {
+            return self.corrupted("retry Job is missing".to_owned());
+        };
+        if job.phase != MutableJobPhase::Executing
+            || self.require_job_state(token.job)?.outcome.is_some()
+        {
+            return Ok(false);
+        }
+        let eligible = self.step(|tx| recoverable_interrupted_allocation(tx, &allocation))?;
+        if !eligible {
+            return Ok(false);
+        }
+        job.phase = MutableJobPhase::Queued;
+        self.insert(JOBS, job.id.get(), encode_mutable_job(&job).as_slice())?;
+        self.enqueue_retry(allocation, job, UnstartedCause::ExternalOutcomeUnknown)?;
+        Ok(true)
+    }
+
+    pub(super) fn recover_interrupted_allocation(
+        &mut self,
+        allocation: crate::db::entities::PoolAllocation,
+    ) -> Result<(), BatchError> {
+        if !self.step(|tx| recoverable_interrupted_allocation(tx, &allocation))? {
+            return self
+                .corrupted("interrupted Allocation cannot be recovered automatically".to_owned());
+        }
+        let Some(mut job) = self.mutable_job(allocation.token.job)? else {
+            return self.corrupted("interrupted Job is missing".to_owned());
+        };
+        job.phase = crate::db::entities::MutableJobPhase::Queued;
+        self.insert(JOBS, job.id.get(), encode_mutable_job(&job).as_slice())?;
+        self.enqueue_retry(
+            allocation,
+            job,
+            crate::db::entities::UnstartedCause::HostRestarted,
+        )
+    }
+
+    pub(super) fn recover_confirmed_answer(
+        &mut self,
+        allocation: crate::db::entities::PoolAllocation,
+    ) -> Result<(), BatchError> {
+        let mut result = self
+            .step(|tx| recoverable_confirmed_answer(tx, &allocation))?
+            .ok_or_else(|| {
+                BatchError(Failure::Storage(StorageError::corrupted(
+                    "confirmed answer cannot be recovered",
+                )))
+            })?;
+        let Some(job) = self.mutable_job(allocation.token.job)? else {
+            return self.corrupted("confirmed answer Job is missing".to_owned());
+        };
+        self.normalize_summary_output(&job, &mut result)?;
+        self.settle_mutable_outcome(allocation.token, &job, OutcomeKind::Completed, result)?;
+        let mut released = allocation.clone();
+        released.phase = crate::db::entities::AllocationPhase::Released;
+        self.put_pool_allocation(&released, Some(&allocation))?;
+        self.settle_summary_membership(&job)?;
+        self.settle_standalone_decision(&job)?;
+        self.freed_capacity = true;
+        Ok(())
+    }
+
+    fn enqueue_retry(
+        &mut self,
+        mut allocation: crate::db::entities::PoolAllocation,
+        job: crate::db::entities::MutableJob,
+        cause: crate::db::entities::UnstartedCause,
+    ) -> Result<(), BatchError> {
+        use crate::db::entities::{AllocationPhase, UnstartedRetry};
+        let token = allocation.token;
+        let submitted = job.submitted_at.ok_or_else(|| {
+            BatchError(Failure::Storage(StorageError::corrupted(
+                "queued Job has no submission time",
+            )))
+        })?;
+        let requirement = mutable_configuration_requirement(&self.frozen_configuration(&job)?);
+        let delay = i64::from(token.generation.get()) * 1_000_000;
+        let retry = UnstartedRetry {
+            cause,
+            eligible_at: Timestamp::from_unix_micros(
+                self.now
+                    .as_unix_micros()
+                    .checked_add(delay)
+                    .ok_or_else(|| {
+                        BatchError(Failure::Storage(StorageError::corrupted(
+                            "retry deadline overflow",
+                        )))
+                    })?,
+            ),
+        };
+        let previous = allocation.clone();
+        allocation.phase = AllocationPhase::Released;
+        self.put_pool_allocation_with_retry(&allocation, Some(&previous), Some(retry))?;
+        self.step(|tx| {
+            if tx
+                .open_table(MUTABLE_READY)?
+                .insert(
+                    (
+                        mutable_priority(job.input.priority),
+                        submitted.as_unix_micros(),
+                        job.id.get(),
+                        requirement,
+                    ),
+                    (),
+                )?
+                .is_some()
+                || tx.open_table(PENDING)?.insert(job.id.get(), ())?.is_some()
+            {
+                return Err(StorageError::corrupted("retry queue entry already exists"));
+            }
+            Ok(())
+        })?;
+        self.freed_capacity = true;
+        self.wake_scheduler();
+        self.probe = Some(Probe::PoolAllocation(token));
+        Ok(())
+    }
+
     fn end_untouched_reservation(
         &mut self,
         token: crate::db::entities::AllocationToken,
@@ -4668,6 +5901,20 @@ impl Batch {
         let token = allocation.token;
         match allocation.phase {
             AllocationPhase::Reserved => {
+                let prior_request = self.step(|tx| {
+                    Ok(tx
+                        .open_table(REQUEST_EVENTS)?
+                        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+                        .next()
+                        .transpose()?
+                        .is_some())
+                })?;
+                if prior_request {
+                    self.transition_pool_allocation(token, AllocationPhase::Uncertain,
+                        Some(crate::db::entities::UncertaintyReason::StopRequestedWithoutConfirmedTermination))?;
+                    self.probe = Some(Probe::Outcome(job));
+                    return Ok(NativeStopRequest::Requested(token));
+                }
                 let (job, _) = self.end_untouched_reservation(
                     token,
                     OutcomeKind::Cancelled,
@@ -4687,7 +5934,89 @@ impl Batch {
                 Ok(NativeStopRequest::Requested(token))
             }
             AllocationPhase::StopRequested => Ok(NativeStopRequest::AlreadyRequested(token)),
-            AllocationPhase::Uncertain | AllocationPhase::Released => self.reject(ended),
+            AllocationPhase::Released => {
+                let Some(job) = self.mutable_job(token.job)? else {
+                    return self.corrupted("retry Job is missing".to_owned());
+                };
+                let retry = self.step(|tx| {
+                    let index = tx.open_table(JOB_EXECUTION_EVENTS)?;
+                    let events = tx.open_table(EXECUTION_EVENTS)?;
+                    let Some((key, _)) = index
+                        .range((token.job.get(), 0)..=(token.job.get(), u128::MAX))?
+                        .next_back()
+                        .transpose()?
+                    else {
+                        return Err(StorageError::corrupted("released Allocation has no event"));
+                    };
+                    let sequence = key.value().1;
+                    let event = events
+                        .get(sequence)?
+                        .ok_or_else(|| StorageError::corrupted("retry event is missing"))?;
+                    let (job, generation, phase, _, retry, _) =
+                        decode_execution_event(sequence, event.value())?;
+                    Ok(job == token.job
+                        && generation == token.generation.get()
+                        && phase == AllocationPhase::Released
+                        && retry.is_some())
+                })?;
+                if !retry || job.phase != crate::db::entities::MutableJobPhase::Queued {
+                    return self.reject(ended);
+                }
+                let prior_request = self.step(|tx| {
+                    Ok(tx
+                        .open_table(REQUEST_EVENTS)?
+                        .range((job.id.get(), 0, 0)..=(job.id.get(), u32::MAX, u32::MAX))?
+                        .next()
+                        .transpose()?
+                        .is_some())
+                })?;
+                let submitted = job.submitted_at.ok_or_else(|| {
+                    BatchError(Failure::Storage(StorageError::corrupted(
+                        "retry Job has no submission time",
+                    )))
+                })?;
+                let requirement =
+                    mutable_configuration_requirement(&self.frozen_configuration(&job)?);
+                self.remove(
+                    MUTABLE_READY,
+                    (
+                        mutable_priority(job.input.priority),
+                        submitted.as_unix_micros(),
+                        job.id.get(),
+                        requirement,
+                    ),
+                )?;
+                self.remove(PENDING, job.id.get())?;
+                if prior_request {
+                    let mut state = self.require_job_state(job.id)?;
+                    state.outcome = Some(OutcomeRecord {
+                        kind: OutcomeKind::Unknown,
+                        at: self.now,
+                        cause: Some(OutcomeCause::Uncertain(
+                            crate::db::entities::UncertaintyReason::StopRequestedWithoutConfirmedTermination,
+                        )),
+                    });
+                    self.put_mutable_job_state(job.id, &state)?;
+                    self.probe = Some(Probe::Outcome(job.id));
+                    return Ok(NativeStopRequest::Requested(token));
+                }
+                self.settle_mutable_outcome(
+                    token,
+                    &job,
+                    OutcomeKind::Cancelled,
+                    crate::db::entities::FinalResult {
+                        summary: Some(STOPPED_BEFORE_START_SUMMARY.to_owned()),
+                        code: Some(STOPPED_BEFORE_START_CODE.to_owned()),
+                        goal_reached: Some(false),
+                        value: None,
+                    },
+                )?;
+                self.settle_standalone_decision(&job)?;
+                self.settle_summary_membership(&job)?;
+                self.probe = Some(Probe::Outcome(token.job));
+                Ok(NativeStopRequest::EndedBeforeStart(token))
+            }
+            AllocationPhase::Uncertain => self.reject(ended),
         }
     }
 
@@ -4777,39 +6106,99 @@ impl Batch {
         allocation: &crate::db::entities::PoolAllocation,
         previous: Option<&crate::db::entities::PoolAllocation>,
     ) -> Result<(), BatchError> {
+        self.put_pool_allocation_with_retry(allocation, previous, None)
+    }
+
+    fn put_pool_allocation_with_retry(
+        &mut self,
+        allocation: &crate::db::entities::PoolAllocation,
+        previous: Option<&crate::db::entities::PoolAllocation>,
+        retry: Option<crate::db::entities::UnstartedRetry>,
+    ) -> Result<(), BatchError> {
         let token = allocation.token;
         let active_key = (token.pool.get(), token.executor.get(), token.job.get());
-        if let Some(previous) = previous
-            && (previous.token != token
-                || previous.request_id != allocation.request_id
-                || !previous.holds_capacity())
-        {
-            return self
-                .corrupted("Allocation identity changed or Released row rewritten".to_owned());
+        let origin_key = (token.job.get(), token.generation.get());
+        let now = self.now;
+        let new_allocation = previous.is_none_or(|previous| previous.token != token);
+        if let Some(previous) = previous {
+            let valid = if new_allocation {
+                previous.token.job == token.job
+                    && previous.phase == crate::db::entities::AllocationPhase::Released
+                    && previous.token.generation.get().checked_add(1)
+                        == Some(token.generation.get())
+                    && allocation.phase == crate::db::entities::AllocationPhase::Reserved
+            } else {
+                previous.request_id == allocation.request_id && previous.holds_capacity()
+            };
+            if !valid {
+                return self.corrupted("invalid Allocation identity transition".to_owned());
+            }
         }
         let outcome = self.step(|tx| {
             let mut allocations = tx.open_table(POOL_ALLOCATIONS)?;
             let mut requests = tx.open_table(ALLOCATION_REQUESTS)?;
             let mut active = tx.open_table(ACTIVE_ALLOCATIONS)?;
-            let stored = allocations.get(token.job.get())?.is_some();
-            if stored != previous.is_some() {
-                return Ok(Some("Allocation presence disagrees with the writer's view"));
+            let stored = allocations.get(token.job.get())?;
+            match (stored.as_ref(), previous) {
+                (None, None) => {}
+                (Some(stored), Some(previous))
+                    if stored.value() == encode_pool_allocation(previous).as_slice() => {}
+                (Some(_), Some(_)) => {
+                    return Ok(Some("Allocation disagrees with the writer's view"));
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Ok(Some("Allocation presence disagrees with the writer's view"));
+                }
             }
-            if previous.is_none() {
+            drop(stored);
+            if new_allocation {
+                if allocation_origin(
+                    &tx.open_table(JOB_EXECUTION_EVENTS)?,
+                    &tx.open_table(EXECUTION_EVENTS)?,
+                    origin_key,
+                )?
+                .is_some()
+                {
+                    return Ok(Some("Allocation identity already exists"));
+                }
                 if requests
-                    .insert(allocation.request_id.get(), token.job.get())?
+                    .insert(allocation.request_id.get(), origin_key)?
                     .is_some()
                 {
                     return Ok(Some("duplicate reservation request identity"));
                 }
-            } else if requests
-                .get(allocation.request_id.get())?
-                .is_none_or(|job| job.value() != token.job.get())
-            {
-                return Ok(Some("reservation request index is missing or wrong"));
+            } else {
+                if requests
+                    .get(allocation.request_id.get())?
+                    .is_none_or(|origin| origin.value() != origin_key)
+                {
+                    return Ok(Some("reservation request index is missing or wrong"));
+                }
+                let Some(created) = allocation_origin(
+                    &tx.open_table(JOB_EXECUTION_EVENTS)?,
+                    &tx.open_table(EXECUTION_EVENTS)?,
+                    origin_key,
+                )?
+                else {
+                    return Ok(Some("Allocation references a missing Allocation"));
+                };
+                if created.token != token
+                    || created.request_id != allocation.request_id
+                    || created.claimed_at != allocation.claimed_at
+                    || created.job_revision != allocation.job_revision
+                    || created.host_id != allocation.host_id
+                    || created.boot_id != allocation.boot_id
+                    || created.pool_revision != allocation.pool_revision
+                    || created.executor_revision != allocation.executor_revision
+                    || created.operation != allocation.operation
+                    || created.protocol != allocation.protocol
+                    || created.request_after != allocation.request_after
+                {
+                    return Ok(Some("Allocation disagrees with Allocation creation"));
+                }
             }
             let indexed = active.get(active_key)?.is_some();
-            match (previous.is_some(), allocation.holds_capacity()) {
+            match (!new_allocation, allocation.holds_capacity()) {
                 (false, true) => {
                     if indexed {
                         return Ok(Some("active Allocation index already has this Job"));
@@ -4833,6 +6222,57 @@ impl Batch {
                 token.job.get(),
                 encode_pool_allocation(allocation).as_slice(),
             )?;
+            if new_allocation || previous.is_some_and(|previous| previous.phase != allocation.phase)
+            {
+                use crate::db::entities::AllocationPhase;
+                let mut sequences = tx.open_table(SEQUENCES)?;
+                let sequence = sequences
+                    .get("execution_event")?
+                    .map_or(0, |value| value.value())
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::corrupted("execution event sequence exhausted"))?;
+                sequences.insert("execution_event", sequence)?;
+                let mut event = Enc::new(44);
+                event.u128(sequence);
+                event.u128(token.job.get());
+                event.u32(token.generation.get());
+                event.u8(match allocation.phase {
+                    AllocationPhase::Reserved => 1,
+                    AllocationPhase::Running => 2,
+                    AllocationPhase::StopRequested => 3,
+                    AllocationPhase::Uncertain => 4,
+                    AllocationPhase::Released => 5,
+                });
+                event.ts(now);
+                event.opt(retry.as_ref(), |event, retry| {
+                    use crate::db::entities::UnstartedCause;
+                    event.u8(match retry.cause {
+                        UnstartedCause::FrozenSecretUnavailable => 1,
+                        UnstartedCause::InputUnavailable => 2,
+                        UnstartedCause::StartRefused => 3,
+                        UnstartedCause::ExternalOutcomeUnknown => 4,
+                        UnstartedCause::HostRestarted => 5,
+                        UnstartedCause::OfflineReconciled => 6,
+                    });
+                    event.ts(retry.eligible_at);
+                });
+                if new_allocation {
+                    let origin = encode_allocation_origin(allocation);
+                    event.u32(origin.len() as u32);
+                    event.0.extend_from_slice(&origin);
+                }
+                if tx
+                    .open_table(EXECUTION_EVENTS)?
+                    .insert(sequence, event.0.as_slice())?
+                    .is_some()
+                    || tx
+                        .open_table(JOB_EXECUTION_EVENTS)?
+                        .insert((token.job.get(), sequence), ())?
+                        .is_some()
+                {
+                    return Ok(Some("execution event identity already exists"));
+                }
+            }
             Ok(None)
         })?;
         match outcome {
@@ -5152,6 +6592,14 @@ impl Batch {
             }
             Ok(())
         })?;
+        self.append_job_lifecycle(
+            call.job,
+            JobLifecycle::ToolEvidence {
+                request: call.request,
+                index: call.index,
+                outcome: false,
+            },
+        )?;
         if let Some(original) = approval
             && let Some(conversation) = conversation
         {
@@ -5236,6 +6684,14 @@ impl Batch {
             at: self.now,
         });
         self.put_tool_evidence(&record)?;
+        self.append_job_lifecycle(
+            call.job,
+            JobLifecycle::ToolEvidence {
+                request: call.request,
+                index: call.index,
+                outcome: true,
+            },
+        )?;
         self.insert(TOOL_STATS, record.name.as_str(), updated_stats)?;
         self.probe = Some(Probe::ToolOutcome(call));
         Ok(())
@@ -5253,6 +6709,7 @@ impl Batch {
             ));
         }
         self.require_development_write(proof)?;
+        self.require_allocation_request(proof.token(), call.request)?;
         Ok(())
     }
 }

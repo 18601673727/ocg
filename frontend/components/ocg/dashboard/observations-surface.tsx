@@ -1,15 +1,9 @@
 "use client";
 
-import type * as Api from "@/components/ocg/contracts/api";
-
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
-import { useI18n } from "../i18n";
-import { ContentContainer, ContentHeader } from "../layout/content-container";
-import { HealthChart, ReliabilityChart, UsageChart } from "./chart";
-import { LoadMore } from "../primitives/load-more";
-import { ListStatus } from "../primitives/list-status";
+
+import type * as Api from "@/components/ocg/contracts/api";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import {
   Select,
   SelectContent,
@@ -17,6 +11,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+
+import { useI18n } from "../i18n";
+import { ContentContainer, ContentHeader } from "../layout/content-container";
+import { LoadMore } from "../primitives/load-more";
+import { ListStatus } from "../primitives/list-status";
+import type { HttpControlClient } from "../runtime/control-client";
+
+import { HealthChart, ReliabilityChart, UsageChart } from "./chart";
 
 type Usage = Api.Usage["observations"][number];
 type Availability = Api.Availability["observations"][number];
@@ -28,7 +30,7 @@ export function ObservationsSurface({
   health,
   onJob,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   kind: "usage" | "health";
   health: Api.Health | null;
   onJob: (job: string) => void;

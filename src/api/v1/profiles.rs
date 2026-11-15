@@ -16,8 +16,8 @@ use crate::db::entities::{
     Violation,
 };
 use crate::db::entities::{
-    FrozenHeaders, HeaderError, HeaderScope, OutboundHeader, OutboundHeaderValue, canonical_name,
-    merge, validate_fields, validate_value,
+    FrozenHeaders, HeaderError, HeaderScope, OutboundHeader, OutboundHeaderValue, merge,
+    normalize_name, validate_fields, validate_value,
 };
 use crate::db::mutations::{
     HeaderChange, HeaderEdit, HeaderEditValue, ImportModelsSave, ModelProfileDefinition,
@@ -614,7 +614,7 @@ async fn plan_headers(
             let mut edits = Vec::with_capacity(inputs.len());
             let mut fields = Vec::with_capacity(inputs.len());
             for (index, input) in inputs.into_iter().enumerate() {
-                let name = canonical_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
+                let name = normalize_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
                 let value = input.value.filter(|value| !value.is_empty());
                 if let Some(value) = &value {
                     validate_value(value).map_err(|e| invalid_headers(&e))?;
@@ -2011,7 +2011,7 @@ pub(super) async fn global_outbound_headers(
             if input.secret {
                 return Err(invalid_headers(&HeaderError::GlobalSecret));
             }
-            let name = canonical_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
+            let name = normalize_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
             let value = input
                 .value
                 .filter(|value| !value.is_empty())

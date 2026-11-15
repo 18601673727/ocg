@@ -19,7 +19,7 @@ import {
   bindComposerContext,
   confirmMutableComposerNavigation,
 } from "../chat/mutable-composer";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
 import { useI18n } from "../i18n";
 import { PageTitleVisibilityContext } from "./page-title";
@@ -100,7 +100,7 @@ function currentLocation() {
 }
 
 type AppShellProps = {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   health: Health | null;
   sessionExpiresAtUs: number | null;
   signingOut: boolean;
@@ -477,7 +477,7 @@ function AppShellContent({
           : undefined
       }
       runtimeStatus={runtime.snapshot.status}
-      runtimeAuthority="canonical"
+      runtimeAuthority="control"
       activeView={location.view}
       onNavigate={(view) => go(view)}
       onSettingsClick={() => go("settings")}

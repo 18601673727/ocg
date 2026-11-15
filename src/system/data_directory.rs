@@ -6,6 +6,31 @@ use std::path::{Path, PathBuf};
 pub const DATA_DIRECTORY_VARIABLE: &str = "OCG_DATA_DIR";
 pub(crate) const DATABASE_LOCK_FILE: &str = ".ocg-database.lock";
 
+#[cfg(unix)]
+pub fn resolve_path(path: &Path) -> io::Result<PathBuf> {
+    use std::ffi::{CStr, CString, OsString};
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let input = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))?;
+    // The operating system allocates this buffer; release it after copying the path.
+    let resolved = unsafe { libc::realpath(input.as_ptr(), std::ptr::null_mut()) };
+    if resolved.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let bytes = unsafe { CStr::from_ptr(resolved) }.to_bytes().to_vec();
+    unsafe { libc::free(resolved.cast()) };
+    Ok(PathBuf::from(OsString::from_vec(bytes)))
+}
+
+#[cfg(not(unix))]
+pub fn resolve_path(_path: &Path) -> io::Result<PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "unsupported platform",
+    ))
+}
+
 pub(crate) fn lock_database(directory: &Path) -> io::Result<std::fs::File> {
     let path = directory.join(DATABASE_LOCK_FILE);
     let mut options = OpenOptions::new();
@@ -89,12 +114,10 @@ impl DataDirectory {
     pub fn bootstrap(root: OsString) -> Result<Self, DataDirectoryError> {
         let root = PathBuf::from(root);
         create_directory(&root)?;
-        let root = root
-            .canonicalize()
-            .map_err(|source| DataDirectoryError::Io {
-                path: root.clone(),
-                source,
-            })?;
+        let root = resolve_path(&root).map_err(|source| DataDirectoryError::Io {
+            path: root.clone(),
+            source,
+        })?;
         make_private(&root)?;
 
         let data_directory = Self { root };
@@ -110,12 +133,10 @@ impl DataDirectory {
 
     pub fn existing(root: impl Into<PathBuf>) -> Result<Self, DataDirectoryError> {
         let named = root.into();
-        let root = named
-            .canonicalize()
-            .map_err(|source| DataDirectoryError::Io {
-                path: named.clone(),
-                source,
-            })?;
+        let root = resolve_path(&named).map_err(|source| DataDirectoryError::Io {
+            path: named.clone(),
+            source,
+        })?;
         let metadata =
             std::fs::symlink_metadata(&root).map_err(|source| DataDirectoryError::Io {
                 path: root.clone(),

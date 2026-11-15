@@ -26,7 +26,7 @@ const UNSUPPORTED_IMAGE_TYPE: Refusal = Refusal::new(
 const MALFORMED_IMAGE_DATA: Refusal = Refusal::new(
     StatusCode::BAD_REQUEST,
     "malformed_image_data",
-    "data_base64 is not canonical standard base64; nothing was stored",
+    "data_base64 is not standard base64; nothing was stored",
 );
 const IMAGE_TOO_LARGE: Refusal = Refusal::new(
     StatusCode::PAYLOAD_TOO_LARGE,

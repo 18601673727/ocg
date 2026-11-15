@@ -167,7 +167,7 @@ export function executionActivity(execution: JobExecution | null | undefined): A
   if (!execution) return [];
   const steps: ActivityStep[] = [];
   const calls = execution.calls
-    .filter((call) => call.attemptGeneration === execution.generation)
+    .filter((call) => call.generation === execution.generation)
     .sort(
       (left, right) => left.createdAt - right.createdAt || left.callId.localeCompare(right.callId),
     );

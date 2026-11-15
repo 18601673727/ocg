@@ -1,3 +1,4 @@
+use crate::system::data_directory::resolve_path;
 use std::path::{Path, PathBuf};
 
 use ntex::http::StatusCode;
@@ -20,7 +21,7 @@ pub(super) struct Asset {
 
 impl UiAssets {
     pub(super) fn open(directory: &Path) -> Result<Self, std::io::Error> {
-        let root = std::fs::canonicalize(directory)?;
+        let root = resolve_path(directory)?;
         if !root.is_dir() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotADirectory,
@@ -56,7 +57,7 @@ fn serve_file(root: &std::path::Path, path: &str) -> Result<Asset, Refusal> {
 fn file_under(root: &std::path::Path, relative: &str) -> Result<(PathBuf, bool), Refusal> {
     for candidate in candidates(relative) {
         let path = root.join(&candidate);
-        let Ok(resolved) = std::fs::canonicalize(&path) else {
+        let Ok(resolved) = resolve_path(&path) else {
             continue;
         };
         if !resolved.starts_with(root) {

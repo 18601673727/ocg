@@ -14,7 +14,7 @@ import {
 } from "@/components/ui/dialog";
 import type { ControlProfilesSnapshot } from "../contracts";
 import type { ProviderModel as ControlProviderModel } from "../contracts/api";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { HttpControlClient } from "../runtime/control-client";
 import { useI18n } from "../i18n";
 import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { describeError } from "./settings-parts";
@@ -30,7 +30,7 @@ export function ProviderModelImport({
   snapshot,
   onImported,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   snapshot: ControlProfilesSnapshot | null;
   onImported: (message: string) => void;
 }) {
@@ -42,7 +42,7 @@ function ImportContent({
   snapshot,
   onImported,
 }: {
-  client: HttpCanonicalControlClient;
+  client: HttpControlClient;
   snapshot: ControlProfilesSnapshot | null;
   onImported: (message: string) => void;
 }) {

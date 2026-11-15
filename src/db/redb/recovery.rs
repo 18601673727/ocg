@@ -291,7 +291,7 @@ pub(crate) fn verify_recovered(
                 .map(|row| transactions::decode_pool_allocation(state.job_id.get(), row.value()))
                 .transpose()?
                 .is_some_and(|allocation| allocation.holds_capacity());
-            if !retained {
+            if !retained && !stopped_retry_unknown(&tx, &state)? {
                 return Err(StorageError::corrupted(format!(
                     "{} is unresolved Unknown without a retained held Allocation",
                     state.job_id
@@ -354,10 +354,6 @@ pub(crate) struct ResidualOwnership {
 }
 
 impl ResidualOwnership {
-    fn unresolved(&self) -> bool {
-        !self.held.is_empty() || !self.retained_unknown.is_empty()
-    }
-
     fn facts(&self) -> serde_json::Value {
         let ids = |set: &std::collections::BTreeSet<u128>| {
             set.iter()
@@ -436,7 +432,7 @@ fn residual_ownership_in(tx: &ReadTransaction) -> Result<ResidualOwnership, Stor
         }
         if resolved_unknown_ownership(tx, &state)? {
             ownership.resolved_unknown.insert(key.value());
-        } else if ownership.held.contains(&key.value()) {
+        } else if ownership.held.contains(&key.value()) || stopped_retry_unknown(tx, &state)? {
             ownership.retained_unknown.insert(key.value());
         } else {
             return Err(StorageError::corrupted(format!(
@@ -446,6 +442,80 @@ fn residual_ownership_in(tx: &ReadTransaction) -> Result<ResidualOwnership, Stor
         }
     }
     Ok(ownership)
+}
+
+fn stopped_retry_unknown(tx: &ReadTransaction, state: &JobState) -> Result<bool, StorageError> {
+    use crate::db::entities::{AllocationPhase, OutcomeCause, UncertaintyReason};
+    if !state.outcome.as_ref().is_some_and(|outcome| {
+        outcome.kind == OutcomeKind::Unknown
+            && outcome.cause
+                == Some(OutcomeCause::Uncertain(
+                    UncertaintyReason::StopRequestedWithoutConfirmedTermination,
+                ))
+    }) {
+        return Ok(false);
+    }
+    let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+    let Some(row) = allocations.get(state.job_id.get())? else {
+        return Ok(false);
+    };
+    let allocation = transactions::decode_pool_allocation(state.job_id.get(), row.value())?;
+    if allocation.phase != AllocationPhase::Released
+        || tx.open_table(PENDING)?.get(state.job_id.get())?.is_some()
+    {
+        return Ok(false);
+    }
+    let jobs = tx.open_table(JOBS)?;
+    let Some(row) = jobs.get(state.job_id.get())? else {
+        return Ok(false);
+    };
+    let job = transactions::decode_mutable_job(state.job_id.get(), row.value())?;
+    let Some(submitted) = job.submitted_at else {
+        return Ok(false);
+    };
+    let ready = tx.open_table(MUTABLE_READY)?;
+    let prefix = (
+        transactions::mutable_priority(job.input.priority),
+        submitted.as_unix_micros(),
+        state.job_id.get(),
+    );
+    if ready
+        .range((prefix.0, prefix.1, prefix.2, 0)..=(prefix.0, prefix.1, prefix.2, u16::MAX))?
+        .next()
+        .transpose()?
+        .is_some()
+        || tx.open_table(UNSETTLED)?.get(state.job_id.get())?.is_none()
+    {
+        return Ok(false);
+    }
+    if tx
+        .open_table(REQUEST_EVENTS)?
+        .range((state.job_id.get(), 0, 0)..=(state.job_id.get(), u32::MAX, u32::MAX))?
+        .next()
+        .transpose()?
+        .is_none()
+    {
+        return Ok(false);
+    }
+    let index = tx.open_table(JOB_EXECUTION_EVENTS)?;
+    let Some((key, _)) = index
+        .range((state.job_id.get(), 0)..=(state.job_id.get(), u128::MAX))?
+        .next_back()
+        .transpose()?
+    else {
+        return Ok(false);
+    };
+    let sequence = key.value().1;
+    let events = tx.open_table(EXECUTION_EVENTS)?;
+    let Some(row) = events.get(sequence)? else {
+        return Ok(false);
+    };
+    let (job, generation, phase, _, retry, _) =
+        transactions::decode_execution_event(sequence, row.value())?;
+    Ok(job == state.job_id
+        && generation == allocation.token.generation.get()
+        && phase == AllocationPhase::Released
+        && retry.is_some())
 }
 
 pub(crate) struct ReservedResidual {
@@ -460,17 +530,10 @@ pub(crate) fn verify_reserved_residual(
     startup_metadata(&tx)?;
     check_records(&tx)?;
     let ownership = residual_ownership_in(&tx)?;
-    let must_refuse =
-        !ExecutionControl::RecoveryAndRedispatch.is_enabled() && ownership.unresolved();
-    let normal_startup_accepts = match (refuse_unresolved_ownership(&tx), must_refuse) {
-        (Ok(()), false) => true,
-        (Err(error), true) if error.kind == StorageErrorKind::Other => false,
-        (Err(error), _) => return Err(error),
-        (Ok(()), true) => {
-            return Err(StorageError::corrupted(
-                "normal startup would accept ownership that is still unresolved",
-            ));
-        }
+    let normal_startup_accepts = match refuse_unresolved_ownership(&tx) {
+        Ok(()) => true,
+        Err(error) if error.kind == StorageErrorKind::Other => false,
+        Err(error) => return Err(error),
     };
     drop(tx);
     if normal_startup_accepts {
@@ -496,6 +559,9 @@ fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
         JOBS.name(),
         JOB_STATES.name(),
         POOL_ALLOCATIONS.name(),
+        EXECUTION_EVENTS.name(),
+        JOB_EXECUTION_EVENTS.name(),
+        JOB_LIFECYCLE_EVENTS.name(),
         JOB_OUTPUTS.name(),
         SUBMISSIONS.name(),
         ATTACHMENTS.name(),
@@ -516,12 +582,10 @@ fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
         ACTIVE_ALLOCATIONS.name(),
         ALLOCATION_REQUESTS.name(),
         DRAFT_CONTEXTS.name(),
-        JOB_ALLOCATIONS.name(),
         CONVERSATIONS.name(),
         TURNS.name(),
         PENDING.name(),
         MUTABLE_READY.name(),
-        DELAYED.name(),
         DEPENDENCY_WAITERS.name(),
         UNSETTLED.name(),
         CHILDREN.name(),
@@ -529,10 +593,8 @@ fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
         CONVERSATION_SEARCH.name(),
         CHILD_GROUPS.name(),
         LIVE_CHILDREN.name(),
-        USER_INPUT_AT.name(),
         ACTIVE_JOBS.name(),
         GROUP_RESULTS.name(),
-        NOTICE_READ.name(),
         TOOL_CALL_IDS.name(),
         TOOL_STATS.name(),
         USAGE_TOTALS.name(),
@@ -561,7 +623,7 @@ fn check_record_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
     macro_rules! headers {
         ($($table:ident => $tags:expr),+ $(,)?) => { $(check_preflight_table(tx, $table, $tags)?;)+ };
     }
-    headers!(CONFIGS => &[1,40,41], JOBS => &[2,53], JOB_STATES => &[3], JOB_INPUTS => &[11,52], POOL_ALLOCATIONS => &[42]);
+    headers!(CONFIGS => &[1,40,41], JOBS => &[2,53], JOB_STATES => &[3], JOB_INPUTS => &[11,52], POOL_ALLOCATIONS => &[42], EXECUTION_EVENTS => &[44,45]);
     headers!(JOB_OUTPUTS => &[4], SUBMISSIONS => &[5], ATTACHMENTS => &[6], TOOL_CALLS => &[7],
         REQUEST_EVENTS => &[8], PROJECTS => &[9], JOB_CONTROLS => &[10], NOTICES => &[12],
         RECURRENCES => &[13], APPROVALS => &[15]);
@@ -592,7 +654,10 @@ fn allocations_are_quiet(tx: &ReadTransaction) -> Result<bool, StorageError> {
         }
         _ => return Ok(false),
     };
-    let Ok(computed) = indexes::compute_allocation_indexes(&allocations, &configs) else {
+    let Ok(events) = tx.open_table(EXECUTION_EVENTS) else {
+        return Ok(false);
+    };
+    let Ok(computed) = indexes::compute_allocation_indexes(&allocations, &configs, &events) else {
         return Ok(false);
     };
     Ok(computed.active.is_empty()
@@ -615,7 +680,13 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
             ));
         }
     };
-    if !indexes::allocation_indexes_agree(&allocations, &configs, &active, &requests)? {
+    if !indexes::allocation_indexes_agree(
+        &allocations,
+        &configs,
+        &active,
+        &requests,
+        &tx.open_table(EXECUTION_EVENTS)?,
+    )? {
         return Err(StorageError::corrupted(
             "the Allocation indexes differ from their source rows",
         ));
@@ -726,13 +797,33 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
 
 fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError> {
     if !ExecutionControl::RecoveryAndRedispatch.is_enabled() {
+        let epoch = {
+            let meta = tx.open_table(META)?;
+            let value = meta
+                .get("open_epoch")?
+                .ok_or_else(|| StorageError::corrupted("missing open epoch"))?;
+            u64::from_le_bytes(
+                value
+                    .value()
+                    .try_into()
+                    .map_err(|_| StorageError::corrupted("invalid open epoch"))?,
+            )
+        };
         let mut held = 0u64;
         match tx.open_table(POOL_ALLOCATIONS) {
             Ok(table) => {
                 for entry in table.iter()? {
                     let (key, value) = entry?;
-                    if transactions::decode_pool_allocation(key.value(), value.value())?
-                        .holds_capacity()
+                    let allocation =
+                        transactions::decode_pool_allocation(key.value(), value.value())?;
+                    if allocation.holds_capacity() && allocation.token.epoch != epoch {
+                        return Err(StorageError::corrupted(
+                            "held Allocation belongs to a different database epoch",
+                        ));
+                    }
+                    if allocation.holds_capacity()
+                        && !transactions::recoverable_interrupted_allocation(tx, &allocation)?
+                        && transactions::recoverable_confirmed_answer(tx, &allocation)?.is_none()
                     {
                         held += 1;
                     }
@@ -752,6 +843,7 @@ fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError>
                         .as_ref()
                         .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
                         && !resolved_unknown_ownership(tx, &state)?
+                        && !stopped_retry_unknown(tx, &state)?
                     {
                         unknown += 1;
                     }
@@ -937,7 +1029,11 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
             )));
         }
     }
-    for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
+    let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+    let execution_events = tx.open_table(EXECUTION_EVENTS)?;
+    let event_index = tx.open_table(JOB_EXECUTION_EVENTS)?;
+    let lifecycle_index = tx.open_table(JOB_LIFECYCLE_EVENTS)?;
+    for entry in allocations.iter()? {
         let (key, value) = entry?;
         let allocation = transactions::decode_pool_allocation(key.value(), value.value())?;
         let Some(job_row) = jobs.get(allocation.token.job.get())? else {
@@ -957,6 +1053,368 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
                 "pool_allocation references missing executor config",
             ));
         }
+        let origin_key = (
+            allocation.token.job.get(),
+            allocation.token.generation.get(),
+        );
+        let created = transactions::allocation_origin(&event_index, &execution_events, origin_key)?
+            .ok_or_else(|| StorageError::corrupted("Allocation references a missing Allocation"))?;
+        if created.token != allocation.token
+            || created.request_id != allocation.request_id
+            || created.claimed_at != allocation.claimed_at
+            || created.job_revision != allocation.job_revision
+            || created.host_id != allocation.host_id
+            || created.boot_id != allocation.boot_id
+            || created.pool_revision != allocation.pool_revision
+            || created.executor_revision != allocation.executor_revision
+            || created.operation != allocation.operation
+            || created.protocol != allocation.protocol
+            || created.request_after != allocation.request_after
+        {
+            return Err(StorageError::corrupted(
+                "Allocation disagrees with Allocation creation",
+            ));
+        }
+    }
+    let mut latest = std::collections::BTreeMap::new();
+    let mut lifecycle: std::collections::BTreeMap<u128, (bool, bool, Option<JobState>)> =
+        std::collections::BTreeMap::new();
+    let mut request_refs = std::collections::BTreeSet::new();
+    let mut tool_refs = std::collections::BTreeSet::new();
+    let mut output_refs = std::collections::BTreeSet::new();
+    let mut current_owner: std::collections::BTreeMap<
+        u128,
+        (
+            u32,
+            crate::db::entities::AllocationPhase,
+            Option<crate::db::entities::UnstartedRetry>,
+        ),
+    > = std::collections::BTreeMap::new();
+    let mut last_sequence = 0u128;
+    for entry in execution_events.iter()? {
+        use crate::db::entities::AllocationPhase;
+        let (key, value) = entry?;
+        let sequence = key.value();
+        if sequence
+            != last_sequence
+                .checked_add(1)
+                .ok_or_else(|| StorageError::corrupted("execution event sequence overflow"))?
+        {
+            return Err(StorageError::corrupted(
+                "execution event sequence is not contiguous",
+            ));
+        }
+        if value.value().first() == Some(&45) {
+            use transactions::JobLifecycle;
+            let (job, _at, event) = transactions::decode_job_lifecycle(sequence, value.value())?;
+            require_job_exists(&jobs, job.get(), "Job lifecycle event")?;
+            if lifecycle_index.get((job.get(), sequence))?.is_none() {
+                return Err(StorageError::corrupted(
+                    "Job lifecycle event index is missing",
+                ));
+            }
+            let state = lifecycle.entry(job.get()).or_default();
+            match event {
+                JobLifecycle::Created if !state.0 && !state.1 && state.2.is_none() => {
+                    state.0 = true
+                }
+                JobLifecycle::Submitted if !state.1 && state.2.is_none() => state.1 = true,
+                JobLifecycle::Waiting | JobLifecycle::Eligible if state.1 && state.2.is_none() => {}
+                JobLifecycle::Outcome(outcome)
+                    if state.2.as_ref().is_none_or(|old| {
+                        old.outcome
+                            .as_ref()
+                            .is_some_and(|record| record.kind == OutcomeKind::Unknown)
+                    }) =>
+                {
+                    state.2 = Some(outcome)
+                }
+                JobLifecycle::RequestEvidence { request, seq } if state.1 && state.2.is_none() => {
+                    let key = (job.get(), request.get(), seq);
+                    if !request_refs.insert(key)
+                        || tx.open_table(REQUEST_EVENTS)?.get(key)?.is_none()
+                    {
+                        return Err(StorageError::corrupted(
+                            "invalid request evidence reference",
+                        ));
+                    }
+                }
+                JobLifecycle::ToolEvidence {
+                    request,
+                    index,
+                    outcome,
+                } if state.1 && state.2.is_none() => {
+                    let key = (job.get(), request.get(), index);
+                    let calls = tx.open_table(TOOL_CALLS)?;
+                    let value = calls.get(key)?.ok_or_else(|| {
+                        StorageError::corrupted("tool event references missing evidence")
+                    })?;
+                    let call = crate::db::entities::ToolCallRef {
+                        job,
+                        request,
+                        index,
+                    };
+                    let record = rows::decode_tool_evidence(call, value.value())?;
+                    if !tool_refs.insert((job.get(), request.get(), index, outcome))
+                        || outcome && record.outcome.is_none()
+                    {
+                        return Err(StorageError::corrupted("invalid tool evidence reference"));
+                    }
+                }
+                JobLifecycle::Output { seq } => {
+                    let key = (job.get(), seq);
+                    let outputs = tx.open_table(JOB_OUTPUTS)?;
+                    let value = outputs.get(key)?.ok_or_else(|| {
+                        StorageError::corrupted("output event references missing evidence")
+                    })?;
+                    let output = rows::decode_output(key, value.value())?;
+                    if !output_refs.insert(key)
+                        || state.2.is_some() && output.kind != OutputKind::Result
+                    {
+                        return Err(StorageError::corrupted("invalid output evidence reference"));
+                    }
+                }
+                JobLifecycle::DependencySettled { prerequisite }
+                    if state.1 && state.2.is_none() =>
+                {
+                    require_job_exists(&jobs, prerequisite.get(), "dependency event")?;
+                    if tx
+                        .open_table(DEPENDENCY_WAITERS)?
+                        .get((prerequisite.get(), job.get()))?
+                        .is_none()
+                    {
+                        return Err(StorageError::corrupted(
+                            "dependency event has no waiter relationship",
+                        ));
+                    }
+                }
+                _ => return Err(StorageError::corrupted("invalid Job lifecycle transition")),
+            }
+            last_sequence = sequence;
+            continue;
+        }
+        let (job, generation, phase, at, retry, origin) =
+            transactions::decode_execution_event(sequence, value.value())?;
+        if lifecycle
+            .get(&job.get())
+            .is_none_or(|state| !state.1 || phase == AllocationPhase::Reserved && state.2.is_some())
+        {
+            return Err(StorageError::corrupted(
+                "Allocation exists before submission or after settlement",
+            ));
+        }
+        let origin_key = (job.get(), generation);
+        if (phase == AllocationPhase::Reserved && origin.is_none())
+            || (phase != AllocationPhase::Reserved && origin.is_some())
+            || event_index.get((job.get(), sequence))?.is_none()
+        {
+            return Err(StorageError::corrupted(
+                "execution event reference is missing",
+            ));
+        }
+        let previous = latest.insert(origin_key, phase);
+        let valid = matches!(
+            (previous, phase),
+            (None, AllocationPhase::Reserved)
+                | (
+                    Some(AllocationPhase::Reserved),
+                    AllocationPhase::Running
+                        | AllocationPhase::StopRequested
+                        | AllocationPhase::Uncertain
+                        | AllocationPhase::Released
+                )
+                | (
+                    Some(AllocationPhase::Running),
+                    AllocationPhase::StopRequested
+                        | AllocationPhase::Uncertain
+                        | AllocationPhase::Released
+                )
+                | (
+                    Some(AllocationPhase::StopRequested),
+                    AllocationPhase::Uncertain | AllocationPhase::Released
+                )
+                | (Some(AllocationPhase::Uncertain), AllocationPhase::Released)
+        );
+        if !valid {
+            return Err(StorageError::corrupted(
+                "invalid execution event transition",
+            ));
+        }
+        if retry.is_some_and(|plan| {
+            generation >= 3
+                || match plan.cause {
+                    crate::db::entities::UnstartedCause::ExternalOutcomeUnknown => {
+                        previous != Some(AllocationPhase::Running)
+                    }
+                    crate::db::entities::UnstartedCause::HostRestarted => !matches!(
+                        previous,
+                        Some(AllocationPhase::Reserved | AllocationPhase::Running)
+                    ),
+                    crate::db::entities::UnstartedCause::FrozenSecretUnavailable
+                    | crate::db::entities::UnstartedCause::InputUnavailable
+                    | crate::db::entities::UnstartedCause::StartRefused => {
+                        previous != Some(AllocationPhase::Reserved)
+                    }
+                    crate::db::entities::UnstartedCause::OfflineReconciled => true,
+                }
+        }) {
+            return Err(StorageError::corrupted("invalid unstarted retry event"));
+        }
+        match current_owner.get(&job.get()) {
+            None if generation == 1 && phase == AllocationPhase::Reserved => {}
+            Some((current_generation, _, _)) if *current_generation == generation => {}
+            Some((current_generation, AllocationPhase::Released, Some(plan)))
+                if current_generation.checked_add(1) == Some(generation)
+                    && phase == AllocationPhase::Reserved
+                    && at >= plan.eligible_at => {}
+            _ => {
+                return Err(StorageError::corrupted(
+                    "conflicting or out-of-order Allocation ownership",
+                ));
+            }
+        }
+        current_owner.insert(job.get(), (generation, phase, retry));
+        last_sequence = sequence;
+    }
+    let stored_sequence = tx
+        .open_table(SEQUENCES)?
+        .get("execution_event")?
+        .map_or(0, |value| value.value());
+    if stored_sequence != last_sequence {
+        return Err(StorageError::corrupted(
+            "execution event sequence disagrees with history",
+        ));
+    }
+    for entry in event_index.iter()? {
+        let (key, _) = entry?;
+        let (job, sequence) = key.value();
+        let event = execution_events.get(sequence)?.ok_or_else(|| {
+            StorageError::corrupted("execution event index references a missing event")
+        })?;
+        if transactions::decode_execution_event(sequence, event.value())?
+            .0
+            .get()
+            != job
+        {
+            return Err(StorageError::corrupted(
+                "execution event index names another Job",
+            ));
+        }
+    }
+    for entry in lifecycle_index.iter()? {
+        let (key, _) = entry?;
+        let (job, sequence) = key.value();
+        let event = execution_events.get(sequence)?.ok_or_else(|| {
+            StorageError::corrupted("Job lifecycle index references missing event")
+        })?;
+        if transactions::decode_job_lifecycle(sequence, event.value())?
+            .0
+            .get()
+            != job
+        {
+            return Err(StorageError::corrupted(
+                "Job lifecycle index names another Job",
+            ));
+        }
+    }
+    for entry in jobs.iter()? {
+        let (key, value) = entry?;
+        if value.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
+            let id = key.value();
+            let projected = states
+                .get(id)?
+                .ok_or_else(|| StorageError::corrupted("Group state is missing"))?;
+            let projected = JobState::decode_at(id, projected.value())?;
+            let (created, submitted, outcome) = lifecycle
+                .get(&id)
+                .ok_or_else(|| StorageError::corrupted("Group has no lifecycle history"))?;
+            if !*created
+                || *submitted
+                || outcome.as_ref().and_then(|state| state.outcome.as_ref())
+                    != projected.outcome.as_ref()
+            {
+                return Err(StorageError::corrupted(
+                    "Group state disagrees with lifecycle history",
+                ));
+            }
+            continue;
+        }
+        let id = key.value();
+        let job = match transactions::decode_mutable_job(id, value.value()) {
+            Ok(job) => job,
+            Err(error) => {
+                if JobSpec::decode_at(id, value.value()).is_ok() {
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let projected = states
+            .get(id)?
+            .ok_or_else(|| StorageError::corrupted("Job state is missing"))?;
+        let projected = JobState::decode_at(id, projected.value())?;
+        let (created, submitted, outcome) = lifecycle
+            .get(&id)
+            .ok_or_else(|| StorageError::corrupted("Job has no lifecycle history"))?;
+        if (!*created && !*submitted)
+            || *submitted != job.submitted_at.is_some()
+            || outcome.as_ref().and_then(|state| state.outcome.as_ref())
+                != projected.outcome.as_ref()
+        {
+            return Err(StorageError::corrupted(
+                "Job state disagrees with lifecycle history",
+            ));
+        }
+        reader::mutable_job_record_in(tx, JobId::new(id))?
+            .ok_or_else(|| StorageError::corrupted("mutable Job cannot be replayed"))?;
+    }
+    let mut previous_origin: Option<(u128, u32)> = None;
+    for (&origin_key, phase) in &latest {
+        let expected_generation = match previous_origin {
+            Some((job, generation)) if job == origin_key.0 => generation.checked_add(1),
+            _ => Some(1),
+        };
+        if expected_generation != Some(origin_key.1) {
+            return Err(StorageError::corrupted(
+                "Allocation generations are not contiguous",
+            ));
+        }
+        let token = transactions::allocation_origin(&event_index, &execution_events, origin_key)?
+            .ok_or_else(|| StorageError::corrupted("Allocation has no reservation event"))?
+            .token;
+        require_job_exists(&jobs, token.job.get(), "Allocation")?;
+        let pool = configs
+            .get(token.pool.get())?
+            .ok_or_else(|| StorageError::corrupted("historical Allocation has no Pool"))?;
+        transactions::decode_allocation_pool(token.pool.get(), pool.value())?;
+        let executor = configs
+            .get(token.executor.get())?
+            .ok_or_else(|| StorageError::corrupted("historical Allocation has no Executor"))?;
+        let executor =
+            transactions::decode_allocation_executor(token.executor.get(), executor.value())?;
+        if executor.pool != token.pool {
+            return Err(StorageError::corrupted(
+                "historical Allocation Executor belongs to another Pool",
+            ));
+        }
+        let current = allocations
+            .get(token.job.get())?
+            .ok_or_else(|| StorageError::corrupted("Allocation has no Allocation projection"))?;
+        let current = transactions::decode_pool_allocation(token.job.get(), current.value())?;
+        if current.token == token && current.phase != *phase {
+            return Err(StorageError::corrupted(
+                "Allocation phase disagrees with execution events",
+            ));
+        }
+        if current.token != token
+            && (current.token.generation.get() <= token.generation.get()
+                || *phase != crate::db::entities::AllocationPhase::Released)
+        {
+            return Err(StorageError::corrupted(
+                "historical Allocation has conflicting ownership",
+            ));
+        }
+        previous_origin = Some(origin_key);
     }
     for entry in tx.open_table(SUBMISSIONS)?.iter()? {
         let (key, value) = entry?;
@@ -968,6 +1426,9 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
         let output_key = key.value();
         let output = rows::decode_output(output_key, value.value())?;
         require_job_exists(&jobs, output_key.0, "job_output")?;
+        if lifecycle.contains_key(&output_key.0) && !output_refs.contains(&output_key) {
+            return Err(StorageError::corrupted("Job output has no lifecycle event"));
+        }
         if output.kind == OutputKind::Result {
             let state = states
                 .get(output_key.0)?
@@ -989,20 +1450,83 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
         rows::decode_attachment(key.value(), value.value())?;
     }
     let tool_calls = tx.open_table(TOOL_CALLS)?;
+    let request_events = tx.open_table(REQUEST_EVENTS)?;
     for entry in tool_calls.iter()? {
         let (key, value) = entry?;
         let call = rows::tool_call_ref(key.value())?;
-        rows::decode_tool_evidence(call, value.value())?;
+        let evidence = rows::decode_tool_evidence(call, value.value())?;
+        if !tool_refs.contains(&(call.job.get(), call.request.get(), call.index, false))
+            || evidence.outcome.is_some()
+                && !tool_refs.contains(&(call.job.get(), call.request.get(), call.index, true))
+        {
+            return Err(StorageError::corrupted(
+                "tool evidence has no lifecycle event",
+            ));
+        }
         require_job_exists(&jobs, call.job.get(), "tool_call")?;
+        let sent = request_events
+            .get((call.job.get(), call.request.get(), 1))?
+            .ok_or_else(|| StorageError::corrupted("tool call has no Provider request"))?;
+        if !matches!(
+            rows::decode_request_event(call.job, call.request, 1, sent.value())?.payload,
+            crate::db::entities::RequestPayload::Sent { .. }
+        ) {
+            return Err(StorageError::corrupted(
+                "tool call has no send authorization",
+            ));
+        }
     }
-    let request_events = tx.open_table(REQUEST_EVENTS)?;
+    let mut last_request: Option<(u128, u32, u32)> = None;
     for entry in request_events.iter()? {
         let (key, value) = entry?;
         let (job_u128, request_u32, seq) = key.value();
         let request = crate::db::entities::RequestNumber::new(request_u32)
             .ok_or_else(|| StorageError::corrupted("invalid request number in request_event"))?;
-        rows::decode_request_event(JobId::new(job_u128), request, seq, value.value())?;
+        let event = rows::decode_request_event(JobId::new(job_u128), request, seq, value.value())?;
+        if !request_refs.contains(&(job_u128, request_u32, seq)) {
+            return Err(StorageError::corrupted(
+                "request evidence has no lifecycle event",
+            ));
+        }
         require_job_exists(&jobs, job_u128, "request_event")?;
+        if let crate::db::entities::RequestPayload::Sent {
+            allocation_generation,
+            ..
+        } = event.payload
+        {
+            let expected = match last_request {
+                Some((job, previous, generation)) if job == job_u128 => {
+                    if allocation_generation.get() < generation {
+                        return Err(StorageError::corrupted(
+                            "request Allocation generation moved backwards",
+                        ));
+                    }
+                    previous.checked_add(1)
+                }
+                _ => Some(1),
+            };
+            if seq != 1
+                || expected != Some(request_u32)
+                || transactions::allocation_origin(
+                    &event_index,
+                    &execution_events,
+                    (job_u128, allocation_generation.get()),
+                )?
+                .is_none()
+            {
+                return Err(StorageError::corrupted(
+                    "request references an invalid Allocation or sequence",
+                ));
+            }
+            last_request = Some((job_u128, request_u32, allocation_generation.get()));
+        } else if seq == 1
+            || !last_request
+                .is_some_and(|(job, number, _)| job == job_u128 && number == request_u32)
+        {
+            return Err(StorageError::corrupted(
+                "request evidence has no send authorization",
+            ));
+        }
     }
     for entry in tx.open_table(REQUEST_TIMELINE)?.iter()? {
         let (key, _) = entry?;
@@ -1226,14 +1750,6 @@ pub(super) fn initialize(
         .map_err(StorageError::from)?
         .map(|table| table.name().to_owned())
         .collect();
-    let indexes_missing = [
-        "job_observation",
-        "content_reference",
-        "content_reclaim",
-        "request_timeline",
-    ]
-    .iter()
-    .any(|name| !existing.iter().any(|table| table == name));
     let empty = existing.is_empty() && tx.list_multimap_tables()?.next().is_none();
     let now = Timestamp::now();
     init_promotion_clock(now.as_unix_micros());
@@ -1317,14 +1833,10 @@ pub(super) fn initialize(
             enabled: true,
             archived: false,
             revision: 1,
-            capabilities: [
-                LlmTransport::OpenAiChatCompletions,
-                LlmTransport::OpenAiResponses,
-                LlmTransport::AnthropicMessages,
-            ]
-            .into_iter()
-            .map(|protocol| (ExecutionOperation::LlmRequest, Some(protocol)))
-            .collect(),
+            capabilities: [LlmTransport::OpenAiChatCompletions]
+                .into_iter()
+                .map(|protocol| (ExecutionOperation::LlmRequest, Some(protocol)))
+                .collect(),
         };
         batch
             .step(|tx| {
@@ -1349,7 +1861,7 @@ pub(super) fn initialize(
     let abandoned = {
         let rebuild = match verification {
             Verification::Full => true,
-            Verification::Quick => !clean_shutdown || indexes_missing,
+            Verification::Quick => !clean_shutdown,
         };
         if rebuild {
             rebuild_mutable_jobs(&mut batch).map_err(|BatchError(failure)| match failure {
@@ -1377,74 +1889,92 @@ pub(super) fn initialize(
 pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
     tx.open_table(META)?;
     tx.open_table(SEQUENCES)?;
-    tx.open_table(JOB_OBSERVATIONS)?;
-    tx.open_table(CONTENT_REFERENCES)?;
-    tx.open_table(CONTENT_RECLAIM)?;
     tx.open_table(CONFIGS)?;
     tx.open_table(CREDENTIALS)?;
     tx.open_table(JOBS)?;
-    tx.open_table(JOB_ALLOCATIONS)?;
-    tx.open_table(CONVERSATIONS)?;
-    tx.open_table(TURNS)?;
     tx.open_table(JOB_STATES)?;
+    tx.open_table(POOL_ALLOCATIONS)?;
+    tx.open_table(EXECUTION_EVENTS)?;
+    tx.open_table(JOB_EXECUTION_EVENTS)?;
+    tx.open_table(JOB_LIFECYCLE_EVENTS)?;
     tx.open_table(JOB_OUTPUTS)?;
     tx.open_table(SUBMISSIONS)?;
     tx.open_table(ATTACHMENTS)?;
     tx.open_table(TOOL_CALLS)?;
-    tx.open_table(REQUEST_EVENTS)?;
     tx.open_table(MESSAGES)?;
+    tx.open_table(REQUEST_EVENTS)?;
     tx.open_table(PROJECTS)?;
     tx.open_table(JOB_CONTROLS)?;
-    tx.open_table(PENDING)?;
-    tx.open_table(MUTABLE_READY)?;
-    tx.open_table(DELAYED)?;
-    tx.open_table(DEPENDENCY_WAITERS)?;
-    tx.open_table(UNSETTLED)?;
-    tx.open_table(POOL_ALLOCATIONS)?;
+    tx.open_table(JOB_INPUTS)?;
+    tx.open_table(NOTICES)?;
+    tx.open_table(APPROVALS)?;
+    tx.open_table(RECURRENCES)?;
+    tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
+    tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
+    tx.open_table(JOB_OBSERVATIONS)?;
+    tx.open_table(CONTENT_REFERENCES)?;
+    tx.open_table(CONTENT_RECLAIM)?;
     tx.open_table(ACTIVE_ALLOCATIONS)?;
     tx.open_table(ALLOCATION_REQUESTS)?;
     tx.open_table(DRAFT_CONTEXTS)?;
+    tx.open_table(CONVERSATIONS)?;
+    tx.open_table(TURNS)?;
+    tx.open_table(PENDING)?;
+    tx.open_table(MUTABLE_READY)?;
+    tx.open_table(DEPENDENCY_WAITERS)?;
+    tx.open_table(UNSETTLED)?;
     tx.open_table(CHILDREN)?;
     tx.open_table(SUCCESSORS)?;
-    tx.open_table(JOB_INPUTS)?;
-    tx.open_table(NOTICES)?;
     tx.open_table(CONVERSATION_SEARCH)?;
     tx.open_table(CHILD_GROUPS)?;
     tx.open_table(LIVE_CHILDREN)?;
-    tx.open_table(USER_INPUT_AT)?;
-    tx.open_table(NOTICE_READ)?;
-    tx.open_table(GROUP_RESULTS)?;
     tx.open_table(ACTIVE_JOBS)?;
+    tx.open_table(GROUP_RESULTS)?;
     tx.open_table(TOOL_CALL_IDS)?;
     tx.open_table(TOOL_STATS)?;
     tx.open_table(USAGE_TOTALS)?;
     tx.open_table(RETRIES)?;
-    tx.open_table(APPROVALS)?;
-    tx.open_table(OPEN_APPROVALS)?;
-    tx.open_table(APPROVAL_CALLS)?;
-    tx.open_table(RECURRENCES)?;
-    tx.open_table(RECURRENCE_DUE)?;
     tx.open_table(USAGE_MODEL)?;
     tx.open_table(REQUEST_TIMELINE)?;
-    tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
-    tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
+    tx.open_table(OPEN_APPROVALS)?;
+    tx.open_table(APPROVAL_CALLS)?;
+    tx.open_table(RECURRENCE_DUE)?;
     Ok(())
 }
 
 fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
     use crate::db::entities::MutableJobPhase;
+    batch.step(indexes::rebuild_allocation_indexes)?;
+    batch.step(indexes::rebuild_execution_event_indexes)?;
+    loop {
+        let interrupted = batch.step(|tx| {
+            let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
+            let Some((key, _)) = active.iter()?.next().transpose()? else {
+                return Ok(None);
+            };
+            let (_, _, job) = key.value();
+            let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+            let row = allocations
+                .get(job)?
+                .ok_or_else(|| StorageError::corrupted("active Allocation has no Allocation"))?;
+            Ok(Some(transactions::decode_pool_allocation(
+                job,
+                row.value(),
+            )?))
+        })?;
+        let Some(allocation) = interrupted else { break };
+        if batch
+            .step(|tx| transactions::recoverable_confirmed_answer(tx, &allocation))?
+            .is_some()
+        {
+            batch.recover_confirmed_answer(allocation)?;
+        } else {
+            batch.recover_interrupted_allocation(allocation)?;
+        }
+    }
     batch.step(|tx| {
-        indexes::rebuild_allocation_indexes(tx)?;
         tx.delete_table(DRAFT_CONTEXTS)?;
         tx.open_table(DRAFT_CONTEXTS)?;
-        for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
-            let (key, value) = entry?;
-            if transactions::decode_pool_allocation(key.value(), value.value())?.holds_capacity() {
-                return Err(StorageError::corrupted(
-                    "recovery is disabled and this database holds Allocations; run `ocg inspect-held`",
-                ));
-            }
-        }
         tx.delete_table(MUTABLE_READY)?;
         tx.delete_table(PENDING)?;
         tx.delete_table(CONVERSATIONS)?;
@@ -2495,7 +3025,7 @@ pub(crate) struct RecoveryAction {
 }
 
 pub(crate) struct HeldRecoveryPlan {
-    pub(crate) canonical: serde_json::Value,
+    pub(crate) normalized: serde_json::Value,
     pub(crate) digest: String,
     actions: Vec<RecoveryAction>,
     epoch: u64,
@@ -2645,7 +3175,7 @@ fn held_recovery_plan_in(
             })),
         }
     }
-    let canonical = json!({
+    let normalized = json!({
         "kind": "ocg-held-recovery-plan-v1",
         "database_format": FORMAT_VERSION,
         "record_version": FORMAT_VERSION,
@@ -2657,9 +3187,9 @@ fn held_recovery_plan_in(
         "actions": action_facts,
         "refused": refusals,
     });
-    let digest = sha256_json(&canonical)?;
+    let digest = sha256_json(&normalized)?;
     Ok(HeldRecoveryPlan {
-        canonical,
+        normalized,
         digest,
         actions,
         epoch,
@@ -3040,7 +3570,7 @@ pub(crate) fn reconcile_held_apply(
         }
         let audit = audit_held_recovery(&*database, &plan)?;
         Ok(json!({
-            "plan": plan.canonical,
+            "plan": plan.normalized,
             "plan_digest": plan.digest,
             "result": audit,
             "page_checksums": "every page checksum verified",
@@ -3157,7 +3687,7 @@ fn audit_held_recovery(
                 .get(allocation.request_id.get())
                 .map_err(StorageError::from)?
                 .map(|row| row.value())
-                != Some(job.get())
+                != Some((job.get(), allocation.token.generation.get()))
             || tx
                 .open_table(PENDING)
                 .map_err(StorageError::from)?
@@ -3226,7 +3756,7 @@ fn audit_held_recovery(
                     .map(|row| transactions::decode_pool_allocation(key.value(), row.value()))
                     .transpose()?
                     .is_some_and(|allocation| allocation.holds_capacity());
-                if !retained {
+                if !retained && !stopped_retry_unknown(&tx, &state)? {
                     return Err(ReservedRefusal::new(
                         "audit_failed",
                         format!(
@@ -3286,7 +3816,7 @@ pub(crate) fn verify_held_publication_delta(
             ));
         }
         let plan = held_recovery_plan_in(&*source_database, source_sha256)?;
-        if plan.digest != expected_digest || &plan.canonical != expected_plan {
+        if plan.digest != expected_digest || &plan.normalized != expected_plan {
             return Err(ReservedRefusal::new(
                 "plan_digest_mismatch",
                 "the prepared plan is not the exact plan authorized by the rollback source",
@@ -3325,7 +3855,7 @@ pub(crate) fn verify_held_publication_delta(
                 "byte-identical to the rollback source except authorized target and active-index deltas"
             );
             Ok(json!({
-                "plan": plan.canonical,
+                "plan": plan.normalized,
                 "plan_digest": plan.digest,
                 "result": audit,
                 "page_checksums": "every page checksum verified",
@@ -3452,21 +3982,17 @@ fn verify_unrelated_recovery_rows(
         CONTENT_RECLAIM,
         ALLOCATION_REQUESTS,
         DRAFT_CONTEXTS,
-        JOB_ALLOCATIONS,
         CONVERSATIONS,
         TURNS,
         PENDING,
         MUTABLE_READY,
-        DELAYED,
         DEPENDENCY_WAITERS,
         CHILDREN,
         SUCCESSORS,
         CONVERSATION_SEARCH,
         CHILD_GROUPS,
         LIVE_CHILDREN,
-        USER_INPUT_AT,
         ACTIVE_JOBS,
-        NOTICE_READ,
         TOOL_CALL_IDS,
         TOOL_STATS,
         USAGE_TOTALS,

@@ -165,7 +165,13 @@ pub(super) fn jobs_page_view(page: &crate::db::redb::JobSearchPage) -> JobsView 
             .items
             .iter()
             .map(|item| {
-                mutable_job_view(&item.record, item.allocation.as_ref(), item.updated_at_us)
+                mutable_job_view(
+                    &item.record,
+                    item.allocation.as_ref(),
+                    item.updated_at_us,
+                    item.last_executor,
+                    item.phase,
+                )
             })
             .collect(),
         next_before: page.next_before.map(|id| id.to_string()),
@@ -185,29 +191,18 @@ pub(super) fn mutable_title(job: &crate::db::entities::MutableJob) -> String {
     .collect()
 }
 
-fn execution_phase(
-    record: &crate::db::entities::MutableJobRecord,
-    allocation: Option<&crate::db::entities::PoolAllocation>,
-) -> ExecutionPhaseView {
-    use crate::db::entities::{AllocationPhase, MutableJobPhase, OutcomeKind};
-    if let Some(outcome) = &record.outcome {
-        return match outcome.kind {
-            OutcomeKind::Completed => ExecutionPhaseView::Completed,
-            OutcomeKind::Failed => ExecutionPhaseView::Failed,
-            OutcomeKind::Cancelled => ExecutionPhaseView::Cancelled,
-            OutcomeKind::Unknown => ExecutionPhaseView::Unknown,
-        };
-    }
-    match allocation.map(|allocation| allocation.phase) {
-        Some(AllocationPhase::Reserved) => ExecutionPhaseView::Reserved,
-        Some(AllocationPhase::Running) => ExecutionPhaseView::Running,
-        Some(AllocationPhase::StopRequested) => ExecutionPhaseView::StopRequested,
-        Some(AllocationPhase::Uncertain) => ExecutionPhaseView::Unknown,
-        Some(AllocationPhase::Released) | None => match record.job.phase {
-            MutableJobPhase::Unsubmitted => ExecutionPhaseView::Unsubmitted,
-            MutableJobPhase::Queued => ExecutionPhaseView::Queued,
-            MutableJobPhase::Executing => ExecutionPhaseView::Running,
-        },
+fn execution_phase(phase: crate::db::redb::JobReplayPhase) -> ExecutionPhaseView {
+    use crate::db::redb::JobReplayPhase;
+    match phase {
+        JobReplayPhase::Unsubmitted => ExecutionPhaseView::Unsubmitted,
+        JobReplayPhase::Waiting | JobReplayPhase::Queued => ExecutionPhaseView::Queued,
+        JobReplayPhase::Reserved => ExecutionPhaseView::Reserved,
+        JobReplayPhase::Running => ExecutionPhaseView::Running,
+        JobReplayPhase::StopRequested => ExecutionPhaseView::StopRequested,
+        JobReplayPhase::Unknown => ExecutionPhaseView::Unknown,
+        JobReplayPhase::Completed => ExecutionPhaseView::Completed,
+        JobReplayPhase::Failed => ExecutionPhaseView::Failed,
+        JobReplayPhase::Cancelled => ExecutionPhaseView::Cancelled,
     }
 }
 
@@ -215,6 +210,8 @@ pub(super) fn mutable_job_view(
     record: &crate::db::entities::MutableJobRecord,
     allocation: Option<&crate::db::entities::PoolAllocation>,
     updated_at_us: i64,
+    last_executor: Option<crate::db::entities::ExecutorId>,
+    phase: crate::db::redb::JobReplayPhase,
 ) -> JobView {
     use crate::db::entities::OutcomeKind;
     let job = &record.job;
@@ -247,9 +244,7 @@ pub(super) fn mutable_job_view(
         assigned_executor: allocation
             .filter(|allocation| allocation.holds_capacity())
             .map(|allocation| allocation.token.executor.to_string()),
-        last_executor: allocation
-            .filter(|allocation| !allocation.holds_capacity())
-            .map(|allocation| allocation.token.executor.to_string()),
+        last_executor: last_executor.map(|executor| executor.to_string()),
         created_at_us: job.created_at.as_unix_micros(),
         updated_at_us,
         started_at_us: allocation
@@ -261,7 +256,7 @@ pub(super) fn mutable_job_view(
             .as_ref()
             .map(|outcome| outcome.at.as_unix_micros()),
         settlement,
-        execution_phase: execution_phase(record, allocation),
+        execution_phase: execution_phase(phase),
         stop_confirmed_at_us: allocation
             .and_then(|allocation| allocation.stop_confirmed_at)
             .map(|time| time.as_unix_micros()),
