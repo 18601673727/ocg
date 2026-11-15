@@ -205,7 +205,6 @@ where
         .build(ntex::rt::DefaultRuntime)
         .block_on(serve(
             database.handle(),
-            data_directory.clone(),
             scope,
             server_config,
             workspace_tools,
@@ -217,10 +216,8 @@ where
     report
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn serve<F>(
     handle: DatabaseHandle,
-    _data_directory: DataDirectory,
     scope: crate::system::scheduler::ClaimScope,
     server_config: Option<ServerConfig>,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
@@ -230,14 +227,7 @@ where
     F: Future<Output = ()>,
 {
     let mut report = HostReport::default();
-    let autonomous_run = scope == crate::system::scheduler::ClaimScope::Stored
-        && crate::system::execution_features::ExecutionFeature::AutonomousScheduling.is_enabled();
-    let started = if autonomous_run {
-        ExecutionRuntime::start_autonomous(handle.clone(), scope, workspace_tools.clone())
-    } else {
-        ExecutionRuntime::start(handle.clone(), scope)
-    };
-    let execution = match started {
+    let execution = match ExecutionRuntime::start_host(handle.clone(), scope, &workspace_tools) {
         Ok(execution) => execution,
         Err(error) => {
             report.fail(Phase::Startup, error);
@@ -272,7 +262,7 @@ where
             }
             log::info!(
                 "autonomous scheduling: {}",
-                if autonomous_run {
+                if execution.is_autonomous() {
                     "enabled for stored jobs (loopback endpoints direct; external endpoints require an active scheduled external policy and grant)"
                 } else {
                     "disabled"

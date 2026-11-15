@@ -176,7 +176,7 @@ impl JobView {
     }
 }
 
-pub(super) fn jobs_page_view(page: &crate::db::redb::JobSearchPage) -> JobsView {
+pub(super) fn jobs_page_view(page: &crate::db::entities::JobSearchPage) -> JobsView {
     JobsView {
         jobs: page
             .items
@@ -436,7 +436,9 @@ fn outcome_cause(cause: &crate::db::entities::OutcomeCause) -> serde_json::Value
     }
 }
 
-fn history_event_view(item: &crate::db::redb::ExecutionHistoryItem) -> ExecutionHistoryEventView {
+fn history_event_view(
+    item: &crate::db::entities::ExecutionHistoryItem,
+) -> ExecutionHistoryEventView {
     use crate::db::entities::{Actor, DependencyState, ExecutionEventKind};
     use serde_json::json;
     let event = &item.event;

@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::db::redb;
+use crate::db::database_file;
 use crate::system::data_directory::DataDirectory;
 use crate::system::logger::{LoggerConfig, LoggerConfigError};
 use crate::system::monitor::{self, FilesystemConfig, FilesystemConfigError, ProtectionReason};
@@ -185,7 +185,7 @@ fn ensure_no_database(
     data_directory: &DataDirectory,
     path: &Path,
 ) -> Result<(), SystemPolicyError> {
-    let database = redb::database_file(data_directory.database_path());
+    let database = database_file(data_directory.database_path());
     match fs::symlink_metadata(&database) {
         Ok(_) => Err(SystemPolicyError::Missing {
             path: path.to_path_buf(),

@@ -3,7 +3,7 @@
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { useI18n } from "../i18n";
-import { type HeaderDraft, type HeaderDraftError, blankHeaderDraft } from "./header-drafts";
+import { blankHeaderDraft, type HeaderDraft, type HeaderDraftError } from "./header-drafts";
 
 export function HeadersEditor({
   value,

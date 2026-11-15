@@ -1,7 +1,7 @@
 "use client";
 
-import { useMemo, useState } from "react";
 import { FileCode2, ImageIcon } from "lucide-react";
+import { useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -10,10 +10,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
+import { useOcgRuntime } from "../runtime/runtime-context";
 import { artifactTitle, isArtifactCall, managedArtifactImages } from "./artifact-model";
-import { ArtifactPreview, type Artifact } from "./artifact-preview";
+import { type Artifact, ArtifactPreview } from "./artifact-preview";
 
 export function ConversationArtifacts({ sessionId }: { sessionId: string }) {
   const { snapshot } = useOcgRuntime();

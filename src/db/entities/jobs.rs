@@ -1114,6 +1114,16 @@ pub(crate) struct JobSpec {
     pub(crate) keep_open: bool,
 }
 
+impl JobSpec {
+    pub(crate) fn is_chunk_group(&self) -> bool {
+        self.parent_id.is_some() && self.origin == Origin::System && !self.keep_open
+    }
+
+    pub(crate) fn is_standalone_decision_group(&self) -> bool {
+        self.parent_id.is_none() && self.origin == Origin::System && !self.keep_open
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct JobState {
     pub(crate) job_id: JobId,
@@ -1158,4 +1168,79 @@ pub(crate) struct JobClosing {
     pub(crate) at: Timestamp,
     pub(crate) by: Actor,
     pub(crate) running: bool,
+}
+
+pub(crate) struct NativeJobItem {
+    pub record: crate::db::entities::MutableJobRecord,
+    pub allocation: Option<crate::db::entities::PoolAllocation>,
+    pub updated_at_us: i64,
+}
+
+pub(crate) struct JobSearchPage {
+    pub items: Vec<NativeJobItem>,
+    pub next_before: Option<JobId>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum TreeFacts {
+    Conversation {
+        title: String,
+        state: &'static str,
+        on_hold: Option<Actor>,
+        origin: &'static str,
+        keep_open: bool,
+        active_turn: Option<(JobId, ConfigId, String)>,
+        recurrence: Option<Recurrence>,
+        depends_on: Vec<(JobId, DependencyCondition, DependencyState)>,
+    },
+    Turn {
+        title: String,
+        state: &'static str,
+        conversation: Option<JobId>,
+        previous: Option<JobId>,
+        model: (ConfigId, String),
+        depends_on: Vec<(JobId, DependencyCondition, DependencyState)>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TreeNode {
+    pub id: JobId,
+    pub parent_id: Option<JobId>,
+    pub created_at: Timestamp,
+    pub facts: TreeFacts,
+    pub agent: Option<(ConfigId, Option<String>)>,
+    pub children: Option<Vec<usize>>,
+    pub has_more_children: bool,
+    pub next_after: Option<JobId>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct JobTree {
+    pub ancestors: Vec<JobId>,
+    pub nodes: Vec<TreeNode>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CursorPage<T, C> {
+    pub records: Vec<T>,
+    pub next: Option<C>,
+}
+
+pub(crate) struct MutableJobDetails {
+    pub record: crate::db::entities::MutableJobRecord,
+    pub allocation: Option<crate::db::entities::PoolAllocation>,
+    pub result: Option<JobOutputRecord>,
+    pub usage: Option<JobUsage>,
+    pub activity: JobActivity,
+    pub unknown_reason: Option<String>,
+    pub configuration: Option<MutableConfiguration>,
+    pub unsupported_decision_history: Option<Result<bool, &'static str>>,
+}
+
+pub(crate) struct MutableConfiguration {
+    pub selection: ExecutionConfiguration,
+    pub model: String,
+    pub context_window: Option<u32>,
 }

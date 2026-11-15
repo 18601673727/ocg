@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
+import { type ReactNode, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { highlightCode } from "./markdown-pipeline";
 import { useI18n } from "../i18n";
+import { highlightCode } from "./markdown-pipeline";
 
 export type FileSnapshot = {
   path: string;
@@ -102,6 +102,7 @@ export function SourceLink({
     },
     [],
   );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Changed snapshots can change the popover geometry.
   useLayoutEffect(() => {
     if (!open) return;
     const updatePosition = () => {
@@ -129,6 +130,7 @@ export function SourceLink({
       window.removeEventListener("scroll", updatePosition, true);
     };
   }, [open, snapshots]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Changed snapshots can change the highlighted line.
   useEffect(() => {
     if (!open || selectedLine === undefined) return;
     const container = viewport.current;
@@ -150,6 +152,7 @@ export function SourceLink({
   const lines = snapshot?.content.split("\n") ?? [];
   if (lines.at(-1) === "") lines.pop();
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: The wrapper keeps the preview open across the trigger and portal and handles Escape from either.
     <span
       ref={anchor}
       className="relative inline-block"
@@ -214,6 +217,7 @@ export function SourceLink({
                         {highlighted ? (
                           <code
                             className="hljs whitespace-pre"
+                            // biome-ignore lint/security/noDangerouslySetInnerHtml: highlight.js escapes source text before emitting syntax markup.
                             dangerouslySetInnerHTML={{ __html: highlighted.html }}
                           />
                         ) : (

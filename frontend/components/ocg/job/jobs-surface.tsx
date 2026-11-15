@@ -1,9 +1,8 @@
 "use client";
 
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ListFilter, MessageSquare, Search } from "lucide-react";
-import { cn } from "@/lib/utils";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -13,14 +12,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import type { ExecutionPhase } from "../contracts";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
-import { SELECTED_ROW } from "../primitives/selection";
-import { LoadMore } from "../primitives/load-more";
 import { ListStatus } from "../primitives/list-status";
+import { LoadMore } from "../primitives/load-more";
 import { Pill } from "../primitives/pill";
+import { SELECTED_ROW } from "../primitives/selection";
+import type { ApiClient } from "../runtime/api-client";
 import { EXECUTION_PHASE_KEYS, EXECUTION_PHASE_TONES } from "../runtime/job-status";
 
 export function JobsSurface({
@@ -62,10 +62,10 @@ export function JobsSurface({
     let timer: ReturnType<typeof setTimeout> | undefined;
     const known = new Set<string>();
     const merge = (incoming: typeof records) => {
-      incoming.forEach((item) => known.add(item.id));
+      incoming.forEach((item) => void known.add(item.id));
       setRecords((current) => {
         const byId = new Map(current.map((item) => [item.id, item]));
-        incoming.forEach((item) => byId.set(item.id, item));
+        incoming.forEach((item) => void byId.set(item.id, item));
         return [...byId.values()].sort((a, b) => b.id.localeCompare(a.id));
       });
     };

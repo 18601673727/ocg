@@ -79,7 +79,6 @@ pub(super) struct Shared {
     pub(super) attachment_slots: (flume::Sender<()>, flume::Receiver<()>),
     pub(super) reclaimed_at_open: Vec<(ContentDigest, Result<Reclamation, StoreError>)>,
     pub(super) reclamation_omitted_at_open: u64,
-    pub(super) recovery: SharedRequest<Result<RecoveryReport, RecoveryError>>,
     pub(super) probes: std::sync::Mutex<std::collections::HashMap<OperationId, Option<Probe>>>,
     pub(super) in_flight_commands: AtomicUsize,
     pub(super) credential_key: std::sync::OnceLock<Arc<redb::CredentialKey>>,
@@ -204,7 +203,6 @@ impl Drop for ReleaseOnPanic {
                         .refuse(|| DatabaseError::NeverExecuted { operation });
                 }
             }
-            self.shared.recovery.abandon();
             for maintenance in self.maintenance.drain() {
                 maintenance.refuse_policy(true);
             }

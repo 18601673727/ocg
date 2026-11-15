@@ -1,13 +1,13 @@
 "use client";
 
+import Image from "next/image";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import Image from "next/image";
-import { useOcgRuntime } from "../runtime/runtime-context";
+import type { ChatImage, ChatModelSelection } from "../contracts";
 import { ApiError, type MutableJob, type MutableJobInput } from "../runtime/api-client";
-import type { ChatModelSelection, ChatImage } from "../contracts";
-import { ModelSelector, type ModelImageSupport } from "./model-selector";
+import { useOcgRuntime } from "../runtime/runtime-context";
+import { type ModelImageSupport, ModelSelector } from "./model-selector";
 
 export const MUTABLE_CONTEXT_KEY = "ocg.mutable-composer.context.v1";
 const QUEUED_KEY = "ocg.mutable-composer.queued.v1";
@@ -307,6 +307,7 @@ export function MutableComposer({
     if (results.some((result) => result.status === "rejected"))
       setError("Some unfinished Jobs could not be loaded. Retry to see their latest state.");
   }, [api]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Restore this composer context once per mount or context change. Presentation callbacks can change during restore.
   useEffect(() => {
     alive.current = true;
     if (!api) return;
@@ -1011,7 +1012,7 @@ export function MutableComposer({
   return (
     <div className="space-y-2 border-t border-border p-3">
       {unfinished.some((job) => job.id !== confirmed?.id) && (
-        <div aria-label="Unsubmitted Jobs" className="space-y-1 text-sm">
+        <fieldset aria-label="Unsubmitted Jobs" className="space-y-1 text-sm">
           {unfinished
             .filter((job) => job.id !== confirmed?.id)
             .map((job) => (
@@ -1030,10 +1031,10 @@ export function MutableComposer({
                 </Button>
               </div>
             ))}
-        </div>
+        </fieldset>
       )}
       {queued.length > 0 && (
-        <div aria-label="Queued Jobs" className="space-y-1 text-sm">
+        <fieldset aria-label="Queued Jobs" className="space-y-1 text-sm">
           {queued.map((job) => (
             <div key={job.id} className="flex items-center gap-2">
               <span
@@ -1076,7 +1077,7 @@ export function MutableComposer({
               )}
             </div>
           ))}
-        </div>
+        </fieldset>
       )}
       <label className="sr-only" htmlFor="mutable-job-input">
         Message
@@ -1290,13 +1291,15 @@ export function MutableComposer({
               size="xs"
               variant="ghost"
               disabled={busy || (conflict && uploading > 0)}
-              onClick={() =>
-                !ready
-                  ? window.location.reload()
-                  : conflict
-                    ? void loadSaved()
-                    : (void flush().catch(() => {}), void refreshQueue(), void refreshUnfinished())
-              }
+              onClick={() => {
+                if (!ready) window.location.reload();
+                else if (conflict) void loadSaved();
+                else {
+                  void flush().catch(() => {});
+                  void refreshQueue();
+                  void refreshUnfinished();
+                }
+              }}
             >
               {!ready ? "Reload" : conflict ? "Load saved version" : "Retry"}
             </Button>

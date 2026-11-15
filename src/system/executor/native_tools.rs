@@ -1,5 +1,3 @@
-use std::cell::RefCell;
-
 use super::blocking;
 use super::tool_loop::{
     ASK_USER_TOOL_NAME, REQUEST_COMMAND_TOOL_NAME, ToolExecution, ToolLoopLimits,
@@ -7,8 +5,8 @@ use super::tool_loop::{
 use super::tools::{ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError};
 use super::workspace_read::{self, Workspace};
 use crate::db::entities::{FrozenExecutionConfig, ModelCapability, ProjectRecord, ToolEffect};
-use crate::db::{DevelopmentToolContext, DevelopmentToolOffer, DevelopmentTooling};
 use crate::service::ai::providers::CancellationToken;
+use crate::service::jobs::{DevelopmentToolContext, DevelopmentToolOffer};
 use crate::system::execution_features::ExecutionFeature;
 
 fn offered_grant(mutation: bool) -> &'static str {
@@ -18,34 +16,32 @@ fn offered_grant(mutation: bool) -> &'static str {
 const MAX_AGENTS_MD_BYTES: usize = 32 * 1024;
 
 pub(crate) struct NativeTooling<'a> {
-    data_directory: Option<&'a crate::system::data_directory::DataDirectory>,
+    data_directory: &'a crate::system::data_directory::DataDirectory,
     stops: crate::system::native_scheduler::NativeStops,
-    built: RefCell<Option<ToolExecution>>,
+    built: Option<ToolExecution>,
     cancellation: CancellationToken,
 }
 
 impl<'a> NativeTooling<'a> {
     pub(crate) fn new(
-        data_directory: Option<&'a crate::system::data_directory::DataDirectory>,
+        data_directory: &'a crate::system::data_directory::DataDirectory,
         stops: crate::system::native_scheduler::NativeStops,
         cancellation: CancellationToken,
     ) -> Self {
         Self {
             data_directory,
             stops,
-            built: RefCell::new(None),
+            built: None,
             cancellation,
         }
     }
 
     pub(crate) fn into_execution(self) -> Option<ToolExecution> {
-        self.built.into_inner()
+        self.built
     }
-}
 
-impl DevelopmentTooling for NativeTooling<'_> {
-    async fn offer(
-        &self,
+    pub(crate) async fn offer(
+        &mut self,
         frozen: &FrozenExecutionConfig,
         project: Option<&ProjectRecord>,
         context: DevelopmentToolContext,
@@ -67,7 +63,7 @@ impl DevelopmentTooling for NativeTooling<'_> {
             return Err("tools_disabled");
         }
         let project = if workspace {
-            let (Some(_), Some(project)) = (self.data_directory, project) else {
+            let Some(project) = project else {
                 return Err("workspace_unavailable");
             };
             Some(project)
@@ -86,14 +82,19 @@ impl DevelopmentTooling for NativeTooling<'_> {
 
         let (execution, offer) = match select(
             self.cancellation.cancelled(),
-            build(self.data_directory, project, wiring, self.stops.clone()),
+            build(
+                Some(self.data_directory),
+                project,
+                wiring,
+                self.stops.clone(),
+            ),
         )
         .await
         {
             Either::Left(()) => return Err("preparation_cancelled"),
             Either::Right(result) => result?,
         };
-        *self.built.borrow_mut() = Some(execution);
+        self.built = Some(execution);
         Ok(Some(offer))
     }
 }

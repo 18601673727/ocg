@@ -119,10 +119,6 @@ pub(super) fn text(value: &str, max_bytes: usize) -> bool {
             .any(|character| character.is_control() && !matches!(character, '\t' | '\n' | '\r'))
 }
 
-fn identity(text: &str, _prefix: &str) -> Option<u128> {
-    crate::db::entities::parse_entity_id(text)
-}
-
 fn sha256(context: Context) -> [u8; 32] {
     context
         .finish()
@@ -684,10 +680,10 @@ impl DecisionJobRequest {
     pub(super) fn parse(body: &[u8]) -> Result<Self, Refusal> {
         let wire: DecisionSubmissionInput =
             serde_json::from_slice(body).map_err(|_| INVALID_DECISION_REQUEST)?;
-        let decision_agent = identity(&wire.decision_agent, "profile:")
+        let decision_agent = crate::db::entities::parse_entity_id(&wire.decision_agent)
             .map(ProfileId::new)
             .ok_or(INVALID_DECISION_REQUEST)?;
-        let decision_model = identity(&wire.decision_model, "profile:")
+        let decision_model = crate::db::entities::parse_entity_id(&wire.decision_model)
             .map(ProfileId::new)
             .ok_or(INVALID_DECISION_REQUEST)?;
         if wire
@@ -924,7 +920,7 @@ pub(super) async fn compact(
         .get("model")
         .and_then(Value::as_str)
         .ok_or(INVALID_ROUTE_BODY)?;
-    let model = identity(model, "profile:").ok_or(INVALID_ROUTE_BODY)?;
+    let model = crate::db::entities::parse_entity_id(model).ok_or(INVALID_ROUTE_BODY)?;
     let fingerprint = RequestFingerprint::from_digest({
         let mut context = Context::new(&SHA256);
         context.update(conversation.to_string().as_bytes());
@@ -1085,9 +1081,7 @@ async fn admitted_job_value(
     job: JobId,
 ) -> Result<Value, Refusal> {
     let record = shared.database.submission(key).await?.ok_or(INTERNAL)?;
-    let crate::db::redb::MutableJobDetailsLookup::Found(details) =
-        shared.database.mutable_job_details(job, None).await?
-    else {
+    let Some(details) = shared.database.mutable_job_details(job, None).await? else {
         return Err(INTERNAL);
     };
     let model = match details.record.job.frozen.as_ref().ok_or(INTERNAL)? {

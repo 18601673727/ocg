@@ -1,12 +1,5 @@
 "use client";
 
-import type { ProfilesSnapshot } from "../contracts";
-import type {
-  CompactionPolicy as CompactionPolicy,
-  PredictiveCompaction as PredictiveCompaction,
-} from "../contracts/api";
-import { useI18n, type I18nKey } from "../i18n";
-import { selectableLlmProfiles } from "./settings-parts";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -15,6 +8,10 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import type { ProfilesSnapshot } from "../contracts";
+import type { CompactionPolicy, PredictiveCompaction } from "../contracts/api";
+import { type I18nKey, useI18n } from "../i18n";
+import { selectableLlmProfiles } from "./settings-parts";
 
 const off: CompactionPolicy = {
   mode: { kind: "off" },

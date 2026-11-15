@@ -2,7 +2,7 @@ pub mod attachments;
 pub(crate) mod derived;
 pub mod entities;
 pub(crate) mod mutations;
-pub(crate) mod redb;
+mod redb;
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -22,8 +22,8 @@ use crate::db::entities::{Actor, Appended, Entry, ExecutionConfiguration, JobAct
 use crate::db::entities::{
     AppendedOutput, Attachment, AttachmentId, AttachmentOrigin, AttachmentRecord,
     AvailabilityStatId, AvailabilityStatRecord, Config, ConfigBody, ConfigId, ConfigKind,
-    ConfigRecord, ContentDigest, ExecutionPoolId, ExecutorId, JobEdit, JobFinalization, JobId,
-    JobOutput, JobOutputRecord, JobRecord, Metrics, MetricsId, MetricsRecord, ObservationCursor,
+    ConfigRecord, ContentDigest, ExecutorId, JobEdit, JobFinalization, JobId, JobOutput,
+    JobOutputRecord, JobRecord, Metrics, MetricsId, MetricsRecord, ObservationCursor,
     ObservationFilter, ObservationPage, OperationId, OperationKind, Project, ProjectCommand,
     ProjectId, ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber, Submission,
     SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord, ToolOutcome,
@@ -36,83 +36,28 @@ pub use crate::db::redb::{StorageError, StorageErrorKind};
 use crate::system::data_directory::DataDirectory;
 use crate::system::monitor::{
     self, FilesystemConfig, FilesystemConfigError, ProtectedArea, ProtectionCell, ProtectionLock,
-    ProtectionReason, ProtectionWatch, RecoveryError, RecoveryReport, ReopenFailure, SharedRequest,
+    ProtectionReason, ProtectionWatch, RecoveryError, RecoveryReport, ReopenFailure,
     SpaceMeasurement, SpaceShortage,
 };
 use crate::system::policy::{SystemPolicy, SystemPolicyError};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;
 
-#[allow(dead_code)]
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum DevelopmentReservationError {
-    #[error("reservation was not committed: {error}")]
-    DefinitelyNotCommitted {
-        error: Box<DatabaseError>,
-        fresh: entities::DevelopmentFreshReservation,
-    },
+    #[error("reservation was not committed: {0}")]
+    DefinitelyNotCommitted(Box<DatabaseError>),
     #[error(transparent)]
     Other(DatabaseError),
 }
 
-#[derive(Debug)]
-pub(crate) enum ScheduledReservation {
-    Pass(Box<entities::DevelopmentReservation>),
-}
-
-pub(crate) fn inspect_held_allocations_offline(
-    directory: &std::path::Path,
-) -> Result<serde_json::Value, DatabaseError> {
-    redb::inspect_held_allocations_offline(directory).map_err(DatabaseError::Read)
-}
-
-pub(crate) fn verify_offline(
-    directory: &std::path::Path,
-    pages: bool,
-) -> Result<redb::OfflineVerification, DatabaseError> {
-    redb::verify_offline(directory, pages).map_err(DatabaseError::Read)
-}
-
 #[cfg(unix)]
-pub(crate) fn verify_reserved_publication(
-    directory: &std::path::Path,
-    database: &std::fs::File,
-    exclusive_lock: &std::fs::File,
-    expected_device: u64,
-    expected_inode: u64,
-) -> Result<serde_json::Value, DatabaseError> {
-    redb::verify_reserved_publication(
-        directory,
-        database,
-        exclusive_lock,
-        expected_device,
-        expected_inode,
-    )
-    .map_err(DatabaseError::Read)
-}
-
-#[cfg(unix)]
-pub(crate) fn verify_recovered_publication(
-    directory: &std::path::Path,
-    database: &std::fs::File,
-    exclusive_lock: &std::fs::File,
-    expected_device: u64,
-    expected_inode: u64,
-) -> Result<serde_json::Value, DatabaseError> {
-    redb::verify_recovered_publication(
-        directory,
-        database,
-        exclusive_lock,
-        expected_device,
-        expected_inode,
-    )
-    .map_err(DatabaseError::Read)
-}
-
+pub(crate) use redb::verify_publication;
 pub(crate) use redb::{
-    DATABASE_FILE_NAME, ReservedRefusal, reconcile_held_apply, reconcile_held_preflight,
-    reconcile_reserved_apply, reconcile_reserved_preflight, storage_format_versions,
-    verify_held_publication_delta, verify_reserved_publication_delta,
+    DATABASE_FILE_NAME, ReservedRefusal, database_file, inspect_held_allocations_offline,
+    reconcile_held_apply, reconcile_held_preflight, reconcile_reserved_apply,
+    reconcile_reserved_preflight, storage_format_versions, verify_held_publication_delta,
+    verify_offline, verify_reserved_publication_delta,
 };
 
 const GROUP_LIMIT: usize = 32;
@@ -139,9 +84,9 @@ mod commands;
 pub(crate) use commands::serialized_len;
 mod errors;
 mod handle;
-pub(crate) use handle::{
-    DevelopmentHandoff, DevelopmentHandoffError, DevelopmentToolContext, DevelopmentToolOffer,
-    DevelopmentTooling, PreparedDevelopmentHandoff,
+mod handoff;
+pub(crate) use handoff::{
+    DevelopmentHandoff, DevelopmentHandoffError, PreparedDevelopmentHandoff, classify_unstarted,
 };
 mod scheduler_wake;
 mod shared;

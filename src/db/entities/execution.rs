@@ -105,3 +105,81 @@ impl ExecutionSnapshot {
         }
     }
 }
+
+pub(crate) struct ExecutionHistoryItem {
+    pub event: ExecutionEvent,
+    pub committed_seq: u64,
+}
+
+pub(crate) struct ExecutionHistoryPage {
+    pub events: Vec<ExecutionHistoryItem>,
+    pub next_after: Option<u64>,
+    pub head_seq: u64,
+}
+
+pub(crate) struct DevelopmentExecutionContext {
+    pub allocation: PoolAllocation,
+    pub job: MutableJob,
+    pub pool: AllocationPool,
+    pub executor: AllocationExecutor,
+    pub configuration: FrozenExecutionConfig,
+    pub conversation: JobSpec,
+    pub conversation_lifecycle: JobLifecycle,
+    pub plan_step: bool,
+    pub project: Option<ProjectRecord>,
+    pub compaction: GlobalCompactionSettings,
+    pub attachments: Vec<AttachmentRecord>,
+    pub adopted_summary: Option<VerifiedNativeSummary>,
+    pub covered_inputs: Vec<DevelopmentRetainedInput>,
+    pub history: Vec<DevelopmentContextTurn>,
+}
+
+impl DevelopmentExecutionContext {
+    pub(crate) fn is_summary_work(&self) -> bool {
+        self.job.summary_source.is_some() || self.conversation.is_chunk_group()
+    }
+}
+
+pub(crate) struct DevelopmentDecisionContext {
+    pub allocation: PoolAllocation,
+    pub job: MutableJob,
+    pub pool: AllocationPool,
+    pub executor: AllocationExecutor,
+    pub configuration: FrozenDecisionConfig,
+    pub conversation: JobSpec,
+    pub conversation_lifecycle: JobLifecycle,
+    pub project: Option<ProjectRecord>,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum DevelopmentCandidate {
+    Generative(DevelopmentExecutionContext),
+    Decision(DevelopmentDecisionContext),
+}
+
+impl DevelopmentCandidate {
+    pub(crate) fn allocation(&self) -> &PoolAllocation {
+        match self {
+            Self::Generative(context) => &context.allocation,
+            Self::Decision(context) => &context.allocation,
+        }
+    }
+}
+
+pub(crate) struct DevelopmentRetainedInput {
+    pub job: JobId,
+    pub text: String,
+    pub attachments: Vec<AttachmentRecord>,
+}
+
+pub(crate) struct DevelopmentContextTurn {
+    pub record: MutableJobRecord,
+    pub attachments: Vec<AttachmentRecord>,
+    pub outputs: Vec<JobOutputRecord>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct VerifiedNativeSummary {
+    pub manifest: NativeSummaryManifest,
+    pub summary: SummarizationResult,
+}

@@ -1,9 +1,13 @@
 "use client";
 
-import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
-import Link from "next/link";
 import { Check, Copy, Maximize2, Minus, Plus } from "lucide-react";
-
+import Link from "next/link";
+import { Fragment, type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { cn } from "@/lib/utils";
+import { useTheme } from "../appearance/theme-provider";
+import { Chart, type ChatChartDefinition, type ChatChartSeries } from "../dashboard/chat-chart";
+import { useI18n } from "../i18n";
 import {
   highlightCode,
   KATEX_OPTIONS,
@@ -11,12 +15,7 @@ import {
   sanitizeUrl,
   type Token,
 } from "./markdown-pipeline";
-import { cn } from "@/lib/utils";
-import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
-import { useTheme } from "../appearance/theme-provider";
-import { useI18n } from "../i18n";
-import { SourceLink, sourceReference, type FileSnapshot } from "./source-snapshot";
-import { Chart, type ChatChartDefinition, type ChatChartSeries } from "../dashboard/chat-chart";
+import { type FileSnapshot, SourceLink, sourceReference } from "./source-snapshot";
 
 export interface MarkdownBodyProps {
   content: string;
@@ -60,38 +59,44 @@ function MermaidDiagram({
   diagramLabel: string;
 }) {
   const { resolvedTheme, hydrated } = useTheme();
-  const containerRef = useRef<HTMLDivElement>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [svg, setSvg] = useState("");
+  const [result, setResult] = useState<{
+    code: string;
+    theme: typeof resolvedTheme;
+    svg?: string;
+    error?: string;
+  }>();
+  const current = result?.code === code && result.theme === resolvedTheme ? result : undefined;
+  const svg = current?.svg;
+  const error = current?.error;
   const [open, setOpen] = useState(false);
   const [zoom, setZoom] = useState(1);
   const { t } = useI18n();
-  const attempt = useRef(0);
 
   useEffect(() => {
-    const container = containerRef.current;
-    if (!hydrated || !container) return;
+    if (!hydrated) return;
 
-    const token = ++attempt.current;
     let cancelled = false;
-    setError(null);
-    setSvg("");
-    container.innerHTML = "";
 
     void import("@crafter/mermaid")
       .then(({ render, THEMES }) => {
-        if (cancelled || attempt.current !== token) return;
+        if (cancelled) return;
         const rendered = render(code, {
           theme: resolvedTheme === "dark" ? THEMES["zinc-dark"] : THEMES["zinc-light"],
           transparent: true,
         });
-        container.innerHTML = rendered;
-        setSvg(rendered);
-        setError(null);
+        setResult({
+          code,
+          theme: resolvedTheme,
+          svg: `data:image/svg+xml;charset=utf-8,${encodeURIComponent(rendered)}`,
+        });
       })
       .catch((cause: unknown) => {
-        if (cancelled || attempt.current !== token) return;
-        setError(cause instanceof Error ? cause.message : errorLabel);
+        if (cancelled) return;
+        setResult({
+          code,
+          theme: resolvedTheme,
+          error: cause instanceof Error ? cause.message : errorLabel,
+        });
       });
 
     return () => {
@@ -101,12 +106,14 @@ function MermaidDiagram({
 
   return (
     <div className={cn("group relative my-3", inMuted && "text-muted-foreground")}>
-      <div
-        ref={containerRef}
-        className={cn("flex justify-center", error && "hidden")}
-        role="img"
-        aria-label={diagramLabel}
-      />
+      {svg && !error && (
+        <div className="flex justify-center">
+          {/* biome-ignore-start lint/performance/noImgElement: The SVG or remote Markdown image is loaded at its source URL. */}
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img src={svg} alt={diagramLabel} className="max-w-full" />
+          {/* biome-ignore-end lint/performance/noImgElement: End of the direct image. */}
+        </div>
+      )}
       {svg && !error && (
         <Dialog
           open={open}
@@ -162,12 +169,10 @@ function MermaidDiagram({
             </div>
             <div className="ocg-subtle-scrollbar min-h-0 flex-1 overflow-auto p-6">
               <div className="w-max min-w-full" style={{ zoom }}>
-                <div
-                  className="[&>svg]:mx-auto [&>svg]:max-w-none"
-                  role="img"
-                  aria-label={diagramLabel}
-                  dangerouslySetInnerHTML={{ __html: svg }}
-                />
+                {/* biome-ignore-start lint/performance/noImgElement: The SVG or remote Markdown image is loaded at its source URL. */}
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={svg} alt={diagramLabel} className="mx-auto max-w-none" />
+                {/* biome-ignore-end lint/performance/noImgElement: End of the direct image. */}
               </div>
             </div>
           </DialogContent>
@@ -352,6 +357,7 @@ function CodeBlock({
         {highlight ? (
           <code
             className="hljs bg-transparent p-0"
+            // biome-ignore lint/security/noDangerouslySetInnerHtml: highlight.js escapes source text before emitting syntax markup.
             dangerouslySetInnerHTML={{ __html: highlight.html }}
           />
         ) : (
@@ -449,8 +455,10 @@ function inline(parent: WalkContext, tokens: Token[], from = 0, to = tokens.leng
         if (src) {
           out.push(
             <span key={key(ctx)} className="block my-3">
+              {/* biome-ignore-start lint/performance/noImgElement: The SVG or remote Markdown image is loaded at its source URL. */}
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img src={src} alt={token.content} className="max-w-full h-auto rounded" />
+              {/* biome-ignore-end lint/performance/noImgElement: End of the direct image. */}
             </span>,
           );
         }

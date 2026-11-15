@@ -1,7 +1,7 @@
 import type * as Api from "./api";
-import type { TreeNode } from "./shared";
-import type { DecisionAnswer } from "./settings";
 import { executionSequence } from "./jobs";
+import type { DecisionAnswer } from "./settings";
+import type { TreeNode } from "./shared";
 
 export type NativeDecisionTurn = {
   kind: "decision";

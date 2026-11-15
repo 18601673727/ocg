@@ -29,20 +29,13 @@ pub(super) async fn provider_responses(
     limit: usize,
     text_offset: u32,
 ) -> Result<Value, Refusal> {
-    if let crate::db::redb::MutableJobDetailsLookup::Found(details) =
-        shared.database.mutable_job_details(job, None).await?
-        && matches!(
-            details.record.job.input.content,
-            crate::db::entities::MutableJobContent::Decision { .. }
-        )
-    {
+    if super::outputs::require_output_job(&shared.database, job).await? {
         return Err(Refusal::new(
             ntex::http::StatusCode::SERVICE_UNAVAILABLE,
             "decision_response_unavailable",
             "Decision evidence is available through typed history",
         ));
     }
-    super::outputs::require_output_job(&shared.database, job).await?;
     let read_after = if text_offset > 0 {
         after.and_then(|request| RequestNumber::new(request.get() - 1))
     } else {
@@ -59,7 +52,7 @@ fn provider_response_page(
     job: JobId,
     after: Option<RequestNumber>,
     text_offset: u32,
-    records: crate::db::redb::ProviderResponsesPage,
+    records: crate::db::entities::ProviderResponsesPage,
     response_bytes: usize,
 ) -> Result<Value, Refusal> {
     if text_offset > 0 && records.responses.first().map(|response| response.request) != after {
@@ -104,7 +97,7 @@ fn provider_response_page(
         let mut bytes = 0;
         let mut end = offset;
         for character in record.text[offset..].chars() {
-            let cost = crate::db::redb::escaped_json_char_cost(character);
+            let cost = crate::db::entities::escaped_json_char_cost(character);
             if bytes + cost > available {
                 break;
             }

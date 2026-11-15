@@ -1,6 +1,5 @@
 "use client";
 
-import { useI18n } from "../i18n";
 import {
   Select,
   SelectContent,
@@ -8,6 +7,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useI18n } from "../i18n";
 
 export type LlmProtocol = "openai_chat_completions" | "openai_responses" | "anthropic_messages";
 

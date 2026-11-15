@@ -854,3 +854,87 @@ pub(in crate::db) fn summary_chunks(
     }
     (!ranges.is_empty()).then_some(ranges)
 }
+
+pub(crate) struct MutableConversationPage {
+    pub turns: Vec<MutableConversationTurn>,
+    pub has_more: bool,
+}
+
+pub(crate) struct MutableConversationTurn {
+    pub details: MutableJobDetails,
+    pub outputs: Vec<JobOutputRecord>,
+    pub outputs_truncated: bool,
+    pub evidence: Vec<ToolEvidenceRecord>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationEntry {
+    pub root_job: JobId,
+    pub tip_job: JobId,
+    pub agent: Option<ConfigId>,
+    pub title: String,
+    pub project: Option<ProjectId>,
+    pub state: String,
+    pub on_hold: Option<Actor>,
+    pub tip_settlement_state: String,
+    pub tip_created_at: Timestamp,
+    pub job_state: String,
+    pub has_children: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ConversationsPage {
+    pub conversations: Vec<ConversationEntry>,
+    pub next_before: Option<JobId>,
+    pub has_more: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChildConversationEntry {
+    pub conversation: ConversationEntry,
+    pub origin: Origin,
+    pub keep_open: bool,
+    pub recurrence: Option<Recurrence>,
+    pub job_state: String,
+}
+
+pub(crate) struct ContextWorkState {
+    pub job: JobId,
+    pub conversation: JobId,
+    pub state: &'static str,
+    pub details: ContextWorkDetails,
+}
+
+pub(crate) enum ContextWorkDetails {
+    Summary {
+        summarizer: ConfigId,
+        failure: Option<String>,
+        automatic: bool,
+        stage: &'static str,
+        chain: Option<JobId>,
+        prediction: Option<JobId>,
+        reserved_tokens: u32,
+        reserved_requests: u32,
+        source: ContentDigest,
+        first: crate::db::entities::SourceBoundary,
+        through: crate::db::entities::SourceBoundary,
+        turn_count: usize,
+    },
+}
+
+pub(crate) struct ContextState {
+    pub policy: crate::db::entities::CompactionPolicy,
+    pub stored_override: Option<crate::db::entities::CompactionPolicy>,
+    pub policy_source: &'static str,
+    pub revision: u64,
+    pub model: Option<FrozenLlmConfig>,
+    pub estimated_tokens: Option<u64>,
+    pub growth: u32,
+    pub predictor: Option<ConfigId>,
+    pub predictor_model: Option<ConfigId>,
+    pub prediction_unavailable: Option<String>,
+    pub last_use: Option<(JobId, u32, Option<JobId>)>,
+    pub steer_blocked_by: Option<&'static str>,
+    pub work: Vec<ContextWorkState>,
+    pub next_before: Option<JobId>,
+}

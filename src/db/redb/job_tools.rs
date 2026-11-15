@@ -48,7 +48,7 @@ impl Batch {
 
     pub(crate) fn apply_job_tool(
         &mut self,
-        proof: &crate::db::handle::DevelopmentWriteProof,
+        proof: &crate::db::handoff::DevelopmentWriteProof,
         call: ToolCallRef,
         tool: JobToolCall,
     ) -> Result<JobToolApplied, BatchError> {

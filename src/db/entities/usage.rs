@@ -418,3 +418,8 @@ impl JobUsage {
             .saturating_add(u64::from(sample.reasoning.value().unwrap_or(0)));
     }
 }
+
+pub(crate) struct UsageRetriesPage {
+    pub rows: Vec<crate::db::entities::UsageRetryRow>,
+    pub next: Option<(u128, u128)>,
+}

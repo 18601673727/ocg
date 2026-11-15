@@ -1,14 +1,16 @@
 "use client";
 
-import { useState, type FormEvent } from "react";
 import Link from "next/link";
-import type { ProfilesSnapshot } from "../contracts";
-import type { DecisionLimits as DecisionLimits } from "../contracts/api";
-import type { ApiClient, ProfileWriteRequest } from "../runtime/api-client";
-import { isProfileConflict } from "../runtime/api-client";
-import { useI18n } from "../i18n";
-import { Section, describeError, selectableLlmProfiles } from "./settings-parts";
+import { type FormEvent, useState } from "react";
 import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import {
   Select,
@@ -18,22 +20,20 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Textarea } from "@/components/ui/textarea";
+import type { ProfilesSnapshot } from "../contracts";
+import type { DecisionLimits } from "../contracts/api";
+import { useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
+import type { ApiClient, ProfileWriteRequest } from "../runtime/api-client";
+import { isProfileConflict } from "../runtime/api-client";
 import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTitle,
-  DialogDescription,
-  DialogFooter,
-} from "@/components/ui/dialog";
-import { HeadersEditor } from "./headers-editor";
-import {
+  draftsToInputs,
   type HeaderDraft,
   type HeaderDraftError,
-  draftsToInputs,
   headersToDrafts,
 } from "./header-drafts";
+import { HeadersEditor } from "./headers-editor";
+import { describeError, Section, selectableLlmProfiles } from "./settings-parts";
 
 const emptyLimits: DecisionLimits = {
   max_input_tokens_per_request: null,

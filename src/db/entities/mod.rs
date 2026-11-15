@@ -33,7 +33,7 @@ pub use approvals::{
     is_handler_version,
 };
 pub use attachments::*;
-pub(crate) use execution::{ExecutionEvent, ExecutionEventKind, ExecutionSnapshot};
+pub(crate) use execution::*;
 pub use headers::*;
 pub use identity::{
     AttachmentId, AvailabilityStatId, ComposerContextId, ConfigId, ExecutionPoolId, ExecutorId,
@@ -43,14 +43,18 @@ pub use identity::{
 };
 pub(in crate::db) use job_context::summary_chunks;
 pub use job_context::{
-    Actor, Appended, COMPACTION_JOB_NAME, CompactionMode, CompactionPolicy, CompactionPreset,
-    CompactionRequest, ContextSourceManifest, CustomPolicy, Entry, EntryKind,
-    GlobalCompactionSettings, JobAction, JobEdit, JobGroup, JobLimits, MAX_JOB_DEPTH,
-    NativeSummaryBoundary, NativeSummaryManifest, NativeSummaryResultLink, Origin,
-    PredictionAcceptance, PredictionMode, PredictiveCompaction, Recurrence, RecurrenceHalt,
-    RecurrencePhase, ResolvedCompaction, ResponseFormat, SUMMARIZER_OUTPUT_RESERVE, SourceBoundary,
-    StopCause, StopProof, SummarizationResult, SummarizationStage, SummarizationWork,
-    SummaryFragment, TITLE_JOB_NAME, title_prompt,
+    Actor, Appended, COMPACTION_JOB_NAME, ChildConversationEntry, CompactionMode, CompactionPolicy,
+    CompactionPreset, CompactionRequest, ContextSourceManifest, ConversationEntry,
+    ConversationsPage, CustomPolicy, Entry, EntryKind, GlobalCompactionSettings, JobAction,
+    JobEdit, JobGroup, JobLimits, MAX_JOB_DEPTH, NativeSummaryBoundary, NativeSummaryManifest,
+    NativeSummaryResultLink, Origin, PredictionAcceptance, PredictionMode, PredictiveCompaction,
+    Recurrence, RecurrenceHalt, RecurrencePhase, ResolvedCompaction, ResponseFormat,
+    SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopCause, StopProof, SummarizationResult,
+    SummarizationStage, SummarizationWork, SummaryFragment, TITLE_JOB_NAME, title_prompt,
+};
+pub(crate) use job_context::{
+    ContextState, ContextWorkDetails, ContextWorkState, MutableConversationPage,
+    MutableConversationTurn,
 };
 pub use jobs::*;
 pub use metrics::*;
@@ -66,7 +70,7 @@ pub use statistics::{
     ObservationFilter, ObservationPage, RejectionCause, TimeRange, ToolStatRecord,
     UnavailableCause,
 };
-pub(crate) use usage::{JobUsage, TokenEvidence, TokenObservation};
+pub(crate) use usage::{JobUsage, TokenEvidence, TokenObservation, UsageRetriesPage};
 pub use usage::{
     RequestEligibility, TokenAnnotation, TokenCount, TokenRequestSample, TokenUsageState,
     USAGE_SUMMARY_HOUR_MICROS, UsageBucketResponse, UsageBucketRow, UsageBucketWidth,

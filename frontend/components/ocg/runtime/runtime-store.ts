@@ -1,6 +1,6 @@
 import type { OcgRuntimeEvent } from "../types";
-import type { RuntimeSnapshot } from "./runtime-types";
 import { reconcileRuntimeEvent } from "./reconciler";
+import type { RuntimeSnapshot } from "./runtime-types";
 
 export function emptyRuntimeSnapshot(): RuntimeSnapshot {
   return {

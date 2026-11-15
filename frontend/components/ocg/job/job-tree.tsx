@@ -1,15 +1,15 @@
 "use client";
 
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useRef, useState, type ReactNode } from "react";
 import { ChevronDown, ChevronRight, CirclePause, Repeat2 } from "lucide-react";
+import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
-import { TONE_CLASS, type Tone } from "../primitives/tone";
 import type { TreeNode, TreeState } from "../contracts";
+import { runtimeStateLabel, type TranslateFn, useI18n } from "../i18n";
+import { TONE_CLASS, type Tone } from "../primitives/tone";
 import type { ApiClient } from "../runtime/api-client";
-import { runtimeStateLabel, useI18n, type TranslateFn } from "../i18n";
 
 const STATE_TONE: Record<TreeState, Tone> = {
   running: "violet",
@@ -257,6 +257,7 @@ export function JobTree({
               {node.on_hold ? (
                 <span
                   title={t("jobs.tree.held")}
+                  role="img"
                   aria-label={t("jobs.tree.held")}
                   className="text-muted-foreground"
                 >
@@ -266,7 +267,6 @@ export function JobTree({
               {node.recurrence ? (
                 <span
                   title={t("jobs.tree.recurring")}
-                  aria-label={t("jobs.tree.recurring")}
                   className="flex items-center gap-1 text-xs text-muted-foreground"
                 >
                   <Repeat2 className="size-4" />

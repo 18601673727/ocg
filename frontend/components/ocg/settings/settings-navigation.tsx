@@ -6,12 +6,11 @@ import {
   Cpu,
   Folder,
   Layers,
+  type LucideIcon,
   Palette,
   UserRound,
   Waypoints,
-  type LucideIcon,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
 import {
   Select,
   SelectContent,
@@ -19,13 +18,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
 import { SELECTED_ROW } from "../primitives/selection";
 import {
   isSettingsSection,
   SETTINGS_SECTIONS,
-  settingsPath,
   type SettingsSection,
+  settingsPath,
 } from "./settings-sections";
 
 const icons: Record<SettingsSection, LucideIcon> = {

@@ -37,7 +37,7 @@ pub(crate) enum ModelProfileDefinition {
 
 #[derive(Clone)]
 pub(crate) struct CredentialPayload {
-    pub(crate) secret: crate::db::redb::CredentialSecret,
+    pub(crate) secret: crate::db::entities::CredentialSecret,
     pub(crate) key: std::sync::Arc<crate::db::redb::CredentialKey>,
 }
 
@@ -63,7 +63,7 @@ pub(crate) struct ModelProfileSave {
     pub(crate) connection_name: String,
     pub(crate) endpoint: Option<String>,
     pub(crate) credential_ref: ProfileCredentialRef,
-    pub(crate) secret: Option<crate::db::redb::CredentialSecret>,
+    pub(crate) secret: Option<crate::db::entities::CredentialSecret>,
     pub(crate) credential: Option<CredentialPayload>,
     pub(crate) guard: Option<ProfileSaveGuard>,
     pub(crate) definition: ModelProfileDefinition,
@@ -73,7 +73,7 @@ pub(crate) struct ImportModelsSave {
     pub(crate) headers: HeaderChange,
     pub(crate) connection: Config,
     pub(crate) credential_ref: ProfileCredentialRef,
-    pub(crate) secret: Option<crate::db::redb::CredentialSecret>,
+    pub(crate) secret: Option<crate::db::entities::CredentialSecret>,
     pub(crate) credential: Option<CredentialPayload>,
     pub(crate) models: Vec<crate::db::entities::DiscoveredModel>,
     pub(crate) capabilities: std::collections::BTreeSet<ModelCapability>,
@@ -88,7 +88,7 @@ pub(crate) fn save_model_profile(
 
 pub(crate) fn record_tool_decision(
     batch: &mut Batch,
-    proof: &crate::db::handle::DevelopmentWriteProof,
+    proof: &crate::db::handoff::DevelopmentWriteProof,
     evidence: ToolEvidence,
 ) -> OpResult<()> {
     let call = evidence.call;
@@ -132,7 +132,7 @@ pub(crate) fn record_tool_decision(
 
 pub(crate) fn record_tool_outcome(
     batch: &mut Batch,
-    proof: &crate::db::handle::DevelopmentWriteProof,
+    proof: &crate::db::handoff::DevelopmentWriteProof,
     call: ToolCallRef,
     outcome: ToolOutcome,
 ) -> OpResult<()> {

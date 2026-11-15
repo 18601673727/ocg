@@ -237,7 +237,7 @@ pub(crate) struct ExternalApproval {
 }
 
 fn approved_credential_ref(credential_ref: &str) -> Result<String, ApprovalRefusal> {
-    if !crate::db::redb::valid_credential_ref(credential_ref) {
+    if !crate::db::entities::valid_credential_ref(credential_ref) {
         return Err(refuse(
             "credential_ref_invalid",
             "the credential reference must be 1..=128 characters without control characters",

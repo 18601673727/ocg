@@ -116,7 +116,7 @@ impl SchedulerHandle {
 pub struct ExecutionRuntime {
     scheduler: SchedulerHandle,
     shutdown: CancellationToken,
-    finished: Option<ntex::rt::JoinHandle<Result<(), ExecutionRuntimeError>>>,
+    finished: Option<ntex::rt::JoinHandle<()>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,56 +127,45 @@ pub enum ClaimScope {
 
 impl ExecutionRuntime {
     pub fn start(
-        database: DatabaseHandle,
-        scope: ClaimScope,
+        _database: DatabaseHandle,
+        _scope: ClaimScope,
     ) -> Result<Self, ExecutionRuntimeError> {
-        Self::start_with(database, scope, false, None)
+        Ok(Self::idle())
     }
 
-    pub(crate) fn start_autonomous(
-        database: DatabaseHandle,
-        scope: ClaimScope,
-        workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
-    ) -> Result<Self, ExecutionRuntimeError> {
-        let autonomous =
-            scope == ClaimScope::Stored && ExecutionFeature::AutonomousScheduling.is_enabled();
-        Self::start_with(database, scope, autonomous, Some(workspace_tools))
+    fn idle() -> Self {
+        Self {
+            scheduler: SchedulerHandle {
+                native_stops: crate::system::native_scheduler::NativeStops::default(),
+            },
+            shutdown: CancellationToken::default(),
+            finished: None,
+        }
     }
 
-    fn start_with(
+    pub(crate) fn start_host(
         database: DatabaseHandle,
         scope: ClaimScope,
-        autonomous: bool,
-        workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
+        workspace_tools: &crate::system::executor::execution_runtime::WorkspaceTools,
     ) -> Result<Self, ExecutionRuntimeError> {
-        let autonomous = autonomous
-            && scope == ClaimScope::Stored
-            && ExecutionFeature::AutonomousScheduling.is_enabled();
-        let wake = if autonomous {
-            Some(
-                database
-                    .take_scheduler_wake()
-                    .ok_or(ExecutionRuntimeError::SchedulerStopped)?,
-            )
-        } else {
-            None
-        };
-        let native_stops = crate::system::native_scheduler::NativeStops::default();
-        let shutdown = CancellationToken::default();
-        let finished = ntex::rt::spawn(dispatch_runtime(
-            database,
-            scope,
-            wake,
-            autonomous,
-            shutdown.clone(),
-            native_stops.clone(),
-            workspace_tools,
-        ));
-        Ok(Self {
-            scheduler: SchedulerHandle { native_stops },
-            shutdown,
-            finished: Some(finished),
-        })
+        let mut runtime = Self::idle();
+        if scope == ClaimScope::Stored && ExecutionFeature::AutonomousScheduling.is_enabled() {
+            let wake = database
+                .take_scheduler_wake()
+                .ok_or(ExecutionRuntimeError::SchedulerStopped)?;
+            runtime.finished = Some(ntex::rt::spawn(crate::system::native_scheduler::run(
+                database,
+                wake,
+                runtime.shutdown.clone(),
+                runtime.scheduler.native_stops.clone(),
+                workspace_tools.clone(),
+            )));
+        }
+        Ok(runtime)
+    }
+
+    pub(crate) fn is_autonomous(&self) -> bool {
+        self.finished.is_some()
     }
 
     pub fn scheduler(&self) -> SchedulerHandle {
@@ -188,7 +177,7 @@ impl ExecutionRuntime {
         if let Some(finished) = self.finished.take() {
             finished
                 .await
-                .map_err(|_| ExecutionRuntimeError::WorkerPanicked)??;
+                .map_err(|_| ExecutionRuntimeError::WorkerPanicked)?;
         }
         Ok(())
     }
@@ -198,38 +187,4 @@ impl Drop for ExecutionRuntime {
     fn drop(&mut self) {
         self.shutdown.cancel();
     }
-}
-
-async fn dispatch_runtime(
-    database: DatabaseHandle,
-    scope: ClaimScope,
-    wake: Option<crate::db::SchedulerWakeSubscription>,
-    autonomous: bool,
-    shutdown: CancellationToken,
-    native_stops: crate::system::native_scheduler::NativeStops,
-    workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
-) -> Result<(), ExecutionRuntimeError> {
-    let Some(wake) = wake.filter(|_| {
-        autonomous
-            && scope == ClaimScope::Stored
-            && ExecutionFeature::AutonomousScheduling.is_enabled()
-    }) else {
-        shutdown.cancelled().await;
-        return Ok(());
-    };
-    match scope {
-        ClaimScope::Stored => {
-            crate::system::native_scheduler::run(
-                database,
-                scope,
-                wake,
-                shutdown,
-                native_stops,
-                workspace_tools,
-            )
-            .await;
-        }
-        ClaimScope::Process => shutdown.cancelled().await,
-    }
-    Ok(())
 }

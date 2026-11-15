@@ -1,4 +1,5 @@
 use super::*;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum LlmTransport {
@@ -634,4 +635,67 @@ pub struct Executor {
     pub name: String,
     pub concurrency_limit: NonZeroU32,
     pub llm_transports: BTreeSet<LlmTransport>,
+}
+
+pub(crate) struct ProfilePageRecords {
+    pub records: Vec<ProfilePageRecord>,
+    pub connections: BTreeMap<ConfigId, (String, ConnectionConfig, bool)>,
+    pub credentials: BTreeSet<String>,
+    pub next_before: Option<ConfigId>,
+}
+
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum ProfilePageRecord {
+    Config(ConfigRecord),
+    Executor(crate::db::entities::AllocationExecutor),
+}
+
+pub(crate) struct AgentModelConfig {
+    pub config: Option<ConfigRecord>,
+    pub executors: Vec<ExecutorId>,
+}
+
+pub(crate) fn valid_credential_ref(reference: &str) -> bool {
+    !reference.is_empty() && reference.len() <= 128 && !reference.chars().any(char::is_control)
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct CredentialSecret(String);
+
+impl std::fmt::Debug for CredentialSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl Drop for CredentialSecret {
+    fn drop(&mut self) {
+        crate::system::secrets::wipe_string(&mut self.0);
+    }
+}
+
+impl CredentialSecret {
+    pub(crate) fn new(secret: impl Into<String>) -> Result<Self, &'static str> {
+        let mut secret = secret.into();
+        if secret.is_empty() || secret.len() > 4096 {
+            crate::system::secrets::wipe_string(&mut secret);
+            return Err("credential secret must be 1..=4096 bytes");
+        }
+        let mut header = format!("Bearer {secret}");
+        let valid = ntex::http::header::HeaderValue::try_from(header.as_str()).is_ok();
+        crate::system::secrets::wipe_string(&mut header);
+        if !valid {
+            crate::system::secrets::wipe_string(&mut secret);
+            return Err("credential secret is not a valid HTTP Bearer token");
+        }
+        Ok(Self(secret))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub(crate) fn into_inner(mut self) -> String {
+        std::mem::take(&mut self.0)
+    }
 }

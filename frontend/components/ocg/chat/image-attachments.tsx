@@ -1,9 +1,9 @@
 "use client";
 
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import { ChevronLeft, ChevronRight, Download, Loader2 } from "lucide-react";
 import Image from "next/image";
 import { useState } from "react";
-import { ChevronLeft, ChevronRight, Download, Loader2 } from "lucide-react";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import type { ChatImage } from "../contracts";
@@ -109,7 +109,7 @@ export function ImageGallery({
   }
   return (
     <>
-      <div
+      <fieldset
         className={
           compact ? "flex shrink-0 gap-1" : "mt-2 grid max-w-lg grid-cols-2 gap-2 sm:grid-cols-3"
         }
@@ -133,7 +133,7 @@ export function ImageGallery({
             <ImagePreview src={image.src} name={image.name} compact={compact} />
           </button>
         ))}
-      </div>
+      </fieldset>
       <Dialog
         open={Boolean(active)}
         onOpenChange={(open) => {

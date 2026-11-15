@@ -1,28 +1,26 @@
 "use client";
 
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
-import Link from "next/link";
 import {
-  ChevronsLeft,
-  ChevronDown,
   Activity,
+  Archive,
   BarChart3,
-  MessageSquare,
-  Plus,
-  Search,
-  ScrollText,
-  Workflow,
-  LoaderCircle,
-  MoreVertical,
+  ChevronDown,
+  ChevronsLeft,
   FolderOpen,
+  LoaderCircle,
+  MessageSquare,
+  MoreVertical,
   Pin,
   PinOff,
-  Archive,
+  Plus,
+  ScrollText,
+  Search,
+  Workflow,
   X,
 } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import Link from "next/link";
+import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -42,19 +40,21 @@ import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import type { ChatSession, RuntimeStatus } from "../types";
-import { ApiError, type ApiClient } from "../runtime/api-client";
-import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
-import { AccountMenu } from "./account-menu";
-import { ConversationSearch } from "./conversation-search";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import { cn } from "@/lib/utils";
+import type { Project } from "../contracts";
 import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
+import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
 import { OcgLogo } from "../primitives/ocg-logo";
 import { SELECTED_ROW } from "../primitives/selection";
-import type { Project } from "../contracts";
-import { usePinnedConversations } from "./sidebar-preferences";
+import { type ApiClient, ApiError } from "../runtime/api-client";
+import type { ChatSession, RuntimeStatus } from "../types";
+import { AccountMenu } from "./account-menu";
 import { SidebarConversationChildren } from "./conversation-children";
+import { ConversationSearch } from "./conversation-search";
 import { HoverMarquee } from "./hover-marquee";
+import { usePinnedConversations } from "./sidebar-preferences";
 
 const subscribePlatform = () => () => {};
 const isApplePlatform = () => /Mac|iPhone|iPad|iPod/i.test(navigator.platform);
@@ -364,14 +364,16 @@ export function OcgSidebar({
           <span className="min-w-0 flex-1 truncate">{label}</span>
           {item.target === "attention" && attentionCount > 0 && (
             <span
-              aria-label={t("sidebar.attentionBadge", { count: attentionCount })}
               className={cn(
                 "shrink-0 rounded-md bg-muted px-1.5",
                 TYPOGRAPHY_SCALE.caption,
                 "font-semibold tabular-nums text-muted-foreground",
               )}
             >
-              {attentionCount > 99 ? "99+" : attentionCount}
+              <span className="sr-only">
+                {t("sidebar.attentionBadge", { count: attentionCount })}
+              </span>
+              <span aria-hidden="true">{attentionCount > 99 ? "99+" : attentionCount}</span>
             </span>
           )}
         </button>
@@ -484,7 +486,11 @@ export function OcgSidebar({
             ))}
             {conversationList === "loading" &&
               Array.from({ length: 5 }, (_, i) => (
-                <Skeleton key={`rail-skeleton-${i}`} className="size-9 shrink-0 rounded-md" />
+                <Skeleton
+                  // biome-ignore lint/suspicious/noArrayIndexKey: Each skeleton represents a fixed placeholder position.
+                  key={`rail-skeleton-${i}`}
+                  className="size-9 shrink-0 rounded-md"
+                />
               ))}
           </ScrollArea>
           <div className="mt-2 w-full border-t border-border pt-2">
@@ -871,7 +877,10 @@ export function OcgSidebar({
           {conversationList === "loading" && (
             <ul aria-label={t("common.loading")} className="mt-2 space-y-1">
               {Array.from({ length: 5 }, (_, i) => (
-                <li key={`list-skeleton-${i}`}>
+                <li
+                  // biome-ignore lint/suspicious/noArrayIndexKey: Each skeleton represents a fixed placeholder position.
+                  key={`list-skeleton-${i}`}
+                >
                   <Skeleton className="h-8 w-full rounded-lg" />
                 </li>
               ))}

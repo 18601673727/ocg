@@ -66,7 +66,7 @@ fn searchable_turn_context(
     let turn_row = jobs
         .get(turn.get())?
         .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
-    let job = transactions::decode_mutable_job(turn.get(), turn_row.value())?;
+    let job = jobs::decode_mutable_job(turn.get(), turn_row.value())?;
     Ok(
         searchable_conversation(&JobSpec::decode_at(conversation.get(), row.value())?)
             && job.parent_id == conversation
@@ -160,9 +160,9 @@ pub(super) fn search_output_text(output: &JobOutputRecord, completed: bool) -> O
 }
 
 fn indexed_identity<'a>(
-    identity: Option<&'a reader::UsageIdentity>,
+    identity: Option<&'a reads::UsageIdentity>,
     event: &RequestEventRecord,
-) -> Option<&'a reader::UsageIdentity> {
+) -> Option<&'a reads::UsageIdentity> {
     identity.filter(|_| {
         !matches!(
             event.payload,
@@ -174,7 +174,7 @@ fn indexed_identity<'a>(
 }
 
 pub(super) fn request_timeline_key(
-    identity: Option<&reader::UsageIdentity>,
+    identity: Option<&reads::UsageIdentity>,
     event: &RequestEventRecord,
 ) -> Option<schema::RequestTimelineKey> {
     indexed_identity(identity, event).map(|_| {
@@ -188,7 +188,7 @@ pub(super) fn request_timeline_key(
 }
 
 pub(super) fn usage_model_key(
-    identity: Option<&reader::UsageIdentity>,
+    identity: Option<&reads::UsageIdentity>,
     event: &RequestEventRecord,
 ) -> Option<(u128, [u8; 32])> {
     indexed_identity(identity, event).map(|identity| {
@@ -288,7 +288,7 @@ pub(super) fn compute_allocation_indexes(
     let mut pools = BTreeSet::<u128>::new();
     for entry in allocations.iter()? {
         let (key, value) = entry?;
-        let allocation = transactions::decode_pool_allocation(key.value(), value.value())?;
+        let allocation = allocations::decode_pool_allocation(key.value(), value.value())?;
         if allocation.token.job.get() != key.value() {
             return Err(StorageError::corrupted(
                 "Allocation is stored under another Job",
@@ -320,7 +320,7 @@ pub(super) fn compute_allocation_indexes(
                 "active Allocation references a missing Pool",
             ));
         };
-        transactions::decode_allocation_pool(pool, bytes.value())?;
+        allocations::decode_allocation_pool(pool, bytes.value())?;
     }
     Ok(indexes)
 }
@@ -359,7 +359,7 @@ pub(super) fn verify_pool_executor_index(
 ) -> Result<(), StorageError> {
     for entry in executors.iter()? {
         let (key, bytes) = entry?;
-        let executor = transactions::decode_allocation_executor(key.value(), bytes.value())?;
+        let executor = allocations::decode_allocation_executor(key.value(), bytes.value())?;
         if members
             .get((executor.pool.get(), executor.id.get()))?
             .is_none()
@@ -374,7 +374,7 @@ pub(super) fn verify_pool_executor_index(
         let bytes = executors.get(id)?.ok_or_else(|| {
             StorageError::corrupted("Pool membership references a missing Executor")
         })?;
-        if transactions::decode_allocation_executor(id, bytes.value())?
+        if allocations::decode_allocation_executor(id, bytes.value())?
             .pool
             .get()
             != pool
@@ -443,7 +443,7 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
     for entry in jobs.iter()? {
         let (key, bytes) = entry?;
         let id = key.value();
-        let job = transactions::decode_mutable_job(id, bytes.value())?;
+        let job = jobs::decode_mutable_job(id, bytes.value())?;
         let runtime = state::require(tx, job.id)?;
         if runtime.last_result.is_some() {
             return Err(StorageError::corrupted(
@@ -454,7 +454,7 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
             let prior = jobs
                 .get(previous.get())?
                 .ok_or_else(|| StorageError::corrupted("Job predecessor is missing"))?;
-            let prior = transactions::decode_mutable_job(previous.get(), prior.value())?;
+            let prior = jobs::decode_mutable_job(previous.get(), prior.value())?;
             if prior.parent_id != job.parent_id || prior.phase == MutableJobPhase::Unsubmitted {
                 return Err(StorageError::corrupted(
                     "Job predecessor is outside its submitted history",
@@ -516,15 +516,15 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
                     })?;
                     let requirement = match job.frozen.as_ref() {
                         Some(MutableFrozenConfiguration::Generative(frozen)) => {
-                            transactions::execution_requirement(frozen)
+                            reservations::execution_requirement(frozen)
                         }
                         Some(MutableFrozenConfiguration::Decision(_)) => {
-                            transactions::decision_requirement()
+                            reservations::decision_requirement()
                         }
                         None => return Err(StorageError::corrupted("queued Job is not frozen")),
                     };
                     ready.insert((
-                        transactions::mutable_priority(job.input.priority),
+                        jobs::mutable_priority(job.input.priority),
                         submitted_at.as_unix_micros(),
                         id,
                         requirement,

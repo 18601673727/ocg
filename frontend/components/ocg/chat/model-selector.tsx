@@ -1,13 +1,13 @@
 "use client";
 
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { ExternalLink } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { ChatModelSelection, AgentProfile, Project } from "../contracts";
-import { ModelSelectorView } from "./model-selector-view";
-import { useOcgRuntime } from "../runtime/runtime-context";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import type { AgentProfile, ChatModelSelection, Project } from "../contracts";
 import { useI18n } from "../i18n";
+import { useOcgRuntime } from "../runtime/runtime-context";
 import { settingsPath } from "../settings/settings-sections";
+import { ModelSelectorView } from "./model-selector-view";
 
 const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -41,6 +41,7 @@ export function ModelSelector({
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [error, setError] = useState<string>();
   const [attempt, setAttempt] = useState(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Changing attempt explicitly retries this operation.
   useEffect(() => {
     if (!api) return;
     const controller = new AbortController();

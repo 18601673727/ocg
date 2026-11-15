@@ -1,14 +1,8 @@
 "use client";
 
-import type * as Api from "@/components/ocg/contracts/api";
-
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useId, useState } from "react";
-import type { ApiClient } from "../runtime/api-client";
-import { useI18n } from "../i18n";
-import { summarize, type RankedUsage } from "./usage-chart-data";
-import { summarizeReliability, type ReliabilitySummary } from "./reliability-chart-data";
-import { HoverMarquee } from "../sidebar/hover-marquee";
+import type * as Api from "@/components/ocg/contracts/api";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
@@ -17,6 +11,11 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useI18n } from "../i18n";
+import type { ApiClient } from "../runtime/api-client";
+import { HoverMarquee } from "../sidebar/hover-marquee";
+import { type ReliabilitySummary, summarizeReliability } from "./reliability-chart-data";
+import { type RankedUsage, summarize } from "./usage-chart-data";
 
 const DAY_US = 86_400_000_000;
 const select = "rounded-md border border-input bg-background px-3 py-2 text-sm";
@@ -191,6 +190,7 @@ function CartesianBarPlot({
           {bars.map((bar, index) => {
             let stacked = 0;
             return (
+              // biome-ignore lint/a11y/noStaticElementInteractions: The SVG bar opens the same tooltip on focus and hover and dismisses it on Escape.
               <g
                 key={bar.key}
                 tabIndex={0}
@@ -362,6 +362,7 @@ function UsageChartData({
     error: null,
   });
   const { t } = useI18n();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: This key explicitly refreshes the data.
   useEffect(() => {
     const controller = new AbortController();
     const { signal } = controller;
@@ -565,6 +566,7 @@ function ReliabilityChartData({
     error: null,
   });
   const { t } = useI18n();
+  // biome-ignore lint/correctness/useExhaustiveDependencies: This key explicitly refreshes the data.
   useEffect(() => {
     const controller = new AbortController();
     const { signal } = controller;

@@ -7,10 +7,9 @@ use super::{
     dashboard, decimal, profiles, routing, submissions,
 };
 use crate::db::entities::{
-    ConfigBody, ConfigKind, DependencyCondition, DependencyState, JobEdit, JobId, ModelCapability,
-    ProfileId, RecordRef, Recurrence, Violation,
+    ConfigBody, ConfigKind, DependencyCondition, DependencyState, JobEdit, JobId, JobTree,
+    ModelCapability, ProfileId, RecordRef, Recurrence, TreeFacts, TreeNode, Violation,
 };
-use crate::db::redb::{JobTree, TreeFacts, TreeNode};
 use crate::db::{DatabaseError, DatabaseHandle};
 
 pub(super) const MAX_CONVERSATION_PAGE: usize = 100;
@@ -201,7 +200,7 @@ pub(super) async fn job_input(
     {
         let context = super::mutable_jobs::optional_context(request)?;
         match database.mutable_job_details(job, context).await? {
-            crate::db::redb::MutableJobDetailsLookup::Found(details) => {
+            Some(details) => {
                 let record = details.record;
                 let configuration = details
                     .configuration
@@ -258,8 +257,7 @@ pub(super) async fn job_input(
                 );
                 Ok(Reply::ok(body))
             }
-            crate::db::redb::MutableJobDetailsLookup::Inaccessible
-            | crate::db::redb::MutableJobDetailsLookup::NotMutable => Err(JOB_NOT_FOUND),
+            None => Err(JOB_NOT_FOUND),
         }
     }
 }
@@ -506,9 +504,7 @@ pub(super) async fn job_tree(
     limit: usize,
     depth: u8,
 ) -> Result<Reply, Refusal> {
-    if let crate::db::redb::MutableJobDetailsLookup::Found(details) =
-        shared.database.mutable_job_details(job, None).await?
-    {
+    if let Some(details) = shared.database.mutable_job_details(job, None).await? {
         return dashboard::bounded(shared, envelope(serde_json::json!(native_tree(&details))));
     }
     let tree = shared
@@ -527,7 +523,7 @@ pub(super) async fn job_tree(
     )
 }
 
-fn native_tree(details: &crate::db::redb::MutableJobDetails) -> TreeView {
+fn native_tree(details: &crate::db::entities::MutableJobDetails) -> TreeView {
     let record = &details.record;
     let job = &record.job;
     let title = super::jobs::mutable_title(job);
@@ -928,7 +924,7 @@ pub(super) async fn search_conversations(
     Ok(Reply::ok(envelope(conversation_page(page))))
 }
 
-fn conversation_page(page: crate::db::redb::ConversationsPage) -> serde_json::Value {
+fn conversation_page(page: crate::db::entities::ConversationsPage) -> serde_json::Value {
     let items = page
         .conversations
         .into_iter()
@@ -1175,7 +1171,7 @@ pub(super) async fn conversation_context(
             .work
             .into_iter()
             .map(|work| match work.details {
-                crate::db::redb::ContextWorkDetails::Summary {
+                crate::db::entities::ContextWorkDetails::Summary {
                     summarizer,
                     failure,
                     automatic,

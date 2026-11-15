@@ -1,7 +1,7 @@
 "use client";
 
-import { useI18n, type I18nKey } from "../i18n";
 import type { ApprovalAssessment } from "../contracts/api";
+import { type I18nKey, useI18n } from "../i18n";
 
 const ACTION_LABELS: Record<string, I18nKey> = {
   job_plan: "chat.card.plan",
@@ -87,7 +87,11 @@ export function ApprovalRequest({
       {plan && (
         <ol className="space-y-3 py-1" aria-label={t("chat.card.plan")}>
           {plan.map((step, index) => (
-            <li key={index} className="rounded-lg border border-border p-3">
+            <li
+              // biome-ignore lint/suspicious/noArrayIndexKey: Plan dependencies identify steps by their position.
+              key={index}
+              className="rounded-lg border border-border p-3"
+            >
               <div className="flex items-start gap-2.5">
                 <span
                   className="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium tabular-nums"

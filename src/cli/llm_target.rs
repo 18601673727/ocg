@@ -139,40 +139,20 @@ async fn native_executor(
     database: &DatabaseHandle,
     protocol: LlmTransport,
 ) -> Result<(ExecutorId, ExecutionPoolId), DatabaseError> {
-    use crate::db::redb::{NativeResource, NativeResourceKind};
     let mut before = None;
     loop {
-        let page = database
-            .native_resources(before, 100, NativeResourceKind::Executor)
-            .await?;
-        for resource in page.records {
-            let NativeResource::Executor(executor) = resource else {
-                continue;
-            };
-            if !executor.enabled
-                || !executor
+        let page = database.allocation_executors(before, 100).await?;
+        for executor in page.records {
+            if executor.enabled
+                && executor
                     .capabilities
                     .contains(&(ExecutionOperation::LlmRequest, Some(protocol)))
+                && database
+                    .allocation_pool(executor.pool)
+                    .await?
+                    .is_some_and(|pool| pool.enabled && !pool.archived)
             {
-                continue;
-            }
-            let mut pool_before = None;
-            loop {
-                let pools = database
-                    .native_resources(pool_before, 100, NativeResourceKind::Pool)
-                    .await?;
-                for pool in pools.records {
-                    if let NativeResource::Pool(pool) = pool
-                        && pool.id == executor.pool
-                        && pool.enabled
-                    {
-                        return Ok((executor.id, pool.id));
-                    }
-                }
-                match pools.next {
-                    Some(next) => pool_before = Some(next),
-                    None => break,
-                }
+                return Ok((executor.id, executor.pool));
             }
         }
         match page.next {

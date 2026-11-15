@@ -1,13 +1,13 @@
 "use client";
 
+import { LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 import { cn } from "@/lib/utils";
-import { DismissibleNotice } from "../primitives/dismissible-notice";
-import { HoverMarquee } from "./hover-marquee";
-import { LoaderCircle } from "lucide-react";
-import { runtimeStateLabel, useI18n } from "../i18n";
 import type { ChildConversation } from "../contracts";
+import { runtimeStateLabel, useI18n } from "../i18n";
+import { DismissibleNotice } from "../primitives/dismissible-notice";
 import type { ApiClient } from "../runtime/api-client";
+import { HoverMarquee } from "./hover-marquee";
 
 export function SidebarConversationChildren({
   conversation,

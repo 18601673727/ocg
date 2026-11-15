@@ -5,7 +5,7 @@ use ntex::http::StatusCode;
 use serde::Deserialize;
 
 use super::{INVALID_REQUEST, Refusal, Reply, catalog, profiles};
-use crate::db::entities::{ExecutionOperation, ExecutionPoolId, RecordRef, Violation};
+use crate::db::entities::{ExecutionOperation, ExecutionPoolId, ExecutorId, RecordRef, Violation};
 use crate::db::{DatabaseError, DatabaseHandle};
 
 const POOL_NOT_FOUND: Refusal =
@@ -70,29 +70,14 @@ pub(super) async fn list(
     before: Option<ExecutionPoolId>,
     limit: usize,
 ) -> Result<Reply, Refusal> {
-    {
-        let page = database
-            .native_resources(
-                before.map(Into::into),
-                limit,
-                crate::db::redb::NativeResourceKind::Pool,
-            )
-            .await?;
-        let next_before = page.next.map(|id| id.to_string());
-        let pools = page
-            .records
-            .into_iter()
-            .map(|record| match record {
-                crate::db::redb::NativeResource::Pool(pool) => Ok(native_pool_json(&pool)),
-                crate::db::redb::NativeResource::Executor(_) => Err(super::INCONSISTENT_RECORD),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut body = envelope(
-            serde_json::json!({"resource_model":"independent", "pools":pools,"has_more":next_before.is_some(),"next_before":next_before}),
-        );
-        body["api_version"] = serde_json::json!(POOL_API_VERSION);
-        Ok(Reply::ok(body))
-    }
+    let page = database.allocation_pools(before, limit).await?;
+    let next_before = page.next.map(|id| id.to_string());
+    let pools: Vec<_> = page.records.iter().map(native_pool_json).collect();
+    let mut body = envelope(
+        serde_json::json!({"resource_model":"independent", "pools":pools,"has_more":next_before.is_some(),"next_before":next_before}),
+    );
+    body["api_version"] = serde_json::json!(POOL_API_VERSION);
+    Ok(Reply::ok(body))
 }
 
 fn native_pool_json(pool: &crate::db::entities::AllocationPool) -> serde_json::Value {
@@ -106,23 +91,12 @@ fn native_executor_json(executor: &crate::db::entities::AllocationExecutor) -> s
 
 pub(super) async fn list_executors(
     database: &DatabaseHandle,
-    before: Option<crate::db::entities::ConfigId>,
+    before: Option<ExecutorId>,
     limit: usize,
 ) -> Result<Reply, Refusal> {
-    let page = database
-        .native_resources(before, limit, crate::db::redb::NativeResourceKind::Executor)
-        .await?;
+    let page = database.allocation_executors(before, limit).await?;
     let next_before = page.next.map(|id| id.to_string());
-    let executors = page
-        .records
-        .into_iter()
-        .map(|record| match record {
-            crate::db::redb::NativeResource::Executor(executor) => {
-                Ok(native_executor_json(&executor))
-            }
-            crate::db::redb::NativeResource::Pool(_) => Err(super::INCONSISTENT_RECORD),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let executors: Vec<_> = page.records.iter().map(native_executor_json).collect();
     Ok(Reply::ok(envelope(
         serde_json::json!({"resource_model":"independent","executors":executors,"has_more":next_before.is_some(),"next_before":next_before}),
     )))
@@ -244,15 +218,15 @@ struct NativeExecutorUpdateInput {
     capabilities: Option<Vec<NativeCapabilityInput>>,
 }
 
-pub(super) fn executor_id(text: &str) -> Result<crate::db::entities::ExecutorId, Refusal> {
+pub(super) fn executor_id(text: &str) -> Result<ExecutorId, Refusal> {
     crate::db::entities::parse_entity_id(text)
-        .map(crate::db::entities::ExecutorId::new)
+        .map(ExecutorId::new)
         .ok_or(INVALID_REQUEST)
 }
 
 pub(super) async fn update_executor(
     database: &DatabaseHandle,
-    id: crate::db::entities::ExecutorId,
+    id: ExecutorId,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     use crate::db::entities::ExecutorUpdate;
@@ -283,7 +257,7 @@ struct ArchiveInput {
 
 pub(super) async fn archive_executor(
     database: &DatabaseHandle,
-    id: crate::db::entities::ExecutorId,
+    id: ExecutorId,
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     let input: ArchiveInput = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
@@ -396,7 +370,7 @@ pub(super) async fn list_allocations(
     let next_after = page.next.map(|(executor, job)| {
         format!(
             "{}.{}",
-            crate::db::entities::ExecutorId::new(executor),
+            ExecutorId::new(executor),
             crate::db::entities::JobId::new(job)
         )
     });

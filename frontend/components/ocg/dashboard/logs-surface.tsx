@@ -1,18 +1,9 @@
 "use client";
 
-import type * as Api from "@/components/ocg/contracts/api";
-
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Clock, FileText } from "lucide-react";
-import type { ApiClient } from "../runtime/api-client";
-import { useI18n } from "../i18n";
-import { ContentContainer, ContentHeader } from "../layout/content-container";
-import { LoadMore } from "../primitives/load-more";
-import { ListStatus } from "../primitives/list-status";
-import { StatusDot } from "../primitives/status-dot";
-import { Pill } from "../primitives/pill";
-import type { Tone } from "../primitives/tone";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type * as Api from "@/components/ocg/contracts/api";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import {
   Select,
   SelectContent,
@@ -20,6 +11,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { useI18n } from "../i18n";
+import { ContentContainer, ContentHeader } from "../layout/content-container";
+import { ListStatus } from "../primitives/list-status";
+import { LoadMore } from "../primitives/load-more";
+import { Pill } from "../primitives/pill";
+import { StatusDot } from "../primitives/status-dot";
+import type { Tone } from "../primitives/tone";
+import type { ApiClient } from "../runtime/api-client";
 
 const levelTone: Record<string, Tone> = {
   ERROR: "red",
@@ -47,7 +46,7 @@ export function LogsSurface({ client }: { client: ApiClient }) {
     let queued: Api.Logs | null = null;
     const merge = (entries: Api.Logs["entries"], page: Api.Logs) => {
       const merged = new Map(entries.map((entry) => [entry.offset, entry]));
-      page.entries.forEach((entry) => merged.set(entry.offset, entry));
+      page.entries.forEach((entry) => void merged.set(entry.offset, entry));
       return [...merged.values()].sort((a, b) => a.offset - b.offset);
     };
     const fail = (cause: unknown) => {

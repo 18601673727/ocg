@@ -1,5 +1,5 @@
-import type { ChatSession } from "../types";
 import type { ApiClient } from "../runtime/api-client";
+import type { ChatSession } from "../types";
 
 export type SearchConversation = Awaited<
   ReturnType<ApiClient["searchConversations"]>

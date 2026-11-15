@@ -1,7 +1,7 @@
 "use client";
 
-import { type ReactNode } from "react";
 import { Check, Copy, FileCode2, Search } from "lucide-react";
+import type { ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import type { ToolCall } from "../contracts";
@@ -100,21 +100,21 @@ function SearchFileResult({ file }: { file: SearchFile }) {
             const highlighted = highlightCode(match.text, sourceLanguage(file.path));
             return (
               <li
+                // biome-ignore lint/suspicious/noArrayIndexKey: Multiple matches can occur on the same line.
                 key={`${match.line}:${index}`}
                 data-slot="search-match"
                 className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] font-mono text-xs leading-5"
               >
-                <span
-                  className="min-w-12 border-r border-border bg-muted/30 px-3 py-1 text-right tabular-nums text-muted-foreground"
-                  aria-label={t("chat.search.line", { line: match.line })}
-                >
-                  {match.line}
+                <span className="min-w-12 border-r border-border bg-muted/30 px-3 py-1 text-right tabular-nums text-muted-foreground">
+                  <span className="sr-only">{t("chat.search.line", { line: match.line })}</span>
+                  <span aria-hidden="true">{match.line}</span>
                 </span>
                 <div className="min-w-0 px-3 py-1">
                   <pre className="whitespace-pre-wrap wrap-anywhere">
                     {highlighted ? (
                       <code
                         className="hljs bg-transparent! p-0!"
+                        // biome-ignore lint/security/noDangerouslySetInnerHtml: highlight.js escapes source text before emitting syntax markup.
                         dangerouslySetInnerHTML={{ __html: highlighted.html }}
                       />
                     ) : (
@@ -220,17 +220,17 @@ export function SearchTool({ call, children }: { call: ToolCall; children: React
         )}
       </div>
       {files.length > 0 ? (
-        <div
+        <section
           data-slot="search-results"
           className="ocg-subtle-scrollbar max-h-96 overflow-auto border-t border-border outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          // biome-ignore lint/a11y/noNoninteractiveTabindex: Keyboard users can focus and scroll this results region.
           tabIndex={0}
-          role="region"
           aria-label={t("chat.search.results")}
         >
           {files.map((file) => (
             <SearchFileResult key={file.path} file={file} />
           ))}
-        </div>
+        </section>
       ) : (
         <p className="border-t border-border px-3 py-5 text-sm text-muted-foreground">
           {t(result.complete ? "chat.search.empty" : "chat.search.emptyPartial")}

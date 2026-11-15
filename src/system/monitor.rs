@@ -393,36 +393,6 @@ impl ProtectionWatch {
     }
 }
 
-pub(crate) struct SharedRequest<T> {
-    waiters: Mutex<Option<Vec<flume::Sender<T>>>>,
-}
-
-impl<T: Clone> SharedRequest<T> {
-    pub(crate) fn new() -> Self {
-        Self {
-            waiters: Mutex::new(None),
-        }
-    }
-
-    pub(crate) fn complete(&self, result: T) {
-        let waiters = self
-            .waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        for waiter in waiters.into_iter().flatten() {
-            waiter.send(result.clone()).ok();
-        }
-    }
-
-    pub(crate) fn abandon(&self) {
-        self.waiters
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-    }
-}
-
 pub(crate) async fn report_protection(watch: ProtectionWatch) {
     let mut lock = watch.status().lock;
     if let Some(notice) = protection_notice(None, lock.as_ref()) {

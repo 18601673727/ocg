@@ -247,11 +247,10 @@ fn view(record: MutableJobRecord) -> Value {
     )
 }
 
-pub(super) async fn add_editable_state(
+pub(super) fn add_editable_state(
     body: &mut Value,
-    database: &DatabaseHandle,
-    context: Option<ComposerContextId>,
     record: &MutableJobRecord,
+    unsupported_decision_history: Option<Result<bool, &'static str>>,
 ) -> Result<(), Refusal> {
     let job = &record.job;
     body["context"] = serde_json::json!(job.composer_context.to_string());
@@ -264,16 +263,10 @@ pub(super) async fn add_editable_state(
         body["autonomous_loopback_eligibility"] =
             crate::system::native_scheduler::loopback_eligibility(job.frozen.as_ref()).to_json();
     }
-    if let Some(context) = context {
-        body["unsupported_decision_history"] = Value::Bool(if queued_generative {
-            database
-                .mutable_job_with_support(context, job.id)
-                .await
-                .map_err(refusal)?
-                .1
-        } else {
-            false
-        });
+    if let Some(unsupported) = unsupported_decision_history {
+        body["unsupported_decision_history"] = Value::Bool(
+            unsupported.map_err(|reason| UNSUPPORTED_CONTEXT.with_reason(reason.to_owned()))?,
+        );
     }
     Ok(())
 }

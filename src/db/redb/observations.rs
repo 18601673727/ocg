@@ -25,7 +25,7 @@ fn frozen_observation_target(
     let Some(bytes) = jobs.get(job.get())? else {
         return Ok(None);
     };
-    let row = transactions::decode_mutable_job(job.get(), bytes.value())?;
+    let row = jobs::decode_mutable_job(job.get(), bytes.value())?;
     match row.frozen {
         Some(MutableFrozenConfiguration::Generative(frozen)) => {
             Ok(Some(ObservationTarget::Llm(Box::new(LlmTarget {
@@ -487,18 +487,6 @@ pub(crate) fn read_availability_stats(
         max_scan,
         |_, job, target, event| Ok(availability_of(job, target, event)),
     )
-}
-
-pub(crate) struct ProviderResponse {
-    pub request: RequestNumber,
-    pub text: Arc<str>,
-    pub requests_tools: bool,
-    pub recorded_at: Timestamp,
-}
-
-pub(crate) struct ProviderResponsesPage {
-    pub responses: Vec<ProviderResponse>,
-    pub has_more: bool,
 }
 
 #[derive(Clone)]

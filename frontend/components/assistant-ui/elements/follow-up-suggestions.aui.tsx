@@ -1,7 +1,7 @@
 "use client";
 
-import { AuiIf, useAuiState, ThreadPrimitive } from "@assistant-ui/react";
-import { useCallback, useEffect, useRef, useState, type FC } from "react";
+import { AuiIf, ThreadPrimitive, useAuiState } from "@assistant-ui/react";
+import { type FC, useCallback, useEffect, useRef, useState } from "react";
 
 const FollowupSuggestionsRow: FC = () => {
   const suggestions = useAuiState((s) => s.thread.suggestions);
@@ -14,7 +14,8 @@ const FollowupSuggestionsRow: FC = () => {
     if (!el) return;
     const maxScroll = el.scrollWidth - el.clientWidth;
     const fromStart = Math.abs(el.scrollLeft);
-    const rtl = (rtlRef.current ??= getComputedStyle(el).direction === "rtl");
+    rtlRef.current ??= getComputedStyle(el).direction === "rtl";
+    const rtl = rtlRef.current;
     const [left, right] = rtl
       ? [maxScroll - fromStart, fromStart]
       : [fromStart, maxScroll - fromStart];
@@ -48,6 +49,7 @@ const FollowupSuggestionsRow: FC = () => {
       <div className="mx-auto flex min-h-8 w-max items-center gap-2 px-0.5">
         {suggestions.map((suggestion, idx) => (
           <ThreadPrimitive.Suggestion
+            // biome-ignore lint/suspicious/noArrayIndexKey: Suggestions have no IDs and may repeat in the same response.
             key={idx}
             className="aui-thread-followup-suggestion border-foreground/10 hover:bg-foreground/[0.03] hover:border-foreground/25 rounded-md border px-2.5 py-1 text-sm whitespace-nowrap transition-colors ease-in motion-reduce:transition-none"
             prompt={suggestion.prompt}

@@ -1,0 +1,852 @@
+use super::*;
+use crate::db::entities::{AllocationPhase, ExecutionOperation, OutcomeKind};
+
+fn context_unavailable(detail: &str) -> StorageError {
+    StorageError {
+        kind: super::StorageErrorKind::Other,
+        os_error: None,
+        detail: detail.to_owned(),
+    }
+}
+
+fn context_attachments(
+    rx: &ReadTransaction,
+    ids: &[AttachmentId],
+) -> Result<Vec<AttachmentRecord>, StorageError> {
+    let table = rx.open_table(ATTACHMENTS)?;
+    ids.iter()
+        .map(|id| {
+            let bytes = table
+                .get(id.get())?
+                .ok_or_else(|| StorageError::corrupted("context Attachment missing"))?;
+            let attachment = decode_attachment(id.get(), bytes.value())?;
+            if !attachment.is_available() {
+                return Err(context_unavailable("context Attachment is unavailable"));
+            }
+            Ok(attachment)
+        })
+        .collect()
+}
+
+const SUMMARY_MAX_OUTPUTS: usize = 100_000;
+
+const SUMMARY_MAX_BYTES: usize = 128 * 1024 * 1024;
+
+const SUMMARY_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
+
+pub(crate) struct SummaryBudget {
+    pub(crate) bytes: usize,
+    pub(crate) outputs: usize,
+}
+
+impl SummaryBudget {
+    fn bytes(&mut self, n: usize) -> Result<(), StorageError> {
+        if n > SUMMARY_MAX_RECORD_BYTES {
+            return Err(context_unavailable(
+                "summary verification record exceeds byte limit",
+            ));
+        }
+        self.bytes = self
+            .bytes
+            .checked_add(n)
+            .ok_or_else(|| context_unavailable("summary verification byte budget exceeded"))?;
+        if self.bytes > SUMMARY_MAX_BYTES {
+            return Err(context_unavailable(
+                "summary verification byte budget exceeded",
+            ));
+        }
+        Ok(())
+    }
+
+    fn output(&mut self) -> Result<(), StorageError> {
+        self.outputs += 1;
+        if self.outputs > SUMMARY_MAX_OUTPUTS {
+            return Err(context_unavailable(
+                "summary verification output budget exceeded",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn native_summary_frame(
+    hash: &mut aws_lc_rs::digest::Context,
+    budget: &mut SummaryBudget,
+    bytes: &[u8],
+) -> Result<(), StorageError> {
+    budget.bytes(bytes.len())?;
+    hash.update(&(bytes.len() as u64).to_le_bytes());
+    hash.update(bytes);
+    Ok(())
+}
+
+fn native_summary_owner(
+    pools: &impl ReadableTable<u128, &'static [u8]>,
+    executors: &impl ReadableTable<u128, &'static [u8]>,
+    allocation: &crate::db::entities::PoolAllocation,
+    budget: &mut SummaryBudget,
+) -> Result<(), StorageError> {
+    let pool = pools
+        .get(allocation.token.pool.get())?
+        .ok_or_else(|| StorageError::corrupted("summary allocation Pool missing"))?;
+    let executor = executors
+        .get(allocation.token.executor.get())?
+        .ok_or_else(|| StorageError::corrupted("summary allocation Executor missing"))?;
+    budget.bytes(pool.value().len())?;
+    budget.bytes(executor.value().len())?;
+    let pool = allocations::decode_allocation_pool(allocation.token.pool.get(), pool.value())?;
+    let executor =
+        allocations::decode_allocation_executor(allocation.token.executor.get(), executor.value())?;
+    if executor.pool != pool.id
+        || pool.revision < allocation.pool_revision
+        || executor.revision < allocation.executor_revision
+        || !executor
+            .capabilities
+            .contains(&(allocation.operation, allocation.protocol))
+    {
+        return Err(context_unavailable(
+            "summary allocation ownership is inconsistent",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) struct NativeSummaryTables<J, S, A, O, AT, T, P, E> {
+    pub jobs: J,
+    pub states: S,
+    pub allocations: A,
+    pub outputs: O,
+    pub attachments: AT,
+    pub tools: T,
+    pub pools: P,
+    pub executors: E,
+}
+
+pub(crate) fn native_source_boundary<J, S, A, O, AT, T, P, E>(
+    tables: &NativeSummaryTables<J, S, A, O, AT, T, P, E>,
+    id: JobId,
+    conversation: JobId,
+    budget: &mut SummaryBudget,
+) -> Result<(crate::db::entities::NativeSummaryBoundary, Option<JobId>), StorageError>
+where
+    J: ReadableTable<u128, &'static [u8]>,
+    S: ReadableTable<u128, &'static [u8]>,
+    A: ReadableTable<u128, &'static [u8]>,
+    O: ReadableTable<(u128, u32), &'static [u8]>,
+    AT: ReadableTable<u128, &'static [u8]>,
+    T: ReadableTable<(u128, u32, u32), &'static [u8]>,
+    P: ReadableTable<u128, &'static [u8]>,
+    E: ReadableTable<u128, &'static [u8]>,
+{
+    use crate::db::entities::MutableJobPhase;
+    use aws_lc_rs::digest::{Context, SHA256};
+    let jobs = &tables.jobs;
+    let states = &tables.states;
+    let allocations = &tables.allocations;
+    let attachments = &tables.attachments;
+    let outputs = &tables.outputs;
+    let tools = &tables.tools;
+    let job_bytes = jobs
+        .get(id.get())?
+        .ok_or_else(|| StorageError::corrupted("summary source Job missing"))?;
+    let state_bytes = states
+        .get(id.get())?
+        .ok_or_else(|| StorageError::corrupted("summary source state missing"))?;
+    let allocation_bytes = allocations
+        .get(id.get())?
+        .ok_or_else(|| StorageError::corrupted("summary source allocation missing"))?;
+    budget.bytes(job_bytes.value().len())?;
+    budget.bytes(state_bytes.value().len())?;
+    budget.bytes(allocation_bytes.value().len())?;
+    let job = crate::db::redb::jobs::decode_mutable_job(id.get(), job_bytes.value())?;
+    if matches!(
+        job.input.content,
+        crate::db::entities::MutableJobContent::Decision { .. }
+    ) {
+        return Err(context_unavailable(
+            "Decision Jobs cannot be summary sources",
+        ));
+    }
+    let state = state::decode_state(id.get(), state_bytes.value())?;
+    let allocation = allocations::decode_pool_allocation(id.get(), allocation_bytes.value())?;
+    if job.parent_id != conversation
+        || job.phase != MutableJobPhase::Executing
+        || job.summary_source.is_some()
+        || job.context_selection != crate::db::entities::MutableContextSelection::FullHistory
+        || !state.outcome.as_ref().is_some_and(|o| {
+            matches!(
+                o.kind,
+                OutcomeKind::Completed | OutcomeKind::Failed | OutcomeKind::Cancelled
+            )
+        })
+        || allocation.phase != AllocationPhase::Released
+        || allocation.stop_confirmed_at.is_some()
+        || allocation.stop_proof.is_some()
+        || allocation.job_revision != job.revision
+        || allocation.operation != ExecutionOperation::LlmRequest
+        || !job
+            .frozen
+            .as_ref()
+            .is_some_and(|frozen| matches!(frozen, crate::db::entities::MutableFrozenConfiguration::Generative(frozen) if allocation.protocol == Some(frozen.llm.provider.transport)))
+        || !job
+            .submitted_at
+            .is_some_and(|at| at <= allocation.claimed_at)
+        || !state
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.at >= allocation.claimed_at)
+    {
+        return Err(context_unavailable(
+            "summary source is not a settled conversation Job",
+        ));
+    }
+    native_summary_owner(&tables.pools, &tables.executors, &allocation, budget)?;
+    if tools
+        .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(context_unavailable(
+            "summary source tool evidence is not supported",
+        ));
+    }
+    let mut hash = Context::new(&SHA256);
+    hash.update(b"ocg-native-summary-source-v1");
+    native_summary_frame(&mut hash, budget, job_bytes.value())?;
+    native_summary_frame(&mut hash, budget, state_bytes.value())?;
+    native_summary_frame(&mut hash, budget, allocation_bytes.value())?;
+    for id in job.input.attachments() {
+        let bytes = attachments
+            .get(id.get())?
+            .ok_or_else(|| StorageError::corrupted("summary source attachment missing"))?;
+        native_summary_frame(&mut hash, budget, bytes.value())?;
+        let attachment = decode_attachment(id.get(), bytes.value())?;
+        if !attachment.is_available() {
+            return Err(context_unavailable("summary source attachment unavailable"));
+        }
+    }
+    let mut through = 0u32;
+    let mut final_result = false;
+    for entry in outputs.range((id.get(), 0)..=(id.get(), u32::MAX))? {
+        let (key, bytes) = entry?;
+        budget.output()?;
+        let seq = key.value().1;
+        if seq
+            != through
+                .checked_add(1)
+                .ok_or_else(|| context_unavailable("summary source output overflow"))?
+        {
+            return Err(StorageError::corrupted(
+                "summary source output sequence has a gap",
+            ));
+        }
+        native_summary_frame(&mut hash, budget, bytes.value())?;
+        let output = decode_output(key.value(), bytes.value())?;
+        if output.created_at < allocation.claimed_at
+            || state
+                .outcome
+                .as_ref()
+                .is_none_or(|outcome| output.created_at > outcome.at)
+        {
+            return Err(context_unavailable(
+                "summary source output timing is inconsistent",
+            ));
+        }
+        if final_result {
+            return Err(StorageError::corrupted(
+                "summary source output follows its final result",
+            ));
+        }
+        final_result = output.kind == OutputKind::Result;
+        through = seq;
+    }
+    if through == 0 || !final_result {
+        return Err(StorageError::corrupted(
+            "summary source final output missing",
+        ));
+    }
+    let digest: [u8; 32] = hash
+        .finish()
+        .as_ref()
+        .try_into()
+        .map_err(|_| StorageError::corrupted("invalid source digest"))?;
+    Ok((
+        crate::db::entities::NativeSummaryBoundary {
+            job: id,
+            revision: job.revision,
+            output_through: through,
+            content: ContentDigest::from_bytes(digest),
+        },
+        job.previous,
+    ))
+}
+
+pub(super) fn verify_native_summary_in(
+    rx: &ReadTransaction,
+    conversation: JobId,
+    consumer: JobId,
+    producer: JobId,
+    source: ContentDigest,
+) -> Result<VerifiedNativeSummary, StorageError> {
+    verify_native_summary_tables(
+        &rx.open_table(JOBS)?,
+        &rx.open_table(JOB_RUNTIME)?,
+        &rx.open_table(JOB_OUTPUTS)?,
+        &rx.open_table(MESSAGES)?,
+        conversation,
+        consumer,
+        producer,
+        source,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_native_summary_tables<J, S, O, M>(
+    jobs: &J,
+    states: &S,
+    outputs: &O,
+    messages: &M,
+    conversation: JobId,
+    consumer: JobId,
+    producer: JobId,
+    source: ContentDigest,
+) -> Result<VerifiedNativeSummary, StorageError>
+where
+    J: ReadableTable<u128, &'static [u8]>,
+    S: ReadableTable<u128, &'static [u8]>,
+    O: ReadableTable<(u128, u32), &'static [u8]>,
+    M: ReadableTable<&'static [u8], &'static [u8]>,
+{
+    if consumer == producer {
+        return Err(context_unavailable(
+            "summary consumer cannot be its own producer",
+        ));
+    }
+    let producer_bytes = jobs
+        .get(producer.get())?
+        .ok_or_else(|| StorageError::corrupted("summary producer missing"))?;
+    let producer_job =
+        crate::db::redb::jobs::decode_mutable_job(producer.get(), producer_bytes.value())?;
+    let state = state::decode_state(
+        producer.get(),
+        states
+            .get(producer.get())?
+            .ok_or_else(|| StorageError::corrupted("summary producer state missing"))?
+            .value(),
+    )?;
+    if producer_job.parent_id != conversation
+        || producer_job.summary_source != Some(source)
+        || !state
+            .outcome
+            .as_ref()
+            .is_some_and(|o| o.kind == OutcomeKind::Completed)
+    {
+        return Err(context_unavailable(
+            "summary producer is not authorized and completed",
+        ));
+    }
+    let manifest_bytes = messages
+        .get(source.as_bytes().as_slice())?
+        .ok_or_else(|| StorageError::corrupted("summary manifest missing"))?;
+    let manifest: crate::db::entities::NativeSummaryManifest =
+        serde_json::from_slice(manifest_bytes.value())
+            .map_err(|_| StorageError::corrupted("malformed summary manifest"))?;
+    manifest.validate().map_err(StorageError::corrupted)?;
+    if manifest.conversation != conversation {
+        return Err(context_unavailable(
+            "summary manifest has an unsupported scope",
+        ));
+    }
+    let output = outputs
+        .range((producer.get(), 0)..=(producer.get(), u32::MAX))?
+        .next_back()
+        .transpose()?
+        .map(|(k, b)| decode_output(k.value(), b.value()))
+        .transpose()?
+        .filter(|o| o.kind == OutputKind::Result)
+        .ok_or_else(|| StorageError::corrupted("summary producer result missing"))?;
+    let link: crate::db::entities::NativeSummaryResultLink = serde_json::from_value(
+        output
+            .value
+            .ok_or_else(|| StorageError::corrupted("summary result link missing"))?,
+    )
+    .map_err(|_| StorageError::corrupted("malformed summary result link"))?;
+    if link.source != source {
+        return Err(context_unavailable("summary result source changed"));
+    }
+    let payload = messages
+        .get(link.payload.as_bytes().as_slice())?
+        .ok_or_else(|| StorageError::corrupted("summary payload missing"))?;
+    let summary: crate::db::entities::SummarizationResult = serde_json::from_slice(payload.value())
+        .map_err(|_| StorageError::corrupted("malformed summary payload"))?;
+    summary.validate().map_err(StorageError::corrupted)?;
+    if summary.source != source {
+        return Err(context_unavailable("summary payload names another source"));
+    }
+    Ok(VerifiedNativeSummary { manifest, summary })
+}
+
+pub(crate) fn read_trial_job(
+    database: &Database,
+    job: JobId,
+) -> Result<
+    Option<(
+        crate::db::entities::MutableJobRecord,
+        Option<crate::db::entities::PoolAllocation>,
+    )>,
+    StorageError,
+> {
+    let rx = read(database)?;
+    let Some(record) = mutable_job_record_in(&rx, job)? else {
+        return Ok(None);
+    };
+    let allocations = rx.open_table(POOL_ALLOCATIONS)?;
+    let allocation = match allocations.get(job.get())? {
+        Some(row) => Some(allocations::decode_pool_allocation(job.get(), row.value())?),
+        None => None,
+    };
+    Ok(Some((record, allocation)))
+}
+
+fn native_epoch(
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+) -> Result<u64, StorageError> {
+    let epoch = meta
+        .get("open_epoch")?
+        .ok_or_else(|| StorageError::corrupted("database epoch missing"))?;
+    let bytes: [u8; 8] = epoch
+        .value()
+        .try_into()
+        .map_err(|_| StorageError::corrupted("invalid database epoch"))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+pub(crate) fn read_development_execution_context(
+    database: &Database,
+    token: crate::db::entities::AllocationToken,
+) -> Result<DevelopmentCandidate, StorageError> {
+    use crate::db::entities::AllocationPhase;
+    let rx = read(database)?;
+    let meta = rx.open_table(META)?;
+    if native_epoch(&meta)? != token.epoch {
+        return Err(context_unavailable(
+            "Allocation belongs to another database epoch",
+        ));
+    }
+    let allocation = rx
+        .open_table(POOL_ALLOCATIONS)?
+        .get(token.job.get())?
+        .map(|v| allocations::decode_pool_allocation(token.job.get(), v.value()))
+        .transpose()?
+        .ok_or_else(|| context_unavailable("Allocation is missing"))?;
+    if allocation.token != token
+        || allocation.phase != AllocationPhase::Reserved
+        || allocation.stop_confirmed_at.is_some()
+        || allocation.stop_proof.is_some()
+    {
+        return Err(context_unavailable(
+            "Allocation ownership is not a current reservation",
+        ));
+    }
+    development_candidate_in(&rx, &meta, allocation)
+}
+
+fn development_candidate_in(
+    rx: &ReadTransaction,
+    meta: &impl ReadableTable<&'static str, &'static [u8]>,
+    allocation: crate::db::entities::PoolAllocation,
+) -> Result<DevelopmentCandidate, StorageError> {
+    use crate::db::entities::MutableJobPhase;
+    let token = allocation.token;
+    let record = mutable_job_record_in(rx, token.job)?
+        .ok_or_else(|| context_unavailable("Job is missing"))?;
+    if record.job.phase != MutableJobPhase::Queued
+        || record.outcome.is_some()
+        || record.job.revision != allocation.job_revision
+        || record.job.frozen.is_none()
+    {
+        return Err(context_unavailable("Job is not the reserved revision"));
+    }
+    let adopted_summary = match record.job.context_selection {
+        crate::db::entities::MutableContextSelection::FullHistory => None,
+        crate::db::entities::MutableContextSelection::AdoptedSummary { producer, source } => Some(
+            verify_native_summary_in(rx, record.job.parent_id, record.job.id, producer, source)?,
+        ),
+    };
+    let pools = rx.open_table(POOLS)?;
+    let executors = rx.open_table(EXECUTORS)?;
+    let pool = pools
+        .get(token.pool.get())?
+        .map(|v| allocations::decode_allocation_pool(token.pool.get(), v.value()))
+        .transpose()?
+        .ok_or_else(|| context_unavailable("Pool is missing"))?;
+    let executor = executors
+        .get(token.executor.get())?
+        .map(|v| allocations::decode_allocation_executor(token.executor.get(), v.value()))
+        .transpose()?
+        .ok_or_else(|| context_unavailable("Executor is missing"))?;
+    if !pool.enabled
+        || pool.archived
+        || !executor.enabled
+        || executor.archived
+        || executor.pool != pool.id
+        || !executor
+            .capabilities
+            .contains(&(allocation.operation, allocation.protocol))
+    {
+        return Err(context_unavailable(
+            "Pool or Executor configuration changed",
+        ));
+    }
+    let conversation = read_conversation_row(rx, record.job.parent_id)?
+        .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
+    let conversation_lifecycle = read_job_lifecycle(rx, conversation.id)?;
+    if conversation_lifecycle.on_hold.is_some() || conversation_lifecycle.closing.is_some() {
+        return Err(context_unavailable("conversation is not eligible"));
+    }
+    let project = record
+        .project
+        .map(|id| {
+            rx.open_table(PROJECTS)?
+                .get(id.get())?
+                .map(|v| decode_project(id.get(), v.value()))
+                .transpose()?
+                .ok_or_else(|| StorageError::corrupted("conversation Project missing"))
+        })
+        .transpose()?;
+    if matches!(
+        &record.job.input.content,
+        crate::db::entities::MutableJobContent::Decision { .. }
+    ) {
+        let configuration = match record.job.frozen.clone() {
+            Some(crate::db::entities::MutableFrozenConfiguration::Decision(configuration)) => {
+                crate::db::entities::FrozenDecisionConfig::Native(configuration)
+            }
+            Some(crate::db::entities::MutableFrozenConfiguration::Generative(configuration)) => {
+                crate::db::entities::FrozenDecisionConfig::Generative(configuration, None)
+            }
+            None => return Err(context_unavailable("Decision configuration is missing")),
+        };
+        return Ok(DevelopmentCandidate::Decision(DevelopmentDecisionContext {
+            allocation,
+            job: record.job,
+            pool,
+            executor,
+            configuration,
+            conversation,
+            conversation_lifecycle,
+            project,
+        }));
+    }
+    let Some(crate::db::entities::MutableFrozenConfiguration::Generative(configuration)) =
+        record.job.frozen.clone()
+    else {
+        return Err(context_unavailable("Job operation is unsupported"));
+    };
+    let plan_step = match conversation.origin {
+        Origin::Agent { call } => tool_call_name(rx, call)?.as_deref() == Some("job_plan"),
+        Origin::User | Origin::System => false,
+    };
+    let attachments = context_attachments(rx, record.job.input.attachments())?;
+    let compaction = global_compaction_settings(meta)?;
+    let covered: BTreeSet<_> = adopted_summary
+        .as_ref()
+        .map_or_else(BTreeSet::new, |summary| {
+            summary
+                .manifest
+                .sources
+                .iter()
+                .map(|source| source.job)
+                .collect()
+        });
+    let mut covered_inputs = Vec::with_capacity(covered.len());
+    if let Some(source_digest) = record.job.summary_source {
+        let messages = rx.open_table(MESSAGES)?;
+        let manifest_bytes = messages
+            .get(source_digest.as_bytes().as_slice())?
+            .ok_or_else(|| StorageError::corrupted("summary manifest missing"))?;
+        let manifest: crate::db::entities::NativeSummaryManifest =
+            serde_json::from_slice(manifest_bytes.value())
+                .map_err(|_| StorageError::corrupted("malformed summary manifest"))?;
+        manifest.validate().map_err(StorageError::corrupted)?;
+        let jobs_table = rx.open_table(JOBS)?;
+        let outputs_table = rx.open_table(JOB_OUTPUTS)?;
+        let is_merge = record.job.input.text().starts_with("Merge ");
+        if !is_merge {
+            for boundary in &manifest.sources {
+                let job_bytes = jobs_table
+                    .get(boundary.job.get())?
+                    .ok_or_else(|| StorageError::corrupted("summary source Job missing"))?;
+                let src_job = crate::db::redb::jobs::decode_mutable_job(
+                    boundary.job.get(),
+                    job_bytes.value(),
+                )?;
+                let mut turn_text = format!("User: {}\n", src_job.input.text());
+                for entry in
+                    outputs_table.range((boundary.job.get(), 0)..=(boundary.job.get(), u32::MAX))?
+                {
+                    let (key, val) = entry?;
+                    let out = decode_output(key.value(), val.value())?;
+                    if let Some(t) = out.display_text() {
+                        turn_text.push_str("Assistant: ");
+                        turn_text.push_str(&t);
+                        turn_text.push('\n');
+                    }
+                }
+                covered_inputs.push(DevelopmentRetainedInput {
+                    job: boundary.job,
+                    text: turn_text,
+                    attachments: Vec::new(),
+                });
+            }
+        }
+        if is_merge {
+            let child_groups = rx.open_table(CHILD_GROUPS)?;
+            let children = rx.open_table(CHILDREN)?;
+            let waiters = rx.open_table(DEPENDENCY_WAITERS)?;
+            for cg in child_groups
+                .range((conversation.id.get(), 0)..=(conversation.id.get(), u128::MAX))?
+            {
+                let (cg_key, _) = cg?;
+                let (_, cg_id) = cg_key.value();
+                for ch in children.range((cg_id, 0)..=(cg_id, u128::MAX))? {
+                    let (ch_key, _) = ch?;
+                    let (_, chunk_id) = ch_key.value();
+                    if waiters.get((chunk_id, record.job.id.get()))?.is_some() {
+                        let mut chunk_text = String::new();
+                        for entry in outputs_table.range((chunk_id, 0)..=(chunk_id, u32::MAX))? {
+                            let (key, val) = entry?;
+                            let out = decode_output(key.value(), val.value())?;
+                            if out.kind == OutputKind::Result
+                                && let Some(t) = out.display_text()
+                            {
+                                chunk_text.push_str(&t);
+                            }
+                        }
+                        if !chunk_text.is_empty() {
+                            covered_inputs.push(DevelopmentRetainedInput {
+                                job: JobId::new(chunk_id),
+                                text: chunk_text,
+                                attachments: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+            if covered_inputs.is_empty() {
+                return Err(context_unavailable("chunk summaries missing for merge"));
+            }
+        }
+    }
+    let mut history = Vec::new();
+    let mut previous = record.job.previous;
+    let outputs = rx.open_table(JOB_OUTPUTS)?;
+    let mut output_count = 0usize;
+    let mut output_bytes = 0usize;
+    let mut selected_bytes = record.job.input.text().len().saturating_add(
+        adopted_summary
+            .as_ref()
+            .map_or(0, |summary| {
+                summary.summary.context_text().len().saturating_add(
+                    "Generated context summary (advisory, not an original user instruction). Originals remain available:\n".len(),
+                )
+            }),
+    );
+    selected_bytes = selected_bytes
+        .saturating_add(crate::service::ai::generative_model::CHART_INSTRUCTIONS.len())
+        .saturating_add(
+            configuration
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.instructions.as_ref())
+                .map_or(0, String::len),
+        );
+    if let Some(project) = &project {
+        let commands: Vec<_> = crate::db::entities::BUILT_IN_COMMANDS
+            .into_iter()
+            .chain(
+                project
+                    .commands
+                    .iter()
+                    .filter(|command| command.status == crate::db::entities::CommandStatus::Allowed)
+                    .map(|command| command.name.as_str()),
+            )
+            .collect();
+        let grant = configuration
+            .agent
+            .as_ref()
+            .and_then(|agent| agent.workspace_grant());
+        let grounding = crate::service::ai::generative_model::ground_project(
+            &project.name,
+            &project.root,
+            grant,
+            &commands,
+        );
+        selected_bytes = selected_bytes.saturating_add(
+            crate::db::serialized_len(&grounding)
+                .map_err(|_| StorageError::corrupted("invalid project context"))?,
+        );
+    }
+    let mut image_count = attachments.len();
+    while let Some(id) = previous {
+        let is_covered = covered.contains(&id);
+        if !is_covered && history.len() == 128 {
+            return Err(context_unavailable(
+                "conversation history exceeds context limit",
+            ));
+        }
+        let prior = mutable_job_record_in(rx, id)?
+            .ok_or_else(|| StorageError::corrupted("predecessor missing"))?;
+        if matches!(
+            prior.job.input.content,
+            crate::db::entities::MutableJobContent::Decision { .. }
+        ) {
+            return Err(context_unavailable(
+                "Decision predecessors cannot be projected as generative messages",
+            ));
+        }
+        let ended_unstarted = prior.job.parent_id == record.job.parent_id
+            && prior.job.phase == MutableJobPhase::Queued
+            && unstarted_settlement_in(
+                rx,
+                &prior,
+                rx.open_table(POOL_ALLOCATIONS)?
+                    .get(id.get())?
+                    .map(|row| allocations::decode_pool_allocation(id.get(), row.value()))
+                    .transpose()?
+                    .as_ref(),
+            )?;
+        if !ended_unstarted
+            && (prior.job.parent_id != record.job.parent_id
+                || prior.job.phase != MutableJobPhase::Executing
+                || prior
+                    .outcome
+                    .as_ref()
+                    .is_none_or(|outcome| outcome.kind == OutcomeKind::Unknown))
+        {
+            return Err(context_unavailable(
+                "predecessor is not settled in this conversation",
+            ));
+        }
+        selected_bytes = selected_bytes.saturating_add(prior.job.input.text().len());
+        if selected_bytes > 8 * 1024 * 1024 {
+            return Err(context_unavailable(
+                "selected execution context exceeds byte limit",
+            ));
+        }
+        image_count = image_count.saturating_add(prior.job.input.attachments().len());
+        if image_count > crate::service::ai::providers::openai_compatible::image::MAX_REQUEST_IMAGES
+        {
+            return Err(context_unavailable(
+                "selected execution context has too many images",
+            ));
+        }
+        let prior_attachments = context_attachments(rx, prior.job.input.attachments())?;
+        if is_covered {
+            previous = prior.job.previous;
+            covered_inputs.push(DevelopmentRetainedInput {
+                job: id,
+                text: prior.job.input.text().to_owned(),
+                attachments: prior_attachments,
+            });
+            continue;
+        }
+        let mut prior_outputs = Vec::new();
+        for (expected_sequence, entry) in
+            (1u32..).zip(outputs.range((id.get(), 0)..=(id.get(), u32::MAX))?)
+        {
+            if output_count == 1000 {
+                return Err(context_unavailable(
+                    "conversation output exceeds context limit",
+                ));
+            }
+            let (key, value) = entry?;
+            if key.value().1 != expected_sequence {
+                return Err(StorageError::corrupted(
+                    "predecessor output sequence has a gap",
+                ));
+            }
+            output_bytes = output_bytes.saturating_add(value.value().len());
+            selected_bytes = selected_bytes.saturating_add(value.value().len());
+            if selected_bytes > 8 * 1024 * 1024 {
+                return Err(context_unavailable(
+                    "selected execution context exceeds byte limit",
+                ));
+            }
+            if output_bytes > 8 * 1024 * 1024 {
+                return Err(context_unavailable(
+                    "conversation output exceeds byte limit",
+                ));
+            }
+            prior_outputs.push(decode_output(key.value(), value.value())?);
+            output_count += 1;
+        }
+        if !ended_unstarted
+            && prior_outputs
+                .last()
+                .is_none_or(|output| output.kind != OutputKind::Result)
+        {
+            return Err(StorageError::corrupted(
+                "settled predecessor has no final output",
+            ));
+        }
+        previous = prior.job.previous;
+        history.push(DevelopmentContextTurn {
+            record: prior,
+            attachments: prior_attachments,
+            outputs: prior_outputs,
+        });
+    }
+    covered_inputs.reverse();
+    history.reverse();
+    if record.job.summary_source.is_none() && covered_inputs.len() != covered.len() {
+        return Err(StorageError::corrupted(
+            "verified summary coverage is incomplete",
+        ));
+    }
+    let model = &configuration.llm.config;
+    if image_count > 0
+        && !model
+            .declared_capabilities
+            .contains(&ModelCapability::Vision)
+    {
+        return Err(context_unavailable(
+            "selected Model does not support images",
+        ));
+    }
+    let output_reserve = model
+        .parameters
+        .max_completion_tokens
+        .or(model.parameters.max_tokens)
+        .unwrap_or(4096);
+    let estimated_tokens = (selected_bytes.div_ceil(3) as u64)
+        .saturating_add((image_count as u64).saturating_mul(1600))
+        .saturating_add(u64::from(output_reserve));
+    let window = model
+        .context_window
+        .unwrap_or(crate::service::ai::compact::DEFAULT_CONTEXT_WINDOW);
+    if estimated_tokens > u64::from(window) {
+        return Err(context_unavailable(
+            "selected execution context exceeds estimated model token budget",
+        ));
+    }
+    Ok(DevelopmentCandidate::Generative(
+        DevelopmentExecutionContext {
+            allocation,
+            job: record.job,
+            pool,
+            executor,
+            configuration,
+            conversation,
+            conversation_lifecycle,
+            plan_step,
+            project,
+            compaction,
+            attachments,
+            adopted_summary,
+            covered_inputs,
+            history,
+        },
+    ))
+}

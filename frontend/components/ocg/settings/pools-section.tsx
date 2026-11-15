@@ -1,15 +1,13 @@
 "use client";
 
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { Pill } from "@/components/ocg/primitives";
 import type { Pool } from "@/components/ocg/contracts";
+import { Pill } from "@/components/ocg/primitives";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import type { ApiClient, PoolUpdate } from "@/components/ocg/runtime/api-client";
 import {
-  configurationIdentity,
   ApiError,
+  configurationIdentity,
   isExecutorConflict,
   type NativeAllocation,
   type NativeAllocationPhase,
@@ -17,9 +15,11 @@ import {
   type NativeExecutorChange,
   type NativePoolAllocations,
 } from "@/components/ocg/runtime/api-client";
-import type { PoolUpdate, ApiClient } from "@/components/ocg/runtime/api-client";
-import { Section, describeError, refusalText } from "./settings-parts";
-import { useI18n, type I18nKey } from "../i18n";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { type I18nKey, useI18n } from "../i18n";
+import { describeError, refusalText, Section } from "./settings-parts";
 
 const POOL_REFUSALS: Partial<Record<string, I18nKey>> = {
   pool_not_found: "settings.pools.refusal.notFound",

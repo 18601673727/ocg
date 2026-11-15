@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import type { Update, UpdateState } from "../contracts/api";
 import { useI18n } from "../i18n";
 import type { ApiClient } from "../runtime/api-client";
-import { Section, describeError } from "./settings-parts";
+import { describeError, Section } from "./settings-parts";
 
 const seenKey = "ocg-settings-update";
 const active = (state: UpdateState | null) =>
@@ -175,9 +175,11 @@ export function UpdatesSection({ client }: { client: ApiClient }) {
           <Button
             disabled={busy || active(view.state)}
             onClick={() => {
+              const latest = view.latest;
+              if (!latest) return;
               setBusy(true);
               void client
-                .startUpdate(view.latest!)
+                .startUpdate(latest)
                 .then(
                   (state) => {
                     const current = identity(state);

@@ -1,11 +1,11 @@
 "use client";
 
-import { useCallback, useState, type ReactNode } from "react";
-import { ChevronDownIcon } from "lucide-react";
 import { cva, type VariantProps } from "class-variance-authority";
-import { cn } from "@/lib/utils";
-import { useI18n } from "@/components/ocg/i18n";
+import { ChevronDownIcon } from "lucide-react";
+import { type ReactNode, useCallback, useState } from "react";
 import { BoundedMessage } from "@/components/ocg/chat/bounded-message";
+import { useI18n } from "@/components/ocg/i18n";
+import { cn } from "@/lib/utils";
 import {
   CollapsibleRoot as Collapsible,
   CollapsibleContent,
@@ -167,4 +167,4 @@ function ToolGroupContent({
   );
 }
 
-export { ToolGroupRoot, ToolGroupTrigger, ToolGroupContent, toolGroupVariants };
+export { ToolGroupContent, ToolGroupRoot, ToolGroupTrigger, toolGroupVariants };

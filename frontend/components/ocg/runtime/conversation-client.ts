@@ -1,39 +1,39 @@
+import {
+  jobTranscript,
+  type PartialToolBoundary,
+  TranscriptAccumulator,
+  type TranscriptTurn,
+} from "../chat/job-transcript-model";
 import type {
   ChatImage,
   ChatImageUploadRequest,
   ChatModelSelection,
   ConversationTurn,
-  JobDetails,
   Job,
+  JobDetails,
   Output,
   ProviderResponse,
   ToolCall,
 } from "../contracts";
+import { ContractError, materializeUserEntries } from "../contracts";
+import { fileSnapshots } from "../markdown/source-snapshot";
 import type { ChatMessage, ChatSession, OcgRuntimeEvent } from "../types";
-import { RuntimeClientBase } from "./runtime-client-base";
-import type { CreateSessionInput } from "./runtime-types";
 import {
-  readTranscriptEvidence,
-  readOutputWindow,
   type ApiClient,
   type JobStreamSubscription,
+  readOutputWindow,
+  readTranscriptEvidence,
 } from "./api-client";
-import {
-  jobTranscript,
-  TranscriptAccumulator,
-  type PartialToolBoundary,
-  type TranscriptTurn,
-} from "../chat/job-transcript-model";
-import { fileSnapshots } from "../markdown/source-snapshot";
-import { nativeExecutionStatus, reconcileJob, taskPlanActive } from "./job-status";
-import { ContractError, materializeUserEntries } from "../contracts";
 import { pageTurns } from "./history-page";
+import { nativeExecutionStatus, reconcileJob, taskPlanActive } from "./job-status";
 import {
   mergeOutputHistory,
   type OutputHistory,
   type OutputSequence,
   type OutputView,
 } from "./output-history";
+import { RuntimeClientBase } from "./runtime-client-base";
+import type { CreateSessionInput } from "./runtime-types";
 
 const TURN_PAGE_SIZE = 20;
 const CATALOG_REFRESH_DELAY_MS = 750;
@@ -891,7 +891,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       partial,
       turn.details?.mutable_phase,
     ];
-    if (!cached.arguments || args.some((value, index) => value !== cached!.arguments![index])) {
+    const previousArgs = cached.arguments;
+    if (!previousArgs || args.some((value, index) => value !== previousArgs[index])) {
       const transcript = jobTranscript(
         turn.job.id,
         turn.entries && turn.entries.length > 0 ? null : turn.input.objective,
@@ -1463,8 +1464,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     );
     const turn = message?.jobId ? this.turns.get(message.jobId) : undefined;
     if (
-      !turn ||
-      !turn.job.conversation ||
+      !turn?.job.conversation ||
       !["failed", "cancelled"].includes(turn.job.settlement.state) ||
       this.tips.get(sessionId) !== turn.job.id
     )

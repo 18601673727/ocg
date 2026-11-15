@@ -2,8 +2,8 @@
 
 import { useState } from "react";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
+import type { ApiClient } from "../runtime/api-client";
 import { JobTree } from "./job-tree";
 import { JobWatch } from "./job-watch";
 

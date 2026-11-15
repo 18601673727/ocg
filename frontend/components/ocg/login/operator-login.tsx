@@ -1,13 +1,12 @@
 "use client";
 
-import { useState } from "react";
 import { ArrowRight, KeyRound, LoaderCircle } from "lucide-react";
-
+import { useState } from "react";
+import { ContractError } from "@/components/ocg/contracts";
+import { type ApiClient, ApiError } from "@/components/ocg/runtime/api-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { ApiError, type ApiClient } from "@/components/ocg/runtime/api-client";
-import { ContractError } from "@/components/ocg/contracts";
-import { useI18n, type I18nKey } from "../i18n";
+import { type I18nKey, useI18n } from "../i18n";
 import { AccessScreen } from "./access-screen";
 
 export type OperatorSession = {

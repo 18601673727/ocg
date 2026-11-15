@@ -1,0 +1,905 @@
+use super::*;
+use crate::db::commands::{
+    byte_count, debug_bytes, json_bytes, output_bytes, search_index_bytes, text_bytes,
+};
+use crate::db::handoff::{
+    DevelopmentHandoff, DevelopmentHandoffError, DevelopmentOutputGuard,
+    DevelopmentUsageCheckpoint, DevelopmentWriteProof, PreparedDevelopmentHandoff,
+    classify_unstarted, development_contains_secret,
+};
+
+impl DatabaseHandle {
+    pub(crate) async fn provider_responses(
+        &self,
+        job: JobId,
+        after: Option<RequestNumber>,
+        limit: usize,
+        max_text_bytes: usize,
+    ) -> Result<crate::db::entities::ProviderResponsesPage, DatabaseError> {
+        self.read(move |database| {
+            redb::read_provider_responses(database, job, after, limit, max_text_bytes)
+        })
+        .await
+    }
+
+    pub async fn provider_request(
+        &self,
+        job: JobId,
+        request: RequestNumber,
+    ) -> Result<Option<ProviderRequestRecord>, DatabaseError> {
+        self.read(move |database| redb::read_provider_request(database, job, request))
+            .await
+    }
+
+    pub async fn tool_evidence(
+        &self,
+        job: JobId,
+        after: Option<(RequestNumber, u32)>,
+        limit: usize,
+    ) -> Result<Vec<ToolEvidenceRecord>, DatabaseError> {
+        self.read(move |database| redb::read_tool_evidence(database, job, after, limit))
+            .await
+    }
+
+    pub(crate) async fn development_trial_job(
+        &self,
+        job: entities::JobId,
+    ) -> Result<Option<(entities::MutableJobRecord, Option<entities::PoolAllocation>)>, DatabaseError>
+    {
+        self.read(move |database| redb::read_trial_job(database, job))
+            .await
+    }
+
+    pub(crate) async fn load_handoff_credentials(
+        &self,
+        prepared: &mut PreparedDevelopmentHandoff,
+    ) -> Result<(), DevelopmentHandoffError> {
+        let references: Vec<String> = prepared
+            .credential_references()
+            .into_iter()
+            .map(str::to_owned)
+            .collect();
+        for reference in references {
+            if !crate::db::entities::valid_credential_ref(&reference) {
+                return Err(classify_unstarted(DatabaseError::Rejected(
+                    Violation::InvalidValue("credential", "invalid credential reference"),
+                )));
+            }
+            let key = self.shared.credential_key();
+            let lookup = reference.clone();
+            let resolved = self
+                .read(move |database| {
+                    redb::read_handoff_credential(database, &lookup, key.as_deref())
+                })
+                .await
+                .map_err(|error| match &error {
+                    DatabaseError::Read(storage)
+                        if storage.kind == StorageErrorKind::Other
+                            && storage.os_error.is_none() =>
+                    {
+                        DevelopmentHandoffError::NotStarted {
+                            cause: entities::UnstartedCause::FrozenSecretUnavailable,
+                            detail: error.to_string(),
+                        }
+                    }
+                    _ => classify_unstarted(error),
+                })?;
+            let Some((secret, encrypted)) = resolved else {
+                return Err(classify_unstarted(DatabaseError::Rejected(
+                    Violation::InvalidValue("credential", "stored credential is unavailable"),
+                )));
+            };
+            prepared.credentials.push(reference, secret, encrypted);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn start_development_handoff(
+        &self,
+        prepared: PreparedDevelopmentHandoff,
+    ) -> Result<DevelopmentHandoff, DevelopmentHandoffError> {
+        let owner = self.shared.clone();
+        let result = self
+            .write_sized(
+                (prepared, owner),
+                |(prepared, _)| {
+                    byte_count(crate::db::serialized_len(&prepared.request).unwrap_or(usize::MAX))
+                        .saturating_add(64 * 1024)
+                },
+                OperationKind::ClaimExecution,
+                |batch, (prepared, owner)| {
+                    let started = batch.start_mutable_job(&prepared)?;
+                    Ok(DevelopmentHandoff {
+                        prepared,
+                        started,
+                        owner,
+                        output_busy: AtomicBool::new(false),
+                        output_uncertain: AtomicBool::new(false),
+                        usage_checkpoint: std::sync::Mutex::new(
+                            DevelopmentUsageCheckpoint::default(),
+                        ),
+                        recorder: std::sync::Mutex::new(
+                            crate::service::ai::providers::RequestRecorder::default(),
+                        ),
+                    })
+                },
+            )
+            .await;
+        match result {
+            Ok(handoff) => Ok(handoff),
+            Err(error) => match &error {
+                DatabaseError::OutcomeUnknown { operation, .. } => {
+                    let reconciliation =
+                        self.reconcile_operation(*operation).await.map_err(Box::new);
+                    Err(DevelopmentHandoffError::OutcomeUnknown {
+                        error: Box::new(error),
+                        reconciliation,
+                    })
+                }
+                _ => Err(classify_unstarted(error)),
+            },
+        }
+    }
+
+    pub(crate) async fn append_development_output(
+        &self,
+        handoff: &DevelopmentHandoff,
+        expected_seq: u32,
+        output: JobOutput,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .write_output(
+                proof.token.job,
+                (proof, expected_seq, output),
+                |(_, _, output)| {
+                    output_bytes(
+                        output.summary.as_deref(),
+                        output.code.as_deref(),
+                        output.value.as_ref(),
+                    )
+                },
+                OperationKind::AppendJobOutput,
+                |batch, (proof, expected_seq, output)| {
+                    batch.append_development_output(&proof, expected_seq, output)
+                },
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    pub(crate) async fn record_development_request(
+        &self,
+        handoff: &DevelopmentHandoff,
+        request_number: entities::RequestNumber,
+        body: &serde_json::Value,
+        observed_at: entities::Timestamp,
+    ) -> Result<(), DatabaseError> {
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = handoff.prepared.candidate.allocation().token;
+        let decision = matches!(
+            handoff.prepared.candidate,
+            crate::db::entities::DevelopmentCandidate::Decision(_)
+        );
+        if handoff
+            .prepared
+            .credentials
+            .spellings
+            .as_ref()
+            .is_some_and(|secret| development_contains_secret(body, secret))
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "request",
+                "request evidence contains credential material",
+            )));
+        }
+        let mut pending_state = None;
+        let mut sent = if decision {
+            let body = entities::MessageBody::new(&serde_json::json!({"decision": body})).map_err(
+                |_| {
+                    DatabaseError::Rejected(Violation::InvalidValue(
+                        "request",
+                        "prepared decision cannot be recorded",
+                    ))
+                },
+            )?;
+            let digest = body.digest();
+            entities::SentRequest {
+                job: token.job,
+                request: request_number,
+                observed_at,
+                messages: vec![digest],
+                tools: None,
+                parameters: digest,
+                dropped_turns: None,
+                bodies: vec![body],
+                required_messages: Vec::new(),
+            }
+        } else {
+            let mut recorder = handoff
+                .recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if request_number == entities::RequestNumber::FIRST {
+                recorder.image_attachments = handoff
+                    .prepared
+                    .conversation
+                    .as_ref()
+                    .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
+                        "request",
+                        "prepared conversation missing",
+                    )))?
+                    .image_attachments
+                    .clone();
+            }
+            let (sent, state) = recorder
+                .prepare(token.job, request_number, body, 0)
+                .map_err(|_| {
+                    DatabaseError::Rejected(Violation::InvalidValue(
+                        "request",
+                        "prepared request cannot be recorded",
+                    ))
+                })?;
+            pending_state = Some(state);
+            sent
+        };
+        sent.observed_at = observed_at;
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let attachments = match &handoff.prepared.candidate {
+            crate::db::entities::DevelopmentCandidate::Generative(context) => context
+                .covered_inputs
+                .iter()
+                .flat_map(|input| input.attachments.iter())
+                .chain(
+                    context
+                        .history
+                        .iter()
+                        .flat_map(|turn| turn.attachments.iter()),
+                )
+                .chain(context.attachments.iter())
+                .cloned()
+                .collect::<Vec<_>>(),
+            crate::db::entities::DevelopmentCandidate::Decision(_) => Vec::new(),
+        };
+        let result = self
+            .write_sized(
+                (proof, sent, attachments),
+                |(_, sent, _)| {
+                    sent.bodies.iter().fold(0u64, |size, body| {
+                        size.saturating_add(byte_count(body.byte_length()))
+                    })
+                },
+                OperationKind::RecordSentRequest,
+                |batch, (proof, sent, attachments)| {
+                    batch.record_development_sent_request(&proof, sent, &attachments)
+                },
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        if result.is_ok()
+            && let Some(state) = pending_state
+        {
+            handoff
+                .recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remember_sent(state);
+        }
+        result
+    }
+
+    pub(crate) async fn record_development_partial_usage(
+        &self,
+        handoff: &DevelopmentHandoff,
+        request: entities::RequestNumber,
+        usages: Vec<Metrics>,
+    ) -> Result<(), DatabaseError> {
+        if usages.is_empty() {
+            return Ok(());
+        }
+        if let Some(secret) = &handoff.prepared.credentials.spellings
+            && usages.iter().any(|metrics| {
+                metrics
+                    .measurements
+                    .usage
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| development_contains_secret(raw, secret))
+            })
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "usage",
+                "usage evidence contains credential material",
+            )));
+        }
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let checkpoint = handoff
+            .usage_checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .for_request(request);
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, request, usages, checkpoint),
+                    reply,
+                    |(_, _, usages, _)| {
+                        usages.iter().fold(0u64, |size, metrics| {
+                            size.saturating_add(json_bytes(metrics.measurements.usage.raw.as_ref()))
+                        })
+                    },
+                    |(proof, request, usages, checkpoint), reply, database, operation, commit| {
+                        let ids = std::cell::Cell::new(None);
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::ConsumeTokenUsage,
+                            reply,
+                            |batch| {
+                                let (usage_ids, next_checkpoint) = batch
+                                    .record_development_partial_usage(
+                                        &proof, request, usages, checkpoint,
+                                    )?;
+                                ids.set(Some(usage_ids));
+                                Ok(next_checkpoint)
+                            },
+                        );
+                        if result.committed
+                            && let Some(usage_ids) = ids.take()
+                        {
+                            for id in usage_ids {
+                                result
+                                    .observations
+                                    .push(ObservationChange::Metrics(proof.token.job, id));
+                            }
+                        }
+                        result
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result.map(|next_checkpoint| {
+            *handoff
+                .usage_checkpoint
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = next_checkpoint.of_request(request);
+        })
+    }
+
+    pub(crate) async fn record_development_provider_answer(
+        &self,
+        handoff: &DevelopmentHandoff,
+        answer: ProviderAnswer,
+        usages: Vec<(u32, Metrics)>,
+    ) -> Result<(), DatabaseError> {
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let response: serde_json::Value =
+            serde_json::from_slice(&answer.response.bytes).map_err(|_| {
+                DatabaseError::Rejected(Violation::InvalidValue(
+                    "response",
+                    "invalid response JSON",
+                ))
+            })?;
+        if let Some(secret) = &handoff.prepared.credentials.spellings {
+            let observation = &answer.stat.observation;
+            let failure_has_secret = observation.failure.as_ref().is_some_and(|f| {
+                [
+                    Some(f.message.as_str()),
+                    f.provider_code.as_deref(),
+                    f.response_body.as_deref(),
+                    f.request_id.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|s| secret.found_in(s))
+            });
+            if development_contains_secret(&response, secret)
+                || answer
+                    .measurements
+                    .usage
+                    .raw
+                    .as_ref()
+                    .is_some_and(|v| development_contains_secret(v, secret))
+                || observation
+                    .raw_finish_reason
+                    .as_deref()
+                    .is_some_and(|s| secret.found_in(s))
+                || failure_has_secret
+            {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "answer",
+                    "answer evidence contains credential material",
+                )));
+            }
+            if usages.iter().any(|(_, metrics)| {
+                metrics
+                    .measurements
+                    .usage
+                    .raw
+                    .as_ref()
+                    .is_some_and(|raw| development_contains_secret(raw, secret))
+            }) {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "usage",
+                    "usage evidence contains credential material",
+                )));
+            }
+        }
+        let request = answer.stat.request;
+        let has_usages = !usages.is_empty();
+        let checkpoint = handoff
+            .usage_checkpoint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .for_request(request);
+        let response_digest = answer.response.digest();
+        let result = self
+            .submit(|reply| {
+                Command::custom(
+                    (proof, answer, usages, checkpoint),
+                    reply,
+                    |(_, answer, usages, _)| {
+                        let base = byte_count(answer.response.byte_length())
+                            .saturating_add(json_bytes(answer.measurements.usage.raw.as_ref()));
+                        usages.iter().fold(base, |acc, (_, metrics)| {
+                            acc.saturating_add(json_bytes(metrics.measurements.usage.raw.as_ref()))
+                        })
+                    },
+                    |(proof, answer, usages, checkpoint), reply, database, operation, commit| {
+                        let ids = std::cell::Cell::new(None);
+                        let mut result = run(
+                            database,
+                            operation,
+                            commit,
+                            OperationKind::RecordProviderAnswer,
+                            reply,
+                            |batch| {
+                                let (metrics, availability, usage_ids, next_checkpoint) = batch
+                                    .record_development_provider_answer(
+                                        &proof, answer, usages, checkpoint,
+                                    )?;
+                                ids.set(Some((metrics, availability, usage_ids)));
+                                Ok(next_checkpoint)
+                            },
+                        );
+                        if result.committed
+                            && let Some((metrics, availability, usage_ids)) = ids.take()
+                        {
+                            result
+                                .observations
+                                .push(ObservationChange::Metrics(proof.token.job, metrics));
+                            result.observations.push(ObservationChange::Availability(
+                                proof.token.job,
+                                availability,
+                            ));
+                            for id in usage_ids {
+                                result
+                                    .observations
+                                    .push(ObservationChange::Metrics(proof.token.job, id));
+                            }
+                        }
+                        result
+                    },
+                )
+            })
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result.map(|next_checkpoint| {
+            handoff
+                .recorder
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remember_response(response_digest);
+            if has_usages {
+                *handoff
+                    .usage_checkpoint
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = next_checkpoint.of_request(request);
+            }
+        })
+    }
+
+    pub(crate) async fn finalize_development_job(
+        &self,
+        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        expected_seq: u32,
+        finalization: JobFinalization,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        let handoff = returned.handoff();
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        if let Some(secret) = &handoff.prepared.credentials.spellings {
+            let result = match &finalization {
+                JobFinalization::Completed(result)
+                | JobFinalization::Failed(result)
+                | JobFinalization::Cancelled(result) => Some(result),
+                JobFinalization::Unknown => None,
+            };
+            if result.is_some_and(|result| {
+                result
+                    .summary
+                    .as_deref()
+                    .is_some_and(|s| secret.found_in(s))
+                    || result.code.as_deref().is_some_and(|s| secret.found_in(s))
+                    || result
+                        .value
+                        .as_ref()
+                        .is_some_and(|v| development_contains_secret(v, secret))
+            }) {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "outcome",
+                    "result contains credential material",
+                )));
+            }
+        }
+        let result = self
+            .write_output(
+                proof.token.job,
+                (proof, expected_seq, finalization),
+                |(_, _, value)| match value {
+                    JobFinalization::Completed(result)
+                    | JobFinalization::Failed(result)
+                    | JobFinalization::Cancelled(result) => output_bytes(
+                        result.summary.as_deref(),
+                        result.code.as_deref(),
+                        result.value.as_ref(),
+                    ),
+                    JobFinalization::Unknown => 0,
+                },
+                OperationKind::FinalizeJob,
+                |batch, (proof, expected_seq, finalization)| {
+                    batch.finalize_development_job(&proof, expected_seq, finalization)
+                },
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    pub(crate) async fn finalize_development_decision(
+        &self,
+        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        expected_seq: u32,
+        result: entities::DecisionResult,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        let handoff = returned.handoff();
+        if !matches!(
+            &handoff.prepared.candidate,
+            crate::db::entities::DevelopmentCandidate::Decision(_)
+        ) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "Decision handoff required",
+            )));
+        }
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let value = serde_json::to_value(&result).map_err(|_| {
+            DatabaseError::Rejected(Violation::InvalidValue(
+                "decision",
+                "result cannot be serialized",
+            ))
+        })?;
+        if handoff
+            .prepared
+            .credentials
+            .spellings
+            .as_ref()
+            .is_some_and(|secret| development_contains_secret(&value, secret))
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "decision",
+                "result contains credential material",
+            )));
+        }
+        let result = self
+            .write_output(
+                proof.token.job,
+                (proof, expected_seq, result),
+                |(_, _, result)| debug_bytes(result),
+                OperationKind::FinalizeJob,
+                |batch, (proof, expected_seq, decision)| {
+                    batch.finalize_development_decision(&proof, expected_seq, decision)
+                },
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    pub(crate) async fn finalize_development_failure(
+        &self,
+        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        expected_seq: u32,
+        finalization: JobFinalization,
+        rejection: Option<(
+            entities::RequestNumber,
+            entities::Timestamp,
+            entities::AvailabilityObservation,
+        )>,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        let handoff = returned.handoff();
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let token = proof.token;
+        if let Some(secret) = &handoff.prepared.credentials.spellings {
+            let (JobFinalization::Completed(result)
+            | JobFinalization::Failed(result)
+            | JobFinalization::Cancelled(result)) = &finalization
+            else {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "outcome",
+                    "an unanswered failure needs a result",
+                )));
+            };
+            let failure = rejection
+                .as_ref()
+                .and_then(|(_, _, observation)| observation.failure.as_ref());
+            if [
+                result.summary.as_deref(),
+                result.code.as_deref(),
+                failure.map(|failure| failure.message.as_str()),
+                failure.and_then(|failure| failure.provider_code.as_deref()),
+                failure.and_then(|failure| failure.response_body.as_deref()),
+                failure.and_then(|failure| failure.request_id.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|text| secret.found_in(text))
+                || result
+                    .value
+                    .as_ref()
+                    .is_some_and(|value| development_contains_secret(value, secret))
+            {
+                return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                    "outcome",
+                    "failure evidence contains credential material",
+                )));
+            }
+        }
+        let rejection =
+            rejection.map(
+                |(request, observed_at, observation)| entities::AvailabilityStat {
+                    job: token.job,
+                    request,
+                    observed_at,
+                    observation,
+                },
+            );
+        let result = self
+            .write_output(
+                proof.token.job,
+                (proof, expected_seq, finalization, rejection),
+                |(_, _, finalization, rejection)| {
+                    let result = match finalization {
+                        JobFinalization::Completed(result)
+                        | JobFinalization::Failed(result)
+                        | JobFinalization::Cancelled(result) => output_bytes(
+                            result.summary.as_deref(),
+                            result.code.as_deref(),
+                            result.value.as_ref(),
+                        ),
+                        JobFinalization::Unknown => 0,
+                    };
+                    result.saturating_add(
+                        rejection
+                            .as_ref()
+                            .map_or(0, |stat| debug_bytes(&stat.observation)),
+                    )
+                },
+                OperationKind::FinalizeJob,
+                |batch, (proof, expected_seq, finalization, rejection)| {
+                    batch.finalize_development_failure(
+                        &proof,
+                        expected_seq,
+                        finalization,
+                        rejection,
+                    )
+                },
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    pub(crate) async fn fail_unstarted_development_reservation(
+        &self,
+        token: entities::AllocationToken,
+        cause: entities::UnstartedCause,
+    ) -> Result<AppendedOutput, DatabaseError> {
+        self.write_output(
+            token.job,
+            (token, cause),
+            |(_, cause)| output_bytes(Some(cause.summary()), Some(cause.code()), None),
+            OperationKind::FinalizeJob,
+            |batch, (token, cause)| batch.fail_unstarted_reservation(token, cause),
+        )
+        .await
+    }
+
+    pub(crate) async fn record_development_uncertain(
+        &self,
+        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        reason: entities::UncertaintyReason,
+    ) -> Result<(), DatabaseError> {
+        let handoff = returned.handoff();
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .write(
+                0,
+                OperationKind::FinalizeJob,
+                (proof, reason),
+                |batch, (proof, reason)| batch.record_development_uncertain(&proof, reason),
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    pub(crate) async fn development_execution_context(
+        &self,
+        token: entities::AllocationToken,
+    ) -> Result<crate::db::entities::DevelopmentCandidate, DatabaseError> {
+        self.read(move |database| redb::read_development_execution_context(database, token))
+            .await
+    }
+
+    pub(crate) async fn apply_development_job_tool(
+        &self,
+        handoff: &DevelopmentHandoff,
+        call: ToolCallRef,
+        tool: entities::JobToolCall,
+    ) -> Result<redb::JobToolApplied, DatabaseError> {
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .write_sized(
+                (proof, call, tool),
+                |(_, _, tool)| {
+                    use entities::JobToolCall;
+                    let search = match tool {
+                        JobToolCall::JobPlan { steps, .. } => steps
+                            .iter()
+                            .map(|step| {
+                                search_index_bytes(&step.objective).saturating_add(64 * 1024)
+                            })
+                            .sum(),
+                        JobToolCall::JobAssign { objective, .. }
+                        | JobToolCall::JobDispatch { objective, .. } => {
+                            search_index_bytes(objective)
+                        }
+                        JobToolCall::JobMessage { text, .. } => search_index_bytes(text),
+                        JobToolCall::JobLimits { .. }
+                        | JobToolCall::JobAgents { .. }
+                        | JobToolCall::JobWorkers { .. }
+                        | JobToolCall::JobStop { .. }
+                        | JobToolCall::JobClose { .. }
+                        | JobToolCall::JobHold { .. }
+                        | JobToolCall::JobUnhold { .. }
+                        | JobToolCall::JobRetry { .. } => 0,
+                    };
+                    debug_bytes(tool)
+                        .saturating_add(4096)
+                        .saturating_add(search)
+                        .saturating_add(match tool {
+                            JobToolCall::JobAssign { objective, .. }
+                            | JobToolCall::JobDispatch { objective, .. }
+                                if objective.len() <= 64 * 1024 =>
+                            {
+                                byte_count(objective.len())
+                                    .saturating_mul(6)
+                                    .saturating_add(64 * 1024)
+                            }
+                            JobToolCall::JobMessage { text, .. } if text.len() <= 64 * 1024 => {
+                                byte_count(text.len())
+                                    .saturating_mul(6)
+                                    .saturating_add(64 * 1024)
+                            }
+                            _ => 0,
+                        })
+                },
+                OperationKind::ApplyJobTool,
+                |batch, (proof, call, tool)| batch.apply_job_tool(&proof, call, tool),
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    fn begin_development_write<'a>(
+        &self,
+        handoff: &'a DevelopmentHandoff,
+    ) -> Result<(DevelopmentOutputGuard<'a>, DevelopmentWriteProof), DatabaseError> {
+        if !Arc::ptr_eq(&self.shared, &handoff.owner) {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "handoff",
+                "different database worker",
+            )));
+        }
+        let token = handoff.prepared.candidate.allocation().token;
+        if handoff.output_uncertain.load(Ordering::SeqCst)
+            || handoff
+                .output_busy
+                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                .is_err()
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "execution",
+                "write is pending or requires reconciliation",
+            )));
+        }
+        let guard = DevelopmentOutputGuard {
+            handoff,
+            known: false,
+        };
+        let proof = DevelopmentWriteProof {
+            token,
+            revision: handoff.started.revision,
+        };
+        Ok((guard, proof))
+    }
+
+    pub(crate) async fn record_development_tool_decision(
+        &self,
+        handoff: &DevelopmentHandoff,
+        evidence: ToolEvidence,
+    ) -> Result<(), DatabaseError> {
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .write_sized(
+                (proof, Box::new(evidence)),
+                |(_, evidence)| {
+                    let identity = byte_count(evidence.tool_call_id.len())
+                        .saturating_add(byte_count(evidence.name.len()));
+                    match evidence.decision.stored_admission() {
+                        None => identity,
+                        Some(admission) => identity
+                            .saturating_add(byte_count(admission.handler_version.len()))
+                            .saturating_add(byte_count(admission.parameters.len()))
+                            .saturating_add(byte_count(admission.arguments.len())),
+                    }
+                },
+                OperationKind::RecordToolDecision,
+                |batch, (proof, evidence)| {
+                    mutations::record_tool_decision(batch, &proof, *evidence)
+                },
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+
+    pub(crate) async fn record_development_tool_outcome(
+        &self,
+        handoff: &DevelopmentHandoff,
+        call: ToolCallRef,
+        outcome: ToolOutcome,
+    ) -> Result<(), DatabaseError> {
+        let (mut guard, proof) = self.begin_development_write(handoff)?;
+        let result = self
+            .write_sized(
+                (proof, call, Box::new(outcome)),
+                |(_, _, outcome)| match outcome.as_ref() {
+                    ToolOutcome::Completed { result } => byte_count(result.len()),
+                    ToolOutcome::NotApplied { message } => byte_count(message.len()),
+                    ToolOutcome::Uncertain { message, .. } => text_bytes(message.as_deref()),
+                    ToolOutcome::CompletedWithheld { .. }
+                    | ToolOutcome::CompletedElided { .. }
+                    | ToolOutcome::NotInvoked { .. } => 0,
+                },
+                OperationKind::RecordToolOutcome,
+                |batch, (proof, call, outcome)| {
+                    mutations::record_tool_outcome(batch, &proof, call, *outcome)
+                },
+            )
+            .await;
+        guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
+        result
+    }
+}

@@ -1,7 +1,9 @@
+use super::rows::encode_request_event;
 use super::*;
 use crate::db::entities::{
     ConfigBody, ConfigKind, ExecutionConfiguration, OutcomeKind, Submission, Violation,
 };
+use crate::db::entities::{RequestEventRecord, RequestPayload, ToolCallRef};
 use ::redb::ReadableTableMetadata;
 
 impl Batch {
@@ -90,7 +92,7 @@ impl Batch {
         }
         if automatic.is_none() {
             let (policy, _, _) =
-                self.step(|tx| reader::effective_context_policy(&tx.open_table(META)?))?;
+                self.step(|tx| reads::effective_context_policy(&tx.open_table(META)?))?;
             let allowed_by_policy = policy.summarization_model == Some(model);
             let allowed_by_agent = match row.agent {
                 Some(agent_id) => match self.require_config_kind(agent_id, ConfigKind::Agent)?.body
@@ -185,7 +187,7 @@ impl Batch {
             }
         }
         let sealed = self.step(|tx| {
-            let tables = reader::NativeSummaryTables {
+            let tables = reads::NativeSummaryTables {
                 jobs: tx.open_table(JOBS)?,
                 states: tx.open_table(JOB_RUNTIME)?,
                 allocations: tx.open_table(POOL_ALLOCATIONS)?,
@@ -195,14 +197,14 @@ impl Batch {
                 pools: tx.open_table(POOLS)?,
                 executors: tx.open_table(EXECUTORS)?,
             };
-            let mut summary_budget = reader::SummaryBudget {
+            let mut summary_budget = reads::SummaryBudget {
                 bytes: 0,
                 outputs: 0,
             };
             let mut boundaries = Vec::new();
             let mut cursor = Some(through);
             while let Some(id) = cursor {
-                let (boundary, prev) = match reader::native_source_boundary(
+                let (boundary, prev) = match reads::native_source_boundary(
                     &tables,
                     id,
                     conversation,
@@ -224,7 +226,7 @@ impl Batch {
                 let Some(bytes) = tables.jobs.get(boundary.job.get())? else {
                     return Ok(None);
                 };
-                let job = transactions::decode_mutable_job(boundary.job.get(), bytes.value())?;
+                let job = jobs::decode_mutable_job(boundary.job.get(), bytes.value())?;
                 let mut turn_text = format!("User: {}\n", job.input.text());
                 for entry in tables
                     .outputs
@@ -280,7 +282,7 @@ impl Batch {
                 let Some(bytes) = jobs.get(child_id.get())? else {
                     continue;
                 };
-                let job = transactions::decode_mutable_job(child_id.get(), bytes.value())?;
+                let job = jobs::decode_mutable_job(child_id.get(), bytes.value())?;
                 if job.summary_source != Some(source_digest) {
                     continue;
                 }
@@ -296,9 +298,7 @@ impl Batch {
                     Some(OutcomeKind::Completed) => {
                         let released = allocations
                             .get(child_id.get())?
-                            .map(|b| {
-                                transactions::decode_pool_allocation(child_id.get(), b.value())
-                            })
+                            .map(|b| allocations::decode_pool_allocation(child_id.get(), b.value()))
                             .transpose()?
                             .is_some_and(|a| a.phase == AllocationPhase::Released);
                         if released {
@@ -547,10 +547,10 @@ impl Batch {
             if ready_now {
                 tx.open_table(MUTABLE_READY)?.insert(
                     (
-                        transactions::mutable_priority(job.input.priority),
+                        jobs::mutable_priority(job.input.priority),
                         submitted.as_unix_micros(),
                         job.id.get(),
-                        transactions::mutable_configuration_requirement(&frozen_config),
+                        reservations::mutable_configuration_requirement(&frozen_config),
                     ),
                     (),
                 )?;
@@ -567,10 +567,10 @@ impl Batch {
     }
 
     pub(crate) fn group_head(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
-        self.step(|tx| reader::turn_head(&tx.open_table(TURNS)?, conversation))
+        self.step(|tx| reads::turn_head(&tx.open_table(TURNS)?, conversation))
     }
     pub(crate) fn active_job(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
-        self.step(|tx| Ok(reader::active_job_in(tx, conversation)?.map(|job| job.id)))
+        self.step(|tx| Ok(reads::active_job_in(tx, conversation)?.map(|job| job.id)))
     }
 
     pub(crate) fn live_children(&mut self, conversation: JobId) -> Result<Vec<JobId>, BatchError> {
@@ -579,6 +579,233 @@ impl Batch {
             table
                 .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
                 .map(|entry| Ok(JobId::new(entry?.0.value().1)))
+                .collect()
+        })
+    }
+}
+
+impl Batch {
+    pub(crate) fn submission(
+        &mut self,
+        key: SubmissionKey,
+    ) -> Result<Option<SubmissionRecord>, BatchError> {
+        self.get(SUBMISSIONS, key.as_bytes().as_slice(), |bytes| {
+            decode_submission(key.as_bytes(), bytes)
+        })
+    }
+
+    pub(crate) fn require_attachment(
+        &mut self,
+        id: AttachmentId,
+    ) -> Result<AttachmentRecord, BatchError> {
+        let record = self.get(ATTACHMENTS, id.get(), |bytes| {
+            decode_attachment(id.get(), bytes)
+        })?;
+        match record {
+            Some(record) => Ok(record),
+            None => self.reject(Violation::NotFound(RecordRef::Attachment(id))),
+        }
+    }
+
+    pub(crate) fn insert_attachment(
+        &mut self,
+        record: &AttachmentRecord,
+    ) -> Result<(), BatchError> {
+        self.step(|tx| {
+            let previous = tx
+                .open_table(ATTACHMENTS)?
+                .get(record.id.get())?
+                .map(|bytes| decode_attachment(record.id.get(), bytes.value()))
+                .transpose()?;
+            indexes::content_reference(tx, record, previous.as_ref())?;
+            tx.open_table(ATTACHMENTS)?
+                .insert(record.id.get(), encode_attachment(record).as_slice())?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn require_project(&mut self, id: ProjectId) -> Result<(), BatchError> {
+        let exists = self.step(|tx| Ok(tx.open_table(PROJECTS)?.get(id.get())?.is_some()))?;
+        if exists {
+            Ok(())
+        } else {
+            self.reject(Violation::NotFound(RecordRef::Project(id)))
+        }
+    }
+
+    pub(crate) fn insert_project(&mut self, record: &ProjectRecord) -> Result<(), BatchError> {
+        self.catalog_changed = true;
+        self.insert(PROJECTS, record.id.get(), encode_project(record).as_slice())
+    }
+
+    pub(crate) fn require_project_record(
+        &mut self,
+        id: ProjectId,
+    ) -> Result<ProjectRecord, BatchError> {
+        let record = self.get(PROJECTS, id.get(), |bytes| decode_project(id.get(), bytes))?;
+        match record {
+            Some(record) => Ok(record),
+            None => self.reject(Violation::NotFound(RecordRef::Project(id))),
+        }
+    }
+
+    pub(crate) fn project_roots(&mut self) -> Result<Vec<(ProjectId, String)>, BatchError> {
+        self.step(|tx| {
+            let mut roots = Vec::new();
+            for entry in tx.open_table(PROJECTS)?.iter()? {
+                let (key, bytes) = entry?;
+                roots.push(decode_project_root(key.value(), bytes.value())?);
+            }
+            Ok(roots)
+        })
+    }
+}
+
+impl Batch {
+    pub(crate) fn tool_evidence(
+        &mut self,
+        call: ToolCallRef,
+    ) -> Result<Option<ToolEvidenceRecord>, BatchError> {
+        self.get(TOOL_CALLS, tool_call_key(call), |bytes| {
+            decode_tool_evidence(call, bytes)
+        })
+    }
+
+    pub(crate) fn put_tool_evidence(
+        &mut self,
+        record: &ToolEvidenceRecord,
+    ) -> Result<(), BatchError> {
+        self.catalog_changed = true;
+        self.insert(
+            TOOL_CALLS,
+            tool_call_key(record.call),
+            encode_tool_evidence(record).as_slice(),
+        )
+    }
+
+    pub(crate) fn put_message(
+        &mut self,
+        body: &crate::db::entities::MessageBody,
+    ) -> Result<(), BatchError> {
+        self.step(|tx| {
+            let mut table = tx.open_table(MESSAGES)?;
+            {
+                if let Some(existing) = table.get(body.digest.as_bytes().as_slice())? {
+                    if existing.value() != body.bytes.as_slice() {
+                        return Err(StorageError::corrupted("message digest collision"));
+                    }
+                    return Ok(());
+                }
+            }
+            table.insert(body.digest.as_bytes().as_slice(), body.bytes.as_slice())?;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn require_messages(
+        &mut self,
+        digests: impl Iterator<Item = ContentDigest>,
+    ) -> Result<(), BatchError> {
+        let missing = self.step(|tx| {
+            let table = tx.open_table(MESSAGES)?;
+            for digest in digests {
+                if table.get(digest.as_bytes().as_slice())?.is_none() {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        if missing {
+            return self.reject(Violation::InvalidValue(
+                "messages",
+                "request references a missing message",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn request_observed(
+        &mut self,
+        job: JobId,
+        request: RequestNumber,
+    ) -> Result<bool, BatchError> {
+        self.step(|tx| {
+            let events = tx.open_table(REQUEST_EVENTS)?;
+            let observed = events
+                .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
+                .next()
+                .is_some();
+            Ok(observed)
+        })
+    }
+
+    pub(crate) fn insert_request_event(
+        &mut self,
+        job: JobId,
+        request: RequestNumber,
+        observed_at: Timestamp,
+        payload: RequestPayload,
+    ) -> Result<RequestEventRecord, BatchError> {
+        let identity = self.development_usage_identity(job)?;
+        let seq = self.step(|tx| {
+            let events = tx.open_table(REQUEST_EVENTS)?;
+            let last = events
+                .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
+                .next_back()
+                .transpose()?
+                .map_or(0, |(key, _)| key.value().2);
+            Ok(last)
+        })?;
+        let Some(seq) = seq.checked_add(1) else {
+            return self.reject(Violation::ValueOutOfRange("seq"));
+        };
+        let event = RequestEventRecord {
+            id: crate::db::entities::RequestEventId::new(self.next_id()?),
+            job_id: job,
+            request,
+            seq,
+            observed_at,
+            recorded_at: self.now,
+            payload,
+        };
+        let timeline = indexes::request_timeline_key(Some(&identity), &event);
+        let usage_model = indexes::usage_model_key(Some(&identity), &event);
+        self.step(|tx| {
+            tx.open_table(REQUEST_EVENTS)?.insert(
+                (job.get(), request.get(), seq),
+                encode_request_event(&event).as_slice(),
+            )?;
+            if let Some(kind) =
+                observations::observation_kind(&tx.open_table(REQUEST_EVENTS)?, &event)?
+            {
+                tx.open_table(JOB_OBSERVATIONS)?
+                    .insert((job.get(), kind, event.id.get()), (request.get(), seq))?;
+            }
+            if let Some(key) = timeline {
+                tx.open_table(REQUEST_TIMELINE)?.insert(key, ())?;
+            }
+            if let Some(key) = usage_model {
+                indexes::record_usage_model(tx, key, job)?;
+            }
+            Ok(())
+        })?;
+        self.record_request_reference(job, request, seq)?;
+        Ok(event)
+    }
+}
+
+impl Batch {
+    pub(crate) fn previous_tool_evidence(
+        &mut self,
+        call: ToolCallRef,
+    ) -> Result<Vec<ToolEvidenceRecord>, BatchError> {
+        self.step(|tx| {
+            tx.open_table(TOOL_CALLS)?
+                .range((call.job.get(), 0, 0)..(call.job.get(), call.request.get(), call.index))?
+                .map(|entry| {
+                    let (key, bytes) = entry?;
+                    rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, bytes.value())
+                })
                 .collect()
         })
     }

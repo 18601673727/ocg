@@ -1,6 +1,8 @@
 use super::codec::TAG_APPROVAL;
 use super::*;
-use crate::db::entities::{MessageBody, ToolCallRef, ToolDecision, Violation};
+use crate::db::entities::{
+    ExecutionEventKind, MessageBody, Recorded, ToolCallRef, ToolDecision, ToolOutcome, Violation,
+};
 
 pub(super) fn open_key(conversation: JobId, call: ToolCallRef) -> (u128, u128, u32, u32) {
     (
@@ -383,6 +385,295 @@ impl Batch {
             self.put_approval(call, ApprovalDecision::Voided, by.clone())?;
             self.remove(OPEN_APPROVALS, open_key(conversation, call))?;
         }
+        Ok(())
+    }
+}
+
+impl Batch {
+    pub(crate) fn tool_decide(
+        &mut self,
+        proof: &crate::db::handoff::DevelopmentWriteProof,
+        evidence: crate::db::entities::ToolEvidence,
+    ) -> Result<(), BatchError> {
+        let crate::db::entities::ToolEvidence {
+            call,
+            approval,
+            tool_call_id,
+            name,
+            decision,
+            spawns,
+        } = evidence;
+        let (tool_call_id, name) = (tool_call_id.as_str(), name.as_str());
+        self.require_development_call(proof, call)?;
+        if matches!(
+            &decision,
+            ToolDecision::Admitted(admitted) if admitted.effect != ToolEffect::ReadOnly
+        ) && name != "job_plan"
+        {
+            self.require_planning_decision_satisfied(call)?;
+        }
+        let conversation = self.turn_conversation(call.job)?;
+        if let Some(original) = approval {
+            let Some(conversation) = conversation else {
+                return self.reject(Violation::InvalidValue(
+                    "approval_executed",
+                    "no matching approval in this conversation",
+                ));
+            };
+            if self.job_lifecycle(conversation)?.closing.is_some() {
+                return self.reject(Violation::InvalidValue(
+                    "conversation_closing",
+                    "approved calls cannot run while closing",
+                ));
+            }
+            let eligible = self.step(|tx| {
+                Ok(tx
+                    .open_table(OPEN_APPROVALS)?
+                    .get(approvals::open_key(conversation, original))?
+                    .is_some_and(|v| v.value() == 1)
+                    && tx
+                        .open_table(APPROVAL_CALLS)?
+                        .get(tool_call_key(original))?
+                        .is_none())
+            })?;
+            if !eligible {
+                return self.reject(Violation::InvalidValue(
+                    "approval_executed",
+                    "approval is unavailable or already executed",
+                ));
+            }
+            let Some(original) = self.tool_evidence(original)? else {
+                return self.reject(Violation::InvalidValue(
+                    "approval_not_found",
+                    "awaiting call missing",
+                ));
+            };
+            if original.name != name {
+                return self.reject(Violation::InvalidValue(
+                    "name",
+                    "must equal the approved tool name",
+                ));
+            }
+            let (ToolDecision::AwaitingApproval(awaited) | ToolDecision::AwaitingAnswer(awaited)) =
+                &original.decision.fact
+            else {
+                return self.reject(Violation::InvalidValue(
+                    "approval_executed",
+                    "the approved call was not awaiting a decision",
+                ));
+            };
+            match &decision {
+                ToolDecision::Admitted(admitted) if admitted != awaited => {
+                    return self.reject(Violation::InvalidValue(
+                        "admission",
+                        "must equal the approved admission",
+                    ));
+                }
+                ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_) => {
+                    return self.reject(Violation::InvalidValue(
+                        "decision",
+                        "an approved call cannot await another decision",
+                    ));
+                }
+                ToolDecision::Admitted(_) | ToolDecision::Refused(_) => {}
+            }
+            if call.request == RequestNumber::FIRST
+                && !self.request_observed(call.job, call.request)?
+            {
+                self.insert_request_event(
+                    call.job,
+                    call.request,
+                    self.now,
+                    crate::db::entities::RequestPayload::ApprovedCalls,
+                )?;
+            }
+        }
+        if matches!(
+            decision,
+            ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_)
+        ) && conversation.is_none()
+        {
+            return self.reject(Violation::InvalidValue(
+                "approve",
+                "awaiting calls require a conversation",
+            ));
+        }
+        if !self.request_observed(call.job, call.request)? {
+            return self.reject(Violation::RequestNotObserved {
+                job: call.job,
+                request: call.request,
+            });
+        }
+        let key = tool_call_key(call);
+        if self.tool_evidence(call)?.is_some() {
+            return self.reject(Violation::DuplicateToolCall(call));
+        }
+        let existing = self.step(|tx| {
+            Ok(tx
+                .open_table(TOOL_CALL_IDS)?
+                .get((call.job.get(), tool_call_id))?
+                .map(|found| found.value()))
+        })?;
+        if let Some((request, index)) = existing {
+            let existing = tool_call_ref((call.job.get(), request, index))
+                .map_err(|error| BatchError(Failure::Storage(error)))?;
+            return self.reject(Violation::DuplicateToolCallId { call, existing });
+        }
+        let current_stats = self.step(|tx| {
+            Ok(tx
+                .open_table(TOOL_STATS)?
+                .get(name)?
+                .map(|found| found.value()))
+        })?;
+        let mut stats_changed = false;
+        let mut updated_stats = current_stats.unwrap_or((0, 0, 0, 0, 0, 0));
+        match &decision {
+            ToolDecision::Admitted(_) => {
+                updated_stats.0 = updated_stats.0.saturating_add(1);
+                stats_changed = true;
+            }
+            ToolDecision::Refused(ToolCallRefusal::InvalidArguments) => {
+                updated_stats.1 = updated_stats.1.saturating_add(1);
+                stats_changed = true;
+            }
+            ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_) => {}
+            ToolDecision::Refused(
+                ToolCallRefusal::Malformed
+                | ToolCallRefusal::ConflictingIdentity
+                | ToolCallRefusal::AmbiguousIdentity
+                | ToolCallRefusal::LimitExceeded
+                | ToolCallRefusal::Incomplete
+                | ToolCallRefusal::Unauthorized
+                | ToolCallRefusal::MissingSchema
+                | ToolCallRefusal::UnsupportedSchema
+                | ToolCallRefusal::NoDecider,
+            ) => {}
+        }
+        let record = ToolEvidenceRecord {
+            call,
+            approval,
+            tool_call_id: tool_call_id.to_owned(),
+            name: name.to_owned(),
+            spawns: spawns && matches!(decision, ToolDecision::Admitted(_)),
+            decision: Recorded {
+                fact: decision,
+                at: self.now,
+            },
+            outcome: None,
+            reconciliation: None,
+        };
+        self.step(|tx| {
+            tx.open_table(TOOL_CALLS)?
+                .insert(key, encode_tool_evidence(&record).as_slice())?;
+            tx.open_table(TOOL_CALL_IDS)?.insert(
+                (call.job.get(), tool_call_id),
+                (call.request.get(), call.index),
+            )?;
+            if stats_changed || current_stats.is_some() {
+                tx.open_table(TOOL_STATS)?.insert(name, updated_stats)?;
+            }
+            Ok(())
+        })?;
+        self.record_execution_event(
+            call.job,
+            ExecutionEventKind::ToolRecorded {
+                call,
+                completed: false,
+            },
+        )?;
+        if let Some(original) = approval
+            && let Some(conversation) = conversation
+        {
+            self.step(|tx| {
+                tx.open_table(OPEN_APPROVALS)?
+                    .remove(approvals::open_key(conversation, original))?;
+                tx.open_table(APPROVAL_CALLS)?
+                    .insert(tool_call_key(original), tool_call_key(call))?;
+                Ok(())
+            })?;
+        }
+        if matches!(
+            record.decision.fact,
+            ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_)
+        ) && let Some(conversation) = conversation
+        {
+            if let Some(closing) = self.job_lifecycle(conversation)?.closing {
+                self.put_approval(call, ApprovalDecision::Voided, closing.by)?;
+            } else {
+                self.insert(OPEN_APPROVALS, approvals::open_key(conversation, call), 0)?;
+            }
+        }
+        self.probe = Some(Probe::ToolCall(call));
+        Ok(())
+    }
+
+    pub(crate) fn tool_outcome(
+        &mut self,
+        proof: &crate::db::handoff::DevelopmentWriteProof,
+        call: ToolCallRef,
+        outcome: ToolOutcome,
+    ) -> Result<(), BatchError> {
+        self.require_development_call(proof, call)?;
+        let Some(mut record) = self.tool_evidence(call)? else {
+            return self.reject(Violation::ToolCallNotFound(call));
+        };
+        if record.admission().is_none() {
+            return self.reject(Violation::ToolCallNotAdmitted(call));
+        }
+        if record.outcome.is_some() {
+            return self.reject(Violation::ToolOutcomeAlreadyRecorded(call));
+        }
+        if matches!(outcome, ToolOutcome::CompletedElided { .. })
+            && record
+                .admission()
+                .is_none_or(|admission| admission.effect != ToolEffect::ReadOnly)
+        {
+            return self.reject(Violation::InvalidValue(
+                "outcome",
+                "only a read-only call may keep just the size and digest of its result",
+            ));
+        }
+        let current_stats = self.step(|tx| {
+            Ok(tx
+                .open_table(TOOL_STATS)?
+                .get(record.name.as_str())?
+                .map(|found| found.value())
+                .unwrap_or((0, 0, 0, 0, 0, 0)))
+        })?;
+        let mut updated_stats = current_stats;
+        let duration_us = self
+            .now
+            .as_unix_micros()
+            .saturating_sub(record.decision.at.as_unix_micros())
+            .max(0) as u64;
+        updated_stats.4 = updated_stats.4.saturating_add(duration_us);
+        updated_stats.5 = updated_stats.5.max(duration_us);
+        match &outcome {
+            ToolOutcome::Completed { .. }
+            | ToolOutcome::CompletedWithheld { .. }
+            | ToolOutcome::CompletedElided { .. } => {
+                updated_stats.2 = updated_stats.2.saturating_add(1);
+            }
+            ToolOutcome::NotApplied { .. }
+            | ToolOutcome::NotInvoked { .. }
+            | ToolOutcome::Uncertain { .. } => {
+                updated_stats.3 = updated_stats.3.saturating_add(1);
+            }
+        }
+        record.outcome = Some(Recorded {
+            fact: outcome,
+            at: self.now,
+        });
+        self.put_tool_evidence(&record)?;
+        self.record_execution_event(
+            call.job,
+            ExecutionEventKind::ToolRecorded {
+                call,
+                completed: true,
+            },
+        )?;
+        self.insert(TOOL_STATS, record.name.as_str(), updated_stats)?;
+        self.probe = Some(Probe::ToolOutcome(call));
         Ok(())
     }
 }

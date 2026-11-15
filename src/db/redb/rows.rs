@@ -25,14 +25,6 @@ fn check_table_key(table: &str, key: u128, embedded: u128) -> DecodeResult<()> {
 impl JobSpec {
     const TAG: u8 = 53;
 
-    pub(super) fn is_chunk_group(&self) -> bool {
-        self.parent_id.is_some() && self.origin == Origin::System && !self.keep_open
-    }
-
-    pub(super) fn is_standalone_decision_group(&self) -> bool {
-        self.parent_id.is_none() && self.origin == Origin::System && !self.keep_open
-    }
-
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(Self::TAG);
         e.u128(self.id.get());
@@ -656,7 +648,7 @@ pub(super) fn encode_request_event(r: &RequestEventRecord) -> Vec<u8> {
             dropped_turns,
         } => {
             e.u8(4);
-            e.u32(u32::try_from(messages.len()).expect("request messages fit u32"));
+            e.u32(u32::try_from(messages.len()).unwrap_or(u32::MAX));
             for digest in messages {
                 e.0.extend_from_slice(digest.as_bytes());
             }
@@ -801,51 +793,6 @@ fn credential_aad(reference: &str) -> Vec<u8> {
     aad.extend_from_slice(CREDENTIAL_AAD_PREFIX);
     aad.extend_from_slice(reference.as_bytes());
     aad
-}
-
-pub(crate) fn valid_credential_ref(reference: &str) -> bool {
-    !reference.is_empty() && reference.len() <= 128 && !reference.chars().any(char::is_control)
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct CredentialSecret(String);
-
-impl CredentialSecret {
-    pub(crate) fn new(secret: impl Into<String>) -> Result<Self, &'static str> {
-        let mut secret = secret.into();
-        if secret.is_empty() || secret.len() > 4096 {
-            crate::system::secrets::wipe_string(&mut secret);
-            return Err("credential secret must be 1..=4096 bytes");
-        }
-        let mut header = format!("Bearer {secret}");
-        let valid = ntex::http::header::HeaderValue::try_from(header.as_str()).is_ok();
-        crate::system::secrets::wipe_string(&mut header);
-        if !valid {
-            crate::system::secrets::wipe_string(&mut secret);
-            return Err("credential secret is not a valid HTTP Bearer token");
-        }
-        Ok(Self(secret))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    pub(crate) fn into_inner(mut self) -> String {
-        std::mem::take(&mut self.0)
-    }
-}
-
-impl Drop for CredentialSecret {
-    fn drop(&mut self) {
-        crate::system::secrets::wipe_string(&mut self.0);
-    }
-}
-
-impl std::fmt::Debug for CredentialSecret {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("<redacted>")
-    }
 }
 
 pub(crate) struct CredentialKey {

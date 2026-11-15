@@ -13,8 +13,8 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import type { ProfilesSnapshot, Project } from "../contracts";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
+import type { ApiClient } from "../runtime/api-client";
 
 type Selection = { agent: string | null; model: string; projects: string[] };
 
@@ -51,6 +51,7 @@ export function DispatchSelectionCard({
     const parsed = JSON.parse(argumentsText);
     if (parsed && typeof parsed === "object") request = parsed;
   } catch {}
+  // biome-ignore lint/correctness/useExhaustiveDependencies: The revision explicitly refreshes the data.
   useEffect(() => {
     const controller = new AbortController();
     void Promise.all([

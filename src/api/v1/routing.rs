@@ -102,7 +102,7 @@ pub(super) enum Route {
     NativePoolArchive(ExecutionPoolId),
     NativePoolCreate,
     NativeExecutors {
-        before: Option<ProfileId>,
+        before: Option<crate::db::entities::ExecutorId>,
         limit: usize,
     },
     NativeExecutorCreate,
@@ -396,7 +396,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 limit,
             })
         }
-        ["executors"] => catalog::page_query(query, profiles::profile_id)
+        ["executors"] => catalog::page_query(query, pools::executor_id)
             .map(|(before, limit)| Route::NativeExecutors { before, limit }),
         ["attachments", attachment] => {
             let attachment = attachments::attachment_id(attachment)?;
@@ -609,7 +609,7 @@ pub(super) async fn respond(
         Route::Job(job) => {
             let context = mutable_jobs::optional_context(request)?;
             match database.mutable_job_details(job, context).await? {
-                crate::db::redb::MutableJobDetailsLookup::Found(details) => {
+                Some(details) => {
                     let job_view = jobs::mutable_job_view(
                         &details.record,
                         details.allocation.as_ref(),
@@ -629,12 +629,14 @@ pub(super) async fn respond(
                     body["project"] = serde_json::json!(
                         details.record.project.map(|project| project.to_string())
                     );
-                    mutable_jobs::add_editable_state(&mut body, database, context, &details.record)
-                        .await?;
+                    mutable_jobs::add_editable_state(
+                        &mut body,
+                        &details.record,
+                        details.unsupported_decision_history,
+                    )?;
                     Ok(Reply::ok(body))
                 }
-                crate::db::redb::MutableJobDetailsLookup::Inaccessible
-                | crate::db::redb::MutableJobDetailsLookup::NotMutable => Err(JOB_NOT_FOUND),
+                None => Err(JOB_NOT_FOUND),
             }
         }
         Route::JobInput(job) => catalog::job_input(database, job, request).await,
@@ -767,7 +769,7 @@ pub(super) async fn respond(
             pools::archive_pool(database, pool, &body).await
         }
         Route::NativeExecutors { before, limit } => {
-            pools::list_executors(database, before.map(Into::into), limit).await
+            pools::list_executors(database, before, limit).await
         }
         Route::NativeExecutorCreate => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;

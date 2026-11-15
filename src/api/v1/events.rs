@@ -21,8 +21,8 @@ use serde_json::Value;
 use super::{
     INVALID_REQUEST, JOB_NOT_FOUND, OUTPUT_TOO_LARGE, Refusal, SHUTTING_DOWN, Shared, decimal,
 };
+use crate::db::entities::NativeJobItem;
 use crate::db::entities::{JobId, JobOutputRecord};
-use crate::db::redb::NativeJobItem;
 
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "JobEvent")]

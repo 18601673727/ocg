@@ -121,7 +121,7 @@ fn encode_event(event: &ExecutionEvent) -> DecodeResult<Vec<u8>> {
         }
         ExecutionEventKind::AllocationReserved { allocation } => {
             e.u8(2);
-            let bytes = transactions::encode_pool_allocation(allocation);
+            let bytes = allocations::encode_pool_allocation(allocation);
             e.u32(
                 u32::try_from(bytes.len())
                     .map_err(|_| StorageError::corrupted("Job reservation record is too large"))?,
@@ -238,7 +238,7 @@ pub(crate) fn decode_event(key: (u128, u64), bytes: &[u8]) -> DecodeResult<Execu
         },
         2 => {
             let length = d.u32()? as usize;
-            let allocation = transactions::decode_pool_allocation(job.get(), d.take(length)?)?;
+            let allocation = allocations::decode_pool_allocation(job.get(), d.take(length)?)?;
             if !reservation_is_valid(&allocation, job, at) {
                 return Err(StorageError::corrupted("invalid Job reservation event"));
             }
@@ -524,7 +524,7 @@ pub(crate) fn replay_job(
                 let row = jobs
                     .get(job.get())?
                     .ok_or_else(|| StorageError::corrupted("input revision has no Job"))?;
-                let current = transactions::decode_mutable_job(job.get(), row.value())?;
+                let current = jobs::decode_mutable_job(job.get(), row.value())?;
                 if current.revision < *revision {
                     return Err(StorageError::corrupted(
                         "input revision exceeds its current Job",
@@ -538,7 +538,7 @@ pub(crate) fn replay_job(
                     let input = inputs.get((job.get(), revision))?.ok_or_else(|| {
                         StorageError::corrupted("historical input revision is missing")
                     })?;
-                    transactions::decode_mutable_input_revision(job, revision, input.value())?;
+                    jobs::decode_mutable_input_revision(job, revision, input.value())?;
                 }
                 snapshot.input_revision = Some(*revision);
             }
@@ -879,4 +879,84 @@ impl Batch {
         }
         Ok(())
     }
+}
+
+fn execution_job_visible(
+    rx: &ReadTransaction,
+    job: JobId,
+    context: Option<crate::db::entities::ComposerContextId>,
+) -> Result<bool, StorageError> {
+    if reads::read_conversation_row(rx, job)?.is_some() {
+        return Ok(true);
+    }
+    let jobs = rx.open_table(JOBS)?;
+    let Some(row) = jobs.get(job.get())? else {
+        return Ok(false);
+    };
+    let record = crate::db::redb::jobs::decode_mutable_job(job.get(), row.value())?;
+    Ok(
+        !context.is_some_and(|context| context != record.composer_context)
+            && (record.phase != crate::db::entities::MutableJobPhase::Unsubmitted
+                || context.is_some()),
+    )
+}
+
+pub(crate) fn read_execution_history(
+    database: &Database,
+    job: JobId,
+    after: Option<u64>,
+    limit: usize,
+    context: Option<crate::db::entities::ComposerContextId>,
+) -> Result<Option<ExecutionHistoryPage>, StorageError> {
+    let rx = read(database)?;
+    if !execution_job_visible(&rx, job, context)? {
+        return Ok(None);
+    }
+    let table = rx.open_table(JOB_EVENTS)?;
+    let limit = limit.clamp(1, MAX_PAGE);
+    let mut events = Vec::new();
+    let mut more = false;
+    let mut transaction_end = None;
+    for entry in table.range((
+        std::ops::Bound::Excluded((job.get(), after.unwrap_or(0))),
+        std::ops::Bound::Included((job.get(), u64::MAX)),
+    ))? {
+        if events.len() == limit {
+            more = true;
+            break;
+        }
+        let (key, value) = entry?;
+        let event = execution::decode_event(key.value(), value.value())?;
+        let committed_seq = match transaction_end {
+            Some((transaction, end)) if transaction == event.transaction => end,
+            _ => {
+                let end = execution::commit_end(&rx, event.transaction)?;
+                transaction_end = Some((event.transaction, end));
+                end
+            }
+        };
+        events.push(ExecutionHistoryItem {
+            event,
+            committed_seq,
+        });
+    }
+    let next_after = events.last().map(|item| item.event.seq).filter(|_| more);
+    Ok(Some(ExecutionHistoryPage {
+        events,
+        next_after,
+        head_seq: execution::latest_seq(&rx, job)?,
+    }))
+}
+
+pub(crate) fn read_execution_snapshot(
+    database: &Database,
+    job: JobId,
+    at_seq: Option<u64>,
+    context: Option<crate::db::entities::ComposerContextId>,
+) -> Result<Option<crate::db::entities::ExecutionSnapshot>, StorageError> {
+    let rx = read(database)?;
+    if !execution_job_visible(&rx, job, context)? {
+        return Ok(None);
+    }
+    execution::replay_job(&rx, job, at_seq)
 }

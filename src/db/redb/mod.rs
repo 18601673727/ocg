@@ -7,7 +7,7 @@ use ::redb::{
 };
 
 use crate::db::entities::{
-    Actor, Appended, ApprovalDecision, ApprovalRecord, Entry, JobGroup, JobKind, JobLimits, Origin,
+    Actor, Appended, ApprovalDecision, ApprovalRecord, Entry, JobKind, JobLimits, Origin,
     OutcomeKind, Recurrence, RecurrenceHalt, RecurrencePhase, StopProof,
 };
 use crate::db::entities::{
@@ -24,6 +24,17 @@ use crate::service::ai::providers::openai_compatible::{
     ChatFinishReason, NormalizedUsage, ProviderFailure, ToolCallRefusal,
 };
 
+use crate::db::entities::{
+    AgentModelConfig, ChildConversationEntry, ContextState, ContextWorkDetails, ContextWorkState,
+    ConversationEntry, ConversationsPage, CredentialSecret, CursorPage, DevelopmentCandidate,
+    DevelopmentContextTurn, DevelopmentDecisionContext, DevelopmentExecutionContext,
+    DevelopmentRetainedInput, ExecutionHistoryItem, ExecutionHistoryPage, JobSearchPage, JobTree,
+    MutableConfiguration, MutableConversationPage, MutableConversationTurn, MutableJobDetails,
+    NativeJobItem, ProfilePageRecord, ProfilePageRecords, ProviderResponse, ProviderResponsesPage,
+    TreeFacts, TreeNode, UsageRetriesPage, VerifiedNativeSummary, escaped_json_char_cost,
+    valid_credential_ref,
+};
+
 mod approvals;
 mod codec;
 pub(crate) mod execution;
@@ -33,18 +44,33 @@ mod job_tools;
 pub(crate) use job_tools::JobToolApplied;
 mod job_tree;
 mod observations;
-mod reader;
+mod reads;
 mod recovery;
-pub(crate) use recovery::reclaim_pending;
 mod recurrences;
 mod rows;
 mod schema;
 mod state;
 use state::JobRuntime;
-mod transactions;
-mod writer;
+mod allocations;
+mod batch;
+mod configs;
+mod execution_writes;
+mod jobs;
+mod reservations;
+mod scheduled_external;
+mod settlement;
 
 use crate::db::entities::AvailabilityStatId;
+use allocations::*;
+pub(crate) use allocations::{
+    NativeResourceCatalog, read_executors, read_native_resource_catalog, read_pool,
+    read_pool_allocations, read_pools, read_uncertain_allocations,
+};
+pub(crate) use batch::{
+    Batch, BatchError, BatchFailure, BatchOutcome, Commit, CompactFailure, Failure,
+    NativeResourceDelta, Probe, allocated_bytes, compact, persist_staged, probe_committed,
+    run_batch_declinable, run_batch_with,
+};
 use codec::{
     Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_GLOBAL_COMPACTION,
     TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME, TAG_OUTPUT, TAG_PROJECT, TAG_REQUEST_EVENT,
@@ -52,79 +78,26 @@ use codec::{
     decode_scheduled_external_policy, encode_scheduled_external_binding,
     encode_scheduled_external_policy,
 };
-pub(crate) use writer::Failure;
-pub(crate) use writer::{
-    Batch, BatchError, BatchFailure, BatchOutcome, Commit, CompactFailure, NativeResourceDelta,
-    Probe, allocated_bytes, compact, persist_staged, run_batch_declinable, run_batch_with,
-};
+use jobs::*;
+pub(crate) use reservations::queue_counts;
+use reservations::*;
 
-pub(crate) use reader::{
-    DevelopmentCandidate, DevelopmentResolvedCandidate, DevelopmentResolvedContext,
-    read_development_execution_context,
-};
-pub(crate) use reader::{
-    ExecutionHistoryItem, ExecutionHistoryPage, read_execution_history, read_execution_snapshot,
-};
-pub(crate) use reader::{
-    NativeResource, NativeResourceCatalog, NativeResourceKind, PoolAllocationPage,
-    read_native_resource_catalog, read_native_resources, read_pool_allocations,
-};
-pub(crate) use reader::{OfflineVerification, inspect_held_allocations_offline, verify_offline};
-pub(crate) use reader::{ProfilePageRecord, read_global_compaction_settings};
-#[cfg(unix)]
-pub(crate) use reader::{verify_recovered_publication, verify_reserved_publication};
-pub(crate) use recovery::{
-    ReservedRefusal, reconcile_held_apply, reconcile_held_preflight, reconcile_reserved_apply,
-    reconcile_reserved_preflight, verify_held_publication_delta, verify_reserved_publication_delta,
-};
-pub(crate) fn escaped_json_char_cost(character: char) -> usize {
-    match character {
-        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
-        c if c <= '\u{1f}' => 6,
-        c => c.len_utf8(),
-    }
-}
-
-pub(crate) use observations::{
-    ProviderResponsesPage, read_availability_stats, read_job_availability, read_job_metrics,
-    read_metrics, read_provider_request, read_provider_responses,
-};
-use reader::read;
-use recovery::allocate;
-pub(crate) use recovery::{OpenedFile, database_file, open};
-
-pub(crate) use reader::read_global_outbound_headers;
-pub(crate) use reader::read_handoff_credential;
-pub(crate) use reader::read_trial_job;
-pub(crate) use reader::{
-    AgentModelConfig, ChildConversationEntry, ConversationsPage, CursorPage, JobSearchPage,
-    NativeJobItem, read_cards, read_conversation_children,
-};
-pub(crate) use reader::{
-    ContextState, ContextWorkDetails, JobTree, TreeFacts, TreeNode, UncertainAllocation,
-    UsageRetriesPage, check_readable, probe_committed, queue_counts, read_agent_model_configs,
-    read_attachment, read_attachments, read_children, read_config, read_configs,
-    read_context_state, read_conversation_search, read_conversations, read_credential_ref_in_use,
-    read_job, read_job_search, read_job_tree, read_latest_output, read_native_job, read_outputs,
-    read_profile_page, read_project, read_projects, read_retries, read_submission,
-    read_tool_evidence, read_tool_stats, read_uncertain_allocations, read_usage_buckets,
-    read_usage_retries, read_usage_summary,
-};
-pub(crate) use reader::{
-    MutableConversationPage, MutableJobDetails, MutableJobDetailsLookup, read_conversation_limits,
-    read_mutable_conversation_turn_page, read_mutable_job_details,
-};
-pub(crate) use reader::{ProfilePageRecords, StoredCredential, credential_count, read_credential};
-pub(crate) use reader::{
+pub(crate) use execution::{read_execution_history, read_execution_snapshot};
+pub(crate) use reads::*;
+pub(crate) use recovery::*;
+pub(crate) use scheduled_external::{
     read_scheduled_external_binding_with_policy, read_scheduled_external_policies,
     read_scheduled_external_policy,
 };
 
-pub(crate) use crate::db::entities::{JobLifecycle, JobSpec, JobState};
-pub(crate) use rows::{
-    ConfigRow, CredentialKey, CredentialSecret, create_credential_key, load_credential_key,
-    valid_credential_ref,
+pub(crate) use observations::{
+    read_availability_stats, read_job_availability, read_job_metrics, read_metrics,
+    read_provider_request, read_provider_responses,
 };
+use reads::read;
+
+pub(crate) use crate::db::entities::{JobLifecycle, JobSpec, JobState};
+pub(crate) use rows::{ConfigRow, CredentialKey, create_credential_key, load_credential_key};
 use rows::{
     decode_attachment, decode_credential, decode_output, decode_project, decode_project_root,
     decode_submission, decode_tool_evidence, encode_attachment, encode_output, encode_project,
@@ -252,4 +225,4 @@ storage_from!(
     CommitError
 );
 
-pub(crate) use crate::db::entities::{JobActivity, JobUsage};
+use crate::db::entities::JobUsage;

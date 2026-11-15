@@ -1,31 +1,31 @@
 "use client";
 
+import { useAuiState } from "@assistant-ui/react";
 import {
   createContext,
-  useContext,
-  useEffect,
-  useCallback,
-  useMemo,
-  useState,
   type FC,
   type ReactNode,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useState,
 } from "react";
 import { Thread } from "@/components/assistant-ui/elements/thread.aui";
-import { useAuiState } from "@assistant-ui/react";
-import { OcgAssistantProvider } from "../runtime/assistant-ui-provider";
-import { useOcgRuntime } from "../runtime/runtime-context";
-import { ConversationChildrenStrip, ConversationCardStrip } from "./chat-view";
-import { WorkspaceToolFallback } from "./workspace-tool";
+import type { ChatModelSelection } from "../contracts";
+import { useI18n } from "../i18n";
 import { TaskStatus } from "../job/task-status";
+import { OcgAssistantProvider } from "../runtime/assistant-ui-provider";
+import { executionDetail, executionLabel } from "../runtime/job-status";
+import { useOcgRuntime } from "../runtime/runtime-context";
+import type { ChatSession } from "../types";
+import { ConversationCardStrip, ConversationChildrenStrip } from "./chat-view";
+import { ContextTranscript } from "./context-transcript";
 import { ConversationArtifacts } from "./conversation-artifacts";
 import { FileChanges } from "./file-changes";
 import { readModelPreference, writeModelPreference } from "./model-preference";
-import { useI18n } from "../i18n";
-import { executionDetail, executionLabel } from "../runtime/job-status";
-import type { ChatSession } from "../types";
-import type { ChatModelSelection } from "../contracts";
-import { ContextTranscript } from "./context-transcript";
-import { MutableComposer, contextForSession } from "./mutable-composer";
+import { contextForSession, MutableComposer } from "./mutable-composer";
+import { WorkspaceToolFallback } from "./workspace-tool";
 
 export interface ChatScreenProps {
   session: ChatSession;
@@ -76,8 +76,7 @@ const ChatComposerSlot: FC = () => {
         setModel("error");
       });
     return () => abort.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, sessionId]);
+  }, [api, sessionId, conversationId]);
   if (!value) return null;
   if (model === "checking" || probedSession !== sessionId)
     return <p role="status">Checking Composer availability…</p>;

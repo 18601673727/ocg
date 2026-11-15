@@ -1,10 +1,8 @@
 "use client";
 
-import { useState, type ReactNode } from "react";
 import { Check, ChevronDown, ChevronRight, Plus, Search, Trash2 } from "lucide-react";
+import { type ReactNode, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
   DialogContent,
@@ -13,9 +11,11 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import { useI18n, type I18nKey } from "../i18n";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
+import { type I18nKey, useI18n } from "../i18n";
 import type { ProjectCommand } from "../runtime/api-client";
-import { nextCommandDraftId, toProjectCommands, type CommandDraft } from "./command-drafts";
+import { type CommandDraft, nextCommandDraftId, toProjectCommands } from "./command-drafts";
 
 type CommandGroup = {
   id: string;
@@ -190,9 +190,8 @@ export function CommandEditor({
                 <DialogDescription>{t("settings.projects.commandGroupsNote")}</DialogDescription>
               </DialogHeader>
               <div className="ocg-subtle-scrollbar grid min-h-0 min-w-0 flex-1 gap-4 overflow-y-auto overscroll-contain sm:grid-cols-[11rem_1fr]">
-                <div
+                <fieldset
                   className="grid content-start grid-cols-2 gap-1 sm:grid-cols-1"
-                  role="group"
                   aria-label={t("settings.projects.addGroups")}
                 >
                   {COMMAND_GROUPS.map((item) => (
@@ -207,14 +206,13 @@ export function CommandEditor({
                       {t(item.title)}
                     </Button>
                   ))}
-                </div>
+                </fieldset>
                 <div className="min-w-0 space-y-3">
                   <p className="text-sm text-muted-foreground">{t(group.description)}</p>
                   {group.id === "node" && (
                     <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground">
                       <span>{t("settings.projects.packageManager")}</span>
-                      <div
-                        role="group"
+                      <fieldset
                         aria-label={t("settings.projects.packageManager")}
                         className="flex gap-1 rounded-md border border-border p-1"
                       >
@@ -231,7 +229,7 @@ export function CommandEditor({
                             {manager}
                           </Button>
                         ))}
-                      </div>
+                      </fieldset>
                     </div>
                   )}
                   <div className="divide-y divide-border rounded-md border border-border">

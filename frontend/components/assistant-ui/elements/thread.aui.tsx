@@ -1,51 +1,19 @@
 "use client";
 
 import {
-  ComposerAddAttachment,
-  ComposerAttachments,
-  UserMessageAttachments,
-} from "@/components/assistant-ui/elements/attachment.aui";
-import { File, getFileHref } from "@/components/assistant-ui/elements/file";
-import { ThreadFollowupSuggestions } from "@/components/assistant-ui/elements/follow-up-suggestions.aui";
-import { Image } from "@/components/assistant-ui/elements/image";
-import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
-import {
-  Reasoning,
-  ReasoningContent,
-  ReasoningRoot,
-  ReasoningText,
-  ReasoningTrigger,
-  estimateReasoningTokens,
-} from "@/components/assistant-ui/elements/reasoning.aui";
-import { ToolFallback } from "@/components/assistant-ui/elements/tool-fallback.aui";
-import {
-  ToolGroupContent,
-  ToolGroupRoot,
-  ToolGroupTrigger,
-} from "@/components/assistant-ui/elements/tool-group.aui";
-import {
-  FloatingIconButton,
-  TooltipIconButton,
-} from "@/components/assistant-ui/elements/tooltip-icon-button";
-import { Button } from "@/components/ui/button";
-import { Skeleton } from "@/components/ui/skeleton";
-import { cn } from "@/lib/utils";
-import { ToolActivityLabel } from "@/components/ocg/chat/tool-activity-label";
-import type { ToolActivity } from "@/components/ocg/chat/tool-activity-summary";
-import {
   ActionBarMorePrimitive,
   ActionBarPrimitive,
-  AuiIf,
   type AssistantState,
+  AuiIf,
   BranchPickerPrimitive,
   ComposerPrimitive,
+  type FileMessagePartComponent,
   groupPartByType,
+  type ImageMessagePartComponent,
   MessagePrimitive,
   SuggestionPrimitive,
-  ThreadPrimitive,
-  type FileMessagePartComponent,
-  type ImageMessagePartComponent,
   type TextMessagePartComponent,
+  ThreadPrimitive,
   type ToolCallMessagePartComponent,
   useAuiState,
 } from "@assistant-ui/react";
@@ -67,16 +35,48 @@ import {
   ThumbsUpIcon,
 } from "lucide-react";
 import {
-  createContext,
-  useContext,
-  useLayoutEffect,
-  useRef,
   type ComponentType,
+  createContext,
   type FC,
   type PropsWithChildren,
   type ReactNode,
+  useContext,
+  useLayoutEffect,
+  useRef,
 } from "react";
+import {
+  ComposerAddAttachment,
+  ComposerAttachments,
+  UserMessageAttachments,
+} from "@/components/assistant-ui/elements/attachment.aui";
+import { File, getFileHref } from "@/components/assistant-ui/elements/file";
+import { ThreadFollowupSuggestions } from "@/components/assistant-ui/elements/follow-up-suggestions.aui";
+import { Image } from "@/components/assistant-ui/elements/image";
+import { MarkdownText } from "@/components/assistant-ui/elements/markdown-text";
+import {
+  estimateReasoningTokens,
+  Reasoning,
+  ReasoningContent,
+  ReasoningRoot,
+  ReasoningText,
+  ReasoningTrigger,
+} from "@/components/assistant-ui/elements/reasoning.aui";
+import { ToolFallback } from "@/components/assistant-ui/elements/tool-fallback.aui";
+import {
+  ToolGroupContent,
+  ToolGroupRoot,
+  ToolGroupTrigger,
+} from "@/components/assistant-ui/elements/tool-group.aui";
+import {
+  FloatingIconButton,
+  TooltipIconButton,
+} from "@/components/assistant-ui/elements/tooltip-icon-button";
+import { ToolActivityLabel } from "@/components/ocg/chat/tool-activity-label";
+import type { ToolActivity } from "@/components/ocg/chat/tool-activity-summary";
 import { useI18n } from "@/components/ocg/i18n";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { cn } from "@/lib/utils";
 
 export type ThreadGroupPart = MessagePrimitive.GroupedParts.GroupPart;
 
@@ -396,6 +396,7 @@ const ThreadLoadEarlier: FC = () => {
   }, [visible]);
 
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: The wrapper observes focus on its child button to restore it when the button is removed.
     <div
       ref={slotRef}
       className="contents"
@@ -971,8 +972,11 @@ const UserMessage: FC = () => {
       {revisions.length > 0 && (
         <details className="col-start-2 max-w-prose text-xs text-muted-foreground">
           <summary className="cursor-pointer text-right">{t("chat.queueEdited")}</summary>
-          {revisions.map((revision, index) => (
-            <p key={index} className="mt-2 whitespace-pre-wrap break-words rounded border p-2">
+          {revisions.map((revision) => (
+            <p
+              key={JSON.stringify([revision.at, revision.content])}
+              className="mt-2 whitespace-pre-wrap break-words rounded border p-2"
+            >
               {revision.content}
             </p>
           ))}

@@ -1,8 +1,8 @@
 "use client";
 
-import type { ComponentProps } from "react";
 import { ScrollArea as ScrollAreaPrimitive } from "@base-ui/react/scroll-area";
 import { cn } from "cn";
+import type { ComponentProps } from "react";
 
 type ScrollAreaPartProps = ComponentProps<"div"> & {
   [attribute: `data-${string}`]: string | number | boolean | undefined;

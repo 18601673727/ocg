@@ -1,7 +1,9 @@
 "use client";
 
+import { AlertCircle, ChevronDown, X } from "lucide-react";
 import {
   createContext,
+  type ReactNode,
   useCallback,
   useContext,
   useEffect,
@@ -9,13 +11,11 @@ import {
   useMemo,
   useRef,
   useState,
-  type ReactNode,
 } from "react";
-import { AlertCircle, ChevronDown, X } from "lucide-react";
-import { cn } from "@/lib/utils";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { useI18n } from "../i18n";
 import { dismissNotice, isNoticeDismissed, noticeIdentity } from "@/lib/notice-dismissal";
+import { cn } from "@/lib/utils";
+import { useI18n } from "../i18n";
 
 type Retry = { label: string; run: () => void };
 type ConversationError = {
@@ -163,6 +163,7 @@ export function ConversationErrorHeader() {
 
   if (!latest || !history || !active) return null;
   return (
+    // biome-ignore lint/a11y/noStaticElementInteractions: Escape dismisses the panel from any of its controls.
     <div
       ref={root}
       className="pointer-events-none relative w-full min-w-0 max-w-3xl"

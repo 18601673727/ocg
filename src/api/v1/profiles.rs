@@ -11,9 +11,9 @@ use super::wire::{
 };
 use crate::db::entities::{
     AgentCapability, AgentConfig, Config, ConfigBody, ConfigId, ConfigKind, ConfigRecord,
-    ConnectionConfig, DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionProtocol,
-    ExecutionOperation, LlmParameters, LlmTransport, ModelCapability, ProfileId, RecordRef,
-    Violation,
+    ConnectionConfig, CredentialSecret, DecisionAgentConfig, DecisionCapability, DecisionLimits,
+    DecisionProtocol, ExecutionOperation, LlmParameters, LlmTransport, ModelCapability, ProfileId,
+    RecordRef, Violation,
 };
 use crate::db::entities::{
     FrozenHeaders, HeaderError, HeaderScope, OutboundHeader, OutboundHeaderValue, merge,
@@ -23,7 +23,6 @@ use crate::db::mutations::{
     HeaderChange, HeaderEdit, HeaderEditValue, ImportModelsSave, ModelProfileDefinition,
     ModelProfileSave, ProfileCredentialRef,
 };
-use crate::db::redb::CredentialSecret;
 use crate::db::{DatabaseError, DatabaseHandle};
 use crate::service::ai::providers::CredentialResolver;
 use crate::system::http::{RequestHeaders, resolve_request_headers};
@@ -931,10 +930,10 @@ fn push_page_item<T: serde::Serialize>(
 }
 
 fn build_profiles_page(
-    page: crate::db::redb::ProfilePageRecords,
+    page: crate::db::entities::ProfilePageRecords,
     saved_profile: Option<ProfileId>,
 ) -> Result<Value, Refusal> {
-    let crate::db::redb::ProfilePageRecords {
+    let crate::db::entities::ProfilePageRecords {
         records,
         connections,
         credentials,
@@ -963,8 +962,8 @@ fn build_profiles_page(
 
     for record in records {
         let record = match record {
-            crate::db::redb::ProfilePageRecord::Config(record) => record,
-            crate::db::redb::ProfilePageRecord::Executor(executor) => {
+            crate::db::entities::ProfilePageRecord::Config(record) => record,
+            crate::db::entities::ProfilePageRecord::Executor(executor) => {
                 let offered: Vec<_> = executor
                     .capabilities
                     .iter()

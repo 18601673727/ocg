@@ -1,7 +1,7 @@
 "use client";
 
-import { type ReactNode } from "react";
 import { Check, Copy, Terminal } from "lucide-react";
+import type { ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import type { ToolCall } from "../contracts";
@@ -11,7 +11,7 @@ import { toolObject } from "./artifact-model";
 
 function commandArgument(value: string): string {
   if (/^[a-zA-Z0-9_@%+=:,./-]+$/.test(value)) return value;
-  return "'" + value.replace(/'/g, "'\"'\"'") + "'";
+  return `'${value.replace(/'/g, "'\"'\"'")}'`;
 }
 
 function commandLine(value: unknown): string | null {
@@ -61,8 +61,10 @@ function CommandOutput({ title, text }: { title: string; text: string }) {
         )}
       </header>
       {text ? (
+        // biome-ignore lint/a11y/useSemanticElements: The named, focusable pre preserves native preformatted text and keyboard scrolling.
         <pre
           className="ocg-subtle-scrollbar max-h-80 overflow-auto whitespace-pre-wrap break-words px-3 py-3 font-mono text-xs leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          // biome-ignore lint/a11y/noNoninteractiveTabindex: Keyboard users can focus and scroll this results region.
           tabIndex={0}
           role="region"
           aria-label={title}
@@ -70,6 +72,7 @@ function CommandOutput({ title, text }: { title: string; text: string }) {
           {highlighted ? (
             <code
               className="hljs bg-transparent! p-0!"
+              // biome-ignore lint/security/noDangerouslySetInnerHtml: highlight.js escapes source text before emitting syntax markup.
               dangerouslySetInnerHTML={{ __html: highlighted.html }}
             />
           ) : (
@@ -171,9 +174,11 @@ export function CommandTool({ call, children }: { call: ToolCall; children: Reac
           {isCopied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
         </Button>
       </header>
+      {/* biome-ignore lint/a11y/useSemanticElements: The named, focusable pre preserves native preformatted text and keyboard scrolling. */}
       <pre
         data-slot="command-input"
         className="ocg-subtle-scrollbar overflow-x-auto px-3 py-3 font-mono text-xs leading-5 outline-none focus-visible:ring-2 focus-visible:ring-ring"
+        // biome-ignore lint/a11y/noNoninteractiveTabindex: Keyboard users can focus and scroll this results region.
         tabIndex={0}
         role="region"
         aria-label={command}

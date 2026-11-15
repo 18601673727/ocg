@@ -16,22 +16,22 @@ export function WorkspaceIllustration({ className }: { className?: string }) {
       strokeLinecap="round"
     >
       <defs>
-        <pattern id={id + "grid"} width="32" height="16" patternUnits="userSpaceOnUse">
+        <pattern id={`${id}grid`} width="32" height="16" patternUnits="userSpaceOnUse">
           <path d="m0 0 32 16m0-16L0 16" stroke="var(--drawing-line)" strokeWidth=".6" />
         </pattern>
-        <radialGradient id={id + "fade"}>
+        <radialGradient id={`${id}fade`}>
           <stop offset=".4" stopColor="white" />
           <stop offset="1" stopColor="white" stopOpacity="0" />
         </radialGradient>
-        <mask id={id + "mask"}>
+        <mask id={`${id}mask`}>
           <ellipse cx="260" cy="226" rx="265" ry="104" fill={`url(#${id}fade)`} />
         </mask>
-        <g id={id + "plate"} stroke="var(--drawing-ink)" strokeWidth="1.6">
+        <g id={`${id}plate`} stroke="var(--drawing-ink)" strokeWidth="1.6">
           <path d="m260 43 113 56-113 57-113-57Z" fill="var(--drawing-surface)" />
           <path d="m147 99 113 57v10l-113-56Z" fill="var(--drawing-side)" />
           <path d="m260 156 113-57v11l-113 56Z" fill="var(--drawing-edge)" />
         </g>
-        <g id={id + "terminal"} transform="matrix(1 .5 -1 .5 260 68)">
+        <g id={`${id}terminal`} transform="matrix(1 .5 -1 .5 260 68)">
           <rect width="65" height="65" rx="8" fill="var(--drawing-ink)" />
           <path d="m15 22 13 10-13 10m21 1h15" stroke="var(--drawing-highlight)" strokeWidth="5" />
         </g>

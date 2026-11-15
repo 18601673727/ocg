@@ -630,7 +630,7 @@ impl Batch {
                 let Some(row) = jobs.get(id)? else {
                     continue;
                 };
-                if transactions::decode_mutable_job(id, row.value())?
+                if jobs::decode_mutable_job(id, row.value())?
                     .summary_source
                     .is_some()
                 {
@@ -844,7 +844,7 @@ impl Batch {
                     "retry source missing",
                 )))
             })?;
-            transactions::validate_retry_source(&original, &root)
+            jobs::validate_retry_source(&original, &root)
                 .map_err(|error| BatchError(Failure::Storage(error)))?;
         }
         if matches!(by, Actor::Agent { .. }) {
@@ -859,7 +859,7 @@ impl Batch {
                     let row = jobs
                         .get(id)?
                         .ok_or_else(|| StorageError::corrupted("retry Job missing"))?;
-                    let job = transactions::decode_mutable_job(id, row.value())?;
+                    let job = jobs::decode_mutable_job(id, row.value())?;
                     let retry = job.retry.ok_or_else(|| {
                         StorageError::corrupted("retry index names an ordinary Job")
                     })?;

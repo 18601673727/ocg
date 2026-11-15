@@ -286,22 +286,13 @@ fn digest_bytes(bytes: &[u8]) -> String {
 }
 
 fn digest(file: &mut File) -> std::io::Result<(String, u64)> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut context = Context::new(&SHA256);
-    let mut buffer = vec![0u8; 1 << 20];
-    let mut length = 0u64;
-    loop {
-        let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        context.update(&buffer[..read]);
-        length += read as u64;
-    }
-    Ok((hex(context.finish().as_ref()), length))
+    copy_with_digest(file, &mut std::io::sink())
 }
 
-fn copy_with_digest(source: &mut File, destination: &mut File) -> std::io::Result<(String, u64)> {
+fn copy_with_digest(
+    source: &mut File,
+    destination: &mut impl Write,
+) -> std::io::Result<(String, u64)> {
     source.seek(SeekFrom::Start(0))?;
     let mut context = Context::new(&SHA256);
     let mut buffer = vec![0u8; 1 << 20];
@@ -1291,22 +1282,15 @@ fn verify_publication(
             "published ownership or permissions differ from the source; do not roll back automatically",
         ));
     }
-    let inspection = match operation {
-        Operation::Reserved(_) => crate::db::verify_reserved_publication(
-            directory,
-            &published_file,
-            lock,
-            replacement.device,
-            replacement.inode,
-        ),
-        Operation::Held { .. } => crate::db::verify_recovered_publication(
-            directory,
-            &published_file,
-            lock,
-            replacement.device,
-            replacement.inode,
-        ),
-    }
+    let inspection = crate::db::verify_publication(
+        directory,
+        &published_file,
+        lock,
+        replacement.device,
+        replacement.inode,
+        operation.kind() == RecoveryKind::Held,
+    )
+    .map_err(crate::db::DatabaseError::Read)
     .map_err(|error| {
         refused_in_state(
             "post_publication_verification",

@@ -1,26 +1,26 @@
-import type { Projects, Pool, Pools, Children } from "../contracts";
 import type * as Api from "@/components/ocg/contracts/api";
+import type { Children, Pool, Pools, Projects } from "../contracts";
 import {
-  projectJob,
-  executionSequence,
-  projectContextStatus,
-  ContractError,
-  TREE_MAX_DEPTH,
-  projectAgentProfiles,
   type Approval,
-  projectJobDetails,
-  projectNativeStop,
-  projectConversation,
-  projectJobEvent,
-  projectProfiles,
   type Attachment,
-  type Output,
   type Capability,
+  ContractError,
+  executionSequence,
   type JobEvent,
   type JobToolsPage,
+  type Output,
   type Project,
-  type ToolCall,
   type ProviderResponse,
+  projectAgentProfiles,
+  projectContextStatus,
+  projectConversation,
+  projectJob,
+  projectJobDetails,
+  projectJobEvent,
+  projectNativeStop,
+  projectProfiles,
+  type ToolCall,
+  TREE_MAX_DEPTH,
 } from "../contracts";
 import { SseParser } from "./sse";
 
@@ -593,7 +593,7 @@ export async function readOutputWindow(
     if (!incoming.length || incoming[0].seq <= after)
       throw new ContractError("outputs.seq", "an advancing output window");
     outputs.push(...incoming);
-    after = incoming.at(-1)!.seq;
+    after = incoming[incoming.length - 1].seq;
     if (!page.has_more && after < end)
       throw new ContractError("outputs.seq", "the complete requested output window");
   }
@@ -946,7 +946,7 @@ export function createApiClient(options: ApiClientOptions) {
             await listener(event);
           }
           if (event.type === "settlement") {
-            conversationListeners.forEach((listener) => listener());
+            conversationListeners.forEach((listener) => void listener());
             return "settled";
           }
           if (event.type === "stream_error") return "stream_error";
@@ -1121,9 +1121,12 @@ export function createApiClient(options: ApiClientOptions) {
             delay = 250;
             return { keepGoing: true, wait: 100 };
           }
-          if (stalled) error = new ApiError("stream_idle", 0, true);
-          onError(error);
-          if (error instanceof ContractError || (error instanceof ApiError && !error.retryable))
+          const reportedError = stalled ? new ApiError("stream_idle", 0, true) : error;
+          onError(reportedError);
+          if (
+            reportedError instanceof ContractError ||
+            (reportedError instanceof ApiError && !reportedError.retryable)
+          )
             return { keepGoing: false, wait: 0 };
           const wait = delay;
           delay = Math.min(delay * 2, 10000);
@@ -1195,12 +1198,12 @@ export function createApiClient(options: ApiClientOptions) {
         () => {
           catalogReady = true;
           catalogError = undefined;
-          catalogObservers.forEach((item) => item.receive());
+          catalogObservers.forEach((item) => void item.receive());
         },
         (cause) => {
           catalogReady = false;
           catalogError = cause;
-          catalogObservers.forEach((item) => item.error(cause));
+          catalogObservers.forEach((item) => void item.error(cause));
         },
       );
     } else if (catalogReady || catalogError !== undefined) {
@@ -1229,10 +1232,10 @@ export function createApiClient(options: ApiClientOptions) {
     let retryDelay = 750;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const report = (error: unknown) => {
-      sidebarObservers.forEach((observer) => observer.error(error));
-      projectObservers.forEach((observer) => observer.error(error));
-      childObservers.forEach((observers) =>
-        observers.forEach((_, observer) => observer.error(error)),
+      sidebarObservers.forEach((observer) => void observer.error(error));
+      projectObservers.forEach((observer) => void observer.error(error));
+      childObservers.forEach(
+        (observers) => void observers.forEach((_, observer) => void observer.error(error)),
       );
     };
     const advance = (before: string | undefined, next: string | null | undefined) => {
@@ -1260,8 +1263,9 @@ export function createApiClient(options: ApiClientOptions) {
           projects = [...projects, ...page.projects];
           if (!page.has_more) {
             if (signal.aborted) return;
-            latestProjects = { ...page, projects };
-            projectObservers.forEach((observer) => observer.receive(latestProjects!));
+            const published = { ...page, projects };
+            latestProjects = published;
+            projectObservers.forEach((observer) => void observer.receive(published));
             break;
           }
           before = advance(before, page.next_before);
@@ -1275,8 +1279,9 @@ export function createApiClient(options: ApiClientOptions) {
           conversations = [...conversations, ...page.conversations];
           if (!page.has_more) {
             if (signal.aborted) return;
-            latestConversations = { ...page, conversations };
-            sidebarObservers.forEach((observer) => observer.receive(latestConversations!));
+            const published = { ...page, conversations };
+            latestConversations = published;
+            sidebarObservers.forEach((observer) => void observer.receive(published));
             break;
           }
           before = advance(before, page.next_before);
@@ -1297,7 +1302,7 @@ export function createApiClient(options: ApiClientOptions) {
             if (page.children.some((child) => child.origin !== "system")) visiblePages++;
             if (!page.has_more || visiblePages >= maxPages) {
               if (signal.aborted) return;
-              observers.forEach((_, observer) => observer.receive({ ...page, children }));
+              observers.forEach((_, observer) => void observer.receive({ ...page, children }));
               break;
             }
             childBefore = advance(childBefore, page.next_before);
@@ -1356,15 +1361,17 @@ export function createApiClient(options: ApiClientOptions) {
               ? page.conversations
               : [...conversations, ...page.conversations];
             if (snapshot.last) {
-              latestConversations = { ...page, conversations };
-              sidebarObservers.forEach((observer) => observer.receive(latestConversations!));
+              const published = { ...page, conversations };
+              latestConversations = published;
+              sidebarObservers.forEach((observer) => void observer.receive(published));
             }
           } else if (snapshot.topic === "projects") {
             const page = snapshot.value as Projects;
             projects = snapshot.first ? page.projects : [...projects, ...page.projects];
             if (snapshot.last) {
-              latestProjects = { ...page, projects };
-              projectObservers.forEach((observer) => observer.receive(latestProjects!));
+              const published = { ...page, projects };
+              latestProjects = published;
+              projectObservers.forEach((observer) => void observer.receive(published));
             }
           } else if (snapshot.topic === "children" && snapshot.key) {
             const page = snapshot.value as Children;
@@ -1375,14 +1382,14 @@ export function createApiClient(options: ApiClientOptions) {
             if (snapshot.last)
               childObservers
                 .get(snapshot.key)
-                ?.forEach((_, observer) => observer.receive({ ...page, children: items }));
+                ?.forEach((_, observer) => void observer.receive({ ...page, children: items }));
           } else throw new ContractError("snapshot.topic", "a sidebar topic");
         },
         (error) => {
-          sidebarObservers.forEach((observer) => observer.error(error));
-          projectObservers.forEach((observer) => observer.error(error));
-          childObservers.forEach((observers) =>
-            observers.forEach((_, observer) => observer.error(error)),
+          sidebarObservers.forEach((observer) => void observer.error(error));
+          projectObservers.forEach((observer) => void observer.error(error));
+          childObservers.forEach(
+            (observers) => void observers.forEach((_, observer) => void observer.error(error)),
           );
         },
         [
@@ -1836,7 +1843,7 @@ export function createApiClient(options: ApiClientOptions) {
         signal,
       });
       const result = (answer.input as Api.ConversationEdited).conversation;
-      conversationListeners.forEach((listener) => listener());
+      conversationListeners.forEach((listener) => void listener());
       return result;
     },
 
@@ -2150,7 +2157,7 @@ export function createApiClient(options: ApiClientOptions) {
           signal,
         })
       ).input as Api.ApprovalDecision;
-      conversationListeners.forEach((listener) => listener());
+      conversationListeners.forEach((listener) => void listener());
       return result;
     },
     async holdConversation(conversation: string, signal?: AbortSignal) {
@@ -2162,7 +2169,7 @@ export function createApiClient(options: ApiClientOptions) {
           signal,
         })
       ).input as Api.Stop;
-      conversationListeners.forEach((listener) => listener());
+      conversationListeners.forEach((listener) => void listener());
       return result;
     },
     async unholdConversation(conversation: string, signal?: AbortSignal) {
@@ -2174,7 +2181,7 @@ export function createApiClient(options: ApiClientOptions) {
           signal,
         })
       ).input as Api.Stop;
-      conversationListeners.forEach((listener) => listener());
+      conversationListeners.forEach((listener) => void listener());
       return result;
     },
 
@@ -2212,7 +2219,7 @@ export function createApiClient(options: ApiClientOptions) {
         signal,
       });
       const result = answer.input as Api.Envelope<Api.Append>;
-      conversationListeners.forEach((listener) => listener());
+      conversationListeners.forEach((listener) => void listener());
       return result;
     },
 
@@ -2682,7 +2689,7 @@ export function createApiClient(options: ApiClientOptions) {
         signal,
       });
       const result = answer.input as Api.ProviderModels;
-      profileListeners.forEach((listener) => listener());
+      profileListeners.forEach((listener) => void listener());
       return result;
     },
 
@@ -2708,7 +2715,7 @@ export function createApiClient(options: ApiClientOptions) {
         sign: true,
       });
       const result = answer.input as Api.ImportedModels;
-      profileListeners.forEach((listener) => listener());
+      profileListeners.forEach((listener) => void listener());
       return result;
     },
 
@@ -2757,7 +2764,7 @@ export function createApiClient(options: ApiClientOptions) {
         sign: true,
       });
       projectProfiles(answer.input as Api.Profiles);
-      profileListeners.forEach((listener) => listener());
+      profileListeners.forEach((listener) => void listener());
       return readAllProfiles();
     },
 
@@ -2767,13 +2774,13 @@ export function createApiClient(options: ApiClientOptions) {
         body: { enabled },
         sign: true,
       });
-      profileListeners.forEach((listener) => listener({ availability: profileId }));
+      profileListeners.forEach((listener) => void listener({ availability: profileId }));
     },
 
     async removeProvider(providerId: string) {
       identity(providerId, "provider");
       await send("DELETE", `/api/v1/providers/${providerId}`, { sign: true });
-      profileListeners.forEach((listener) => listener());
+      profileListeners.forEach((listener) => void listener());
     },
 
     async createProfile(profile: ProfileWriteRequest, signal?: AbortSignal) {
@@ -2784,7 +2791,7 @@ export function createApiClient(options: ApiClientOptions) {
       });
       const saved = projectProfiles(answer.input as Api.Profiles).profile_id;
       const snapshot = await readAllProfiles(signal);
-      profileListeners.forEach((listener) => listener());
+      profileListeners.forEach((listener) => void listener());
       return { ...snapshot, profile_id: saved };
     },
 
@@ -2797,7 +2804,7 @@ export function createApiClient(options: ApiClientOptions) {
       });
       const saved = projectProfiles(answer.input as Api.Profiles).profile_id;
       const snapshot = await readAllProfiles(signal);
-      profileListeners.forEach((listener) => listener());
+      profileListeners.forEach((listener) => void listener());
       return { ...snapshot, profile_id: saved };
     },
 
@@ -2932,7 +2939,7 @@ export function createApiClient(options: ApiClientOptions) {
 
     async readAllJobTools(job: string, signal?: AbortSignal): Promise<ToolCall[]> {
       const tools: ToolCall[] = [];
-      let cursor: string | undefined = undefined;
+      let cursor: string | undefined;
       for (let pageCount = 0; pageCount < 50; pageCount++) {
         const page = await readJobToolsInternal(job, {
           after: cursor,

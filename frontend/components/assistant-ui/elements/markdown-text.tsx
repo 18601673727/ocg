@@ -1,8 +1,7 @@
 "use client";
 
-import { type FC, memo } from "react";
-
 import type { TextMessagePartProps } from "@assistant-ui/react";
+import { type FC, memo } from "react";
 
 import { MarkdownBody } from "@/components/ocg/markdown/markdown-body";
 import type { FileSnapshot } from "@/components/ocg/markdown/source-snapshot";

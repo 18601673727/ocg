@@ -1,9 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
 import { RefreshCw, Trash2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -12,14 +11,15 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
 import type { ProfilesSnapshot } from "../contracts";
 import type { ProviderModel } from "../contracts/api";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
-import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
-import { describeError } from "./settings-parts";
+import type { ApiClient } from "../runtime/api-client";
+import { draftsToInputs, type HeaderDraft, type HeaderDraftError } from "./header-drafts";
 import { HeadersEditor } from "./headers-editor";
-import { type HeaderDraft, type HeaderDraftError, draftsToInputs } from "./header-drafts";
+import { type LlmProtocol, ProtocolSelect } from "./protocol-select";
+import { describeError } from "./settings-parts";
 
 function sourceName(name: string) {
   return name.replace(/\s+provider\s*$/i, "");
@@ -93,8 +93,10 @@ function ImportContent({
   const savedProfile = sourceId === "new" ? undefined : provider?.profile_ids[0];
   const headersKey = JSON.stringify(headers ?? null);
   const canDiscover = sourceId !== "new" || newConnection !== null;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: The saved profile revision invalidates discovery.
   useEffect(() => {
     if (!endpoint || !canDiscover) return;
+    const headers = JSON.parse(headersKey) as NonNullable<typeof newConnection>["headers"] | null;
     const controller = new AbortController();
     let active = true;
     const timer = setTimeout(
@@ -134,7 +136,6 @@ function ImportContent({
       clearTimeout(timer);
       controller.abort();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     canDiscover,
     client,
@@ -259,8 +260,7 @@ function ImportContent({
         </DialogContent>
       </Dialog>
       <div className="grid min-h-0 flex-1 grid-cols-[14rem_minmax(0,1fr)] gap-5 overflow-hidden">
-        <div
-          role="group"
+        <fieldset
           aria-label={t("settings.llm.provider")}
           className="ocg-subtle-scrollbar flex min-h-0 min-w-0 flex-col gap-2 overflow-y-auto overscroll-contain border-r border-border pr-4"
         >
@@ -317,7 +317,7 @@ function ImportContent({
           >
             {t("settings.llm.newProvider")}
           </Button>
-        </div>
+        </fieldset>
         <div className="flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden">
           {sourceId === "new" && (
             <div className="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-2">

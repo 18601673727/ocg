@@ -1,12 +1,12 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import Image from "next/image";
+import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { DiffViewer } from "@/components/ui/diff-viewer";
 import type { ToolCall } from "../contracts";
-import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
+import { useOcgRuntime } from "../runtime/runtime-context";
 import { fileArtifact } from "./artifact-model";
 
 export type Artifact = { id: string; title: string } & (
@@ -21,6 +21,7 @@ export function ArtifactPreview({ artifact }: { artifact: Artifact }) {
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const needsRead = "call" in artifact && (artifact.call.arguments_cut || artifact.call.result_cut);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Changing attempt explicitly retries the read.
   useEffect(() => {
     if (!needsRead || !("call" in artifact) || !api) return;
     const controller = new AbortController();

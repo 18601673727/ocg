@@ -5,15 +5,13 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::db::entities::{
-    AllocationPhase, AllocationToken, ConfigId, DevelopmentFreshReservation,
-    DevelopmentReadyCursor, DevelopmentReservation, ExecutionOperation, ExecutionPoolId,
-    ExecutorId, FrozenExecutionConfig, JobId, LlmTransport, NativeDecisionConfig, OutcomeKind,
-    PoolAllocation, UnstartedCause,
+    AllocationPhase, AllocationToken, DevelopmentFreshReservation, DevelopmentReadyCursor,
+    DevelopmentReservation, ExecutionOperation, ExecutionPoolId, ExecutorId, FrozenExecutionConfig,
+    JobId, LlmTransport, OutcomeKind, PoolAllocation, UnstartedCause,
 };
-use crate::db::redb::{NativeResource, NativeResourceKind};
 use crate::db::{
     DatabaseError, DatabaseHandle, DevelopmentHandoffError, DevelopmentReservationError,
-    ScheduledReservation, SchedulerWakeSubscription,
+    SchedulerWakeSubscription,
 };
 use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
 use crate::system::execution_features::ExecutionFeature;
@@ -23,7 +21,7 @@ use crate::system::executor::execution_runtime::{
 };
 use crate::system::executor::native_tools::NativeTooling;
 use crate::system::external_approval::MAX_TIMEOUT_CEILING;
-use crate::system::scheduler::{ClaimScope, Scheduler};
+use crate::system::scheduler::Scheduler;
 
 const EXECUTOR_PAGE: usize = 100;
 const MAX_EXECUTOR_PAGES: usize = 16;
@@ -38,17 +36,6 @@ const GENERATIVE_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
 );
 const DECISION_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) =
     (ExecutionOperation::Decision, None);
-
-pub(crate) struct SchedulingAuthority(());
-
-impl SchedulingAuthority {
-    pub(crate) fn host_autonomous(database: &DatabaseHandle, scope: ClaimScope) -> Option<Self> {
-        (scope == ClaimScope::Stored
-            && ExecutionFeature::AutonomousScheduling.is_enabled()
-            && database.status() == crate::db::DatabaseStatus::Open)
-            .then_some(Self(()))
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct LoopbackEligibility {
@@ -174,11 +161,29 @@ fn scheduled_policy(frozen: &FrozenExecutionConfig) -> bool {
         || ExecutionFeature::ScheduledExternalTransport.is_enabled()
 }
 
-fn scheduled_decision_policy(native: &NativeDecisionConfig) -> bool {
-    native
-        .endpoint
-        .as_deref()
-        .is_some_and(crate::system::http::direct_diagnostic_loopback)
+fn can_schedule(
+    configuration: &crate::db::entities::FrozenConfiguration,
+    summary_work: bool,
+) -> bool {
+    use crate::db::entities::{FrozenConfiguration, FrozenDecisionConfig};
+    match configuration {
+        FrozenConfiguration::Generative(frozen) => {
+            let refusal = if summary_work {
+                frozen.provider_refusal()
+            } else {
+                frozen.native_execution_refusal()
+            };
+            refusal.is_none() && scheduled_policy(frozen)
+        }
+        FrozenConfiguration::Decision(FrozenDecisionConfig::Native(native)) => native
+            .endpoint
+            .as_deref()
+            .is_some_and(crate::system::http::direct_diagnostic_loopback),
+        FrozenConfiguration::Decision(FrozenDecisionConfig::Generative(frozen, _)) => {
+            frozen.llm.provider.transport == LlmTransport::OpenAiChatCompletions
+                && scheduled_policy(frozen)
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -237,34 +242,21 @@ impl Drop for Registration {
 
 pub(crate) async fn run(
     database: DatabaseHandle,
-    scope: ClaimScope,
     wake: SchedulerWakeSubscription,
     shutdown: CancellationToken,
     stops: NativeStops,
-    workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
+    workspace_tools: WorkspaceTools,
 ) {
-    let Some(authority) = SchedulingAuthority::host_autonomous(&database, scope) else {
+    if database.status() != crate::db::DatabaseStatus::Open {
         shutdown.cancelled().await;
         return;
-    };
-    run_with(authority, database, wake, shutdown, stops, workspace_tools).await;
-}
-
-pub(crate) async fn run_with(
-    authority: SchedulingAuthority,
-    database: DatabaseHandle,
-    wake: SchedulerWakeSubscription,
-    shutdown: CancellationToken,
-    stops: NativeStops,
-    workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
-) {
+    }
     log::info!("native scheduler running: native Generative Jobs, loopback endpoints only");
     if let Err(error) = database.settle_unreported_children().await {
         log::warn!("native scheduler: unreported child conversations were not settled ({error})");
     }
     let scheduler = Rc::new(NativeScheduler::new(
         database.clone(),
-        authority,
         shutdown.clone(),
         stops,
         workspace_tools,
@@ -290,18 +282,18 @@ pub(crate) enum ExecutorPass {
 
 #[derive(Clone, Copy, Default)]
 struct Discovery {
-    next: Option<ConfigId>,
+    next: Option<ExecutorId>,
     sweep: Option<Sweep>,
 }
 
 #[derive(Clone, Copy)]
 struct Sweep {
-    origin: Option<ConfigId>,
+    origin: Option<ExecutorId>,
     wrapped: bool,
 }
 
 impl Discovery {
-    fn advanced(self, reached: Option<ConfigId>) -> Self {
+    fn advanced(self, reached: Option<ExecutorId>) -> Self {
         let sweep = self.sweep.unwrap_or(Sweep {
             origin: self.next,
             wrapped: false,
@@ -323,16 +315,14 @@ impl Discovery {
 
 pub(crate) struct NativeScheduler {
     database: DatabaseHandle,
-    _authority: SchedulingAuthority,
     shutdown: CancellationToken,
     stops: NativeStops,
-    // A scan may skip Jobs that another capability set or workspace access admits.
-    // Two capability bits and one workspace bit bound the independent cursors.
-    resume: Cell<[Option<DevelopmentReadyCursor>; 8]>,
+    // Each supported executor capability set has its own ready cursor.
+    resume: Cell<[Option<DevelopmentReadyCursor>; 4]>,
     // A changed queue may make a Job eligible in a previously scanned segment.
     rescan: Cell<u8>,
     discovery: Cell<Discovery>,
-    workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
+    workspace_tools: WorkspaceTools,
     running: RefCell<Vec<ntex::rt::JoinHandle<Dispatched>>>,
     halted: Rc<Cell<bool>>,
 }
@@ -340,18 +330,16 @@ pub(crate) struct NativeScheduler {
 impl NativeScheduler {
     pub(crate) fn new(
         database: DatabaseHandle,
-        authority: SchedulingAuthority,
         shutdown: CancellationToken,
         stops: NativeStops,
-        workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
+        workspace_tools: WorkspaceTools,
     ) -> Self {
         Self {
             workspace_tools,
             database,
-            _authority: authority,
             shutdown,
             stops,
-            resume: Cell::new([None; 8]),
+            resume: Cell::new([None; 4]),
             rescan: Cell::new(0),
             discovery: Cell::new(Discovery::default()),
             running: RefCell::new(Vec::new()),
@@ -411,12 +399,10 @@ impl NativeScheduler {
             }
             let page = self
                 .database
-                .native_resources(before, EXECUTOR_PAGE, NativeResourceKind::Executor)
+                .allocation_executors(before, EXECUTOR_PAGE)
                 .await?;
-            for resource in page.records {
-                if let NativeResource::Executor(executor) = resource
-                    && executor.enabled
-                    && !executor.archived
+            for executor in page.records {
+                if executor.enabled
                     && (executor.capabilities.contains(&GENERATIVE_CAPABILITY)
                         || executor.capabilities.contains(&DECISION_CAPABILITY))
                 {
@@ -438,11 +424,8 @@ impl NativeScheduler {
         let mut capacity_reached = false;
         let mut dispatched = 0;
         let mut last_examined = None;
-        // Workspace preparation acquires its bounded file permit when it actually
-        // reads files. Claims never retain permits for other Jobs or provider IO.
-        let workspace_permit = self.workspace_tools.is_some();
         let mut exhausted = 0u8;
-        for (pool, executor, capabilities) in executors {
+        for (pool, executor, scan) in executors {
             if self.halted.get() || self.shutdown.is_cancelled() {
                 break;
             }
@@ -450,15 +433,11 @@ impl NativeScheduler {
                 capacity_reached = true;
                 break;
             }
-            last_examined = Some(ConfigId::new(executor.get()));
-            let scan = capabilities | (usize::from(workspace_permit) << 2);
+            last_examined = Some(executor);
             if exhausted & (1 << scan) != 0 {
                 continue;
             }
-            match self
-                .reserve_for(pool, executor, workspace_permit, scan)
-                .await
-            {
+            match self.reserve_for(pool, executor, scan).await {
                 ExecutorPass::Reserved(allocation) => {
                     // Transfer each committed claim to its dispatch owner before
                     // awaiting the next reservation in this bounded sweep.
@@ -501,7 +480,6 @@ impl NativeScheduler {
         &self,
         pool: ExecutionPoolId,
         executor: ExecutorId,
-        workspace_permit: bool,
         scan: usize,
     ) -> ExecutorPass {
         let resume = self.resume.get()[scan];
@@ -516,21 +494,15 @@ impl NativeScheduler {
             let fresh = DevelopmentFreshReservation::new(pool, executor, after);
             let passed = self
                 .database
-                .reserve_scheduled_job(
-                    fresh,
-                    scheduled_policy,
-                    scheduled_decision_policy,
-                    workspace_permit,
-                )
-                .await
-                .map(|ScheduledReservation::Pass(passed)| *passed);
+                .reserve_scheduled_job(fresh, can_schedule)
+                .await;
             match passed {
                 Ok(DevelopmentReservation::Reserved(allocation)) => {
                     if allocation.token.executor != executor || allocation.token.pool != pool {
                         self.halt("a reservation names another Executor");
                         return ExecutorPass::Halted;
                     }
-                    return ExecutorPass::Reserved(Box::new(allocation));
+                    return ExecutorPass::Reserved(allocation);
                 }
                 Ok(DevelopmentReservation::Continue(cursor)) => after = Some(cursor),
                 Ok(DevelopmentReservation::Exhausted) => {
@@ -545,11 +517,11 @@ impl NativeScheduler {
                         ExecutorPass::IndexExhausted
                     };
                 }
-                Ok(DevelopmentReservation::Replayed(_) | DevelopmentReservation::Unresolved) => {
+                Ok(DevelopmentReservation::Replayed) => {
                     self.halt("a first reservation attempt was answered as a replay");
                     return ExecutorPass::Halted;
                 }
-                Err(DevelopmentReservationError::DefinitelyNotCommitted { error, .. }) => {
+                Err(DevelopmentReservationError::DefinitelyNotCommitted(error)) => {
                     log::debug!("native scheduler: Executor {executor} reserved nothing: {error}");
                     return ExecutorPass::Nothing;
                 }
@@ -583,7 +555,7 @@ impl NativeScheduler {
                 &database,
                 allocation,
                 &cancellation,
-                workspace_tools.as_ref(),
+                &workspace_tools,
                 &stops,
             )
             .await;
@@ -776,7 +748,7 @@ pub(crate) async fn dispatch(
     database: &DatabaseHandle,
     allocation: PoolAllocation,
     cancellation: &CancellationToken,
-    workspace_tools: Option<&crate::system::executor::execution_runtime::WorkspaceTools>,
+    workspace_tools: &WorkspaceTools,
     stops: &NativeStops,
 ) -> Dispatched {
     let token = allocation.token;
@@ -808,9 +780,7 @@ pub(crate) async fn dispatch(
                     cancellation,
                     &config,
                     EndpointPolicy::Loopback,
-                    workspace_tools
-                        .filter(|_| allocation.operation == ExecutionOperation::LlmRequest)
-                        .map(WorkspaceTools::data_directory),
+                    workspace_tools.data_directory(),
                     stops,
                     check_prepared_native,
                 )
@@ -848,9 +818,7 @@ pub(crate) async fn dispatch(
                     cancellation,
                     &config,
                     EndpointPolicy::ScheduledExternal(&grant),
-                    workspace_tools
-                        .filter(|_| allocation.operation == ExecutionOperation::LlmRequest)
-                        .map(WorkspaceTools::data_directory),
+                    workspace_tools.data_directory(),
                     stops,
                     guard,
                 )
@@ -894,16 +862,56 @@ async fn start_and_exchange(
     cancellation: &CancellationToken,
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
-    data_directory: Option<&crate::system::data_directory::DataDirectory>,
+    data_directory: &crate::system::data_directory::DataDirectory,
     stops: &NativeStops,
     guard: impl Fn(&crate::db::PreparedDevelopmentHandoff) -> Result<(), &'static str>,
 ) -> String {
-    let tooling = NativeTooling::new(data_directory, stops.clone(), cancellation.clone());
+    let mut tooling = NativeTooling::new(data_directory, stops.clone(), cancellation.clone());
     let handoff = loop {
-        match database
-            .checked_development_handoff_guarded(token, &tooling, &guard)
-            .await
-        {
+        let result = async {
+            use crate::db::classify_unstarted;
+            use crate::db::entities::{JobQueuePriority, Violation};
+            use crate::service::jobs::{
+                DevelopmentResolvedCandidate, DevelopmentToolContext, prepare_development_handoff,
+                resolve_development_candidate,
+            };
+            let invalid = |reason| {
+                classify_unstarted(DatabaseError::Rejected(Violation::InvalidValue(
+                    "handoff", reason,
+                )))
+            };
+            let snapshot = database
+                .development_execution_context(token)
+                .await
+                .map_err(classify_unstarted)?;
+            let resolved = resolve_development_candidate(database, snapshot).await?;
+            let offer = if let DevelopmentResolvedCandidate::Generative(context) = &resolved
+                && !context.snapshot.is_summary_work()
+            {
+                let context = &context.snapshot;
+                tooling
+                    .offer(
+                        &context.configuration,
+                        context.project.as_ref(),
+                        DevelopmentToolContext {
+                            decider: context.job.input.priority == JobQueuePriority::Foreground,
+                            nested: context.conversation.parent_id.is_some(),
+                            plan_step: context.plan_step,
+                        },
+                    )
+                    .await
+                    .map_err(invalid)?
+            } else {
+                None
+            };
+            let mut prepared = prepare_development_handoff(resolved, offer.as_ref())
+                .map_err(classify_unstarted)?;
+            database.load_handoff_credentials(&mut prepared).await?;
+            guard(&prepared).map_err(invalid)?;
+            database.start_development_handoff(prepared).await
+        }
+        .await;
+        match result {
             Err(DevelopmentHandoffError::Database(error)) if protection_refused(&error) => {
                 if !wait_for_protection_recovery(database, cancellation).await {
                     return "protection interrupted the start; the reservation remains held".into();
@@ -938,7 +946,7 @@ async fn start_and_exchange(
                 Err(error) => error.to_string(),
             }
         }
-        Err(DevelopmentHandoffError::NotStarted { cause, error }) => {
+        Err(DevelopmentHandoffError::NotStarted { cause, detail }) => {
             let cause = if cancellation.is_cancelled() {
                 UnstartedCause::Cancelled
             } else {
@@ -959,10 +967,10 @@ async fn start_and_exchange(
             };
             match settled {
                 Ok(_) => format!(
-                    "the start was refused before any request ({error}); the reservation was ended"
+                    "the start was refused before any request ({detail}); the reservation was ended"
                 ),
                 Err(settle) => format!(
-                    "the start was refused before any request ({error}); the reservation was not ended here ({settle})"
+                    "the start was refused before any request ({detail}); the reservation was not ended here ({settle})"
                 ),
             }
         }

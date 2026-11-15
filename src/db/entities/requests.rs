@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::Value;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MessageBody {
@@ -206,4 +207,24 @@ pub struct RequestEventRecord {
     pub observed_at: Timestamp,
     pub recorded_at: Timestamp,
     pub payload: RequestPayload,
+}
+
+pub(crate) struct ProviderResponse {
+    pub request: RequestNumber,
+    pub text: Arc<str>,
+    pub requests_tools: bool,
+    pub recorded_at: Timestamp,
+}
+
+pub(crate) struct ProviderResponsesPage {
+    pub responses: Vec<ProviderResponse>,
+    pub has_more: bool,
+}
+
+pub(crate) fn escaped_json_char_cost(character: char) -> usize {
+    match character {
+        '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+        c if c <= '\u{1f}' => 6,
+        c => c.len_utf8(),
+    }
 }

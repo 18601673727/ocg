@@ -1,17 +1,17 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
 import {
+  type AccentPreference,
   APPEARANCE_STORAGE_KEY,
+  type AppearancePreferences,
   appearanceRootState,
   DEFAULT_APPEARANCE,
+  type ResolvedTheme,
   readAppearancePreferences,
   resolveEffectiveTheme,
   serializeAppearancePreferences,
-  type AppearancePreferences,
-  type AccentPreference,
-  type ResolvedTheme,
   type ThemePreference,
 } from "./theme-domain";
 

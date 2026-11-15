@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import type { ExecutionHistory, ExecutionState } from "../contracts";
+import type { ExecutionHistory as ExecutionHistoryRecord, ExecutionState } from "../contracts";
 import { useI18n } from "../i18n";
 import type { ApiClient } from "../runtime/api-client";
 
@@ -10,7 +10,7 @@ type Props = { client: ApiClient; jobId: string; context?: string };
 type Query = { after?: string; revision: number };
 type Page = {
   query: Query;
-  history: ExecutionHistory;
+  history: ExecutionHistoryRecord;
 };
 
 function HistoryBody({ client, jobId, context }: Props) {

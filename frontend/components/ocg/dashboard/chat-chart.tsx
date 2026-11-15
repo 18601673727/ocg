@@ -1,7 +1,7 @@
 "use client";
 
-import { useI18n } from "../i18n";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { useI18n } from "../i18n";
 
 export type ChartType = "line" | "bar" | "pie" | "combo";
 export type ChatChartSeries = {
@@ -49,7 +49,10 @@ function Legend({ series }: { series: readonly ChatChartSeries[] }) {
   return (
     <div className="mb-2 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
       {series.map((item, index) => (
-        <span key={`${item.label}-${index}`}>
+        <span
+          // biome-ignore lint/suspicious/noArrayIndexKey: Chart slots are positional because labels and values can repeat.
+          key={`${item.label}-${index}`}
+        >
           <i
             className="mr-1 inline-block h-2.5 w-2.5 rounded-sm"
             style={{ background: colors[index % colors.length] }}
@@ -155,6 +158,7 @@ function CartesianChart({ definition }: { definition: ChatChartDefinition }) {
                   const barIndex = barSeries.indexOf(series);
                   return (
                     <rect
+                      // biome-ignore lint/suspicious/noArrayIndexKey: Chart slots are positional because labels and values can repeat.
                       key={`${series.label}-${index}`}
                       x={
                         left +
@@ -187,6 +191,7 @@ function CartesianChart({ definition }: { definition: ChatChartDefinition }) {
               (series.type || definition.type) === "line"
                 ? series.data.map((value, index) => (
                     <circle
+                      // biome-ignore lint/suspicious/noArrayIndexKey: Chart slots are positional because labels and values can repeat.
                       key={`${series.label}-${index}`}
                       cx={left + index * step + step / 2}
                       cy={axisScale(series, value)}
@@ -197,7 +202,10 @@ function CartesianChart({ definition }: { definition: ChatChartDefinition }) {
                 : null,
             )}
             {definition.labels.map((label, index) => (
-              <Tooltip key={`${label}-${index}`}>
+              <Tooltip
+                // biome-ignore lint/suspicious/noArrayIndexKey: Chart slots are positional because labels and values can repeat.
+                key={`${label}-${index}`}
+              >
                 <TooltipTrigger
                   render={
                     <rect
@@ -271,6 +279,7 @@ function PieChart({ definition }: { definition: ChatChartDefinition }) {
             const end = start + (value / total) * Math.PI * 2;
             return (
               <path
+                // biome-ignore lint/suspicious/noArrayIndexKey: Chart slots are positional because labels and values can repeat.
                 key={`${definition.labels[index]}-${index}`}
                 d={path(start, end)}
                 fill={colors[index % colors.length]}
@@ -284,7 +293,10 @@ function PieChart({ definition }: { definition: ChatChartDefinition }) {
         </svg>
         <div className="text-xs text-muted-foreground">
           {series.data.map((value, index) => (
-            <div key={`${definition.labels[index]}-${index}`}>
+            <div
+              // biome-ignore lint/suspicious/noArrayIndexKey: Chart slots are positional because labels and values can repeat.
+              key={`${definition.labels[index]}-${index}`}
+            >
               <i
                 className="mr-1 inline-block h-2.5 w-2.5 rounded-sm"
                 style={{ background: colors[index % colors.length] }}

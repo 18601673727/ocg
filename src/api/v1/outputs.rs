@@ -27,16 +27,11 @@ pub(crate) struct OutputsView {
 pub(super) async fn require_output_job(
     database: &DatabaseHandle,
     job: JobId,
-) -> Result<(), Refusal> {
-    match database.mutable_job_details(job, None).await? {
-        crate::db::redb::MutableJobDetailsLookup::Found(_) => return Ok(()),
-        crate::db::redb::MutableJobDetailsLookup::Inaccessible => return Err(JOB_NOT_FOUND),
-        crate::db::redb::MutableJobDetailsLookup::NotMutable => {}
-    }
-    if database.job(job).await?.is_none() {
-        return Err(JOB_NOT_FOUND);
-    }
-    Ok(())
+) -> Result<bool, Refusal> {
+    database
+        .output_job_is_decision(job)
+        .await?
+        .ok_or(JOB_NOT_FOUND)
 }
 
 pub(super) fn output_view(record: &JobOutputRecord) -> OutputView {

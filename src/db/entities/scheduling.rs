@@ -128,7 +128,7 @@ impl PoolAllocation {
 pub struct DevelopmentReadyCursor(pub(crate) (u8, i64, u128, u16));
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct DevelopmentReservationRequest {
+pub(crate) struct DevelopmentReservationRequest {
     pub id: ReservationRequestId,
     pub pool: ExecutionPoolId,
     pub executor: ExecutorId,
@@ -161,17 +161,6 @@ impl DevelopmentFreshReservation {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub enum ReadySelection {
-    Any,
-    Only(JobId),
-    Scheduled {
-        generative_policy: fn(&FrozenExecutionConfig) -> bool,
-        decision_policy: fn(&NativeDecisionConfig) -> bool,
-        workspace_permit: bool,
-    },
-}
-
 pub const STOP_JOB_NOT_RUNNING: &str = "the Job is not running";
 pub const STOP_JOB_ENDED: &str = "the Job has already ended";
 pub const STOPPED_BEFORE_SEND: &str = "a stop was requested before the request was sent";
@@ -184,17 +173,33 @@ pub enum NativeStopRequest {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DevelopmentReservation {
-    Reserved(PoolAllocation),
-    Replayed(PoolAllocation),
-    Unresolved,
+pub(crate) enum DevelopmentReservation {
+    Reserved(Box<PoolAllocation>),
+    Replayed,
     Continue(DevelopmentReadyCursor),
     Exhausted,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DevelopmentReservationReconciliation {
-    Found(Box<PoolAllocation>),
-    Conflict,
-    Unresolved,
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PoolOccupancy {
+    pub held: u64,
+    pub reserved: u64,
+    pub running: u64,
+    pub stop_requested: u64,
+    pub uncertain: u64,
+}
+
+pub(crate) struct PoolAllocationPage {
+    pub pool: crate::db::entities::AllocationPool,
+    pub occupancy: Option<PoolOccupancy>,
+    pub allocations: Vec<crate::db::entities::PoolAllocation>,
+    pub next: Option<(u128, u128)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UncertainAllocation {
+    pub job: JobId,
+    pub pool: ExecutionPoolId,
+    pub epoch: u64,
+    pub since: Timestamp,
 }

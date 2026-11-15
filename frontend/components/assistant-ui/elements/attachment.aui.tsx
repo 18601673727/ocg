@@ -1,18 +1,18 @@
 "use client";
 
-import { type PropsWithChildren, useState, type FC, isValidElement } from "react";
-import { XIcon, PlusIcon, FileText, Loader2Icon, AlertCircleIcon } from "lucide-react";
 import {
   AttachmentPrimitive,
   ComposerPrimitive,
   MessagePrimitive,
-  useAuiState,
   useAui,
+  useAuiState,
 } from "@assistant-ui/react";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { Dialog, DialogTitle, DialogContent, DialogTrigger } from "@/components/ui/dialog";
-import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
+import { AlertCircleIcon, FileText, Loader2Icon, PlusIcon, XIcon } from "lucide-react";
+import { type FC, isValidElement, type PropsWithChildren, useState } from "react";
 import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
+import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
+import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useAttachmentSrc } from "@/hooks/use-attachment-src";
 import { cn } from "@/lib/utils";
 
@@ -24,7 +24,8 @@ type AttachmentPreviewProps = {
 const AttachmentPreview: FC<AttachmentPreviewProps> = ({ src, name }) => {
   const [isLoaded, setIsLoaded] = useState(false);
   return (
-    // eslint-disable-next-line @next/next/no-img-element
+    /* eslint-disable @next/next/no-img-element -- Preserve the browser URL and intrinsic dimensions. */
+    // biome-ignore lint/performance/noImgElement: The image loads directly at its browser URL.
     <img
       src={src}
       alt={`Preview of ${name}`}
@@ -36,6 +37,7 @@ const AttachmentPreview: FC<AttachmentPreviewProps> = ({ src, name }) => {
       )}
       onLoad={() => setIsLoaded(true)}
     />
+    /* eslint-enable @next/next/no-img-element */
   );
 };
 
@@ -130,6 +132,7 @@ const AttachmentUI: FC = () => {
           <AttachmentPreviewDialog src={src} name={name}>
             <TooltipTrigger
               render={
+                // biome-ignore lint/a11y/useAriaPropsSupportedByRole: The conditional roles are paired with an accessible label.
                 <div
                   className={cn(
                     "aui-attachment-tile bg-muted hover:after:bg-foreground/10 focus-visible:ring-ring/50 relative size-14 overflow-hidden rounded-[calc(var(--composer-radius,1rem)-var(--composer-padding,8px))] transition-transform outline-none after:pointer-events-none after:absolute after:inset-0 after:rounded-[inherit] after:ring-1 after:ring-black/10 after:transition-colors after:ring-inset focus-visible:ring-1 motion-reduce:transition-none dark:after:ring-white/10",

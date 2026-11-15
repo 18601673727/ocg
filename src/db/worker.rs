@@ -259,7 +259,6 @@ impl DatabaseWorker {
                     attachment_slots,
                     reclaimed_at_open: reclamation.details,
                     reclamation_omitted_at_open: reclamation.omitted,
-                    recovery: SharedRequest::new(),
                     probes: std::sync::Mutex::new(std::collections::HashMap::new()),
                     in_flight_commands: AtomicUsize::new(0),
                     credential_key: credential_key_cell,
@@ -1081,9 +1080,6 @@ impl WriteWorker {
                 command.refuse(|| DatabaseError::NeverExecuted { operation });
             }
         }
-        self.shared
-            .recovery
-            .complete(Err(RecoveryError::ShuttingDown));
         for maintenance in self.maintenance.drain() {
             maintenance.refuse_policy(false);
         }

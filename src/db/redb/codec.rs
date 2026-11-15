@@ -57,7 +57,8 @@ impl Enc {
         self.i64(v.as_unix_micros());
     }
     pub(super) fn str(&mut self, v: &str) {
-        self.u32(u32::try_from(v.len()).expect("strings above 4 GiB are refused by redb first"));
+        // The complete record exceeds redb's value limit if this length overflows.
+        self.u32(u32::try_from(v.len()).unwrap_or(u32::MAX));
         self.0.extend_from_slice(v.as_bytes());
     }
     pub(super) fn opt<T: ?Sized>(&mut self, v: Option<&T>, mut put: impl FnMut(&mut Self, &T)) {

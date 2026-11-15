@@ -1,16 +1,16 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
 import { Pause, Play, Square, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import type { ChildConversation, ConversationCard, TaskPlan } from "../contracts";
 import { useI18n } from "../i18n";
+import { type ApiClient, ApiError } from "../runtime/api-client";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { ApiError, type ApiClient } from "../runtime/api-client";
-import type { ConversationCard, ChildConversation, TaskPlan } from "../contracts";
-import { useConversationError } from "./conversation-errors";
 import { ApprovalRequest } from "./approval-request";
-import { outputDisplayText } from "./job-transcript-model";
+import { useConversationError } from "./conversation-errors";
 import { DispatchSelectionCard } from "./dispatch-selection-card";
+import { outputDisplayText } from "./job-transcript-model";
 
 function useConversation(turn?: string) {
   const { api } = useOcgRuntime();
@@ -61,6 +61,7 @@ function ChildConversationCard({
   useConversationError(modelError, child.id);
   const phase = child.recurrence?.phase;
   const due = child.recurrence?.due_us;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: State and schedule changes refresh the child details.
   useEffect(() => {
     const controller = new AbortController();
     void api
@@ -77,6 +78,7 @@ function ChildConversationCard({
       });
     return () => controller.abort();
   }, [api, child.id, child.state, phase, due]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: State and schedule changes refresh the child details.
   useEffect(() => {
     const controller = new AbortController();
     void api
@@ -221,6 +223,7 @@ export function ConversationChildrenStrip({
       unsubscribe();
     };
   }, [api, hasChildren]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: The revision explicitly refreshes the data.
   useEffect(() => {
     if (!api || !conversation) return;
     return api.subscribeChildren(
@@ -349,6 +352,7 @@ export function ConversationCardStrip({
   useConversationError(error);
   const lock = useRef(false);
   const actionVersion = useRef(0);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: The revision explicitly refreshes the data.
   useEffect(() => {
     if (!api || !conversation) return;
     const controller = new AbortController();

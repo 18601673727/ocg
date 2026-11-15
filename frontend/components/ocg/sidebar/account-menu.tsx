@@ -1,14 +1,14 @@
 "use client";
 
 import { ChevronsUpDown, LogOut, SlidersHorizontal, User } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
 
 export type AccountMenuProps = {

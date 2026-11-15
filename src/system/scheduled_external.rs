@@ -52,7 +52,7 @@ impl ScheduledExternalPolicyDraft {
         timeout_secs: u32,
     ) -> Result<Self, ScheduledExternalRefusal> {
         let endpoint = ApprovedEndpoint::parse(endpoint)?;
-        if !crate::db::redb::valid_credential_ref(credential_ref) {
+        if !crate::db::entities::valid_credential_ref(credential_ref) {
             return Err(ScheduledExternalRefusal::new(
                 "scheduled_external_credential_ref_invalid",
                 "the credential reference must be 1..=128 characters without control characters",
@@ -141,7 +141,7 @@ impl ScheduledExternalGrant {
                 "the stored limits are out of range",
             ));
         }
-        if !crate::db::redb::valid_credential_ref(&record.credential_ref) {
+        if !crate::db::entities::valid_credential_ref(&record.credential_ref) {
             return Err(ScheduledExternalRefusal::new(
                 "scheduled_external_credential_ref_invalid",
                 "the stored credential reference is invalid",
