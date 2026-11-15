@@ -1,22 +1,22 @@
-import type {
-  ControlExecutionPhase,
-  ControlJob,
-  ControlJobDetails,
-  ControlTaskPlan,
-} from "../contracts";
+import type { ExecutionPhase, Job, JobDetails, TaskPlan } from "../contracts";
 import type { I18nKey, TranslateFn } from "../i18n";
 import type { Tone } from "../primitives/tone";
 
-export function reconcileJob(current: ControlJob, incoming: ControlJob): ControlJob {
-  if (
-    incoming.updated_at_us < current.updated_at_us ||
-    (current.settlement.state !== "unsettled" && incoming.settlement.state === "unsettled")
-  )
-    return current;
+export function reconcileJob(current: Job, incoming: Job): Job {
+  const currentSeq = current.event_seq;
+  const incomingSeq = incoming.event_seq;
+  const older =
+    incomingSeq.length < currentSeq.length ||
+    (incomingSeq.length === currentSeq.length && incomingSeq < currentSeq);
+  const final =
+    current.settlement.state === "completed" ||
+    current.settlement.state === "failed" ||
+    current.settlement.state === "cancelled";
+  if (older || (final && incoming.settlement.state !== current.settlement.state)) return current;
   return incoming;
 }
 
-export function taskPlanActive(plan: ControlTaskPlan | null | undefined): boolean {
+export function taskPlanActive(plan: TaskPlan | null | undefined): boolean {
   return (
     !!plan &&
     plan.state !== "completed" &&
@@ -27,10 +27,11 @@ export function taskPlanActive(plan: ControlTaskPlan | null | undefined): boolea
 }
 
 export type NativeExecutionStatus = {
-  phase: ControlExecutionPhase;
+  phase: ExecutionPhase;
   holdsCapacity: boolean;
   owner?: { executor: string; pool: string };
   actionsSupported: boolean;
+  retrySupported: boolean;
 };
 
 export const EXECUTION_PHASE_KEYS = {
@@ -43,7 +44,7 @@ export const EXECUTION_PHASE_KEYS = {
   completed: "job.phase.completed",
   failed: "job.phase.failed",
   cancelled: "job.phase.cancelled",
-} as const satisfies Record<ControlExecutionPhase, I18nKey>;
+} as const satisfies Record<ExecutionPhase, I18nKey>;
 
 export const EXECUTION_PHASE_TONES = {
   unsubmitted: "slate",
@@ -55,17 +56,19 @@ export const EXECUTION_PHASE_TONES = {
   completed: "emerald",
   failed: "red",
   cancelled: "slate",
-} as const satisfies Record<ControlExecutionPhase, Tone>;
+} as const satisfies Record<ExecutionPhase, Tone>;
 
 export function nativeExecutionStatus(
-  phase: ControlExecutionPhase,
-  details: Pick<ControlJobDetails, "allocation" | "mutable_phase"> | undefined,
+  phase: ExecutionPhase,
+  details: Pick<JobDetails, "allocation" | "mutable_phase"> | undefined,
+  retrySupported = false,
 ): NativeExecutionStatus {
   const allocation = details?.allocation;
   return {
     phase,
     holdsCapacity: allocation?.holds_capacity ?? false,
     actionsSupported: details?.mutable_phase === undefined,
+    retrySupported,
     ...(allocation ? { owner: { executor: allocation.executor, pool: allocation.pool } } : {}),
   };
 }

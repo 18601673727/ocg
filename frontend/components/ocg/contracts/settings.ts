@@ -1,7 +1,7 @@
 import type * as Api from "./api";
 
 type Confidence = { value: number; semantics: string };
-export type ControlDecisionAnswer =
+export type DecisionAnswer =
   | {
       kind: "choice";
       selected: string;
@@ -15,31 +15,31 @@ export type ControlDecisionAnswer =
       distribution?: number[] | null;
       confidence?: Confidence | null;
     };
-export type ControlPredictionResult = {
+export type PredictionResult = {
   outcome:
-    | { kind: "answer"; answer: ControlDecisionAnswer }
+    | { kind: "answer"; answer: DecisionAnswer }
     | { kind: "uncertain" | "unusable"; reason: string };
   requested_model: string;
   reported_model: string | null;
   model_version: string | null;
 };
-type WirePredictionResult = Omit<ControlPredictionResult, "outcome"> & {
+type WirePredictionResult = Omit<PredictionResult, "outcome"> & {
   outcome:
-    | { status: "answer"; answer: ControlDecisionAnswer }
+    | { status: "answer"; answer: DecisionAnswer }
     | { status: "uncertain" | "unusable"; reason: string };
 };
 type PredictionWork = Omit<Extract<Api.ContextWork, { kind: "prediction" }>, "result"> & {
-  result: ControlPredictionResult | null;
+  result: PredictionResult | null;
 };
-export type ControlContextStatus = Omit<Api.ContextStatus, "work" | "steer_blocked_by"> & {
+export type ContextStatus = Omit<Api.ContextStatus, "work" | "steer_blocked_by"> & {
   steer_blocked_by?: "rule_based" | "manual";
   work: (Extract<Api.ContextWork, { kind: "summarization" }> | PredictionWork)[];
 };
 
-export function projectContextStatus(value: Api.ContextStatus): ControlContextStatus {
+export function projectContextStatus(value: Api.ContextStatus): ContextStatus {
   return {
     ...value,
-    steer_blocked_by: value.steer_blocked_by as ControlContextStatus["steer_blocked_by"],
+    steer_blocked_by: value.steer_blocked_by as ContextStatus["steer_blocked_by"],
     work: value.work.map((work) => {
       if (work.kind !== "prediction" || work.result === null)
         return work as PredictionWork | Extract<Api.ContextWork, { kind: "summarization" }>;
@@ -49,7 +49,7 @@ export function projectContextStatus(value: Api.ContextStatus): ControlContextSt
         ...work,
         result: {
           ...result,
-          outcome: { ...outcome, kind: status } as ControlPredictionResult["outcome"],
+          outcome: { ...outcome, kind: status } as PredictionResult["outcome"],
         },
       };
     }),

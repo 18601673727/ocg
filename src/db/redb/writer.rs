@@ -1,9 +1,10 @@
 use super::rows::{decode_request_event, encode_request_event};
 use super::*;
 use crate::db::entities::{
-    AttachmentId, ConfigBody, ConfigId, ConfigKind, ConnectionConfig, DecisionModelConfig, JobId,
-    ModelConfig, OutputKind, ProjectId, ProjectRecord, RequestEventRecord, RequestNumber,
-    RequestPayload, SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidenceRecord, Violation,
+    AttachmentId, ConfigBody, ConfigId, ConfigKind, ConnectionConfig, DecisionModelConfig,
+    ExecutionEventKind, JobId, ModelConfig, OutputKind, ProjectId, ProjectRecord,
+    RequestEventRecord, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord,
+    ToolCallRef, ToolEvidenceRecord, Violation,
 };
 use std::time::Instant;
 
@@ -31,6 +32,7 @@ pub(crate) enum Probe {
     ToolCall(ToolCallRef),
     ToolOutcome(ToolCallRef),
     Outcome(JobId),
+    ExecutionEvent(JobId, u64),
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +84,7 @@ pub(crate) struct Batch {
     pub(super) catalog_changed: bool,
     pub(super) probe: Option<Probe>,
     pub(super) resource_deltas: Vec<NativeResourceDelta>,
+    pub(super) execution_transaction: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +279,7 @@ impl Batch {
             catalog_changed: false,
             probe: None,
             resource_deltas: Vec::new(),
+            execution_transaction: None,
         }
     }
 
@@ -410,11 +414,8 @@ impl Batch {
             {
                 let (key, bytes) = entry?;
                 let id = key.value();
-                let record = ConfigRow::scan_at(id, bytes.value())?;
-                if let Some(record) = record
-                    && record.kind == ConfigKind::Agent
-                    && record.archived_at.is_none()
-                {
+                let record = ConfigRow::decode_at(id, bytes.value())?;
+                if record.kind == ConfigKind::Agent && record.archived_at.is_none() {
                     ids.push(record.id);
                 }
                 if ids.len() == limit || scanned == 511 {
@@ -430,9 +431,8 @@ impl Batch {
         self.step(|tx| {
             tx.open_table(CONFIGS)?
                 .get(id.get())?
-                .map(|bytes| ConfigRow::scan_at(id.get(), bytes.value()))
+                .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
                 .transpose()
-                .map(Option::flatten)
         })
     }
 
@@ -511,9 +511,7 @@ impl Batch {
             let mut found = None;
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), value.value())? else {
-                    continue;
-                };
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
                 if (!require_unarchived || row.archived_at.is_none())
                     && matches!(&row.body, ConfigBody::Connection(c) if c == &body)
                 {
@@ -549,10 +547,7 @@ impl Batch {
             let connection_id = match &profile.body {
                 ConfigBody::Model(model) => model.connection_id,
                 ConfigBody::DecisionModel(model) => model.connection_id,
-                ConfigBody::Connection(_)
-                | ConfigBody::Agent(_)
-                | ConfigBody::DecisionAgent(_)
-                | ConfigBody::Pool(_) => {
+                ConfigBody::Connection(_) | ConfigBody::Agent(_) | ConfigBody::DecisionAgent(_) => {
                     return self.reject(Violation::WrongConfigKind {
                         config: profile.id,
                         expected: profile_kind,
@@ -770,9 +765,7 @@ impl Batch {
             let table = tx.open_table(CONFIGS)?;
             for entry in table.iter()? {
                 let (key, bytes) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), bytes.value())? else {
-                    continue;
-                };
+                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
                 if let ConfigBody::Connection(connection) = &row.body {
                     connection.credential_refs().for_each(&mut record);
                 }
@@ -823,9 +816,7 @@ impl Batch {
             let mut live_connections = std::collections::BTreeSet::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, bytes) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), bytes.value())? else {
-                    continue;
-                };
+                let row = ConfigRow::decode_at(key.value(), bytes.value())?;
                 match &row.body {
                     ConfigBody::Connection(connection) => {
                         connection_refs.insert(
@@ -845,8 +836,7 @@ impl Batch {
                     ConfigBody::Model(_)
                     | ConfigBody::DecisionModel(_)
                     | ConfigBody::Agent(_)
-                    | ConfigBody::DecisionAgent(_)
-                    | ConfigBody::Pool(_) => {}
+                    | ConfigBody::DecisionAgent(_) => {}
                 }
             }
             let used_refs: std::collections::BTreeSet<&str> = live_connections
@@ -901,14 +891,6 @@ impl Batch {
                             "each assigned model must support every selected Agent capability",
                         ));
                     }
-                }
-            }
-            ConfigBody::Pool(pool) => {
-                if pool.concurrency_limit == 0 {
-                    return self.reject(Violation::InvalidValue(
-                        "concurrency_limit",
-                        "must be at least 1",
-                    ));
                 }
             }
             ConfigBody::DecisionModel(dm) => {
@@ -986,10 +968,7 @@ impl Batch {
         let value = match kind {
             ConfigKind::Connection => &mut row.discovery_visible,
             ConfigKind::Model => &mut row.model_enabled,
-            ConfigKind::Agent
-            | ConfigKind::Pool
-            | ConfigKind::DecisionModel
-            | ConfigKind::DecisionAgent => {
+            ConfigKind::Agent | ConfigKind::DecisionModel | ConfigKind::DecisionAgent => {
                 return self.reject(Violation::InvalidValue(
                     "kind",
                     "only connections and models have availability",
@@ -1011,12 +990,6 @@ impl Batch {
         name: String,
         body: ConfigBody,
     ) -> Result<ConfigId, BatchError> {
-        if matches!(body, ConfigBody::Pool(_)) {
-            return self.reject(Violation::InvalidValue(
-                "pool",
-                "legacy combined Pool/Executor configurations are unavailable",
-            ));
-        }
         self.check_config_body(&name, &body)?;
         let id = ConfigId::new(self.next_id()?);
         let row = ConfigRow {
@@ -1031,9 +1004,6 @@ impl Batch {
             discovery_visible: true,
             body,
         };
-        if row.kind == ConfigKind::Pool {
-            self.changed_pool = true;
-        }
         self.put_config(&row)?;
         if row.kind == ConfigKind::DecisionModel {
             self.provision_decision_executor(id)?;
@@ -1072,10 +1042,6 @@ impl Batch {
             });
         }
         self.check_config_body(&name, &body)?;
-        if existing.kind == ConfigKind::Pool {
-            self.changed_pool = true;
-            self.freed_capacity = true;
-        }
         let row = ConfigRow {
             name,
             edit_seq: existing.edit_seq + 1,
@@ -1134,9 +1100,7 @@ impl Batch {
             let mut known = std::collections::BTreeMap::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), value.value())? else {
-                    continue;
-                };
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
                 if row.archived_at.is_none()
                     && let ConfigBody::Model(model) = row.body
                     && model.connection_id == connection_id
@@ -1222,9 +1186,7 @@ impl Batch {
             let mut connections = std::collections::BTreeSet::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), value.value())? else {
-                    continue;
-                };
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
                 if row.archived_at.is_none() && matches!(&row.body, ConfigBody::Connection(body) if body.protocol == connection.protocol && body.credential_ref == connection.credential_ref && {
                     let default = if body.protocol == LlmTransport::AnthropicMessages { "https://api.anthropic.com/v1" } else { "https://api.openai.com/v1" };
                     body.endpoint.as_deref().unwrap_or(default).trim_end_matches('/') == connection.endpoint.as_deref().unwrap_or(default).trim_end_matches('/')
@@ -1234,9 +1196,7 @@ impl Batch {
             }
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), value.value())? else {
-                    continue;
-                };
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
                 if row.archived_at.is_none() && matches!(&row.body, ConfigBody::Model(model) if connections.contains(&model.connection_id)) {
                     rows.push(row);
                 }
@@ -1292,9 +1252,7 @@ impl Batch {
             let mut agents = Vec::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), value.value())? else {
-                    continue;
-                };
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
                 if row.archived_at.is_none()
                     && matches!(
                         &row.body,
@@ -1360,10 +1318,8 @@ impl Batch {
                         agent.default_model = None;
                     }
                 }
-                ConfigBody::Connection(_)
-                | ConfigBody::Model(_)
-                | ConfigBody::DecisionModel(_)
-                | ConfigBody::Pool(_) => {}
+                ConfigBody::Connection(_) | ConfigBody::Model(_) | ConfigBody::DecisionModel(_) => {
+                }
             }
             if agent_row.body != before {
                 self.update_config(agent_row.id, agent_row.name, agent_row.body)?;
@@ -1371,9 +1327,12 @@ impl Batch {
         }
         let conversations = self.step(|tx| {
             let mut changes = Vec::new();
-            for entry in tx.open_table(JOB_CONTROLS)?.iter()? {
+            for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
                 let (key, bytes) = entry?;
-                if let Some(mut policy) = JobControl::decode(bytes.value())?.compaction_policy {
+                if let Some(mut policy) = JobRuntime::decode_at(key.value(), bytes.value())?
+                    .lifecycle
+                    .compaction_policy
+                {
                     let before = policy.clone();
                     clear_policy(&mut policy);
                     if policy != before {
@@ -1439,9 +1398,7 @@ impl Batch {
             let mut models = Vec::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {
                 let (key, value) = entry?;
-                let Some(row) = ConfigRow::scan_at(key.value(), value.value())? else {
-                    continue;
-                };
+                let row = ConfigRow::decode_at(key.value(), value.value())?;
                 if row.archived_at.is_none()
                     && matches!(&row.body, ConfigBody::Model(model) if model.connection_id == id)
                 {
@@ -1454,20 +1411,16 @@ impl Batch {
     }
 
     pub(crate) fn job(&mut self, id: JobId) -> Result<Option<JobSpec>, BatchError> {
-        self.get(JOBS, id.get(), |bytes| JobSpec::decode_at(id.get(), bytes))
+        self.get(CONVERSATIONS, id.get(), |bytes| {
+            JobSpec::decode_at(id.get(), bytes)
+        })
     }
 
     pub(crate) fn turn_conversation(&mut self, id: JobId) -> Result<Option<JobId>, BatchError> {
-        self.get(JOBS, id.get(), |bytes| {
-            if matches!(bytes, [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION) {
-                return transactions::decode_mutable_job(id.get(), bytes)
-                    .map(|job| Some(job.parent_id));
-            }
-            let row = JobSpec::decode_at(id.get(), bytes)?;
-            Ok(row.kind.is_persistent().then_some(row.parent_id).flatten())
-        })?
-        .map(Ok)
-        .unwrap_or_else(|| self.reject(Violation::InvalidValue("job", "the Job does not exist")))
+        match self.mutable_job(id)? {
+            Some(job) => Ok(Some(job.parent_id)),
+            None => self.reject(Violation::InvalidValue("job", "the Job does not exist")),
+        }
     }
 
     pub(crate) fn require_job(&mut self, id: JobId) -> Result<JobSpec, BatchError> {
@@ -1478,9 +1431,7 @@ impl Batch {
     }
 
     pub(crate) fn job_state(&mut self, id: JobId) -> Result<Option<JobState>, BatchError> {
-        self.get(JOB_STATES, id.get(), |bytes| {
-            JobState::decode_at(id.get(), bytes)
-        })
+        self.step(|tx| Ok(state::read(tx, id)?.map(|row| row.state)))
     }
 
     pub(crate) fn require_job_state(&mut self, id: JobId) -> Result<JobState, BatchError> {
@@ -1492,7 +1443,14 @@ impl Batch {
 
     pub(crate) fn put_job_state(&mut self, job: JobId, state: &JobState) -> Result<(), BatchError> {
         self.catalog_changed = true;
-        self.insert(JOB_STATES, job.get(), state.encode().as_slice())
+        if state.job_id != job {
+            return self.corrupted("Job state has a different identity".into());
+        }
+        let previous = self.step(|tx| state::read(tx, job))?;
+        self.record_job_state(previous.as_ref().map(|row| &row.state), state)?;
+        let mut row = previous.unwrap_or_else(|| JobRuntime::new(job));
+        row.state = state.clone();
+        self.step(|tx| state::write(tx, &row))
     }
 
     pub(crate) fn append_development_output(
@@ -1609,6 +1567,7 @@ impl Batch {
             (event.job_id.get(), event.request.get(), event.seq),
             encode_request_event(&event).as_slice(),
         )?;
+        self.record_request_reference(event.job_id, event.request, event.seq)?;
         Ok(())
     }
 
@@ -1871,10 +1830,18 @@ impl Batch {
         let timeline = indexes::request_timeline_key(Some(identity), &event);
         let model = indexes::usage_model_key(Some(identity), &event);
         self.step(|tx| {
-            tx.open_table(REQUEST_EVENTS)?.insert(
-                (job.get(), request.get(), seq),
-                encode_request_event(&event).as_slice(),
-            )?;
+            if tx
+                .open_table(REQUEST_EVENTS)?
+                .insert(
+                    (job.get(), request.get(), seq),
+                    encode_request_event(&event).as_slice(),
+                )?
+                .is_some()
+            {
+                return Err(StorageError::corrupted(
+                    "request evidence would overwrite history",
+                ));
+            }
             if let Some(kind) =
                 observations::observation_kind(&tx.open_table(REQUEST_EVENTS)?, &event)?
             {
@@ -1888,7 +1855,21 @@ impl Batch {
                 indexes::record_usage_model(tx, key, job)?;
             }
             Ok(())
-        })
+        })?;
+        self.record_request_reference(job, request, seq)
+    }
+
+    fn record_request_reference(
+        &mut self,
+        job: JobId,
+        request: RequestNumber,
+        seq: u32,
+    ) -> Result<(), BatchError> {
+        if self.pool_allocation(job)?.is_none() {
+            return self.corrupted("request evidence has no Job allocation".into());
+        }
+        self.record_execution_event(job, ExecutionEventKind::RequestRecorded { request, seq })?;
+        Ok(())
     }
 
     fn development_only_sent(
@@ -1930,8 +1911,11 @@ impl Batch {
             {
                 return Ok(false);
             }
-            let Some(previous) = request.get().checked_sub(1).and_then(RequestNumber::new) else {
+            if request == RequestNumber::FIRST {
                 return Ok(true);
+            }
+            let Some(previous) = request.get().checked_sub(1).and_then(RequestNumber::new) else {
+                return Ok(false);
             };
             let (mut sent, mut answered) = (false, false);
             for entry in events
@@ -1942,7 +1926,13 @@ impl Batch {
                 match decode_request_event(job, previous, seq, bytes.value())?.payload {
                     RequestPayload::Sent { .. } => sent = true,
                     RequestPayload::Availability { .. } => answered = true,
-                    _ => {}
+                    RequestPayload::ApprovedCalls => {
+                        sent = true;
+                        answered = true;
+                    }
+                    RequestPayload::Measurement { .. }
+                    | RequestPayload::Received { .. }
+                    | RequestPayload::Token { .. } => {}
                 }
             }
             Ok(sent && answered)
@@ -2006,7 +1996,7 @@ impl Batch {
         };
         let identity = self.development_usage_identity(job)?;
         let parent = self.require_mutable_conversation(row.parent_id)?;
-        let agent = usage_agent(&parent, None);
+        let agent = parent.agent.map_or(0, ConfigId::get);
         let provider = identity.provider;
         let hash = *ContentDigest::of(identity.model.as_bytes()).as_bytes();
         let key = |sample: &crate::db::entities::TokenRequestSample| {
@@ -2137,19 +2127,15 @@ impl Batch {
                     .open_table(JOBS)?
                     .get(job.get())?
                     .map(|bytes| {
-                        if matches!(bytes.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION) {
-                            return transactions::decode_mutable_job(job.get(), bytes.value())
-                                .map(|job| Some(job.parent_id));
-                        }
-                        JobSpec::decode_at(job.get(), bytes.value()).map(|row| row.parent_id)
+                        transactions::decode_mutable_job(job.get(), bytes.value())
+                            .map(|job| job.parent_id)
                     })
-                    .transpose()?
-                    .flatten();
+                    .transpose()?;
                 if let Some(conversation) = conversation {
                     let completed = tx
-                        .open_table(JOB_STATES)?
+                        .open_table(JOB_RUNTIME)?
                         .get(job.get())?
-                        .map(|bytes| JobState::decode_at(job.get(), bytes.value()))
+                        .map(|bytes| state::decode_state(job.get(), bytes.value()))
                         .transpose()?
                         .and_then(|state| state.outcome)
                         .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
@@ -2158,6 +2144,7 @@ impl Batch {
             }
             Ok(())
         })?;
+        self.record_execution_event(job, ExecutionEventKind::OutputRecorded { seq })?;
         Ok((seq, id))
     }
 
@@ -2240,15 +2227,6 @@ impl Batch {
         &mut self,
         id: JobId,
     ) -> Result<JobSpec, BatchError> {
-        let is_conversation = self.step(|tx| {
-            Ok(tx
-                .open_table(JOBS)?
-                .get(id.get())?
-                .is_some_and(|row| row.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG)))
-        })?;
-        if !is_conversation {
-            return self.reject(Violation::NotFound(RecordRef::Job(id)));
-        }
         self.require_job(id)
     }
 
@@ -2264,40 +2242,81 @@ impl Batch {
             id,
             created_at: self.now,
             parent_id: None,
-            allocation: None,
-            kind: JobKind::Group {
-                agent: None,
-                project,
-                origin: Origin::User,
-                keep_open: true,
-            },
+            agent: None,
+            project,
+            origin: Origin::User,
+            keep_open: true,
         };
-        self.insert(JOBS, id.get(), row.encode_mutable_conversation().as_slice())?;
+        self.insert(CONVERSATIONS, id.get(), row.encode().as_slice())?;
         self.put_job_state(id, &JobState::new(id))?;
-        self.put_job_control(id, &JobControl::default())?;
-        self.insert(CONVERSATIONS, id.get(), ())?;
-        self.insert(UNSETTLED, id.get(), (0, 0))?;
+        self.put_job_lifecycle(id, &JobLifecycle::default())?;
+        self.step(|tx| state::set_pending(tx, id, Some((0, 0))))?;
         self.insert(CHILDREN, (0, id.get()), ())?;
         Ok(id)
     }
 
-    pub(crate) fn job_control(&mut self, root: JobId) -> Result<JobControl, BatchError> {
-        self.step(|tx| {
-            tx.open_table(JOB_CONTROLS)?
-                .get(root.get())?
-                .map(|bytes| JobControl::decode(bytes.value()))
-                .transpose()?
-                .ok_or_else(|| StorageError::corrupted(format!("{root} has no conversation row")))
-        })
+    pub(crate) fn job_lifecycle(&mut self, root: JobId) -> Result<JobLifecycle, BatchError> {
+        self.step(|tx| Ok(state::require(tx, root)?.lifecycle))
     }
 
-    pub(crate) fn put_job_control(
+    pub(crate) fn put_job_lifecycle(
         &mut self,
         root: JobId,
-        row: &JobControl,
+        row: &JobLifecycle,
     ) -> Result<(), BatchError> {
         self.catalog_changed = true;
-        self.insert(JOB_CONTROLS, root.get(), row.encode().as_slice())?;
+        let mut runtime = self.step(|tx| state::require(tx, root))?;
+        let previous = &runtime.lifecycle;
+        if previous.closing != row.closing {
+            match (&previous.closing, &row.closing) {
+                (None, Some(closing)) => {
+                    self.record_execution_event(
+                        root,
+                        ExecutionEventKind::Closing {
+                            at: closing.at,
+                            by: closing.by.clone(),
+                            running: closing.running,
+                        },
+                    )?;
+                }
+                (Some(old), Some(closing)) if old.at == closing.at && old.by == closing.by => {
+                    self.record_execution_event(
+                        root,
+                        ExecutionEventKind::ClosingRunningChanged {
+                            running: closing.running,
+                        },
+                    )?;
+                }
+                (Some(_), None | Some(_)) | (None, None) => {
+                    return self
+                        .corrupted("Job closing intent cannot be removed or rewritten".into());
+                }
+            }
+        }
+        if previous.on_hold != row.on_hold {
+            self.record_execution_event(
+                root,
+                ExecutionEventKind::HoldChanged {
+                    reason: row.on_hold,
+                },
+            )?;
+        }
+        if previous.hidden_at != row.hidden_at {
+            self.record_execution_event(
+                root,
+                ExecutionEventKind::VisibilityChanged { at: row.hidden_at },
+            )?;
+        }
+        if previous.after != row.after {
+            self.record_execution_event(
+                root,
+                ExecutionEventKind::PrerequisitesChanged {
+                    after: row.after.clone(),
+                },
+            )?;
+        }
+        runtime.lifecycle = row.clone();
+        self.step(|tx| state::write(tx, &runtime))?;
         if (row.closing.is_some() || row.hidden_at.is_some())
             && let Some(mut rec) = self.get(RECURRENCES, root.get(), Recurrence::decode)?
             && !matches!(rec.phase, RecurrencePhase::Halted { .. })
@@ -2400,7 +2419,7 @@ impl Batch {
         observed_at: Timestamp,
         payload: RequestPayload,
     ) -> Result<RequestEventRecord, BatchError> {
-        let row = self.require_job(job)?;
+        let identity = self.development_usage_identity(job)?;
         let seq = self.step(|tx| {
             let events = tx.open_table(REQUEST_EVENTS)?;
             let last = events
@@ -2422,10 +2441,8 @@ impl Batch {
             recorded_at: self.now,
             payload,
         };
-        let identity =
-            self.step(|tx| reader::turn_usage_identity_of(&tx.open_table(JOBS)?, &row))?;
-        let timeline = indexes::request_timeline_key(identity.as_ref(), &event);
-        let usage_model = indexes::usage_model_key(identity.as_ref(), &event);
+        let timeline = indexes::request_timeline_key(Some(&identity), &event);
+        let usage_model = indexes::usage_model_key(Some(&identity), &event);
         self.step(|tx| {
             tx.open_table(REQUEST_EVENTS)?.insert(
                 (job.get(), request.get(), seq),
@@ -2445,6 +2462,7 @@ impl Batch {
             }
             Ok(())
         })?;
+        self.record_request_reference(job, request, seq)?;
         Ok(event)
     }
 }

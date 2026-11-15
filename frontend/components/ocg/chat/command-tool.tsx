@@ -4,7 +4,7 @@ import { type ReactNode } from "react";
 import { Check, Copy, Terminal } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import type { ControlToolCall } from "../contracts";
+import type { ToolCall } from "../contracts";
 import { useI18n } from "../i18n";
 import { highlightCode } from "../markdown/markdown-pipeline";
 import { toolObject } from "./artifact-model";
@@ -87,7 +87,7 @@ function nonnegative(value: unknown): number | null {
   return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
-export function CommandTool({ call, children }: { call: ControlToolCall; children: ReactNode }) {
+export function CommandTool({ call, children }: { call: ToolCall; children: ReactNode }) {
   const { t, locale } = useI18n();
   const { isCopied, copyToClipboard } = useCopyToClipboard();
   const args = toolObject(call.arguments);

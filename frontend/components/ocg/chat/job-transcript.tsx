@@ -6,13 +6,13 @@ import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { TEXT_TONE } from "@/components/ocg/primitives";
-import type { ControlToolCall, ControlToolOutcomeKind } from "@/components/ocg/contracts";
+import type { ToolCall, ToolOutcomeKind } from "@/components/ocg/contracts";
 import type { TranscriptTurn } from "./job-transcript-model";
 import { useI18n, type I18nKey, type TranslateFn } from "../i18n";
 import { ToolActivityLabel } from "./tool-activity-label";
 import { formatToolJson, jobPlanTitles } from "./tool-activity-summary";
 import { MarkdownBody } from "../markdown/markdown-body";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ApiClient } from "../runtime/api-client";
 import { WorkspaceTool } from "./workspace-tool";
 import {
   ReasoningRoot,
@@ -37,7 +37,7 @@ function TurnRow({
   client,
 }: {
   jobId?: string;
-  client?: HttpCanonicalControlClient;
+  client?: ApiClient;
   turn: TranscriptTurn;
   userLabel: string;
   attachmentContentUrl?: (id: string) => string;
@@ -195,8 +195,8 @@ function argumentSummary(name: string, raw: string | null): string {
 }
 
 function outcomeLabel(
-  kind: ControlToolOutcomeKind | null | undefined,
-  decision: ControlToolCall["decision"],
+  kind: ToolOutcomeKind | null | undefined,
+  decision: ToolCall["decision"],
   isLive: boolean,
 ): string {
   if (!kind && (decision === "awaiting_approval" || decision === "awaiting_answer"))
@@ -214,8 +214,8 @@ function outcomeLabel(
 
 function outcomeText(
   t: TranslateFn,
-  kind: ControlToolOutcomeKind | null | undefined,
-  decision: ControlToolCall["decision"],
+  kind: ToolOutcomeKind | null | undefined,
+  decision: ToolCall["decision"],
   isLive: boolean,
 ): string {
   if (!kind && decision === "awaiting_approval") return t("transcript.outcome.awaitingApproval");
@@ -244,10 +244,10 @@ function TurnToolCalls({
   jobId,
   client,
 }: {
-  tools: readonly ControlToolCall[];
+  tools: readonly ToolCall[];
   isLive: boolean;
   jobId?: string;
-  client?: HttpCanonicalControlClient;
+  client?: ApiClient;
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -377,7 +377,7 @@ export function JobTranscript({
 }: {
   turns: readonly TranscriptTurn[];
   jobId?: string;
-  client?: HttpCanonicalControlClient;
+  client?: ApiClient;
   userLabel?: string;
   attachmentContentUrl?: (id: string) => string;
 }) {

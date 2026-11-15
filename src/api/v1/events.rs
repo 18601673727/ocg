@@ -41,6 +41,7 @@ pub(crate) struct OutputEventView {
 #[ts(rename = "SettlementEvent")]
 pub(crate) struct SettlementEventView {
     job: String,
+    event_seq: String,
     settlement: super::jobs::SettlementView,
     stop_confirmed_at_us: Option<i64>,
 }
@@ -266,7 +267,7 @@ struct Feed {
     _slot: Slot,
 }
 
-type Lifecycle = [Option<i64>; 4];
+type Lifecycle = (String, [Option<i64>; 4]);
 
 impl Feed {
     async fn next(mut self) -> Option<(Bytes, Self)> {
@@ -300,10 +301,10 @@ impl Feed {
                     }
                     Err(error) => return self.fail(Refusal::from(error)),
                 }
-            } else if self.view().concluded() {
-                return self.settle();
             } else if self.announced != Some(self.view().lifecycle()) {
                 return self.announce();
+            } else if self.view().concluded() {
+                return self.settle();
             }
             if self.written.elapsed() >= limits.heartbeat {
                 return self.send(Bytes::from_static(b": heartbeat\n\n"));
@@ -356,6 +357,7 @@ impl Feed {
         self.ended = true;
         let data = envelope(serde_json::json!(SettlementEventView {
             job: self.job.to_string(),
+            event_seq: described.event_seq().to_owned(),
             settlement: described.settlement(),
             stop_confirmed_at_us: described.stop_confirmed_at_us(),
         }));

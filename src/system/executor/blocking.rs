@@ -42,7 +42,6 @@ struct Counts {
     files: usize,
     waiters: Vec<(u64, Waker)>,
     next_waiter: u64,
-    scheduler: Option<Waker>,
 }
 
 #[derive(Default)]
@@ -59,25 +58,6 @@ pub(crate) struct Permit {
 }
 
 impl Permit {
-    pub(crate) fn try_file() -> Option<Self> {
-        let governor = GOVERNOR
-            .get_or_init(|| Arc::new(Governor::default()))
-            .clone();
-        let mut counts = governor
-            .counts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if counts.total >= TOTAL || counts.files >= FILES {
-            return None;
-        }
-        counts.total += 1;
-        counts.files += 1;
-        drop(counts);
-        Some(Self {
-            governor,
-            kind: Kind::File,
-        })
-    }
     async fn acquire_async(kind: Kind, stop: Option<&StopSignal>) -> Result<Self, &'static str> {
         struct Registration {
             governor: Arc<Governor>,
@@ -237,35 +217,12 @@ impl Drop for Permit {
             .iter()
             .map(|(_, waker)| waker.clone())
             .collect::<Vec<_>>();
-        let scheduler = counts.scheduler.take();
         drop(counts);
         self.governor.changed.notify_all();
-        if let Some(waker) = scheduler {
-            waker.wake();
-        }
         for waker in waiters {
             waker.wake();
         }
     }
-}
-
-pub(crate) async fn file_capacity_available() {
-    let governor = GOVERNOR
-        .get_or_init(|| Arc::new(Governor::default()))
-        .clone();
-    std::future::poll_fn(|context| {
-        let mut counts = governor
-            .counts
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if counts.total < TOTAL && counts.files < FILES {
-            Poll::Ready(())
-        } else {
-            counts.scheduler = Some(context.waker().clone());
-            Poll::Pending
-        }
-    })
-    .await;
 }
 
 pub(crate) struct Sentinel {

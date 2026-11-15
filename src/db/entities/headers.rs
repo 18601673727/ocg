@@ -127,7 +127,7 @@ impl HeaderError {
     }
 }
 
-pub fn canonical_name(name: &str) -> Result<String, HeaderError> {
+pub fn normalize_header_name(name: &str) -> Result<String, HeaderError> {
     let valid = !name.is_empty()
         && name.len() <= MAX_HEADER_NAME_BYTES
         && name.bytes().all(|byte| {
@@ -190,21 +190,21 @@ pub fn validate_fields(fields: &[OutboundHeader], scope: HeaderScope) -> Result<
     }
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for field in fields {
-        let canonical = canonical_name(&field.name)?;
-        if canonical != field.name {
+        let normalized = normalize_header_name(&field.name)?;
+        if normalized != field.name {
             return Err(HeaderError::InvalidName);
         }
-        if !seen.insert(canonical.clone()) {
-            return Err(HeaderError::Duplicate(canonical));
+        if !seen.insert(normalized.clone()) {
+            return Err(HeaderError::Duplicate(normalized));
         }
-        if is_protected(&canonical) {
-            return Err(HeaderError::Protected(canonical));
+        if is_protected(&normalized) {
+            return Err(HeaderError::Protected(normalized));
         }
         match (&field.value, scope) {
             (OutboundHeaderValue::Plain(value), _) => {
                 validate_value(value)?;
-                if is_credential_like(&canonical) {
-                    return Err(HeaderError::CredentialLike(canonical));
+                if is_credential_like(&normalized) {
+                    return Err(HeaderError::CredentialLike(normalized));
                 }
             }
             (OutboundHeaderValue::Secret(_), HeaderScope::Global) => {

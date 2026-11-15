@@ -1,4 +1,4 @@
-import type { ControlProjectCommand } from "../runtime/control-client";
+import type { ProjectCommand } from "../runtime/api-client";
 
 export type CommandDraft = {
   id: string;
@@ -35,7 +35,7 @@ export function toCommandDrafts(
   }));
 }
 
-export function toProjectCommands(commands: readonly CommandDraft[]): ControlProjectCommand[] {
+export function toProjectCommands(commands: readonly CommandDraft[]): ProjectCommand[] {
   return commands.map((cmd) => ({
     name: cmd.name.trim(),
     owner: cmd.owner ?? "user",

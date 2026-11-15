@@ -63,17 +63,17 @@ impl ProviderCounters {
 }
 
 #[derive(Default)]
-struct ControlState {
+struct StreamState {
     gates: BTreeMap<String, (flume::Sender<()>, flume::Receiver<()>)>,
     emitted: BTreeMap<String, Instant>,
 }
 
 #[derive(Default)]
-struct StreamControl {
-    state: Mutex<ControlState>,
+struct StreamGate {
+    state: Mutex<StreamState>,
 }
 
-impl StreamControl {
+impl StreamGate {
     fn receiver(&self, job_key: &str) -> flume::Receiver<()> {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state
@@ -119,7 +119,7 @@ impl StreamControl {
 pub struct MockProvider {
     address: std::net::SocketAddr,
     counters: Arc<ProviderCounters>,
-    control: Arc<StreamControl>,
+    gate: Arc<StreamGate>,
     server: ntex::rt::JoinHandle<std::io::Result<()>>,
     handle: ntex::server::Server,
 }
@@ -134,9 +134,9 @@ impl MockProvider {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let address = listener.local_addr()?;
         let counters = Arc::new(ProviderCounters::default());
-        let control = Arc::new(StreamControl::default());
+        let gate = Arc::new(StreamGate::default());
         let served = Arc::clone(&counters);
-        let streaming = Arc::clone(&control);
+        let streaming = Arc::clone(&gate);
         let workers = std::thread::available_parallelism().map_or(4, |value| value.get());
 
         let server = HttpServer::new(async move || {
@@ -186,7 +186,7 @@ impl MockProvider {
         Ok(Self {
             address,
             counters,
-            control,
+            gate,
             server: finished,
             handle: server,
         })
@@ -201,11 +201,11 @@ impl MockProvider {
     }
 
     pub fn release_markers(&self, job_key: &str) -> Result<(), String> {
-        self.control.release(job_key)
+        self.gate.release(job_key)
     }
 
     pub fn emitted_at(&self, marker: &str) -> Option<Instant> {
-        self.control.emitted_at(marker)
+        self.gate.emitted_at(marker)
     }
 
     pub async fn stop(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -234,7 +234,7 @@ struct ProviderBody {
     pace: Duration,
     sleep: Option<Pin<Box<dyn Future<Output = ()>>>>,
     counters: Arc<ProviderCounters>,
-    control: Arc<StreamControl>,
+    gate: Arc<StreamGate>,
     usage_tokens: usize,
     finished: bool,
 }
@@ -244,14 +244,14 @@ impl ProviderBody {
         plan: ResponsePlan,
         pace: Duration,
         counters: Arc<ProviderCounters>,
-        control: Arc<StreamControl>,
+        gate: Arc<StreamGate>,
     ) -> Self {
         Self {
             chunks: plan.chunks,
             pace,
             sleep: None,
             counters,
-            control,
+            gate,
             usage_tokens: plan.usage_tokens,
             finished: false,
         }
@@ -285,7 +285,7 @@ impl Stream for ProviderBody {
             PlannedChunk::Raw(event) => event,
             PlannedChunk::Marker { job_key, sequence } => {
                 let marker = format!("OCGMARK-{job_key}-{sequence:04}");
-                if let Err(error) = self.control.emitted(&marker, Instant::now()) {
+                if let Err(error) = self.gate.emitted(&marker, Instant::now()) {
                     return Poll::Ready(Some(Err(error)));
                 }
                 self.counters.chunks.fetch_add(1, Ordering::Relaxed);

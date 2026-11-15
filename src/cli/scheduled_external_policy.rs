@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::db::entities::{ScheduledExternalPolicyId, ScheduledExternalPolicyRecord, Timestamp};
 use crate::system::data_directory::DataDirectory;
-use crate::system::execution_controls::ExecutionControl;
+use crate::system::execution_features::ExecutionFeature;
 use crate::system::scheduled_external::ScheduledExternalPolicyDraft;
 
 pub(super) const COMMAND: &str = "scheduled-external-policy";
@@ -60,7 +60,7 @@ pub(super) fn run(
                             serde_json::to_string_pretty(&serde_json::json!({
                                 "records": records,
                                 "next_after": page.next.map(|id| id.to_string()),
-                                "transport_control": control_json(),
+                                "transport_feature": feature_json(),
                             }))?
                         );
                     }
@@ -316,7 +316,7 @@ fn set_once<T: Copy>(
 fn parse_id(value: String) -> Result<ScheduledExternalPolicyId, Box<dyn std::error::Error>> {
     value
         .parse()
-        .map_err(|_| "policy id must be a canonical UUID".into())
+        .map_err(|_| "policy id must be a lowercase hyphenated UUID".into())
 }
 
 fn parse_revision(value: String) -> Result<u32, Box<dyn std::error::Error>> {
@@ -372,15 +372,15 @@ fn policy_json(record: &ScheduledExternalPolicyRecord) -> serde_json::Value {
         "revision": record.revision,
         "created_at_micros": micros(record.created_at),
         "updated_at_micros": micros(record.updated_at),
-        "transport_control": control_json(),
+        "transport_feature": feature_json(),
     })
 }
 
-fn control_json() -> serde_json::Value {
+fn feature_json() -> serde_json::Value {
     serde_json::json!({
-        "name": ExecutionControl::ScheduledExternalTransport.name(),
-        "enabled": ExecutionControl::ScheduledExternalTransport.is_enabled(),
-        "note": "a stored policy never enables the control; every dispatch needs both",
+        "name": ExecutionFeature::ScheduledExternalTransport.name(),
+        "enabled": ExecutionFeature::ScheduledExternalTransport.is_enabled(),
+        "note": "a stored policy never enables the feature; every dispatch needs both",
     })
 }
 

@@ -34,7 +34,6 @@ export function reconcileRuntimeEvent(
         ...snapshot,
         sessions: snapshot.sessions.filter((session) => session.id !== sessionId),
         messagesBySession: withoutSession(snapshot.messagesBySession),
-        executionBySession: withoutSession(snapshot.executionBySession),
         ...(snapshot.chatQueues ? { chatQueues: withoutSession(snapshot.chatQueues) } : {}),
       };
     }
@@ -70,10 +69,6 @@ export function reconcileRuntimeEvent(
         messagesBySession: {
           ...snapshot.messagesBySession,
           [session.id]: snapshot.messagesBySession[session.id] ?? [],
-        },
-        executionBySession: {
-          ...snapshot.executionBySession,
-          [session.id]: snapshot.executionBySession[session.id] ?? null,
         },
       };
     }

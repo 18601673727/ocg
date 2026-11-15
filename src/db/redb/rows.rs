@@ -1,13 +1,11 @@
 use std::collections::BTreeSet;
 
-use super::codec::{TAG_JOB_INPUT, TAG_NOTICE};
 use super::*;
 use crate::db::entities::{
     AttachmentCleanup, AttachmentId, AttachmentOrigin, AttachmentRecord, AuthorizationBasis,
     CleanupKind, CommandOwner, CommandStatus, ConfigBody, ConfigId, ConfigKind, ConnectionConfig,
-    ContentDigest, EffectConclusion, ExecutionOperation, JobClosing, JobId, JobOutputId,
-    JobOutputRecord, LlmParameters, LlmTransport, Measurements, ModelCapability, ModelConfig,
-    NotInvokedReason, OutcomeCause, OutcomeKind, OutcomeRecord, PoolConfig, ProjectCommand,
+    ContentDigest, EffectConclusion, JobId, JobOutputId, JobOutputRecord, LlmParameters,
+    LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason, ProjectCommand,
     ProjectDecisionConfig, ProjectId, ProjectRecord, Recorded, RequestEventRecord,
     RequestFingerprint, RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord, Timestamp,
     ToolAdmission, ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome,
@@ -24,223 +22,76 @@ fn check_table_key(table: &str, key: u128, embedded: u128) -> DecodeResult<()> {
     }
 }
 
-pub(crate) fn usage_agent(row: &JobSpec, parent: Option<&JobSpec>) -> u128 {
-    match &row.kind {
-        JobKind::Group { agent, .. } => agent.map_or(0, ConfigId::get),
-        JobKind::Execution {
-            execution: JobExecution::Frozen(execution),
-            plan_source: PlanSource::Process { .. },
-            ..
-        } => execution.agent_ref.map_or(0, |agent| agent.id.get()),
-        JobKind::Execution { .. } => parent.map_or(0, |parent| usage_agent(parent, None)),
-    }
-}
-
 impl JobSpec {
-    pub(super) const MUTABLE_CONVERSATION_TAG: u8 = 53;
+    const TAG: u8 = 53;
 
     pub(super) fn is_chunk_group(&self) -> bool {
-        self.parent_id.is_some()
-            && matches!(
-                self.kind,
-                JobKind::Group {
-                    origin: Origin::System,
-                    keep_open: false,
-                    ..
-                }
-            )
+        self.parent_id.is_some() && self.origin == Origin::System && !self.keep_open
     }
 
     pub(super) fn is_standalone_decision_group(&self) -> bool {
-        self.parent_id.is_none()
-            && matches!(
-                self.kind,
-                JobKind::Group {
-                    origin: Origin::System,
-                    keep_open: false,
-                    ..
-                }
-            )
-    }
-
-    pub(super) fn encode_mutable_conversation(&self) -> Vec<u8> {
-        let mut encoded = self.encode();
-        encoded[0] = Self::MUTABLE_CONVERSATION_TAG;
-        encoded
+        self.parent_id.is_none() && self.origin == Origin::System && !self.keep_open
     }
 
     pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_JOB);
+        let mut e = Enc::new(Self::TAG);
         e.u128(self.id.get());
-        e.job_kind(&self.kind);
+        e.ou128(self.agent.map(ConfigId::get));
+        e.ou128(self.project.map(ProjectId::get));
+        match self.origin {
+            Origin::User => e.u8(0),
+            Origin::Agent { call } => {
+                e.u8(1);
+                e.call_ref(&call);
+            }
+            Origin::System => e.u8(2),
+        }
+        e.bool(self.keep_open);
         e.ts(self.created_at);
         e.ou128(self.parent_id.map(JobId::get));
-        e.opt(self.allocation.as_ref(), |e, allocation| {
-            e.u128(allocation.owner.get());
-            e.bool(allocation.synthesis);
-        });
         e.0
     }
 
     pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        if bytes.first() == Some(&Self::MUTABLE_CONVERSATION_TAG) {
-            let mut d = Dec::new(bytes, Self::MUTABLE_CONVERSATION_TAG)?;
-            let id = JobId::new(d.u128()?);
-            let kind = d.job_kind()?;
-            let created_at = d.ts()?;
-            let parent_id = d.ou128()?.map(JobId::new);
-            let allocation = d.opt(|d| {
-                Ok(crate::db::entities::JobAllocation {
-                    owner: JobId::new(d.u128()?),
-                    synthesis: d.bool()?,
-                })
-            })?;
-            d.end()?;
-            let shape = match &kind {
-                JobKind::Group {
-                    origin: Origin::User,
-                    keep_open: true,
-                    ..
-                } => parent_id.is_none(),
-                JobKind::Group {
-                    origin: Origin::Agent { .. },
-                    ..
-                } => parent_id.is_some(),
-                JobKind::Group {
-                    origin: Origin::System,
-                    keep_open: false,
-                    ..
-                } => true,
-                JobKind::Group {
-                    origin: Origin::User | Origin::System,
-                    ..
-                }
-                | JobKind::Execution { .. } => false,
-            };
-            if !shape || allocation.is_some() || id.get() == 0 {
-                return Err(StorageError::corrupted("invalid mutable conversation"));
-            }
-            return Ok(JobSpec {
-                id,
-                created_at,
-                parent_id,
-                kind,
-                allocation,
-            });
-        }
-        Err(StorageError::corrupted("expected a conversation record"))
-    }
-
-    pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
-        let row = Self::decode(bytes)?;
-        check_table_key("job", key, row.id.get())?;
-        Ok(row)
-    }
-}
-
-impl JobState {
-    pub(crate) fn new(job_id: JobId) -> Self {
-        Self {
-            job_id,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn locally_stopped(&self) -> bool {
-        match &self.outcome {
-            Some(o) => match o.kind {
-                OutcomeKind::Completed | OutcomeKind::Failed | OutcomeKind::Cancelled => true,
-                OutcomeKind::Unknown => self.stop_confirmed_at.is_some(),
+        let mut d = Dec::new(bytes, Self::TAG)?;
+        let id = JobId::new(d.u128()?);
+        let agent = d.ou128()?.map(ConfigId::new);
+        let project = d.ou128()?.map(ProjectId::new);
+        let origin = match d.u8()? {
+            0 => Origin::User,
+            1 => Origin::Agent {
+                call: d.call_ref()?,
             },
-            None => false,
-        }
-    }
-
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_JOB_STATE);
-        e.u128(self.job_id.get());
-        e.opt(self.outcome.as_ref(), |e, o| {
-            e.u8(o.kind.code());
-            e.ts(o.at);
-            e.opt(o.cause.as_ref(), |e, cause| match cause {
-                OutcomeCause::Code(c) => {
-                    e.u8(1);
-                    e.u8(*c);
-                }
-                OutcomeCause::Text(t) => {
-                    e.u8(2);
-                    e.str(t);
-                }
-                OutcomeCause::Abandoned => {
-                    e.u8(3);
-                }
-                OutcomeCause::DependencyImpossible => e.u8(4),
-                OutcomeCause::Stopped { record } => {
-                    e.u8(5);
-                    e.u32(*record);
-                }
-                OutcomeCause::Closed => e.u8(6),
-                OutcomeCause::Uncertain(reason) => {
-                    e.u8(7);
-                    e.u8(reason.code());
-                }
-            });
-        });
-        e.ots(self.stop_confirmed_at);
-        e.opt(self.stop_confirmed_by.as_ref(), |e, proof| {
-            e.u8(proof.code())
-        });
-        e.0
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_JOB_STATE)?;
-        let job_id = JobId::new(d.u128()?);
-        let outcome = d.opt(|d| {
-            let kind = d.code_with(OutcomeKind::from_code, |code| {
-                StorageError::corrupted(format!("invalid outcome kind {code}"))
-            })?;
-            let at = d.ts()?;
-            let cause = d.opt(|d| match d.u8()? {
-                1 => Ok(OutcomeCause::Code(d.u8()?)),
-                2 => Ok(OutcomeCause::Text(d.str()?)),
-                3 => Ok(OutcomeCause::Abandoned),
-                4 => Ok(OutcomeCause::DependencyImpossible),
-                5 => Ok(OutcomeCause::Stopped { record: d.u32()? }),
-                6 => Ok(OutcomeCause::Closed),
-                7 => {
-                    let code = d.u8()?;
-                    crate::db::entities::UncertaintyReason::from_code(code)
-                        .map(OutcomeCause::Uncertain)
-                        .ok_or_else(|| {
-                            StorageError::corrupted(format!("invalid uncertainty reason {code}"))
-                        })
-                }
-                code => Err(StorageError::corrupted(format!(
-                    "invalid outcome cause {code}"
-                ))),
-            })?;
-            Ok(OutcomeRecord { kind, at, cause })
-        })?;
-        let stop_confirmed_at = d.ots()?;
-        let stop_confirmed_by = d.opt(|d| {
-            d.code_with(StopProof::from_code, |_| {
-                StorageError::corrupted("invalid stop proof")
-            })
-        })?;
+            2 => Origin::System,
+            _ => return Err(StorageError::corrupted("invalid conversation origin")),
+        };
+        let keep_open = d.bool()?;
+        let created_at = d.ts()?;
+        let parent_id = d.ou128()?.map(JobId::new);
         d.end()?;
-        Ok(JobState {
-            job_id,
-            outcome,
-            stop_confirmed_at,
-            stop_confirmed_by,
+        let shape = match origin {
+            Origin::User => keep_open && parent_id.is_none(),
+            Origin::Agent { .. } => parent_id.is_some(),
+            Origin::System => !keep_open,
+        };
+        if !shape || id.get() == 0 {
+            return Err(StorageError::corrupted("invalid mutable conversation"));
+        }
+        Ok(JobSpec {
+            id,
+            created_at,
+            parent_id,
+            agent,
+            project,
+            origin,
+            keep_open,
         })
     }
 
     pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
-        let state = Self::decode(bytes)?;
-        check_table_key("job_state", key, state.job_id.get())?;
-        Ok(state)
+        let row = Self::decode(bytes)?;
+        check_table_key("conversation", key, row.id.get())?;
+        Ok(row)
     }
 }
 
@@ -259,21 +110,6 @@ pub(crate) struct ConfigRow {
 }
 
 impl ConfigRow {
-    pub(super) fn scan_at(key: u128, bytes: &[u8]) -> DecodeResult<Option<Self>> {
-        match bytes.first() {
-            Some(&super::transactions::TAG_ALLOCATION_POOL) => {
-                super::transactions::decode_allocation_pool(key, bytes)?;
-                return Ok(None);
-            }
-            Some(&super::transactions::TAG_ALLOCATION_EXECUTOR) => {
-                super::transactions::decode_allocation_executor(key, bytes)?;
-                return Ok(None);
-            }
-            _ => {}
-        }
-        Self::decode_at(key, bytes).map(Some)
-    }
-
     pub(super) fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new(TAG_CONFIG);
         e.u128(self.id.get());
@@ -319,16 +155,6 @@ impl ConfigRow {
                 e.u8(3);
                 e.agent_config(a);
             }
-            ConfigBody::Pool(p) => {
-                e.u8(4);
-                e.u32(p.capabilities.len() as u32);
-                for (op, proto) in &p.capabilities {
-                    e.u8(op.code());
-                    e.opt(proto.as_ref(), |e, pr| e.u8(pr.code()));
-                }
-                e.u32(p.concurrency_limit);
-                e.bool(p.enabled);
-            }
             ConfigBody::DecisionModel(model) => {
                 e.u8(5);
                 e.decision_model(model);
@@ -341,10 +167,7 @@ impl ConfigRow {
         match self.kind {
             ConfigKind::Connection => e.bool(self.discovery_visible),
             ConfigKind::Model => e.bool(self.model_enabled),
-            ConfigKind::Agent
-            | ConfigKind::Pool
-            | ConfigKind::DecisionModel
-            | ConfigKind::DecisionAgent => {}
+            ConfigKind::Agent | ConfigKind::DecisionModel | ConfigKind::DecisionAgent => {}
         }
         e.0
     }
@@ -411,32 +234,15 @@ impl ConfigRow {
                 })
             }
             ConfigKind::Agent => ConfigBody::Agent(d.agent_config()?),
-            ConfigKind::Pool => {
-                let cap_len = d.u32()? as usize;
-                let mut capabilities = BTreeSet::new();
-                for _ in 0..cap_len {
-                    let op = d.code(ExecutionOperation::from_code)?;
-                    let proto = d.opt(|d| d.code(LlmTransport::from_code))?;
-                    capabilities.insert((op, proto));
-                }
-                let concurrency_limit = d.u32()?;
-                let enabled = d.bool()?;
-                ConfigBody::Pool(PoolConfig {
-                    capabilities,
-                    concurrency_limit,
-                    enabled,
-                })
-            }
             ConfigKind::DecisionModel => ConfigBody::DecisionModel(d.decision_model()?),
             ConfigKind::DecisionAgent => ConfigBody::DecisionAgent(d.decision_agent()?),
         };
         let (model_enabled, discovery_visible) = match kind {
             ConfigKind::Connection => (true, d.bool()?),
             ConfigKind::Model => (d.bool()?, true),
-            ConfigKind::Agent
-            | ConfigKind::Pool
-            | ConfigKind::DecisionModel
-            | ConfigKind::DecisionAgent => (true, true),
+            ConfigKind::Agent | ConfigKind::DecisionModel | ConfigKind::DecisionAgent => {
+                (true, true)
+            }
         };
         d.end()?;
         Ok(ConfigRow {
@@ -660,93 +466,6 @@ pub(super) fn decode_project_root(key: u128, bytes: &[u8]) -> DecodeResult<(Proj
     d.str()?;
     d.ostr()?;
     Ok((id, d.str()?))
-}
-
-impl JobControl {
-    pub(super) fn encode(&self) -> Vec<u8> {
-        let mut e = Enc::new(TAG_JOB_CONTROL);
-        e.ostr(self.title.as_deref());
-        e.ots(self.hidden_at);
-        e.ou32(self.on_hold);
-        e.u8(self.loop_count);
-        e.opt(self.closing.as_ref(), |e, closing| {
-            e.ts(closing.at);
-            e.actor(&closing.by);
-            e.bool(closing.running);
-        });
-        e.opt(self.limits.as_ref(), |e, limits| {
-            e.u8(limits.max_depth);
-            e.u8(limits.max_auto_turns);
-            e.u32(limits.max_iterations);
-        });
-        e.opt(self.compaction_policy.as_ref(), Enc::compaction_policy);
-        e.u64(self.compaction_revision);
-        e.u8(u8::try_from(self.after.len()).unwrap_or(u8::MAX));
-        for (job, condition) in &self.after {
-            e.u128(job.get());
-            e.u8(match condition {
-                DependencyCondition::Success => 1,
-                DependencyCondition::Settled => 2,
-            });
-        }
-        e.u8(u8::try_from(self.retried.len()).unwrap_or(u8::MAX));
-        for job in &self.retried {
-            e.u128(job.get());
-        }
-        e.bool(self.user_input);
-        e.ou128(self.reported.map(JobId::get));
-        e.0
-    }
-
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_JOB_CONTROL)?;
-        let row = Self {
-            title: d.ostr()?,
-            hidden_at: d.ots()?,
-            on_hold: d.ou32()?,
-            loop_count: d.u8()?,
-            closing: d.opt(|d| {
-                Ok(JobClosing {
-                    at: d.ts()?,
-                    by: d.actor()?,
-                    running: d.bool()?,
-                })
-            })?,
-            limits: d.opt(|d| {
-                Ok(JobLimits {
-                    max_depth: d.u8()?,
-                    max_auto_turns: d.u8()?,
-                    max_iterations: d.u32()?,
-                })
-            })?,
-            compaction_policy: d.opt(Dec::compaction_policy)?,
-            compaction_revision: d.u64()?,
-            after: {
-                let mut after = Vec::new();
-                for _ in 0..d.u8()? {
-                    let job = JobId::new(d.u128()?);
-                    let condition = match d.u8()? {
-                        1 => DependencyCondition::Success,
-                        2 => DependencyCondition::Settled,
-                        _ => return Err(StorageError::corrupted("invalid dependency condition")),
-                    };
-                    after.push((job, condition));
-                }
-                after
-            },
-            retried: {
-                let mut retried = Vec::new();
-                for _ in 0..d.u8()? {
-                    retried.push(JobId::new(d.u128()?));
-                }
-                retried
-            },
-            user_input: d.bool()?,
-            reported: d.ou128()?.map(JobId::new),
-        };
-        d.end()?;
-        Ok(row)
-    }
 }
 
 pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
@@ -1073,43 +792,6 @@ pub(super) fn decode_request_event(
         recorded_at,
         payload,
     })
-}
-
-impl JobInputEntry {
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_JOB_INPUT)?;
-        let row = Self {
-            entry: d.entry()?,
-            at: d.ts()?,
-        };
-        d.end()?;
-        Ok(row)
-    }
-}
-impl Notice {
-    pub(super) fn decode(bytes: &[u8]) -> DecodeResult<Self> {
-        let mut d = Dec::new(bytes, TAG_NOTICE)?;
-        let class = d.code_with(NoticeClass::from_code, |_| {
-            StorageError::corrupted("invalid notice class")
-        })?;
-        let body = match d.u8()? {
-            0 => NoticeBody::Event {
-                child: JobId::new(d.u128()?),
-                event: d.notice_event()?,
-                reference: JobId::new(d.u128()?),
-            },
-            1 => NoticeBody::Record {
-                event: d.code_with(RecordEvent::from_code, |_| {
-                    StorageError::corrupted("invalid record event")
-                })?,
-                by: d.actor()?,
-                at: d.ts()?,
-            },
-            _ => return Err(StorageError::corrupted("invalid notice body")),
-        };
-        d.end()?;
-        Ok(Self { class, body })
-    }
 }
 
 const CREDENTIAL_AAD_PREFIX: &[u8] = b"ocg.credential.v1\0";

@@ -967,7 +967,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 return Ok(json!({
                     "outcome": "planned",
                     "state": if supersedes.is_some() { json!(PREPARED_NOT_PUBLISHED) } else { Value::Null },
-                    "plan": plan.canonical,
+                    "plan": plan.evidence,
                     "plan_digest": plan.digest,
                     "original": {"sha256": source_sha256, "bytes": source_length},
                     "source_unchanged": true,

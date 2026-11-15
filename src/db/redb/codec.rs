@@ -1,25 +1,20 @@
 use super::*;
 use crate::db::entities::{
-    ChoiceOption, CommandAssessment, CommandOwner, CommandStatus, CompactionMode, CompactionPolicy,
-    CompactionPreset, ConfigKind, CustomPolicy, DecisionAgentConfig, DecisionAssignment,
-    DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol, DecisionQuestion,
-    DecisionRequest, DecisionWork, FrozenDecisionAgent, FrozenDecisionConfig, NativeDecisionConfig,
-    PredictionAcceptance, PredictionMode, PredictiveCompaction, RequestEligibility, ScoreLevel,
-    SummarizationStage, UsageFinality,
+    CommandOwner, CommandStatus, CompactionMode, CompactionPolicy, CompactionPreset, ConfigKind,
+    CustomPolicy, DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig,
+    DecisionProtocol, FrozenDecisionAgent, NativeDecisionConfig, PredictionAcceptance,
+    PredictionMode, PredictiveCompaction, RequestEligibility, UsageFinality,
 };
 
 pub(super) const TAG_CONFIG: u8 = 1;
 pub(super) const TAG_JOB: u8 = 2;
-pub(super) const TAG_JOB_STATE: u8 = 3;
+pub(super) const TAG_JOB_RUNTIME: u8 = 3;
 pub(super) const TAG_OUTPUT: u8 = 4;
 pub(super) const TAG_SUBMISSION: u8 = 5;
 pub(super) const TAG_ATTACHMENT: u8 = 6;
 pub(super) const TAG_TOOL_CALL: u8 = 7;
 pub(super) const TAG_REQUEST_EVENT: u8 = 8;
 pub(super) const TAG_PROJECT: u8 = 9;
-pub(super) const TAG_JOB_CONTROL: u8 = 10;
-pub(super) const TAG_JOB_INPUT: u8 = 11;
-pub(super) const TAG_NOTICE: u8 = 12;
 pub(super) const TAG_RECURRENCE: u8 = 13;
 pub(super) const TAG_GLOBAL_COMPACTION: u8 = 14;
 pub(super) const TAG_APPROVAL: u8 = 15;
@@ -196,81 +191,6 @@ impl Enc {
         self.ostr(frozen.endpoint.as_deref());
         self.ostr(frozen.credential_ref.as_deref());
         self.frozen_headers(&frozen.headers);
-    }
-    fn decision_work(&mut self, work: &DecisionWork) {
-        match &work.frozen {
-            FrozenDecisionConfig::Native(frozen) => {
-                self.u8(0);
-                self.opt(frozen.agent.as_ref(), |encoder, agent| match agent {
-                    FrozenDecisionAgent::Agent(agent) => {
-                        encoder.u8(0);
-                        encoder.agent_config(agent);
-                    }
-                    FrozenDecisionAgent::Profile(agent) => {
-                        encoder.u8(1);
-                        encoder.decision_agent(agent);
-                    }
-                });
-                self.opt(frozen.agent_ref.as_ref(), Self::config_ref);
-                self.decision_model(&frozen.model);
-                self.config_ref(&frozen.model_ref);
-                self.config_ref(&frozen.connection_ref);
-                self.ostr(frozen.endpoint.as_deref());
-                self.ostr(frozen.credential_ref.as_deref());
-                self.frozen_headers(&frozen.headers);
-            }
-            FrozenDecisionConfig::Generative(frozen, profile) => {
-                self.u8(1);
-                self.frozen_execution(frozen);
-                self.opt(profile.as_ref(), |encoder, (agent, reference)| {
-                    encoder.decision_agent(agent);
-                    encoder.config_ref(reference);
-                });
-            }
-        }
-        self.opt(work.assignment.as_ref(), |encoder, assignment| {
-            encoder.u128(assignment.project.get());
-            encoder.u64(assignment.revision);
-        });
-        self.str(&work.request.state.to_string());
-        match &work.request.question {
-            DecisionQuestion::Choice { prompt, options } => {
-                self.u8(0);
-                self.str(prompt);
-                self.u32(options.len() as u32);
-                for option in options {
-                    self.str(&option.id);
-                    self.str(&option.description);
-                }
-            }
-            DecisionQuestion::BinaryProbability { prompt } => {
-                self.u8(1);
-                self.str(prompt);
-            }
-            DecisionQuestion::OrdinalScore { prompt, levels } => {
-                self.u8(2);
-                self.str(prompt);
-                self.u32(levels.len() as u32);
-                for level in levels {
-                    self.0.extend_from_slice(&level.value.to_le_bytes());
-                    self.str(&level.description);
-                }
-            }
-        }
-        self.opt(work.prediction.as_ref(), |encoder, binding| {
-            encoder.u128(binding.conversation.get());
-            encoder.u128(binding.activity_turn.get());
-            encoder.u64(binding.policy_revision);
-            encoder.opt(binding.policy_profile.as_ref(), Self::config_ref);
-            encoder.u32(binding.max_tokens);
-            encoder.compaction_policy(&binding.policy);
-        });
-        self.opt(work.commands.as_ref(), |encoder, binding| {
-            encoder.u128(binding.approval.job.get());
-            encoder.u32(binding.approval.request.get());
-            encoder.u32(binding.approval.index);
-            encoder.u32(u32::from(binding.minimum_confidence_millis));
-        });
     }
     pub(super) fn config_ref(&mut self, config: &ConfigRef) {
         self.u128(config.id.get());
@@ -587,105 +507,6 @@ impl<'a> Dec<'a> {
             headers: self.frozen_headers()?,
         })
     }
-    fn decision_work(&mut self) -> DecodeResult<DecisionWork> {
-        let frozen = match self.u8()? {
-            0 => FrozenDecisionConfig::Native(NativeDecisionConfig {
-                agent: self.opt(|decoder| match decoder.u8()? {
-                    0 => decoder
-                        .agent_config()
-                        .map(|agent| FrozenDecisionAgent::Agent(Box::new(agent))),
-                    1 => decoder.decision_agent().map(FrozenDecisionAgent::Profile),
-                    _ => Err(StorageError::corrupted("invalid decision Agent kind")),
-                })?,
-                agent_ref: self.opt(Self::config_ref)?,
-                model: self.decision_model()?,
-                model_ref: self.config_ref()?,
-                connection_ref: self.config_ref()?,
-                endpoint: self.ostr()?,
-                credential_ref: self.ostr()?,
-                headers: self.frozen_headers()?,
-            }),
-            1 => FrozenDecisionConfig::Generative(
-                self.frozen_execution()?,
-                self.opt(|decoder| Ok((decoder.decision_agent()?, decoder.config_ref()?)))?,
-            ),
-            _ => return Err(StorageError::corrupted("invalid decision backend")),
-        };
-        let assignment = self.opt(|decoder| {
-            Ok(DecisionAssignment {
-                project: ProjectId::new(decoder.u128()?),
-                revision: decoder.u64()?,
-            })
-        })?;
-        let state = serde_json::from_str(&self.str()?)
-            .map_err(|_| StorageError::corrupted("invalid decision state"))?;
-        let kind = self.u8()?;
-        let prompt = self.str()?;
-        let question = match kind {
-            0 => {
-                let count = self.u32()?;
-                if count > 256 {
-                    return Err(StorageError::corrupted("too many choice options"));
-                }
-                let mut options = Vec::new();
-                for _ in 0..count {
-                    options.push(ChoiceOption {
-                        id: self.str()?,
-                        description: self.str()?,
-                    });
-                }
-                DecisionQuestion::Choice { prompt, options }
-            }
-            1 => DecisionQuestion::BinaryProbability { prompt },
-            2 => {
-                let count = self.u32()?;
-                if count > 256 {
-                    return Err(StorageError::corrupted("too many score levels"));
-                }
-                let mut levels = Vec::new();
-                for _ in 0..count {
-                    levels.push(ScoreLevel {
-                        value: self.u32()? as i32,
-                        description: self.str()?,
-                    });
-                }
-                DecisionQuestion::OrdinalScore { prompt, levels }
-            }
-            _ => return Err(StorageError::corrupted("invalid decision primitive")),
-        };
-        let prediction = self.opt(|decoder| {
-            Ok(crate::db::entities::PredictionBinding {
-                conversation: JobId::new(decoder.u128()?),
-                activity_turn: JobId::new(decoder.u128()?),
-                policy_revision: decoder.u64()?,
-                policy_profile: decoder.opt(Self::config_ref)?,
-                max_tokens: decoder.u32()?,
-                policy: decoder.compaction_policy()?,
-            })
-        })?;
-        let commands = self.opt(|decoder| {
-            Ok(CommandAssessment {
-                approval: crate::db::entities::ToolCallRef {
-                    job: JobId::new(decoder.u128()?),
-                    request: RequestNumber::new(decoder.u32()?).ok_or_else(|| {
-                        StorageError::corrupted("invalid command assessment request")
-                    })?,
-                    index: decoder.u32()?,
-                },
-                minimum_confidence_millis: u16::try_from(decoder.u32()?)
-                    .map_err(|_| StorageError::corrupted("invalid command confidence"))?,
-            })
-        })?;
-        let work = DecisionWork {
-            assignment,
-            commands,
-            frozen,
-            prediction,
-            request: DecisionRequest { state, question },
-        };
-        work.validate().map_err(StorageError::corrupted)?;
-        Ok(work)
-    }
     pub(super) fn config_ref(&mut self) -> DecodeResult<ConfigRef> {
         Ok(ConfigRef {
             id: ConfigId::new(self.u128()?),
@@ -811,14 +632,12 @@ codes!(OutcomeKind { OutcomeKind::Completed = 1, OutcomeKind::Failed = 2, Outcom
 codes!(StopProof { StopProof::Proof = 0, StopProof::Reboot = 1, StopProof::Settled = 2, StopProof::User = 3, StopProof::Operator = 4 });
 codes!(ConfigKind {
     ConfigKind::Connection = 1, ConfigKind::Model = 2, ConfigKind::Agent = 3,
-    ConfigKind::Pool = 4, ConfigKind::DecisionModel = 5, ConfigKind::DecisionAgent = 6,
+    ConfigKind::DecisionModel = 5, ConfigKind::DecisionAgent = 6,
 });
 codes!(CommandOwner { CommandOwner::User = 0, CommandOwner::Decision = 1 });
 codes!(CommandStatus { CommandStatus::Allowed = 0, CommandStatus::Review = 1, CommandStatus::Blocked = 2 });
 codes!(RequestEligibility { RequestEligibility::Eligible = 1, RequestEligibility::Excluded = 2 });
 codes!(UsageFinality { UsageFinality::Cumulative = 1, UsageFinality::Final = 2 });
-codes!(NoticeClass { NoticeClass::Attention = 0, NoticeClass::Progress = 1, NoticeClass::Record = 2 });
-codes!(RecordEvent { RecordEvent::Hold = 0, RecordEvent::Unhold = 1, RecordEvent::Stop = 2 });
 codes!(RecurrenceHalt {
     RecurrenceHalt::Closed = 0, RecurrenceHalt::ConfigUnavailable = 1,
     RecurrenceHalt::Refused = 2, RecurrenceHalt::LimitReached = 3,
@@ -844,125 +663,8 @@ impl Enc {
             Actor::Loop => self.u8(3),
         }
     }
-    pub(super) fn job_kind(&mut self, kind: &JobKind) {
-        match kind {
-            JobKind::Group {
-                agent,
-                project,
-                origin,
-                keep_open,
-            } => {
-                self.u8(0);
-                self.ou128(agent.map(ConfigId::get));
-                self.ou128(project.map(ProjectId::get));
-                match origin {
-                    Origin::User => self.u8(0),
-                    Origin::Agent { call } => {
-                        self.u8(1);
-                        self.call_ref(call);
-                    }
-                    Origin::System => self.u8(2),
-                };
-                self.bool(*keep_open);
-            }
-            JobKind::Execution {
-                name,
-                execution,
-                plan_source,
-            } => {
-                self.u8(1);
-                self.ostr(name.as_deref());
-                match execution {
-                    JobExecution::Frozen(frozen) => {
-                        self.u8(0);
-                        self.frozen_execution(frozen);
-                    }
-                    JobExecution::Summarization(work) => {
-                        self.u8(3);
-                        self.frozen_execution(&work.frozen);
-                        self.0.extend_from_slice(work.source.as_bytes());
-                        self.u32(work.target_tokens);
-                        self.u32(work.minimum_savings_tokens);
-                        self.opt(work.policy_revision.as_ref(), |encoder, revision| {
-                            encoder.u64(*revision)
-                        });
-                        self.opt(work.policy_profile.as_ref(), Self::config_ref);
-                        match work.stage {
-                            SummarizationStage::Direct => self.u8(0),
-                            SummarizationStage::Chunk {
-                                start,
-                                end,
-                                content,
-                            } => {
-                                self.u8(1);
-                                self.u64(start);
-                                self.u64(end);
-                                self.0.extend_from_slice(content.as_bytes());
-                            }
-                            SummarizationStage::Reduce => self.u8(2),
-                        }
-                        self.ou128(work.chain.map(JobId::get));
-                        self.ou128(work.prediction.map(JobId::get));
-                        self.u32(work.reserved_tokens);
-                        self.u32(work.reserved_requests);
-                    }
-                    JobExecution::Decision(work) => {
-                        self.u8(2);
-                        self.decision_work(work);
-                    }
-                    JobExecution::Ref(owner) => {
-                        self.u8(1);
-                        self.u128(owner.get());
-                    }
-                };
-                match plan_source {
-                    PlanSource::Stored {
-                        previous,
-                        dependencies,
-                    } => {
-                        self.u8(0);
-                        self.ou128(previous.map(JobId::get));
-                        self.u32(dependencies.len() as u32);
-                        for (job, condition) in dependencies {
-                            self.u128(job.get());
-                            self.u8(condition.code());
-                        }
-                    }
-                    PlanSource::Process {
-                        project,
-                        grant,
-                        eligible_at,
-                        objective,
-                        attachments,
-                    } => {
-                        self.u8(1);
-                        self.ou128(project.map(ProjectId::get));
-                        self.ostr(grant.as_deref());
-                        self.ots(*eligible_at);
-                        self.ostr(objective.as_deref());
-                        self.u32(attachments.len() as u32);
-                        for attachment in attachments {
-                            self.u128(attachment.get());
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 impl Dec<'_> {
-    fn response_format(&mut self) -> DecodeResult<ResponseFormat> {
-        Ok(match self.u8()? {
-            0 => ResponseFormat::JsonObject,
-            1 => ResponseFormat::JsonSchema {
-                name: self.str()?,
-                schema: serde_json::from_str(&self.str()?)
-                    .map_err(|_| StorageError::corrupted("invalid response schema"))?,
-                strict: self.opt(Self::bool)?,
-            },
-            _ => return Err(StorageError::corrupted("invalid response format")),
-        })
-    }
     pub(super) fn call_ref(&mut self) -> DecodeResult<crate::db::entities::ToolCallRef> {
         Ok(crate::db::entities::ToolCallRef {
             job: JobId::new(self.u128()?),
@@ -980,180 +682,6 @@ impl Dec<'_> {
             2 => Actor::User,
             3 => Actor::Loop,
             _ => return Err(StorageError::corrupted("invalid actor")),
-        })
-    }
-    pub(super) fn job_kind(&mut self) -> DecodeResult<JobKind> {
-        Ok(match self.u8()? {
-            0 => JobKind::Group {
-                agent: self.ou128()?.map(ConfigId::new),
-                project: self.ou128()?.map(ProjectId::new),
-                origin: match self.u8()? {
-                    0 => Origin::User,
-                    1 => Origin::Agent {
-                        call: self.call_ref()?,
-                    },
-                    2 => Origin::System,
-                    _ => return Err(StorageError::corrupted("invalid origin")),
-                },
-                keep_open: self.bool()?,
-            },
-            1 => JobKind::Execution {
-                name: self.ostr()?,
-                execution: match self.u8()? {
-                    0 => JobExecution::Frozen(self.frozen_execution()?),
-                    1 => JobExecution::Ref(JobId::new(self.u128()?)),
-                    2 => JobExecution::Decision(self.decision_work()?),
-                    3 => {
-                        let work = crate::db::entities::SummarizationWork {
-                            frozen: self.frozen_execution()?,
-                            source: ContentDigest::from_bytes(
-                                self.take(32)?.try_into().map_err(|_| {
-                                    StorageError::corrupted("invalid source digest")
-                                })?,
-                            ),
-                            target_tokens: self.u32()?,
-                            minimum_savings_tokens: self.u32()?,
-                            policy_revision: self.opt(Self::u64)?,
-                            policy_profile: self.opt(Self::config_ref)?,
-                            stage: match self.u8()? {
-                                0 => SummarizationStage::Direct,
-                                1 => SummarizationStage::Chunk {
-                                    start: self.u64()?,
-                                    end: self.u64()?,
-                                    content: ContentDigest::from_bytes(
-                                        self.take(32)?.try_into().map_err(|_| {
-                                            StorageError::corrupted("invalid chunk digest")
-                                        })?,
-                                    ),
-                                },
-                                2 => SummarizationStage::Reduce,
-                                _ => return Err(StorageError::corrupted("invalid summary stage")),
-                            },
-                            chain: self.ou128()?.map(JobId::new),
-                            prediction: self.ou128()?.map(JobId::new),
-                            reserved_tokens: self.u32()?,
-                            reserved_requests: self.u32()?,
-                        };
-                        work.validate_stage().map_err(StorageError::corrupted)?;
-                        JobExecution::Summarization(work)
-                    }
-                    _ => return Err(StorageError::corrupted("invalid execution")),
-                },
-                plan_source: match self.u8()? {
-                    0 => {
-                        let previous = self.ou128()?.map(JobId::new);
-                        let mut dependencies = Vec::new();
-                        for _ in 0..self.u32()? {
-                            dependencies.push((
-                                JobId::new(self.u128()?),
-                                self.code(DependencyCondition::from_code)?,
-                            ));
-                        }
-                        PlanSource::Stored {
-                            previous,
-                            dependencies,
-                        }
-                    }
-                    1 => PlanSource::Process {
-                        project: self.ou128()?.map(ProjectId::new),
-                        grant: self.ostr()?,
-                        eligible_at: self.ots()?,
-                        objective: self.ostr()?,
-                        attachments: {
-                            let mut attachments = Vec::new();
-                            for _ in 0..self.u32()? {
-                                attachments.push(AttachmentId::new(self.u128()?));
-                            }
-                            attachments
-                        },
-                    },
-                    _ => return Err(StorageError::corrupted("invalid plan source")),
-                },
-            },
-            _ => return Err(StorageError::corrupted("invalid job kind")),
-        })
-    }
-    pub(super) fn notice_event(&mut self) -> DecodeResult<NoticeEvent> {
-        Ok(match self.u8()? {
-            0 => NoticeEvent::ClosedSelf,
-            1 => NoticeEvent::ClosedAbove,
-            2 => NoticeEvent::StoppedAbove,
-            3 => NoticeEvent::TurnEnded {
-                kind: self.code_with(OutcomeKind::from_code, |_| {
-                    StorageError::corrupted("invalid outcome")
-                })?,
-            },
-            4 => NoticeEvent::Requested,
-            5 => NoticeEvent::Stalled,
-            6 => NoticeEvent::ObjectiveCompleted,
-            7 => {
-                let mut waiting = Vec::new();
-                for _ in 0..self.u32()? {
-                    waiting.push(JobId::new(self.u128()?));
-                }
-                NoticeEvent::WaitersBlocked { waiting }
-            }
-            9 => NoticeEvent::IterationCompleted,
-            10 => NoticeEvent::RecurrenceHalted,
-            _ => return Err(StorageError::corrupted("invalid notice event")),
-        })
-    }
-    pub(super) fn entry(&mut self) -> DecodeResult<Entry> {
-        Ok(match self.u8()? {
-            0 => {
-                let text = self.str()?;
-                let n = self.u32()?;
-                let mut attachments = Vec::new();
-                for _ in 0..n {
-                    attachments.push(AttachmentId::new(self.u128()?));
-                }
-                Entry::UserMessage { text, attachments }
-            }
-            1 => Entry::AgentMessage {
-                text: self.str()?,
-                call: self.call_ref()?,
-            },
-            2 => Entry::Notice {
-                child: JobId::new(self.u128()?),
-                event: self.notice_event()?,
-                reference: JobId::new(self.u128()?),
-            },
-            3 => Entry::Decision {
-                approval: (JobId::new(self.u128()?), self.u32()?, self.u32()?),
-            },
-            4 => Entry::RetryOf {
-                turn: JobId::new(self.u128()?),
-                by: self.actor()?,
-            },
-            5 => Entry::Iteration { n: self.u64()? },
-            7 => Entry::ContextPreparation {
-                job: JobId::new(self.u128()?),
-                policy_revision: self.u64()?,
-            },
-            8 => Entry::ContextUse {
-                artifact: self.ou128()?.map(JobId::new),
-            },
-            9 => {
-                let message = self.u32()?;
-                let text = self.str()?;
-                let n = self.u32()?;
-                let mut attachments = Vec::new();
-                for _ in 0..n {
-                    attachments.push(AttachmentId::new(self.u128()?));
-                }
-                Entry::UserMessageEdit {
-                    message,
-                    text,
-                    attachments,
-                }
-            }
-            10 => Entry::UserMessageWithdraw {
-                message: self.u32()?,
-            },
-            6 => Entry::ResponseFormat {
-                format: self.response_format()?,
-            },
-            _ => return Err(StorageError::corrupted("invalid entry")),
         })
     }
 }

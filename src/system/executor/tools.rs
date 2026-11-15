@@ -227,11 +227,11 @@ impl ToolRegistry {
     }
 
     pub(crate) fn authorize(&self, name: &str) -> Result<(), ToolRegistryError> {
-        let control = crate::system::execution_controls::ExecutionControl::ToolsAndChildJobs;
-        if !control.is_enabled() {
+        let feature = crate::system::execution_features::ExecutionFeature::ToolsAndChildJobs;
+        if !feature.is_enabled() {
             return Err(ToolRegistryError::Disabled(
                 name.to_owned(),
-                control.refusal(),
+                feature.refusal(),
             ));
         }
         self.set_authorized(name, true)

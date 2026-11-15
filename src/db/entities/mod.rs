@@ -9,6 +9,7 @@ use crate::service::ai::providers::openai_compatible::{
 
 mod approvals;
 mod attachments;
+mod execution;
 mod headers;
 mod identity;
 mod job_context;
@@ -32,6 +33,7 @@ pub use approvals::{
     is_handler_version,
 };
 pub use attachments::*;
+pub(crate) use execution::{ExecutionEvent, ExecutionEventKind, ExecutionSnapshot};
 pub use headers::*;
 pub use identity::{
     AttachmentId, AvailabilityStatId, ComposerContextId, ConfigId, ExecutionPoolId, ExecutorId,
@@ -39,18 +41,17 @@ pub use identity::{
     RequestEventId, RequestNumber, RequestRef, ReservationRequestId, ScheduledExternalPolicyId,
     Timestamp, parse_entity_id,
 };
+pub(in crate::db) use job_context::summary_chunks;
 pub use job_context::{
     Actor, Appended, COMPACTION_JOB_NAME, CompactionMode, CompactionPolicy, CompactionPreset,
     CompactionRequest, ContextSourceManifest, CustomPolicy, Entry, EntryKind,
-    GlobalCompactionSettings, JobAction, JobEdit, JobGroup, JobInputEntry, JobLimits,
-    MAX_JOB_DEPTH, NativeSummaryBoundary, NativeSummaryManifest, NativeSummaryResultLink, Notice,
-    NoticeBody, NoticeClass, NoticeEvent, Origin, PredictionAcceptance, PredictionMode,
-    PredictiveCompaction, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase,
-    ResolvedCompaction, ResponseFormat, SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopCause,
-    StopProof, SummarizationResult, SummarizationStage, SummarizationWork, SummaryFragment,
-    TITLE_JOB_NAME, title_prompt,
+    GlobalCompactionSettings, JobAction, JobEdit, JobGroup, JobLimits, MAX_JOB_DEPTH,
+    NativeSummaryBoundary, NativeSummaryManifest, NativeSummaryResultLink, Origin,
+    PredictionAcceptance, PredictionMode, PredictiveCompaction, Recurrence, RecurrenceHalt,
+    RecurrencePhase, ResolvedCompaction, ResponseFormat, SUMMARIZER_OUTPUT_RESERVE, SourceBoundary,
+    StopCause, StopProof, SummarizationResult, SummarizationStage, SummarizationWork,
+    SummaryFragment, TITLE_JOB_NAME, title_prompt,
 };
-pub(in crate::db) use job_context::{effective_entries, summary_chunks};
 pub use jobs::*;
 pub use metrics::*;
 pub use operations::{MAX_PENDING_JOBS, OperationId, OperationKind, Violation};

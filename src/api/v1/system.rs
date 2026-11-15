@@ -73,7 +73,7 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
         DatabaseStatus::WorkerStopped => "stopped",
         DatabaseStatus::Closed => "closed",
     };
-    let readable = database.job(database.genesis()).await.is_ok();
+    let readable = database.check_readable().await.is_ok();
     let vitals = database.vitals().await;
     let (quarantined, quarantined_error) = match database.uncertain_allocations().await {
         Ok(uncertain) => (

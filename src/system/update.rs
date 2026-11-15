@@ -46,8 +46,8 @@ pub(crate) fn install() -> Result<Install> {
         }
         Some(Install {
             prefix,
-            port: setting(&text, "OCG_CONTROL_PORT")?.to_owned(),
-            token: setting(&text, "OCG_CONTROL_TOKEN")?.to_owned(),
+            port: setting(&text, "OCG_API_PORT")?.to_owned(),
+            token: setting(&text, "OCG_API_TOKEN")?.to_owned(),
         })
     }
     find().ok_or_else(|| REINSTALL.into())

@@ -2,12 +2,12 @@ import type {
   ChatImage,
   ChatImageUploadRequest,
   ChatModelSelection,
-  ControlConversationTurn,
-  ControlJobDetails,
-  ControlJob,
-  ControlOutput,
-  ControlProviderResponse,
-  ControlToolCall,
+  ConversationTurn,
+  JobDetails,
+  Job,
+  Output,
+  ProviderResponse,
+  ToolCall,
 } from "../contracts";
 import type { ChatMessage, ChatSession, OcgRuntimeEvent } from "../types";
 import { RuntimeClientBase } from "./runtime-client-base";
@@ -15,9 +15,9 @@ import type { CreateSessionInput } from "./runtime-types";
 import {
   readTranscriptEvidence,
   readOutputWindow,
-  type HttpCanonicalControlClient,
+  type ApiClient,
   type JobStreamSubscription,
-} from "./control-client";
+} from "./api-client";
 import {
   jobTranscript,
   TranscriptAccumulator,
@@ -91,15 +91,15 @@ function rememberToolTime(times: Map<number, number>, request: number, at: numbe
 }
 
 async function readMissingOutputs(
-  control: HttpCanonicalControlClient,
+  api: ApiClient,
   job: string,
   after: number,
   through: number,
   signal: AbortSignal,
-): Promise<ControlOutput[]> {
-  const outputs: ControlOutput[] = [];
+): Promise<Output[]> {
+  const outputs: Output[] = [];
   while (after < through) {
-    const page = await control.readOutputs(job, { afterSeq: after, limit: 100, signal });
+    const page = await api.readOutputs(job, { afterSeq: after, limit: 100, signal });
     signal.throwIfAborted();
     const next = page.outputs.filter((output) => output.seq <= through);
     for (const output of next) {
@@ -114,13 +114,13 @@ async function readMissingOutputs(
 }
 
 async function readPartialToolBoundaries(
-  control: HttpCanonicalControlClient,
+  api: ApiClient,
   job: string,
-  tools: readonly ControlToolCall[],
+  tools: readonly ToolCall[],
   outputs: OutputSequence,
   signal: AbortSignal,
   times: Map<number, number>,
-  responses: readonly ControlProviderResponse[],
+  responses: readonly ProviderResponse[],
   gate: ToolTimeGate,
 ): Promise<PartialToolBoundary[] | null> {
   const first = outputs.at(0)?.created_at_us;
@@ -151,7 +151,7 @@ async function readPartialToolBoundaries(
           return Promise.resolve(
             known === undefined
               ? gate.read(controller.signal, () =>
-                  control.readToolResponseTime(job, request, controller.signal),
+                  api.readToolResponseTime(job, request, controller.signal),
                 )
               : known,
           ).then(
@@ -184,24 +184,39 @@ async function readPartialToolBoundaries(
 }
 
 type Turn = {
-  native_decision?: ControlConversationTurn["native_decision"];
-  compaction?: ControlConversationTurn["compaction"];
-  details?: ControlJobDetails;
-  entries?: ControlConversationTurn["entries"];
+  content_kind?: ConversationTurn["content_kind"];
+  native_decision?: ConversationTurn["native_decision"];
+  compaction?: ConversationTurn["compaction"];
+  details?: JobDetails;
+  entries?: ConversationTurn["entries"];
   sessionId: string;
-  job: ControlJob;
-  input: ControlConversationTurn["input"];
+  job: Job;
+  input: ConversationTurn["input"];
   outputs: OutputHistory;
   outputRevision?: number;
   evidenceRevision: number;
-  tools: ControlToolCall[];
-  responses: ControlProviderResponse[];
+  tools: ToolCall[];
+  responses: ProviderResponse[];
   partialToolBoundaries?: PartialToolBoundary[] | null;
   partialToolTimes?: ReadonlyMap<number, number>;
   error?: string;
   toolError?: string;
   unknownReason?: string | null;
 };
+
+function turnCanRetry(turn: Turn): boolean {
+  if (turn.content_kind !== "generative" || turn.native_decision || !turn.details) return false;
+  if (turn.details.allocation?.holds_capacity) return false;
+  switch (turn.job.settlement.state) {
+    case "failed":
+    case "cancelled":
+      return true;
+    case "unknown":
+    case "unsettled":
+    case "completed":
+      return false;
+  }
+}
 
 function* turnAttachments(turn: Turn): Iterable<string> {
   yield* turn.input.attachments;
@@ -215,7 +230,7 @@ type StreamEntry = {
   stop: () => void;
 };
 
-export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
+export class ConversationRuntimeClient extends RuntimeClientBase {
   private started = false;
   private disposed = false;
   private readonly lifetime = new AbortController();
@@ -248,7 +263,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   private conversationListLoaded = false;
   private unsubscribeConversations: (() => void) | null = null;
 
-  constructor(readonly control: HttpCanonicalControlClient) {
+  constructor(readonly api: ApiClient) {
     super();
   }
 
@@ -269,7 +284,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private startConversationSubscription() {
-    this.unsubscribeConversations = this.control.subscribeConversations(
+    this.unsubscribeConversations = this.api.subscribeConversations(
       (page) => {
         void this.applyConversations(page).catch((error) => {
           if (!this.conversationListLoaded) {
@@ -299,9 +314,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       });
   }
 
-  private async applyConversations(
-    page: Awaited<ReturnType<HttpCanonicalControlClient["readConversations"]>>,
-  ) {
+  private async applyConversations(page: Awaited<ReturnType<ApiClient["readConversations"]>>) {
     if (this.disposed) return;
     const updates: Promise<string>[] = [];
     const visible = new Set(page.conversations.map((item) => item.root_job));
@@ -385,7 +398,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   override async deleteSession(sessionId: string): Promise<void> {
     if (!sessionId.startsWith("draft-")) {
-      throw new Error("The 0.5 Control Plane does not provide conversation deletion.");
+      throw new Error("Persisted conversations cannot be deleted; hide the conversation instead.");
     }
     if (this.tips.has(sessionId) || this.sending.has(sessionId)) return;
     this.selections.delete(sessionId);
@@ -433,7 +446,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   async renameSession(sessionId: string, title: string): Promise<void> {
     const root = this.sessionRoot(sessionId);
     const trimmed = title.trim();
-    await this.control.editConversation(root, { title: trimmed }, this.lifetime.signal);
+    await this.api.editConversation(root, { title: trimmed }, this.lifetime.signal);
     const session = this.getSnapshot().sessions.find((s) => s.id === sessionId);
     if (session) {
       this.emit({ type: "conversation.session-updated", session: { ...session, title: trimmed } });
@@ -445,7 +458,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (this.hiding.has(sessionId)) throw new Error("This conversation is being hidden.");
     this.hiding.add(sessionId);
     try {
-      await this.control.editConversation(root, { hidden: true }, this.lifetime.signal);
+      await this.api.editConversation(root, { hidden: true }, this.lifetime.signal);
       this.hiddenRoots.add(root);
       this.selections.delete(sessionId);
       this.earlier.delete(sessionId);
@@ -479,7 +492,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     ) {
       throw new Error("Only PNG, JPEG, GIF and WebP attachments are supported by this host.");
     }
-    const attachment = await this.control.uploadAttachment(
+    const attachment = await this.api.uploadAttachment(
       { mime, data_base64: data, display_name: request.name },
       signal,
     );
@@ -487,7 +500,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       id: attachment.id,
       name: attachment.display_name ?? request.name,
       media_type: attachment.mime,
-      url: this.control.attachmentContentUrl(attachment.id),
+      url: this.api.attachmentContentUrl(attachment.id),
     };
   }
 
@@ -505,7 +518,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   async presentMutableJob(
     sessionId: string,
-    job: import("./control-client").MutableJob,
+    job: import("./api-client").MutableJob,
   ): Promise<void> {
     const session = this.getSnapshot().sessions.find((item) => item.id === sessionId);
     if (!session) throw new Error("Conversation presentation is no longer available.");
@@ -525,8 +538,8 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   }
 
   private async readConversation(job: string): Promise<string> {
-    const root = await this.control.resolveConversation(job, this.lifetime.signal);
-    const page = await this.control.readConversationTurns(
+    const root = await this.api.resolveConversation(job, this.lifetime.signal);
+    const page = await this.api.readConversationTurns(
       root,
       undefined,
       TURN_PAGE_SIZE,
@@ -637,9 +650,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         if (partial) {
           const held = partial.outputs;
           let before = held.firstSeq;
-          let loaded: ControlOutput[] = [];
+          let loaded: Output[] = [];
           while (true) {
-            const earlier = await readOutputWindow(this.control, partial.job.id, {
+            const earlier = await readOutputWindow(this.api, partial.job.id, {
               beforeSeq: before,
               signal: this.lifetime.signal,
             });
@@ -664,7 +677,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             partial.partialToolTimes = undefined;
             partial.partialToolBoundaries = undefined;
             const evidenceRevision = partial.evidenceRevision;
-            const evidence = await readTranscriptEvidence(this.control, partial.job.id, {
+            const evidence = await readTranscriptEvidence(this.api, partial.job.id, {
               signal: this.lifetime.signal,
             });
             if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
@@ -678,7 +691,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
               const firstSeq = partial.outputs.firstSeq;
               const times = new Map(partial.partialToolTimes);
               const boundaries = await readPartialToolBoundaries(
-                this.control,
+                this.api,
                 partial.job.id,
                 partial.tools,
                 partial.outputs,
@@ -701,7 +714,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           return;
         }
         if (!cursor) return;
-        const page = await this.control.readConversationTurns(
+        const page = await this.api.readConversationTurns(
           root,
           cursor,
           TURN_PAGE_SIZE,
@@ -737,7 +750,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
 
   private async readHistoryTurn(
     sessionId: string,
-    turn: ControlConversationTurn,
+    turn: ConversationTurn,
     isCurrent: () => boolean,
   ) {
     if (this.streams.has(turn.job.id) || !isCurrent()) return null;
@@ -746,14 +759,13 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const window =
       turn.outputs_truncated ||
       (turn.job.settlement.state === "unsettled" && (turn.outputs.at(-1)?.seq ?? 0) > 200)
-        ? (await readOutputWindow(this.control, turn.job.id, { signal: this.lifetime.signal }))
-            .outputs
+        ? (await readOutputWindow(this.api, turn.job.id, { signal: this.lifetime.signal })).outputs
         : turn.outputs.slice(-200);
     let outputs = mergeOutputHistory(window);
     if (previous?.outputs.length && window.length) {
       const last = previous.outputs.lastSeq;
       const gap = await readMissingOutputs(
-        this.control,
+        this.api,
         turn.job.id,
         last,
         window[0].seq - 1,
@@ -765,14 +777,16 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const needsDetails =
       turn.job.settlement.state === "unsettled" ||
       turn.job.settlement.state === "unknown" ||
+      turn.job.settlement.state === "failed" ||
+      turn.job.settlement.state === "cancelled" ||
       [...outputs].some((output) => output.code === "task_plan_scheduled");
     const details = needsDetails
-      ? await this.control.readJobDetails(turn.job.id, this.lifetime.signal)
+      ? await this.api.readJobDetails(turn.job.id, this.lifetime.signal)
       : undefined;
     const evidence =
       turn.native_decision || details?.mutable_phase === "queued"
         ? { tools: [], responses: [], error: undefined }
-        : await readTranscriptEvidence(this.control, turn.job.id, {
+        : await readTranscriptEvidence(this.api, turn.job.id, {
             signal: this.lifetime.signal,
             readReplies: complete,
           });
@@ -789,7 +803,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!complete && turn.job.settlement.state === "completed" && state.tools.length) {
       const times = new Map(previous?.partialToolTimes);
       state.partialToolBoundaries = await readPartialToolBoundaries(
-        this.control,
+        this.api,
         turn.job.id,
         state.tools,
         outputs,
@@ -909,12 +923,12 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       [...new Set(turnAttachments(turn))].map(async (id) => {
         const cached = this.images.get(id);
         if (cached) return cached;
-        const attachment = await this.control.readAttachment(id, this.lifetime.signal);
+        const attachment = await this.api.readAttachment(id, this.lifetime.signal);
         return {
           id,
           name: attachment.display_name ?? id,
           media_type: attachment.mime,
-          url: this.control.attachmentContentUrl(id),
+          url: this.api.attachmentContentUrl(id),
         };
       }),
     );
@@ -1006,7 +1020,11 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           intermediate: message.intermediate,
           activity: turn.details?.activity,
           taskPlan: turn.details?.task_plan,
-          execution: nativeExecutionStatus(turn.job.execution_phase, turn.details),
+          execution: nativeExecutionStatus(
+            turn.job.execution_phase,
+            turn.details,
+            turnCanRetry(turn),
+          ),
           createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
           ...(message.role === "user"
             ? { images: turn.input.attachments.flatMap((id) => this.images.get(id) ?? []) }
@@ -1121,18 +1139,21 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       if (inFlight || entry.stopped || this.disposed) return;
       inFlight = true;
       try {
-        const details = await this.control.readJobDetails(jobId, this.lifetime.signal);
+        const details = await this.api.readJobDetails(jobId, this.lifetime.signal);
         const readReplies = turn.outputs.firstSeq === 1;
         const evidenceRevision = turn.evidenceRevision;
-        const evidence = await readTranscriptEvidence(this.control, jobId, {
+        const evidence = await readTranscriptEvidence(this.api, jobId, {
           signal: this.lifetime.signal,
           previous: turn.responses,
-          settled: readReplies && details.settlement.state !== "unsettled",
+          settled:
+            readReplies &&
+            details.settlement.state !== "unsettled" &&
+            details.settlement.state !== "unknown",
           readReplies,
         });
         if (entry.stopped || this.disposed) return;
         if (turn.job.conversation) {
-          const page = await this.control.readConversationTurns(
+          const page = await this.api.readConversationTurns(
             turn.job.conversation,
             undefined,
             20,
@@ -1140,6 +1161,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           );
           const stored = page.turns.find((item) => item.job.id === jobId);
           if (stored) {
+            turn.content_kind = stored.content_kind;
             turn.entries = stored.entries;
             turn.compaction = stored.compaction;
             turn.input = stored.input;
@@ -1153,8 +1175,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         }
         if (entry.stopped || this.disposed) return;
         turn.job = reconcileJob(turn.job, details);
-        turn.details = details;
-        turn.unknownReason = details.unknown_reason;
+        if (turn.job === details) {
+          turn.details = details;
+          turn.unknownReason = details.unknown_reason;
+        }
         const last = turn.outputs.lastSeq;
         const through = Math.max(
           details.activity.last_output_seq,
@@ -1162,10 +1186,10 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           replayThrough,
         );
         if (through > last) {
-          let missing: ControlOutput[];
+          let missing: Output[];
           try {
             missing = await readMissingOutputs(
-              this.control,
+              this.api,
               jobId,
               last,
               through,
@@ -1200,7 +1224,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           const firstSeq = turn.outputs.firstSeq;
           const times = new Map(turn.partialToolTimes);
           const boundaries = await readPartialToolBoundaries(
-            this.control,
+            this.api,
             jobId,
             turn.tools,
             turn.outputs,
@@ -1223,7 +1247,9 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
           if (entry.stopped || this.disposed) return;
         }
         const active =
-          details.settlement.state === "unsettled" || taskPlanActive(details.task_plan);
+          turn.job.settlement.state === "unsettled" ||
+          turn.job.settlement.state === "unknown" ||
+          taskPlanActive(turn.details?.task_plan);
         if (needsReplay && active) {
           needsReplay = false;
           replayThrough = 0;
@@ -1259,7 +1285,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     };
     this.streams.set(jobId, entry);
     const connect = () => {
-      const subscription = this.control.subscribeJobEvents(
+      const subscription = this.api.subscribeJobEvents(
         jobId,
         (event) => {
           if (this.disposed || entry.stopped) return;
@@ -1274,11 +1300,12 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
             turn.outputRevision = (turn.outputRevision ?? 0) + 1;
           }
           if (event.type === "settlement") {
-            turn.job = {
+            turn.job = reconcileJob(turn.job, {
               ...turn.job,
+              event_seq: event.event_seq,
               settlement: event.settlement,
               stop_confirmed_at_us: event.stop_confirmed_at_us,
-            };
+            });
           }
           if (event.type === "stream_error")
             turn.error = `${event.error.code}: ${event.error.message}`;
@@ -1307,7 +1334,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       });
     };
     connect();
-    entry.unsubscribeCatalog = this.control.subscribeCatalog(scheduleCatalogTick, (error) => {
+    entry.unsubscribeCatalog = this.api.subscribeCatalog(scheduleCatalogTick, (error) => {
       if (this.disposed || entry.stopped) return;
       turn.error = `Catalog subscription unavailable: ${error instanceof Error ? error.message : String(error)}`;
       this.publish(turn.sessionId);
@@ -1319,14 +1346,14 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const previous = this.turns.get(job);
     const snapshot = previous ? { ...previous } : undefined;
     const [record, frozen, window] = await Promise.all([
-      this.control.readJob(job),
-      this.control.readJobInput(job),
-      readOutputWindow(this.control, job, { signal: this.lifetime.signal }),
+      this.api.readJobDetails(job),
+      this.api.readJobInput(job),
+      readOutputWindow(this.api, job, { signal: this.lifetime.signal }),
     ]);
     let outputs = mergeOutputHistory(window.outputs);
     if (previous?.outputs.length && window.outputs.length) {
       const gap = await readMissingOutputs(
-        this.control,
+        this.api,
         job,
         previous.outputs.lastSeq,
         window.outputs[0].seq - 1,
@@ -1335,7 +1362,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       outputs = mergeOutputHistory(previous.outputs, gap, window.outputs);
     }
     const page = record.conversation
-      ? await this.control.readConversationTurns(
+      ? await this.api.readConversationTurns(
           record.conversation,
           undefined,
           20,
@@ -1345,14 +1372,16 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     const stored = page?.turns.find((turn) => turn.job.id === job);
     const evidence = stored?.native_decision
       ? { tools: [], responses: [], error: undefined }
-      : await readTranscriptEvidence(this.control, job, {
+      : await readTranscriptEvidence(this.api, job, {
           signal: this.lifetime.signal,
           readReplies: outputs.firstSeq === 1,
         });
     const turn: Turn = {
+      content_kind: stored?.content_kind,
       compaction: stored?.compaction,
       entries: stored?.entries,
       native_decision: stored?.native_decision,
+      details: record,
       sessionId,
       job: record,
       input: stored?.input ?? frozen,
@@ -1366,7 +1395,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (outputs.firstSeq > 1 && record.settlement.state === "completed" && turn.tools.length) {
       const times = new Map(previous?.partialToolTimes);
       turn.partialToolBoundaries = await readPartialToolBoundaries(
-        this.control,
+        this.api,
         job,
         turn.tools,
         outputs,
@@ -1380,6 +1409,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!this.getSnapshot().sessions.some((s) => s.id === sessionId)) return;
     const current = this.turns.get(job);
     if (current && !this.historyTurnIsCurrent({ state: turn, previous, snapshot })) {
+      current.content_kind = turn.content_kind;
       current.entries = turn.entries;
       current.input = turn.input;
       current.compaction = turn.compaction;
@@ -1409,7 +1439,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
     if (!turn?.job.conversation || !entry)
       throw new Error("Queued message is no longer available.");
     try {
-      await this.control.amendQueuedMessage(
+      await this.api.amendQueuedMessage(
         turn.job.conversation,
         content === undefined
           ? { action: "withdraw", turn: turn.job.id, message: entry.seq }
@@ -1432,23 +1462,29 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       (message) => message.id === messageId,
     );
     const turn = message?.jobId ? this.turns.get(message.jobId) : undefined;
-    if (turn?.details?.mutable_phase !== undefined)
-      throw new Error("Retry is not available for native Jobs; submit a new message instead.");
     if (
       !turn ||
       !turn.job.conversation ||
-      !["failed", "unknown", "cancelled"].includes(turn.job.settlement.state) ||
+      !["failed", "cancelled"].includes(turn.job.settlement.state) ||
       this.tips.get(sessionId) !== turn.job.id
     )
-      throw new Error("Only the latest failed, unknown or cancelled turn can be retried.");
+      throw new Error("Only the latest failed or cancelled turn can be retried.");
     if (this.hiding.has(sessionId) || this.sending.has(sessionId))
       throw new Error("Wait for this conversation's current action to finish.");
     const session = this.getSnapshot().sessions.find((session) => session.id === sessionId);
     if (!session) throw new Error("Conversation presentation is no longer available.");
     this.sending.add(sessionId);
     try {
-      const result = await this.control.retryConversation(
-        turn.job.conversation,
+      const latest = await this.api.readJobDetails(turn.job.id, this.lifetime.signal);
+      turn.job = reconcileJob(turn.job, latest);
+      if (turn.job !== latest)
+        throw new Error("The Job changed while reading its status; reload before retrying.");
+      turn.details = latest;
+      const conversation = turn.job.conversation;
+      if (!conversation || !turnCanRetry(turn) || this.tips.get(sessionId) !== turn.job.id)
+        throw new Error("Only the latest stopped Generative Job can be retried as a new Job.");
+      const result = await this.api.retryConversation(
+        conversation,
         turn.job.id,
         this.lifetime.signal,
       );
@@ -1476,7 +1512,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
         throw new Error("This Job's Composer context is unavailable; the stop was not sent.");
       this.stopping.add(sessionId);
       try {
-        const stop = await this.control.stopNativeJob(context, job, this.lifetime.signal);
+        const stop = await this.api.stopNativeJob(context, job, this.lifetime.signal);
         this.stopAccepted.add(job);
         const turn = this.turns.get(job);
         if (turn) {
@@ -1493,7 +1529,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
       }
       return;
     }
-    const result = await this.control.stopConversation(
+    const result = await this.api.stopConversation(
       this.turns.get(job)?.job.conversation ?? job,
       this.lifetime.signal,
     );
@@ -1510,7 +1546,7 @@ export class CanonicalOcgRuntimeClient extends RuntimeClientBase {
   override dispose() {
     this.disposed = true;
     this.lifetime.abort();
-    this.control.close();
+    this.api.close();
     if (this.unsubscribeConversations) {
       this.unsubscribeConversations();
       this.unsubscribeConversations = null;

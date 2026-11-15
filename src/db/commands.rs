@@ -7,12 +7,12 @@ pub(super) enum Message {
     Shutdown,
 }
 
-pub(super) enum Control {
+pub(super) enum Maintenance {
     FilesystemFailure { reason: ProtectionReason },
     CompactStorage(flume::Sender<Result<CompactionOutcome, MaintenanceError>>),
 }
 
-impl Control {
+impl Maintenance {
     pub(super) fn refuse_policy(self, stopped: bool) {
         match self {
             Self::FilesystemFailure { .. } => {}
@@ -256,7 +256,6 @@ pub(super) fn config_bytes(config: &Config) -> u64 {
         ConfigBody::Model(model) => byte_count(model.model.len()),
         ConfigBody::Connection(connection) => text_bytes(connection.endpoint.as_deref())
             .saturating_add(text_bytes(connection.credential_ref.as_deref())),
-        ConfigBody::Pool(_) => 32,
         ConfigBody::DecisionModel(dm) => byte_count(dm.model.len())
             .saturating_add(2048)
             .saturating_add(16)

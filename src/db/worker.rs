@@ -113,7 +113,7 @@ pub struct DatabaseWorker {
 pub struct DatabaseHandle {
     pub(super) sender: flume::Sender<Message>,
     pub(super) read_sender: flume::Sender<ReadMessage>,
-    pub(super) control_sender: flume::Sender<Control>,
+    pub(super) maintenance_sender: flume::Sender<Maintenance>,
     pub(super) shared: Arc<Shared>,
 }
 
@@ -150,7 +150,7 @@ impl DatabaseWorker {
         let data_directory = data_directory.clone();
         let paths = monitor::protected_paths(&data_directory);
         let (sender, receiver) = flume::bounded(COMMAND_QUEUE_CAPACITY);
-        let (control_sender, control) = flume::bounded(CONTROL_QUEUE_CAPACITY);
+        let (maintenance_sender, maintenance) = flume::bounded(MAINTENANCE_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = flume::bounded(1);
         let (scheduler_wake, scheduler_subscription) = SchedulerWake::new();
         let thread = std::thread::Builder::new()
@@ -171,19 +171,13 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
-                let OpenedFile {
-                    database,
-                    epoch,
-                    genesis,
-                    abandoned,
-                } = match redb::open(&directory) {
+                let OpenedFile { database, epoch } = match redb::open(&directory) {
                     Ok(opened) => opened,
                     Err(error) => {
                         ready_sender.send(Err(DatabaseError::Open(error))).ok();
                         return Ok(());
                     }
                 };
-                let abandoned_at_open = abandoned;
                 let next_operation = 1;
                 let attachments = match AttachmentStore::open(&attachment_directory)
                     .and_then(|store| store.remove_staging_files().map(|_| store))
@@ -252,13 +246,11 @@ impl DatabaseWorker {
                     update_paused: AtomicBool::new(false),
                     database: RwLock::new(Some(Opened { database, epoch })),
                     staging: RwLock::new(()),
-                    genesis,
                     epoch: AtomicU64::new(epoch),
                     next_operation: AtomicU64::new(next_operation),
                     durable_commits: AtomicU64::new(0),
                     commit_us_total: AtomicU64::new(0),
                     commit_us_max: AtomicU64::new(0),
-                    abandoned_at_open,
                     released: AtomicBool::new(false),
                     live_readers: AtomicUsize::new(0),
                     reads_stopped: RwLock::new(false),
@@ -279,12 +271,12 @@ impl DatabaseWorker {
                 let _release = ReleaseOnPanic {
                     shared: shared.clone(),
                     receiver: receiver.clone(),
-                    control: control.clone(),
+                    maintenance: maintenance.clone(),
                 };
                 let mut worker = WriteWorker {
                     shared: shared.clone(),
                     receiver,
-                    control,
+                    maintenance,
                     directory,
                     paths,
                     config,
@@ -295,9 +287,6 @@ impl DatabaseWorker {
                     shutdown_requested: false,
                 };
                 worker.check_all_paths();
-                if !worker.shared.abandoned_at_open.is_empty() {
-                    worker.publish_scheduling_change(true, true);
-                }
                 if ready_sender.send(Ok(shared)).is_ok() {
                     worker.serve();
                 }
@@ -321,7 +310,7 @@ impl DatabaseWorker {
             handle: DatabaseHandle {
                 sender,
                 read_sender,
-                control_sender,
+                maintenance_sender,
                 shared,
             },
             thread,
@@ -444,7 +433,7 @@ pub(super) fn space_shortfalls(
 pub(super) struct WriteWorker {
     pub(super) shared: Arc<Shared>,
     pub(super) receiver: flume::Receiver<Message>,
-    pub(super) control: flume::Receiver<Control>,
+    pub(super) maintenance: flume::Receiver<Maintenance>,
     pub(super) directory: PathBuf,
     pub(super) paths: [(ProtectedArea, PathBuf); 3],
     pub(super) config: FilesystemConfig,
@@ -461,7 +450,7 @@ pub(super) enum SpaceRefusal {
 }
 
 pub(super) enum Event {
-    Control(Result<Control, flume::RecvError>),
+    Maintenance(Result<Maintenance, flume::RecvError>),
     Message(Result<Message, flume::RecvError>),
     CheckDue,
 }
@@ -479,31 +468,31 @@ impl WriteWorker {
                 self.check_all_paths();
                 continue;
             }
-            if let Ok(control) = self.control.try_recv() {
-                self.handle(control);
+            if let Ok(maintenance) = self.maintenance.try_recv() {
+                self.handle(maintenance);
                 continue;
             }
             let selector = flume::Selector::new()
-                .recv(&self.control, Event::Control)
+                .recv(&self.maintenance, Event::Maintenance)
                 .recv(&self.receiver, Event::Message);
             let event = match self.next_check {
                 Some(due) => selector.wait_deadline(due).unwrap_or(Event::CheckDue),
                 None => selector.wait(),
             };
             match event {
-                Event::Control(Ok(control)) => self.handle(control),
+                Event::Maintenance(Ok(maintenance)) => self.handle(maintenance),
                 Event::Message(Ok(Message::Run(envelope))) => self.execute_group(*envelope),
                 Event::CheckDue => {}
                 Event::Message(Ok(Message::Shutdown))
                 | Event::Message(Err(_))
-                | Event::Control(Err(_)) => return,
+                | Event::Maintenance(Err(_)) => return,
             }
         }
     }
 
-    pub(super) fn handle(&mut self, control: Control) {
-        match control {
-            Control::FilesystemFailure { reason } => {
+    pub(super) fn handle(&mut self, maintenance: Maintenance) {
+        match maintenance {
+            Maintenance::FilesystemFailure { reason } => {
                 let active = matches!(
                     self.shared.admission(),
                     Admission::Open | Admission::Protected(_)
@@ -512,7 +501,7 @@ impl WriteWorker {
                     self.activate(vec![reason]);
                 }
             }
-            Control::CompactStorage(reply) => {
+            Maintenance::CompactStorage(reply) => {
                 let result = self.compact_storage();
                 send_reply(&reply, result);
             }
@@ -996,21 +985,8 @@ impl WriteWorker {
 
     pub(super) fn reopen(&mut self) -> Result<u64, RecoveryError> {
         self.shared.release_database();
-        let OpenedFile {
-            database,
-            epoch,
-            genesis,
-            ..
-        } = redb::open(&self.directory)
+        let OpenedFile { database, epoch } = redb::open(&self.directory)
             .map_err(|error| RecoveryError::Reopen(ReopenFailure::Storage(error)))?;
-        if genesis != self.shared.genesis {
-            return Err(RecoveryError::Reopen(ReopenFailure::Storage(
-                StorageError::corrupted(format!(
-                    "the reopened database names {genesis} as its Genesis Job, not {}",
-                    self.shared.genesis
-                )),
-            )));
-        }
         let native_resources = redb::read_native_resource_catalog(&database)
             .map_err(|error| RecoveryError::Reopen(ReopenFailure::Storage(error)))?;
         *self
@@ -1108,8 +1084,8 @@ impl WriteWorker {
         self.shared
             .recovery
             .complete(Err(RecoveryError::ShuttingDown));
-        for control in self.control.drain() {
-            control.refuse_policy(false);
+        for maintenance in self.maintenance.drain() {
+            maintenance.refuse_policy(false);
         }
         self.shared.protection.close();
         match self.storage_failure {

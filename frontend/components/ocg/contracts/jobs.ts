@@ -1,36 +1,45 @@
 import type * as Api from "./api";
 import { ContractError } from "./decode";
 
-export type ControlJob = Api.Job;
-export type ControlExecutionPhase = Api.ExecutionPhase;
-export type ControlOutput = Api.Output;
-export type ControlJobDetails = Api.Job &
+export type Job = Api.Job;
+export type ExecutionPhase = Api.ExecutionPhase;
+export type ExecutionHistory = Api.ExecutionHistory;
+export type ExecutionHistoryEvent = Api.ExecutionHistoryEvent;
+export type ExecutionState = Api.ExecutionState;
+export type Output = Api.Output;
+export type JobDetails = Api.Job &
   Pick<Api.JobDetails, "result" | "unknown_reason" | "activity" | "task_plan" | "allocation"> & {
     mutable_phase?: string;
     context?: string;
   };
-export type ControlJobActivity = ControlJobDetails["activity"];
-export type ControlTaskPlan = NonNullable<ControlJobDetails["task_plan"]>;
-export type ControlJobToolsPage = Api.Tools;
-export type ControlProviderResponse = Omit<Api.ProviderResponse, "text_offset" | "text_complete">;
-export type ControlAttachment = Omit<Api.Attachment, "created_at_us"> & {
+export type JobActivity = JobDetails["activity"];
+export type TaskPlan = NonNullable<JobDetails["task_plan"]>;
+export type JobToolsPage = Api.Tools;
+export type ProviderResponse = Omit<Api.ProviderResponse, "text_offset" | "text_complete">;
+export type Attachment = Omit<Api.Attachment, "created_at_us"> & {
   created_at_us: number | null;
   data_url: string | undefined;
 };
-export type ControlJobEvent =
+export type JobEvent =
   | ({ type: "job" } & Api.JobEvent)
   | ({ type: "output" } & Api.OutputEvent)
   | ({ type: "settlement" } & Api.SettlementEvent)
   | ({ type: "stream_error" } & Api.ErrorResponse);
 
-export function projectJobEvent(name: string, input: unknown): ControlJobEvent {
+export function projectJobEvent(name: string, input: unknown): JobEvent {
   switch (name) {
-    case "job":
-      return { ...(input as Api.JobEvent), type: "job" };
+    case "job": {
+      const event = input as Api.JobEvent;
+      executionSequence(event.job?.event_seq);
+      return { ...event, type: "job" };
+    }
     case "output":
       return { ...(input as Api.OutputEvent), type: "output" };
-    case "settlement":
-      return { ...(input as Api.SettlementEvent), type: "settlement" };
+    case "settlement": {
+      const event = input as Api.SettlementEvent;
+      executionSequence(event.event_seq);
+      return { ...event, type: "settlement" };
+    }
     case "stream_error":
       return { ...(input as Api.ErrorResponse), type: "stream_error" };
     default:
@@ -39,10 +48,22 @@ export function projectJobEvent(name: string, input: unknown): ControlJobEvent {
 }
 
 export function projectJob(input: Api.JobDetails) {
+  executionSequence(input.job?.event_seq);
   return { ...input.job, unknown_reason: input.unknown_reason ?? null };
 }
 
-export function projectJobDetails(input: Api.JobDetails): ControlJobDetails {
+export function executionSequence(input: unknown): string {
+  if (
+    typeof input !== "string" ||
+    !/^(0|[1-9][0-9]*)$/.test(input) ||
+    input.length > 20 ||
+    (input.length === 20 && input > "18446744073709551615")
+  )
+    throw new ContractError("event_seq", "an unsigned 64-bit decimal string without leading zeros");
+  return input;
+}
+
+export function projectJobDetails(input: Api.JobDetails): JobDetails {
   return {
     ...projectJob(input),
     result: input.result,
@@ -54,18 +75,18 @@ export function projectJobDetails(input: Api.JobDetails): ControlJobDetails {
   };
 }
 
-export type ControlNativeStopRequest = "ended_before_start" | "requested" | "already_requested";
+export type NativeStopRequest = "ended_before_start" | "requested" | "already_requested";
 
-export type ControlNativeStop = {
+export type NativeStop = {
   job: string;
-  request: ControlNativeStopRequest;
+  request: NativeStopRequest;
   stopped: boolean;
   execution_phase: "cancelled" | "stop_requested";
 };
 
 const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-export function projectNativeStop(status: number, input: unknown): ControlNativeStop {
+export function projectNativeStop(status: number, input: unknown): NativeStop {
   const body = input as {
     api_version?: number;
     stop?: {

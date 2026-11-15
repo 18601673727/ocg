@@ -379,7 +379,17 @@ fn classify_unstarted(error: DatabaseError) -> DevelopmentHandoffError {
         {
             Some(entities::UnstartedCause::FrozenSecretUnavailable)
         }
+        DatabaseError::Rejected(Violation::InvalidValue(
+            "handoff",
+            "execution snapshot changed",
+        )) => Some(entities::UnstartedCause::ExecutorUnavailable),
         DatabaseError::Rejected(_) => Some(entities::UnstartedCause::StartRefused),
+        DatabaseError::Read(storage)
+            if storage.kind == StorageErrorKind::Other
+                && storage.detail == "Pool or Executor configuration changed" =>
+        {
+            Some(entities::UnstartedCause::ExecutorUnavailable)
+        }
         DatabaseError::Read(storage)
             if storage.kind == StorageErrorKind::Other && storage.os_error.is_none() =>
         {
@@ -783,6 +793,10 @@ fn process_memory() -> (Option<u64>, Option<u64>) {
 }
 
 impl DatabaseHandle {
+    pub(crate) fn wake_scheduler(&self) {
+        self.shared.scheduler_wake.publish(false, true);
+    }
+
     async fn attachment_permit(&self) -> Result<AttachmentPermit, DatabaseError> {
         self.shared
             .attachment_slots
@@ -957,10 +971,10 @@ impl DatabaseHandle {
             *admission = Admission::Protected(lock);
         }
         if let Err(error) = self
-            .control_sender
-            .try_send(Control::FilesystemFailure { reason })
+            .maintenance_sender
+            .try_send(Maintenance::FilesystemFailure { reason })
         {
-            log::debug!("failed to enqueue filesystem protection control notice: {error}");
+            log::debug!("failed to enqueue filesystem protection maintenance notice: {error}");
         }
         true
     }
@@ -1140,10 +1154,6 @@ impl DatabaseHandle {
             .map_err(|_| DatabaseError::ReadInterrupted)?
     }
 
-    pub fn abandoned_at_open(&self) -> &[JobId] {
-        &self.shared.abandoned_at_open
-    }
-
     pub fn reclaimed_at_open(&self) -> &[(ContentDigest, Result<Reclamation, StoreError>)] {
         &self.shared.reclaimed_at_open
     }
@@ -1184,10 +1194,10 @@ impl DatabaseHandle {
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
             admission.check_maintenance()?;
-            self.control_sender
-                .try_send(Control::CompactStorage(reply))
+            self.maintenance_sender
+                .try_send(Maintenance::CompactStorage(reply))
                 .map_err(|error| match error {
-                    flume::TrySendError::Full(_) => MaintenanceError::ControlQueueFull,
+                    flume::TrySendError::Full(_) => MaintenanceError::MaintenanceQueueFull,
                     flume::TrySendError::Disconnected(_) => MaintenanceError::WorkerStopped,
                 })?;
         }
@@ -1197,8 +1207,8 @@ impl DatabaseHandle {
             .unwrap_or(Err(MaintenanceError::WorkerStopped))
     }
 
-    pub fn genesis(&self) -> JobId {
-        self.shared.genesis
+    pub(crate) async fn check_readable(&self) -> Result<(), DatabaseError> {
+        self.read(redb::check_readable).await
     }
 
     pub async fn conversation_children(
@@ -1240,16 +1250,6 @@ impl DatabaseHandle {
         self.read(move |database| redb::read_mutable_job_details(database, job, context))
             .await
     }
-    pub async fn notices(
-        &self,
-        conversation: JobId,
-        after: u32,
-        limit: usize,
-    ) -> Result<Vec<(u32, crate::db::entities::Notice)>, DatabaseError> {
-        self.read(move |database| redb::read_notices(database, conversation, after, limit))
-            .await
-    }
-
     pub async fn job(&self, job: JobId) -> Result<Option<JobRecord>, DatabaseError> {
         self.read(move |database| redb::read_job(database, job))
             .await
@@ -1319,22 +1319,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn job_configuration(
-        &self,
-        job: JobId,
-    ) -> Result<Option<entities::SubmittedConfiguration>, DatabaseError> {
-        self.read(move |database| redb::read_job_configuration(database, job))
-            .await
-    }
-
-    pub async fn decision_work(
-        &self,
-        job: JobId,
-    ) -> Result<Option<entities::DecisionWork>, DatabaseError> {
-        self.read(move |database| redb::read_decision_work(database, job))
-            .await
-    }
-
     pub async fn retries(
         &self,
         original: JobId,
@@ -1360,14 +1344,6 @@ impl DatabaseHandle {
         job: JobId,
     ) -> Result<Option<JobOutputRecord>, DatabaseError> {
         self.read(move |database| redb::read_latest_output(database, job))
-            .await
-    }
-
-    pub async fn job_input(
-        &self,
-        id: JobInputId,
-    ) -> Result<Option<entities::JobInputRecord>, DatabaseError> {
-        self.read(move |database| redb::read_job_input(database, id))
             .await
     }
 
@@ -2997,7 +2973,6 @@ impl DatabaseHandle {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_decision(
         &self,
-        parent: Option<JobId>,
         spec: JobGroup,
         first: Entry,
         configuration: ExecutionConfiguration,
@@ -3006,12 +2981,11 @@ impl DatabaseHandle {
     ) -> Result<(JobId, Appended), DatabaseError> {
         let capabilities = self.shared.native_resources.clone();
         self.write_sized(
-            (parent, spec, first, configuration, request, submission),
-            |(_, _, first, _, request, _)| debug_bytes(first).saturating_add(debug_bytes(request)),
+            (spec, first, configuration, request, submission),
+            |(_, first, _, request, _)| debug_bytes(first).saturating_add(debug_bytes(request)),
             OperationKind::Open,
-            move |batch, (parent, spec, _first, configuration, request, submission)| {
+            move |batch, (spec, _first, configuration, request, submission)| {
                 batch.submit_native_decision(
-                    parent,
                     spec,
                     configuration,
                     request,
@@ -3688,5 +3662,28 @@ impl DatabaseHandle {
             |batch, limit| batch.claim_due_recurrences(limit),
         )
         .await
+    }
+
+    pub(crate) async fn execution_history(
+        &self,
+        job: entities::JobId,
+        after: Option<u64>,
+        limit: usize,
+        context: Option<entities::ComposerContextId>,
+    ) -> Result<Option<redb::ExecutionHistoryPage>, DatabaseError> {
+        self.read(move |database| {
+            redb::read_execution_history(database, job, after, limit, context)
+        })
+        .await
+    }
+
+    pub(crate) async fn execution_snapshot(
+        &self,
+        job: entities::JobId,
+        at_seq: Option<u64>,
+        context: Option<entities::ComposerContextId>,
+    ) -> Result<Option<entities::ExecutionSnapshot>, DatabaseError> {
+        self.read(move |database| redb::read_execution_snapshot(database, job, at_seq, context))
+            .await
     }
 }

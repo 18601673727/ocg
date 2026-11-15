@@ -316,7 +316,7 @@ pub(crate) fn update_project(
     record.commands = commands;
     record.updated_at = batch.now();
     batch.insert_project(&record)?;
-    batch.resume_user_command_grants(&record)
+    Ok(())
 }
 
 pub(crate) fn configure_project_decision(
@@ -359,20 +359,15 @@ pub(crate) fn configure_project_decision(
 }
 
 fn require_conversation(batch: &mut Batch, id: JobId) -> OpResult<()> {
-    let row = match batch.job(id)? {
-        Some(row) => row,
-        None => return batch.reject(Violation::NotFound(RecordRef::Job(id))),
-    };
-    if row.kind.is_group() {
-        Ok(())
-    } else {
-        batch.reject(Violation::NotFound(RecordRef::Job(id)))
+    match batch.job(id)? {
+        Some(_) => Ok(()),
+        None => batch.reject(Violation::NotFound(RecordRef::Job(id))),
     }
 }
 
 pub(crate) fn set_conversation(batch: &mut Batch, root: JobId, edit: JobEdit) -> OpResult<()> {
     require_conversation(batch, root)?;
-    let mut row = batch.job_control(root)?;
+    let mut row = batch.job_lifecycle(root)?;
     match edit {
         JobEdit::Limits(limits) => {
             return batch.set_job_limits(root, limits, Actor::User);
@@ -401,5 +396,5 @@ pub(crate) fn set_conversation(batch: &mut Batch, root: JobId, edit: JobEdit) ->
         JobEdit::Hide if row.hidden_at.is_some() => return Ok(()),
         JobEdit::Hide => row.hidden_at = Some(batch.now()),
     }
-    batch.put_job_control(root, &row)
+    batch.put_job_lifecycle(root, &row)
 }

@@ -14,14 +14,14 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { useI18n, type I18nKey } from "../i18n";
-import type { ControlProjectCommand } from "../runtime/control-client";
+import type { ProjectCommand } from "../runtime/api-client";
 import { nextCommandDraftId, toProjectCommands, type CommandDraft } from "./command-drafts";
 
 type CommandGroup = {
   id: string;
   title: I18nKey;
   description: I18nKey;
-  commands: ControlProjectCommand[];
+  commands: ProjectCommand[];
 };
 
 const COMMAND_GROUPS: CommandGroup[] = [
@@ -68,7 +68,7 @@ const COMMAND_GROUPS: CommandGroup[] = [
   },
 ];
 
-function hasPreset(commands: readonly CommandDraft[], preset: ControlProjectCommand) {
+function hasPreset(commands: readonly CommandDraft[], preset: ProjectCommand) {
   return toProjectCommands(commands).some(
     (command) =>
       command.status !== "blocked" &&

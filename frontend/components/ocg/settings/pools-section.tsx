@@ -6,21 +6,18 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Pill } from "@/components/ocg/primitives";
-import type { ControlPool } from "@/components/ocg/contracts";
+import type { Pool } from "@/components/ocg/contracts";
 import {
   configurationIdentity,
-  ControlTransportError,
+  ApiError,
   isExecutorConflict,
   type NativeAllocation,
   type NativeAllocationPhase,
   type NativeExecutor,
   type NativeExecutorChange,
   type NativePoolAllocations,
-} from "@/components/ocg/runtime/control-client";
-import type {
-  ControlPoolUpdate,
-  HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/control-client";
+} from "@/components/ocg/runtime/api-client";
+import type { PoolUpdate, ApiClient } from "@/components/ocg/runtime/api-client";
 import { Section, describeError, refusalText } from "./settings-parts";
 import { useI18n, type I18nKey } from "../i18n";
 
@@ -106,12 +103,12 @@ const NOT_COMMITTED_CODES: ReadonlySet<string> = new Set([
 ]);
 
 function outcomeUnconfirmed(error: unknown): boolean {
-  return !(error instanceof ControlTransportError && NOT_COMMITTED_CODES.has(error.code));
+  return !(error instanceof ApiError && NOT_COMMITTED_CODES.has(error.code));
 }
 
 function poolUpdateStale(error: unknown): RowStale | null {
   if (
-    error instanceof ControlTransportError &&
+    error instanceof ApiError &&
     (error.code === "pool_revision_conflict" || error.code === "pool_not_found")
   )
     return "changed";
@@ -153,7 +150,7 @@ const ARCHIVE_STALE_CODES: ReadonlySet<string> = new Set([
 function executorUpdateStale(error: unknown): RowStale | null {
   if (
     isExecutorConflict(error) ||
-    (error instanceof ControlTransportError && error.code === "executor_not_found")
+    (error instanceof ApiError && error.code === "executor_not_found")
   )
     return "changed";
   return outcomeUnconfirmed(error) ? "updateUnconfirmed" : null;
@@ -237,7 +234,7 @@ function ExecutorRow({
   onReload,
 }: {
   executor: NativeExecutor;
-  pool: ControlPool | undefined;
+  pool: Pool | undefined;
   busy: boolean;
   stale: RowStale | undefined;
   onUpdate: (executor: NativeExecutor, change: NativeExecutorChange) => Promise<boolean>;
@@ -483,9 +480,9 @@ function PoolRow({
   reloading,
   onReload,
 }: {
-  pool: ControlPool;
-  onUpdate: (pool: ControlPool, update: ControlPoolUpdate) => Promise<void>;
-  onArchive: ((pool: ControlPool) => Promise<ArchiveOutcome>) | undefined;
+  pool: Pool;
+  onUpdate: (pool: Pool, update: PoolUpdate) => Promise<void>;
+  onArchive: ((pool: Pool) => Promise<ArchiveOutcome>) | undefined;
   disabled: boolean;
   stale: RowStale | undefined;
   reloading: boolean;
@@ -679,13 +676,7 @@ function PoolRow({
   );
 }
 
-function PoolAllocations({
-  client,
-  pool,
-}: {
-  client: HttpCanonicalControlClient;
-  pool: ControlPool;
-}) {
+function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
   const { t } = useI18n();
   const [expanded, setExpanded] = useState(false);
   const [snapshot, setSnapshot] = useState<NativePoolAllocations | null>(null);
@@ -889,9 +880,9 @@ function PoolAllocations({
   );
 }
 
-export function PoolsSection({ client }: { client: HttpCanonicalControlClient }) {
+export function PoolsSection({ client }: { client: ApiClient }) {
   const { t } = useI18n();
-  const [pools, setPools] = useState<ControlPool[]>([]);
+  const [pools, setPools] = useState<Pool[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [updatingPoolId, setUpdatingPoolId] = useState<string | null>(null);
@@ -1107,7 +1098,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
         setActionError(t("settings.pools.refusal.executorArchiveUnconfirmed"));
         return { kind: "unconfirmed" };
       }
-      if (error instanceof ControlTransportError && ARCHIVE_STALE_CODES.has(error.code))
+      if (error instanceof ApiError && ARCHIVE_STALE_CODES.has(error.code))
         executorStale.mark(executor.id, "changed");
       return { kind: "refused", text: refusalText(t, error, EXECUTOR_REFUSALS) };
     } finally {
@@ -1124,7 +1115,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     void loadPools(cursor, history, controller.signal);
   }
 
-  async function handlePoolArchive(pool: ControlPool): Promise<ArchiveOutcome> {
+  async function handlePoolArchive(pool: Pool): Promise<ArchiveOutcome> {
     if (poolStale.has(pool.id)) return { kind: "unconfirmed" };
     if (archivedPools.current.has(pool.id)) return { kind: "archived" };
     if (poolMutating.current) return { kind: "refused", text: t("settings.pools.poolBusy") };
@@ -1144,7 +1135,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
         return { kind: "unconfirmed" };
       }
       const text = refusalText(t, error, POOL_ARCHIVE_REFUSALS);
-      if (error instanceof ControlTransportError && POOL_ARCHIVE_STALE_CODES.has(error.code)) {
+      if (error instanceof ApiError && POOL_ARCHIVE_STALE_CODES.has(error.code)) {
         poolStale.mark(pool.id, "changed");
         navigate(before, previous);
         setActionError(text);
@@ -1156,7 +1147,7 @@ export function PoolsSection({ client }: { client: HttpCanonicalControlClient })
     }
   }
 
-  async function handleUpdate(pool: ControlPool, update: ControlPoolUpdate) {
+  async function handleUpdate(pool: Pool, update: PoolUpdate) {
     if (poolStale.has(pool.id) || archivedPools.current.has(pool.id) || poolMutating.current)
       return;
     poolMutating.current = true;

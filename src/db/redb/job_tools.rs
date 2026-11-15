@@ -34,7 +34,7 @@ impl Batch {
             Some(id) => Ok(id),
             None => self.reject(Violation::InvalidValue(
                 "invalid_target",
-                "expected a canonical UUID",
+                "expected a lowercase hyphenated UUID",
             )),
         }
     }
@@ -162,7 +162,7 @@ impl Batch {
 
     fn require_open_conversation(&mut self, conversation: JobId) -> Result<(), BatchError> {
         self.require_mutable_conversation(conversation)?;
-        if self.job_control(conversation)?.closing.is_some() {
+        if self.job_lifecycle(conversation)?.closing.is_some() {
             return self.reject(Violation::InvalidValue(
                 "conversation_closing",
                 "the conversation no longer accepts messages",
@@ -308,10 +308,7 @@ impl Batch {
             ));
         }
         let spec = self.require_mutable_conversation(conversation)?;
-        if let JobKind::Group {
-            origin: Origin::Agent { call: opened },
-            ..
-        } = spec.kind
+        if let Origin::Agent { call: opened } = spec.origin
             && self
                 .tool_evidence(opened)?
                 .is_some_and(|opening| opening.name == "job_plan")
@@ -329,12 +326,7 @@ impl Batch {
             })));
         }
         let (configuration, priority) = self.conversation_configuration(conversation)?;
-        let (agent, project) = match spec.kind {
-            JobKind::Group { agent, project, .. } => (agent, project),
-            JobKind::Execution { .. } => {
-                return self.corrupted("a conversation is not a group".into());
-            }
-        };
+        let (agent, project) = (spec.agent, spec.project);
         let agent = agent.or_else(|| {
             configuration
                 .agent_profile
@@ -357,9 +349,9 @@ impl Batch {
             }
             let child =
                 self.open_child_conversation(conversation, call, agent, project, false, after)?;
-            let mut control = self.job_control(child)?;
-            control.title = Some(step.title);
-            self.put_job_control(child, &control)?;
+            let mut lifecycle = self.job_lifecycle(child)?;
+            lifecycle.title = Some(step.title);
+            self.put_job_lifecycle(child, &lifecycle)?;
             let n = u32::try_from(index).unwrap_or(u32::MAX);
             let turn = self.host_turn(
                 child,
@@ -504,15 +496,10 @@ impl Batch {
         for dependency in depends_on {
             let id = JobId::new(self.job_tool_id(&dependency.conversation)?);
             let row = self.require_mutable_conversation(id)?;
-            if !matches!(
-                row.kind,
-                JobKind::Group {
-                    keep_open: false,
-                    ..
-                }
-            ) || row.is_chunk_group()
+            if row.keep_open
+                || row.is_chunk_group()
                 || row.parent_id != Some(conversation)
-                || self.job_control(id)?.user_input
+                || self.job_lifecycle(id)?.user_input
             {
                 return self.reject(Violation::InvalidValue(
                     "depends_on",
@@ -688,8 +675,7 @@ impl Batch {
                         }),
                         ConfigBody::Agent(_)
                         | ConfigBody::DecisionAgent(_)
-                        | ConfigBody::Connection(_)
-                        | ConfigBody::Pool(_) => {
+                        | ConfigBody::Connection(_) => {
                             return self.corrupted("invalid Agent model target".into());
                         }
                     }
@@ -732,14 +718,11 @@ impl Batch {
         let mut workers = Vec::new();
         for worker in ids.into_iter().take(limit) {
             let row = self.require_mutable_conversation(worker)?;
-            let JobKind::Group { agent, project, .. } = row.kind else {
-                return self.corrupted("child is not a conversation".into());
-            };
             workers.push(json!({
                 "conversation": worker.to_string(),
-                "agent": agent.map(|id| ProfileId::new(id.get()).to_string()),
-                "project": project.map(|id| id.to_string()),
-                "title": self.job_control(worker)?.title,
+                "agent": row.agent.map(|id| ProfileId::new(id.get()).to_string()),
+                "project": row.project.map(|id| id.to_string()),
+                "title": self.job_lifecycle(worker)?.title,
                 "idle": self.idle_worker(caller, worker)?,
             }));
         }

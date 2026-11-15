@@ -66,13 +66,11 @@ pub(super) struct Shared {
     pub(super) update_paused: AtomicBool,
     pub(super) database: RwLock<Option<Opened>>,
     pub(super) staging: RwLock<()>,
-    pub(super) genesis: JobId,
     pub(super) epoch: AtomicU64,
     pub(super) next_operation: AtomicU64,
     pub(super) durable_commits: AtomicU64,
     pub(super) commit_us_total: AtomicU64,
     pub(super) commit_us_max: AtomicU64,
-    pub(super) abandoned_at_open: Vec<JobId>,
     pub(super) released: AtomicBool,
     pub(super) live_readers: AtomicUsize,
     pub(super) reads_stopped: RwLock<bool>,
@@ -183,7 +181,7 @@ impl Drop for StagingBarrier<'_> {
 pub(super) struct ReleaseOnPanic {
     pub(super) shared: Arc<Shared>,
     pub(super) receiver: flume::Receiver<Message>,
-    pub(super) control: flume::Receiver<Control>,
+    pub(super) maintenance: flume::Receiver<Maintenance>,
 }
 
 impl Drop for ReleaseOnPanic {
@@ -207,8 +205,8 @@ impl Drop for ReleaseOnPanic {
                 }
             }
             self.shared.recovery.abandon();
-            for control in self.control.drain() {
-                control.refuse_policy(true);
+            for maintenance in self.maintenance.drain() {
+                maintenance.refuse_policy(true);
             }
             self.shared.release_database();
             self.shared.protection.close();

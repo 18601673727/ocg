@@ -5,11 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import Image from "next/image";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import {
-  ControlTransportError,
-  type MutableJob,
-  type MutableJobInput,
-} from "../runtime/control-client";
+import { ApiError, type MutableJob, type MutableJobInput } from "../runtime/api-client";
 import type { ChatModelSelection, ChatImage } from "../contracts";
 import { ModelSelector, type ModelImageSupport } from "./model-selector";
 
@@ -197,7 +193,7 @@ export function MutableComposer({
   onSelectionChange,
   onPreference,
 }: Props) {
-  const { control, client } = useOcgRuntime();
+  const { api, client } = useOcgRuntime();
   const work = useRef<Work>({
     context,
     job: null,
@@ -255,26 +251,26 @@ export function MutableComposer({
 
   const loadImages = useCallback(
     async (ids: string[]) => {
-      if (!control) return [];
+      if (!api) return [];
       return Promise.all(
         ids.map(async (id) => {
-          const item = await control.readAttachment(id);
+          const item = await api.readAttachment(id);
           if (!item.available) throw new Error(`Attachment ${id} is unavailable.`);
           return {
             id,
             name: item.display_name ?? "Image",
             media_type: item.mime,
-            url: control.attachmentContentUrl(id),
+            url: api.attachmentContentUrl(id),
           };
         }),
       );
     },
-    [control],
+    [api],
   );
   const refreshQueue = useCallback(async () => {
-    if (!control) return;
+    if (!api) return;
     const results = await Promise.allSettled(
-      queuedPointers().map(({ context, job }) => control.readMutableJob(context, job)),
+      queuedPointers().map(({ context, job }) => api.readMutableJob(context, job)),
     );
     if (!alive.current) return;
     setQueued(
@@ -290,11 +286,11 @@ export function MutableComposer({
     );
     if (results.some((result) => result.status === "rejected"))
       setError("Some queued Jobs could not be loaded. Retry to see their latest state.");
-  }, [control]);
+  }, [api]);
   const refreshUnfinished = useCallback(async () => {
-    if (!control) return;
+    if (!api) return;
     const results = await Promise.allSettled(
-      unfinishedContexts().map((item) => control.currentMutableJob(item)),
+      unfinishedContexts().map((item) => api.currentMutableJob(item)),
     );
     if (!alive.current) return;
     setUnfinished(
@@ -310,10 +306,10 @@ export function MutableComposer({
     );
     if (results.some((result) => result.status === "rejected"))
       setError("Some unfinished Jobs could not be loaded. Retry to see their latest state.");
-  }, [control]);
+  }, [api]);
   useEffect(() => {
     alive.current = true;
-    if (!control) return;
+    if (!api) return;
     let cancelled = false;
     void (async () => {
       try {
@@ -324,9 +320,9 @@ export function MutableComposer({
           revision: number;
           fingerprint: string;
         } | null = pendingText ? JSON.parse(pendingText) : null;
-        let job = await control.currentMutableJob(context);
+        let job = await api.currentMutableJob(context);
         if (pending?.context === context) {
-          const submitted = await control.readMutableJob(context, pending.job);
+          const submitted = await api.readMutableJob(context, pending.job);
           if (
             (submitted.phase === "queued" ||
               submitted.phase === "executing" ||
@@ -395,13 +391,12 @@ export function MutableComposer({
       alive.current = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [control, context, loadImages, refreshQueue, refreshUnfinished]);
+  }, [api, context, loadImages, refreshQueue, refreshUnfinished]);
 
   const flush = useCallback(
     function flushWork(): Promise<void> {
       const state = work.current;
       if (state.promise) return state.promise;
-      if (!control) return Promise.reject(new Error("Control Plane unavailable."));
       const run = async () => {
         while (state.dirty && !state.conflict) {
           if (alive.current) {
@@ -417,14 +412,14 @@ export function MutableComposer({
                   ? { project: scope.current.project }
                   : {};
               try {
-                state.job = await control.createMutableJob(
+                state.job = await api.createMutableJob(
                   state.context,
                   state.initial,
                   `create-${state.context}`,
                   state.association,
                 );
               } catch (cause) {
-                const existing = await control.currentMutableJob(state.context).catch(() => null);
+                const existing = await api.currentMutableJob(state.context).catch(() => null);
                 if (!existing) throw cause;
                 state.job = existing;
               }
@@ -436,11 +431,11 @@ export function MutableComposer({
                 (!state.association.conversation &&
                   state.job.project !== (state.association.project ?? null))
               ) {
-                throw new ControlTransportError("mutable_job_conflict", 409, false);
+                throw new ApiError("mutable_job_conflict", 409, false);
               }
               rememberUnfinished(state.context);
             } else if (!same(state.job.input, state.desired)) {
-              state.job = await control.updateMutableJob(
+              state.job = await api.updateMutableJob(
                 state.context,
                 state.job.id,
                 state.job.revision,
@@ -454,14 +449,14 @@ export function MutableComposer({
             }
           } catch (cause) {
             if (
-              cause instanceof ControlTransportError &&
+              cause instanceof ApiError &&
               cause.status === 409 &&
               cause.code !== "unsupported_execution_context"
             ) {
               state.conflict = true;
               if (alive.current) setConflict(true);
               if (state.job) {
-                const latest = await control
+                const latest = await api
                   .readMutableJob(state.context, state.job.id)
                   .catch(() => null);
                 if (latest && alive.current) setConfirmed(latest);
@@ -492,7 +487,7 @@ export function MutableComposer({
         });
       return state.promise;
     },
-    [control],
+    [api],
   );
   useEffect(() => {
     const guard = async () => {
@@ -624,7 +619,7 @@ export function MutableComposer({
   }
   async function send() {
     if (
-      !control ||
+      !api ||
       busyRef.current ||
       pendingImagesRef.current.length ||
       work.current.conflict ||
@@ -667,7 +662,7 @@ export function MutableComposer({
       );
       let result: MutableJob;
       try {
-        result = await control.submitMutableJob(
+        result = await api.submitMutableJob(
           state.context,
           state.job.id,
           revision,
@@ -675,12 +670,10 @@ export function MutableComposer({
           key,
         );
       } catch (cause) {
-        const observed = await control
-          .readMutableJob(state.context, state.job.id)
-          .catch(() => null);
+        const observed = await api.readMutableJob(state.context, state.job.id).catch(() => null);
         if (!observed || observed.phase === "unsubmitted") {
           if (
-            cause instanceof ControlTransportError &&
+            cause instanceof ApiError &&
             cause.status === 409 &&
             cause.code !== "unsupported_execution_context"
           ) {
@@ -692,7 +685,7 @@ export function MutableComposer({
               "The Job revision or conversation head changed. Your local input is preserved. Review the saved version; the Job will not be moved or rebased automatically.",
             );
           }
-          if (cause instanceof ControlTransportError && cause.status >= 400 && cause.status < 500)
+          if (cause instanceof ApiError && cause.status >= 400 && cause.status < 500)
             localStorage.removeItem(pendingKey(state.context));
           else setUncertain(true);
           throw cause;
@@ -746,7 +739,7 @@ export function MutableComposer({
     }
   }
   async function reconcileSubmission() {
-    if (!control || busyRef.current) return;
+    if (!api || busyRef.current) return;
     busyRef.current = true;
     setBusy(true);
     setError(null);
@@ -759,7 +752,7 @@ export function MutableComposer({
         revision: number;
         fingerprint: string;
       };
-      const saved = await control.readMutableJob(pending.context, pending.job);
+      const saved = await api.readMutableJob(pending.context, pending.job);
       if ((await inputFingerprint(saved.input)) !== pending.fingerprint)
         throw new Error(
           "The saved input changed; the pending submission cannot be reconciled automatically.",
@@ -770,7 +763,7 @@ export function MutableComposer({
           throw new Error(
             "The saved revision changed; the pending submission cannot be retried safely.",
           );
-        result = await control.submitMutableJob(
+        result = await api.submitMutableJob(
           pending.context,
           pending.job,
           pending.revision,
@@ -813,7 +806,7 @@ export function MutableComposer({
     }
   }
   async function editQueued(job: MutableJob) {
-    if (!control || busyRef.current || uncertain || work.current.job || work.current.dirty) {
+    if (!api || busyRef.current || uncertain || work.current.job || work.current.dirty) {
       setError("Finish or discard the current Job before editing a queued Job.");
       return;
     }
@@ -821,7 +814,7 @@ export function MutableComposer({
     setBusy(true);
     setQueuedLoading(true);
     try {
-      const latest = await control.readMutableJob(job.context, job.id);
+      const latest = await api.readMutableJob(job.context, job.id);
       if (conversation && latest.conversation !== conversation)
         throw new Error("This Job belongs to another conversation.");
       if (latest.phase !== "queued")
@@ -855,7 +848,7 @@ export function MutableComposer({
   }
   async function cancelUnsupported(job: MutableJob) {
     if (
-      !control ||
+      !api ||
       busyRef.current ||
       uncertain ||
       work.current.dirty ||
@@ -873,7 +866,7 @@ export function MutableComposer({
     busyRef.current = true;
     setBusy(true);
     try {
-      const result = await control.cancelUnsupportedQueuedJob(job.context, job.id, job.revision);
+      const result = await api.cancelUnsupportedQueuedJob(job.context, job.id, job.revision);
       if (result.phase !== "cancelled") throw new Error("The Job cancellation was not confirmed.");
       forgetQueued(job.id);
       await refreshQueue();
@@ -889,7 +882,7 @@ export function MutableComposer({
   }
   async function discard() {
     if (
-      !control ||
+      !api ||
       !work.current.job ||
       editingQueue ||
       uncertain ||
@@ -903,7 +896,7 @@ export function MutableComposer({
       await flush();
       const state = work.current;
       if (!state.job) return;
-      await control.discardMutableJob(state.context, state.job.id, state.job.revision);
+      await api.discardMutableJob(state.context, state.job.id, state.job.revision);
       forgetUnfinished(state.context);
       state.context = rotateContext(sessionId, conversation);
       state.job = null;
@@ -925,7 +918,7 @@ export function MutableComposer({
     }
   }
   async function loadSaved() {
-    if (!control || !work.current.job || busyRef.current || uploadTask.current) return;
+    if (!api || !work.current.job || busyRef.current || uploadTask.current) return;
     if (
       work.current.dirty &&
       !window.confirm("Loading the saved version replaces your unsaved text. Continue?")
@@ -934,7 +927,7 @@ export function MutableComposer({
     busyRef.current = true;
     setBusy(true);
     try {
-      const job = await control.readMutableJob(work.current.context, work.current.job.id);
+      const job = await api.readMutableJob(work.current.context, work.current.job.id);
       const restored = await loadImages(job.input.attachments);
       const unsavedImages = images.filter(
         (image) =>
@@ -970,7 +963,7 @@ export function MutableComposer({
   }
   async function openUnfinished(job: MutableJob) {
     if (
-      !control ||
+      !api ||
       busyRef.current ||
       uncertain ||
       conflict ||
@@ -982,7 +975,7 @@ export function MutableComposer({
     setBusy(true);
     try {
       await flush();
-      const latest = await control.readMutableJob(job.context, job.id);
+      const latest = await api.readMutableJob(job.context, job.id);
       if (conversation && latest.conversation !== conversation)
         throw new Error("This Job belongs to another conversation.");
       if (latest.phase !== "unsubmitted")

@@ -19,7 +19,7 @@ import {
 } from "@/components/ui/dialog";
 import type { ChatSession } from "../types";
 import { useI18n } from "../i18n";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ApiClient } from "../runtime/api-client";
 import {
   appendSearchResults,
   conversationSearchMatches,
@@ -34,7 +34,7 @@ export type ConversationSearchProps = {
   activeSessionId: string;
   onSelect: (id: string) => void;
   onOpenConversation?: (conversation: string) => void;
-  control?: HttpCanonicalControlClient;
+  api?: ApiClient;
   conversationList?: "loading" | "loaded" | "failed";
   onRetryConversations?: () => void;
 };
@@ -45,7 +45,7 @@ export function ConversationSearch({
   activeSessionId,
   onSelect,
   onOpenConversation,
-  control,
+  api,
   conversationList,
   onRetryConversations,
 }: ConversationSearchProps) {
@@ -98,14 +98,14 @@ export function ConversationSearch({
   }, [open, changeOpen]);
 
   useEffect(() => {
-    if (!open || !control || !needle) return;
+    if (!open || !api || !needle) return;
     let cancelled = false;
     const controller = new AbortController();
     const timer = setTimeout(
       () => {
         setLoading(true);
         setFailed(false);
-        void control
+        void api
           .searchConversations({ query: needle, before, limit: 50, signal: controller.signal })
           .then((answer) => {
             if (cancelled) return;
@@ -128,7 +128,7 @@ export function ConversationSearch({
       clearTimeout(timer);
       controller.abort();
     };
-  }, [open, control, needle, before, attempt]);
+  }, [open, api, needle, before, attempt]);
 
   const untitledLabel = t("sidebar.newChat");
   const matches = useMemo<readonly SearchMatch[]>(() => {
@@ -202,7 +202,7 @@ export function ConversationSearch({
                 setServerResults(null);
                 setNextBefore(null);
                 setFailed(false);
-                setLoading(Boolean(control && event.target.value.trim()));
+                setLoading(Boolean(api && event.target.value.trim()));
                 setBefore(undefined);
               }}
               onKeyDown={(event) => {

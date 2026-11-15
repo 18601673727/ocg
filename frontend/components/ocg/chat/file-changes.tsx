@@ -10,20 +10,20 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { ControlToolCall } from "../contracts";
+import type { ToolCall } from "../contracts";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
 import { artifactTitle, changedLines, fileArtifact } from "./artifact-model";
 import { ArtifactPreview } from "./artifact-preview";
 
-export type FileChangeCall = { job: string; call: ControlToolCall };
+export type FileChangeCall = { job: string; call: ToolCall };
 
 export function FileChanges({ changes }: { changes: readonly FileChangeCall[] }) {
   const { t } = useI18n();
-  const { control } = useOcgRuntime();
-  const [details, setDetails] = useState<Record<string, ControlToolCall | null>>({});
+  const { api } = useOcgRuntime();
+  const [details, setDetails] = useState<Record<string, ToolCall | null>>({});
   useEffect(() => {
-    if (!control) return;
+    if (!api) return;
     const pending = changes.filter(
       ({ job, call }) =>
         call.name === "workspace_write_file" &&
@@ -34,13 +34,13 @@ export function FileChanges({ changes }: { changes: readonly FileChangeCall[] })
     if (!pending.length) return;
     const controller = new AbortController();
     let next = 0;
-    const loaded: Record<string, ControlToolCall | null> = {};
+    const loaded: Record<string, ToolCall | null> = {};
     const read = async () => {
       while (next < pending.length && !controller.signal.aborted) {
         const { job, call } = pending[next++],
           key = `${job}:${call.request}:${call.index}`;
         try {
-          loaded[key] = await control.readJobTool(job, call.request, call.index, controller.signal);
+          loaded[key] = await api.readJobTool(job, call.request, call.index, controller.signal);
         } catch {
           if (!controller.signal.aborted) loaded[key] = null;
         }
@@ -50,7 +50,7 @@ export function FileChanges({ changes }: { changes: readonly FileChangeCall[] })
       if (!controller.signal.aborted) setDetails((previous) => ({ ...previous, ...loaded }));
     });
     return () => controller.abort();
-  }, [control, changes, details]);
+  }, [api, changes, details]);
   const complete = useMemo(
     () =>
       changes.map(({ job, call }) => ({

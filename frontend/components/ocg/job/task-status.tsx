@@ -2,11 +2,11 @@
 
 import { Check, CircleDashed, CircleHelp, CircleMinus, CircleX, LoaderCircle } from "lucide-react";
 import Link from "next/link";
-import type { ControlTaskPlan } from "../contracts";
+import type { TaskPlan } from "../contracts";
 import { useI18n } from "../i18n";
 import { useOpenJobDetails } from "./job-details-context";
 
-type StepState = ControlTaskPlan["steps"][number]["state"];
+type StepState = TaskPlan["steps"][number]["state"];
 
 function StepIcon({ state }: { state: StepState }) {
   const iconClass = "mt-0.5 size-4 shrink-0";
@@ -43,7 +43,7 @@ function StepIcon({ state }: { state: StepState }) {
   }
 }
 
-export function TaskStatus({ plan }: { plan?: ControlTaskPlan | null }) {
+export function TaskStatus({ plan }: { plan?: TaskPlan | null }) {
   const { t } = useI18n();
   const openJobDetails = useOpenJobDetails();
   if (!plan) return null;

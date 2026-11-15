@@ -3,8 +3,8 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::*;
-use crate::db::entities::{JobId, OutcomeKind, Timestamp};
-use crate::system::execution_controls::ExecutionControl;
+use crate::db::entities::{JobId, OutcomeKind, OutcomeRecord, Timestamp};
+use crate::system::execution_features::ExecutionFeature;
 
 static PROMOTION_CLOCK_BASE: OnceLock<(i64, Instant)> = OnceLock::new();
 
@@ -101,8 +101,6 @@ pub(crate) fn database_file(directory: &Path) -> PathBuf {
 pub(crate) struct OpenedFile {
     pub(crate) database: Database,
     pub(crate) epoch: u64,
-    pub(crate) genesis: JobId,
-    pub(crate) abandoned: Vec<JobId>,
 }
 
 pub(crate) fn open(directory: &Path) -> Result<OpenedFile, StorageError> {
@@ -114,7 +112,6 @@ pub(crate) fn open(directory: &Path) -> Result<OpenedFile, StorageError> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut verification = Verification::Full;
     let (file, fresh) = match options.open(&path) {
         Ok(file) => (file, false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -147,7 +144,7 @@ pub(crate) fn open(directory: &Path) -> Result<OpenedFile, StorageError> {
             ));
         }
         check_database_identity(&file, &path)?;
-        verification = preflight(&file, &path, directory)?;
+        preflight(&file, &path, directory)?;
         check_database_identity(&file, &path)?;
         if file.metadata().map_err(io_storage_error)?.len() == 0 {
             return Err(StorageError::corrupted(
@@ -164,13 +161,8 @@ pub(crate) fn open(directory: &Path) -> Result<OpenedFile, StorageError> {
     let mut builder = Database::builder();
     builder.set_cache_size(CACHE_BYTES);
     let database = builder.create_file(file).map_err(StorageError::from)?;
-    let (epoch, genesis, abandoned) = initialize(&database, verification)?;
-    Ok(OpenedFile {
-        database,
-        epoch,
-        genesis,
-        abandoned,
-    })
+    let epoch = initialize(&database, fresh)?;
+    Ok(OpenedFile { database, epoch })
 }
 
 fn io_storage_error(error: std::io::Error) -> StorageError {
@@ -276,9 +268,9 @@ pub(crate) fn verify_recovered(
     reader::global_compaction_settings(&meta)?;
     drop(meta);
     check_records(&tx)?;
-    for entry in tx.open_table(JOB_STATES)?.iter()? {
+    for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
         let (key, value) = entry?;
-        let state = JobState::decode_at(key.value(), value.value())?;
+        let state = state::decode_state(key.value(), value.value())?;
         if state
             .outcome
             .as_ref()
@@ -424,9 +416,9 @@ fn residual_ownership_in(tx: &ReadTransaction) -> Result<ResidualOwnership, Stor
         }
         ownership.held.insert(job.get());
     }
-    for entry in tx.open_table(JOB_STATES)?.iter()? {
+    for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
         let (key, value) = entry?;
-        let state = JobState::decode_at(key.value(), value.value())?;
+        let state = state::decode_state(key.value(), value.value())?;
         if !state
             .outcome
             .as_ref()
@@ -461,7 +453,7 @@ pub(crate) fn verify_reserved_residual(
     check_records(&tx)?;
     let ownership = residual_ownership_in(&tx)?;
     let must_refuse =
-        !ExecutionControl::RecoveryAndRedispatch.is_enabled() && ownership.unresolved();
+        !ExecutionFeature::RecoveryAndRedispatch.is_enabled() && ownership.unresolved();
     let normal_startup_accepts = match (refuse_unresolved_ownership(&tx), must_refuse) {
         (Ok(()), false) => true,
         (Err(error), true) if error.kind == StorageErrorKind::Other => false,
@@ -482,117 +474,27 @@ pub(crate) fn verify_reserved_residual(
     })
 }
 
-fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
-    use ::redb::TableHandle;
-    let present: std::collections::BTreeSet<String> = tx
-        .list_tables()?
-        .map(|table| table.name().to_owned())
-        .collect();
-    for required in [
-        META.name(),
-        SEQUENCES.name(),
-        CONFIGS.name(),
-        CREDENTIALS.name(),
-        JOBS.name(),
-        JOB_STATES.name(),
-        POOL_ALLOCATIONS.name(),
-        JOB_OUTPUTS.name(),
-        SUBMISSIONS.name(),
-        ATTACHMENTS.name(),
-        TOOL_CALLS.name(),
-        MESSAGES.name(),
-        REQUEST_EVENTS.name(),
-        PROJECTS.name(),
-        JOB_CONTROLS.name(),
-        JOB_INPUTS.name(),
-        NOTICES.name(),
-        APPROVALS.name(),
-        RECURRENCES.name(),
-        SCHEDULED_EXTERNAL_POLICY.name(),
-        SCHEDULED_EXTERNAL_BINDING.name(),
-        JOB_OBSERVATIONS.name(),
-        CONTENT_REFERENCES.name(),
-        CONTENT_RECLAIM.name(),
-        ACTIVE_ALLOCATIONS.name(),
-        ALLOCATION_REQUESTS.name(),
-        DRAFT_CONTEXTS.name(),
-        JOB_ALLOCATIONS.name(),
-        CONVERSATIONS.name(),
-        TURNS.name(),
-        PENDING.name(),
-        MUTABLE_READY.name(),
-        DELAYED.name(),
-        DEPENDENCY_WAITERS.name(),
-        UNSETTLED.name(),
-        CHILDREN.name(),
-        SUCCESSORS.name(),
-        CONVERSATION_SEARCH.name(),
-        CHILD_GROUPS.name(),
-        LIVE_CHILDREN.name(),
-        USER_INPUT_AT.name(),
-        ACTIVE_JOBS.name(),
-        GROUP_RESULTS.name(),
-        NOTICE_READ.name(),
-        TOOL_CALL_IDS.name(),
-        TOOL_STATS.name(),
-        USAGE_TOTALS.name(),
-        RETRIES.name(),
-        USAGE_MODEL.name(),
-        REQUEST_TIMELINE.name(),
-        OPEN_APPROVALS.name(),
-        APPROVAL_CALLS.name(),
-        RECURRENCE_DUE.name(),
-    ] {
-        if !present.contains(required) {
-            return Err(StorageError::corrupted(format!(
-                "database is marked format {FORMAT_VERSION} but lacks the {required} table; it is not a complete database"
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
     check_record_headers(tx)?;
-    check_native_invariants(tx)
-}
-
-fn check_record_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
-    macro_rules! headers {
-        ($($table:ident => $tags:expr),+ $(,)?) => { $(check_preflight_table(tx, $table, $tags)?;)+ };
-    }
-    headers!(CONFIGS => &[1,40,41], JOBS => &[2,53], JOB_STATES => &[3], JOB_INPUTS => &[11,52], POOL_ALLOCATIONS => &[42]);
-    headers!(JOB_OUTPUTS => &[4], SUBMISSIONS => &[5], ATTACHMENTS => &[6], TOOL_CALLS => &[7],
-        REQUEST_EVENTS => &[8], PROJECTS => &[9], JOB_CONTROLS => &[10], NOTICES => &[12],
-        RECURRENCES => &[13], APPROVALS => &[15]);
-    check_preflight_table(tx, CREDENTIALS, &[16])?;
-    check_preflight_table(tx, SCHEDULED_EXTERNAL_POLICY, &[18])?;
-    check_preflight_table(tx, SCHEDULED_EXTERNAL_BINDING, &[19])?;
-    check_record_payloads(tx)
-}
-
-pub(super) fn verify_migrated(
-    database: &impl ::redb::ReadableDatabase,
-) -> Result<(), StorageError> {
-    if startup_checks(database, false)? == Verification::Quick {
-        check_records(&database.begin_read()?)?;
-    }
-    Ok(())
+    check_record_payloads(tx)?;
+    check_native_invariants(tx)?;
+    indexes::verify_job_indexes(tx)?;
+    check_execution_history(tx)
 }
 
 fn allocations_are_quiet(tx: &ReadTransaction) -> Result<bool, StorageError> {
-    let (allocations, configs, active, requests) = match (
+    let (allocations, pools, active, requests) = match (
         tx.open_table(POOL_ALLOCATIONS),
-        tx.open_table(CONFIGS),
+        tx.open_table(POOLS),
         tx.open_table(ACTIVE_ALLOCATIONS),
         tx.open_table(ALLOCATION_REQUESTS),
     ) {
-        (Ok(allocations), Ok(configs), Ok(active), Ok(requests)) => {
-            (allocations, configs, active, requests)
+        (Ok(allocations), Ok(pools), Ok(active), Ok(requests)) => {
+            (allocations, pools, active, requests)
         }
         _ => return Ok(false),
     };
-    let Ok(computed) = indexes::compute_allocation_indexes(&allocations, &configs) else {
+    let Ok(computed) = indexes::compute_allocation_indexes(&allocations, &pools) else {
         return Ok(false);
     };
     Ok(computed.active.is_empty()
@@ -600,14 +502,18 @@ fn allocations_are_quiet(tx: &ReadTransaction) -> Result<bool, StorageError> {
 }
 
 fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
-    let (allocations, configs, active, requests) = match (
+    indexes::verify_pool_executor_index(
+        &tx.open_table(EXECUTORS)?,
+        &tx.open_table(POOL_EXECUTORS)?,
+    )?;
+    let (allocations, pools, active, requests) = match (
         tx.open_table(POOL_ALLOCATIONS),
-        tx.open_table(CONFIGS),
+        tx.open_table(POOLS),
         tx.open_table(ACTIVE_ALLOCATIONS),
         tx.open_table(ALLOCATION_REQUESTS),
     ) {
-        (Ok(allocations), Ok(configs), Ok(active), Ok(requests)) => {
-            (allocations, configs, active, requests)
+        (Ok(allocations), Ok(pools), Ok(active), Ok(requests)) => {
+            (allocations, pools, active, requests)
         }
         _ => {
             return Err(StorageError::corrupted(
@@ -615,68 +521,124 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
             ));
         }
     };
-    if !indexes::allocation_indexes_agree(&allocations, &configs, &active, &requests)? {
+    if !indexes::allocation_indexes_agree(&allocations, &pools, &active, &requests)? {
         return Err(StorageError::corrupted(
             "the Allocation indexes differ from their source rows",
         ));
     }
     let jobs = tx.open_table(JOBS)?;
+    let conversations = tx.open_table(CONVERSATIONS)?;
     let turns = tx.open_table(TURNS)?;
+    let retries = tx.open_table(RETRY_JOBS)?;
+    let mut agent_retries = std::collections::BTreeMap::<JobId, usize>::new();
+    for entry in conversations.iter()? {
+        let (key, value) = entry?;
+        let spec = JobSpec::decode_at(key.value(), value.value())?;
+        if jobs.get(spec.id.get())?.is_some() {
+            return Err(StorageError::corrupted(
+                "Job and conversation identities overlap",
+            ));
+        }
+        if let Some(parent) = spec.parent_id {
+            require_job_exists(&conversations, parent.get(), "conversation parent")?;
+        }
+        if spec.is_standalone_decision_group() {
+            let mut members = turns.range((spec.id.get(), 0)..=(spec.id.get(), u128::MAX))?;
+            let member = members
+                .next()
+                .transpose()?
+                .ok_or_else(|| StorageError::corrupted("standalone Decision Group has no Job"))?
+                .0
+                .value()
+                .1;
+            if members.next().transpose()?.is_some() {
+                return Err(StorageError::corrupted(
+                    "standalone Decision Group has multiple Jobs",
+                ));
+            }
+            let row = jobs
+                .get(member)?
+                .ok_or_else(|| StorageError::corrupted("standalone Decision Job is missing"))?;
+            let job = transactions::decode_mutable_job(member, row.value())?;
+            if job.parent_id != spec.id
+                || job.previous.is_some()
+                || job.summary_source.is_some()
+                || !matches!(
+                    job.input.content,
+                    crate::db::entities::MutableJobContent::Decision { .. }
+                )
+            {
+                return Err(StorageError::corrupted("invalid standalone Decision Job"));
+            }
+            let states = tx.open_table(JOB_RUNTIME)?;
+            let group_state = states.get(spec.id.get())?.ok_or_else(|| {
+                StorageError::corrupted("standalone Decision Group state is missing")
+            })?;
+            let job_state = states
+                .get(member)?
+                .ok_or_else(|| StorageError::corrupted("standalone Decision state is missing"))?;
+            let group_outcome = state::decode_state(spec.id.get(), group_state.value())?.outcome;
+            let job_outcome = state::decode_state(member, job_state.value())?.outcome;
+            let confirmed = job_outcome
+                .as_ref()
+                .filter(|outcome| outcome.kind != OutcomeKind::Unknown);
+            if group_outcome.as_ref() != confirmed {
+                return Err(StorageError::corrupted(
+                    "standalone Decision Group outcome disagrees with its Job",
+                ));
+            }
+        }
+    }
     for entry in jobs.iter()? {
         let (key, value) = entry?;
-        if value.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
-            let spec = JobSpec::decode_at(key.value(), value.value())?;
-            if spec.is_standalone_decision_group() {
-                let mut members = turns.range((spec.id.get(), 0)..=(spec.id.get(), u128::MAX))?;
-                let member = members
-                    .next()
-                    .transpose()?
-                    .ok_or_else(|| StorageError::corrupted("standalone Decision Group has no Job"))?
-                    .0
-                    .value()
-                    .1;
-                if members.next().transpose()?.is_some() {
-                    return Err(StorageError::corrupted(
-                        "standalone Decision Group has multiple Jobs",
-                    ));
-                }
-                let row = jobs
-                    .get(member)?
-                    .ok_or_else(|| StorageError::corrupted("standalone Decision Job is missing"))?;
-                let job = transactions::decode_mutable_job(member, row.value())?;
-                if job.parent_id != spec.id
-                    || job.previous.is_some()
-                    || job.summary_source.is_some()
-                    || !matches!(
-                        job.input.content,
-                        crate::db::entities::MutableJobContent::Decision { .. }
-                    )
-                {
-                    return Err(StorageError::corrupted("invalid standalone Decision Job"));
-                }
-                let states = tx.open_table(JOB_STATES)?;
-                let group_state = states.get(spec.id.get())?.ok_or_else(|| {
-                    StorageError::corrupted("standalone Decision Group state is missing")
-                })?;
-                let job_state = states.get(member)?.ok_or_else(|| {
-                    StorageError::corrupted("standalone Decision state is missing")
-                })?;
-                let group_outcome =
-                    JobState::decode_at(spec.id.get(), group_state.value())?.outcome;
-                let job_outcome = JobState::decode_at(member, job_state.value())?.outcome;
-                let confirmed = job_outcome
+        let job = transactions::decode_mutable_job(key.value(), value.value())?;
+        if let Some(retry) = &job.retry {
+            let original = jobs
+                .get(retry.original.get())?
+                .map(|row| transactions::decode_mutable_job(retry.original.get(), row.value()))
+                .transpose()?
+                .ok_or_else(|| StorageError::corrupted("retry source missing"))?;
+            transactions::validate_retry_source(&job, &original)?;
+            if retries.get((retry.original.get(), job.id.get()))?.is_none() {
+                return Err(StorageError::corrupted(
+                    "retry Job has no retry index entry",
+                ));
+            }
+            let previous = job
+                .previous
+                .ok_or_else(|| StorageError::corrupted("retry has no preceding turn"))?;
+            let prior = jobs
+                .get(previous.get())?
+                .map(|row| transactions::decode_mutable_job(previous.get(), row.value()))
+                .transpose()?
+                .ok_or_else(|| StorageError::corrupted("retry predecessor missing"))?;
+            if prior.parent_id != job.parent_id
+                || prior
+                    .retry
                     .as_ref()
-                    .filter(|outcome| outcome.kind != OutcomeKind::Unknown);
-                if group_outcome.as_ref() != confirmed {
-                    return Err(StorageError::corrupted(
-                        "standalone Decision Group outcome disagrees with its Job",
-                    ));
+                    .map_or(prior.id, |retry| retry.original)
+                    != retry.original
+                || !state::require(tx, previous)?
+                    .state
+                    .outcome
+                    .is_some_and(|outcome| {
+                        matches!(outcome.kind, OutcomeKind::Failed | OutcomeKind::Cancelled)
+                    })
+            {
+                return Err(StorageError::corrupted(
+                    "retry predecessor is not a settled retry source",
+                ));
+            }
+            if let crate::db::entities::Actor::Agent { conversation } = retry.by {
+                require_job_exists(&conversations, conversation.get(), "retry actor")?;
+                let count = agent_retries.entry(retry.original).or_default();
+                *count += 1;
+                if *count > job_tree::MAX_AGENT_RETRIES {
+                    return Err(StorageError::corrupted("agent retry limit exceeded"));
                 }
             }
-            continue;
         }
-        let job = transactions::decode_mutable_job(key.value(), value.value())?;
-        let parent = jobs
+        let parent = conversations
             .get(job.parent_id.get())?
             .ok_or_else(|| StorageError::corrupted("mutable Job conversation is missing"))?;
         let spec = JobSpec::decode_at(job.parent_id.get(), parent.value())?;
@@ -710,12 +672,27 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
             ));
         }
     }
-    let states = tx.open_table(JOB_STATES)?;
-    let jobs = tx.open_table(JOBS)?;
+    for entry in retries.iter()? {
+        let (key, _) = entry?;
+        let (original, id) = key.value();
+        let job = jobs
+            .get(id)?
+            .map(|row| transactions::decode_mutable_job(id, row.value()))
+            .transpose()?
+            .ok_or_else(|| StorageError::corrupted("retry index Job missing"))?;
+        if job.retry.as_ref().map(|retry| retry.original.get()) != Some(original) {
+            return Err(StorageError::corrupted(
+                "retry index disagrees with its Job",
+            ));
+        }
+    }
+    let states = tx.open_table(JOB_RUNTIME)?;
     for entry in states.iter()? {
         let (key, value) = entry?;
-        let state = JobState::decode_at(key.value(), value.value())?;
-        if jobs.get(state.job_id.get())?.is_none() {
+        let state = state::decode_state(key.value(), value.value())?;
+        if jobs.get(state.job_id.get())?.is_none()
+            && conversations.get(state.job_id.get())?.is_none()
+        {
             return Err(StorageError::corrupted(
                 "job_state row has no matching job record",
             ));
@@ -724,41 +701,432 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError> {
-    if !ExecutionControl::RecoveryAndRedispatch.is_enabled() {
-        let mut held = 0u64;
-        match tx.open_table(POOL_ALLOCATIONS) {
-            Ok(table) => {
-                for entry in table.iter()? {
-                    let (key, value) = entry?;
-                    if transactions::decode_pool_allocation(key.value(), value.value())?
-                        .holds_capacity()
-                    {
-                        held += 1;
-                    }
+fn check_execution_history(tx: &ReadTransaction) -> Result<(), StorageError> {
+    use crate::db::entities::{
+        AllocationPhase, DependencyState, ExecutionEventKind, MutableJobPhase,
+    };
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let jobs = tx.open_table(JOBS)?;
+    let conversations = tx.open_table(CONVERSATIONS)?;
+    let states = tx.open_table(JOB_RUNTIME)?;
+    let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+    let events = tx.open_table(JOB_EVENTS)?;
+    let commits = tx.open_table(EXECUTION_COMMITS)?;
+    let mut last_commit = 0u64;
+    for entry in commits.iter()? {
+        let (first, last) = entry?;
+        let first = first.value();
+        let last = last.value();
+        if last_commit.checked_add(1) != Some(first) || last < first {
+            return Err(StorageError::corrupted(
+                "execution commit sequence is not contiguous",
+            ));
+        }
+        last_commit = last;
+    }
+    let recorded = tx
+        .open_table(SEQUENCES)?
+        .get(execution::EVENT_SEQUENCE_KEY)?
+        .map_or(0, |value| value.value());
+    if recorded != u128::from(last_commit) {
+        return Err(StorageError::corrupted(
+            "execution event counter disagrees with commits",
+        ));
+    }
+
+    let mut sequences = Vec::new();
+    let mut reserved = BTreeSet::new();
+    let mut request_refs = BTreeSet::new();
+    let mut output_refs = BTreeSet::new();
+    let mut tool_refs = BTreeMap::<(u128, u32, u32), bool>::new();
+    let mut dependency_refs = BTreeMap::new();
+    let mut input_refs = BTreeSet::new();
+    for entry in events.iter()? {
+        let (key, bytes) = entry?;
+        let key = key.value();
+        let event = execution::decode_event(key, bytes.value())?;
+        if jobs.get(key.0)?.is_none() {
+            require_job_exists(&conversations, key.0, "execution event")?;
+        }
+        let end = commits
+            .get(event.transaction)?
+            .ok_or_else(|| StorageError::corrupted("execution event has no committed transaction"))?
+            .value();
+        if event.seq < event.transaction || event.seq > end {
+            return Err(StorageError::corrupted(
+                "execution event is outside its transaction",
+            ));
+        }
+        sequences.push(event.seq);
+        match &event.kind {
+            ExecutionEventKind::InputRevisionRecorded { revision } => {
+                if !input_refs.insert((key.0, *revision)) {
+                    return Err(StorageError::corrupted(
+                        "duplicate historical input revision",
+                    ));
                 }
             }
-            Err(TableError::TableDoesNotExist(_)) => {}
-            Err(error) => return Err(error.into()),
+            ExecutionEventKind::AllocationReserved { allocation } => {
+                if allocation.token.job.get() != key.0
+                    || allocation.phase != AllocationPhase::Reserved
+                    || allocation.started_at.is_some()
+                    || allocation.stop_confirmed_at.is_some()
+                    || allocation.stop_proof.is_some()
+                    || !reserved.insert(key.0)
+                {
+                    return Err(StorageError::corrupted(
+                        "Job has an invalid or duplicate reservation event",
+                    ));
+                }
+                let row = jobs.get(key.0)?.ok_or_else(|| {
+                    StorageError::corrupted("reservation references a missing Job")
+                })?;
+                transactions::decode_mutable_job(key.0, row.value())?;
+                let pools = tx.open_table(POOLS)?;
+                let executors = tx.open_table(EXECUTORS)?;
+                let pool = pools
+                    .get(allocation.token.pool.get())?
+                    .ok_or_else(|| StorageError::corrupted("reservation Pool is missing"))?;
+                transactions::decode_allocation_pool(allocation.token.pool.get(), pool.value())?;
+                let executor = executors
+                    .get(allocation.token.executor.get())?
+                    .ok_or_else(|| StorageError::corrupted("reservation Executor is missing"))?;
+                transactions::decode_allocation_executor(
+                    allocation.token.executor.get(),
+                    executor.value(),
+                )?;
+            }
+            ExecutionEventKind::RequestRecorded { request, seq } => {
+                if !reserved.contains(&key.0) || !request_refs.insert((key.0, request.get(), *seq))
+                {
+                    return Err(StorageError::corrupted(
+                        "request event precedes reservation or duplicates its evidence",
+                    ));
+                }
+            }
+            ExecutionEventKind::ToolRecorded { call, completed } => {
+                if call.job.get() != key.0 || !reserved.contains(&key.0) {
+                    return Err(StorageError::corrupted(
+                        "tool event has incorrect Job ownership or precedes reservation",
+                    ));
+                }
+                *tool_refs.entry(rows::tool_call_key(*call)).or_default() |= *completed;
+            }
+            ExecutionEventKind::OutputRecorded { seq } => {
+                if !output_refs.insert((key.0, *seq)) {
+                    return Err(StorageError::corrupted(
+                        "output has duplicate execution events",
+                    ));
+                }
+            }
+            ExecutionEventKind::DependencyAdded {
+                prerequisite,
+                condition,
+            } => {
+                if jobs.get(prerequisite.get())?.is_none() {
+                    require_job_exists(&conversations, prerequisite.get(), "execution dependency")?;
+                }
+                if dependency_refs
+                    .insert((prerequisite.get(), key.0), *condition)
+                    .is_some()
+                {
+                    return Err(StorageError::corrupted("duplicate historical dependency"));
+                }
+            }
+            ExecutionEventKind::DependencyResolved {
+                prerequisite,
+                state,
+            } => {
+                let condition = dependency_refs
+                    .get(&(prerequisite.get(), key.0))
+                    .ok_or_else(|| {
+                        StorageError::corrupted("dependency resolution has no declaration")
+                    })?;
+                let source = execution::replay_job(tx, *prerequisite, Some(end))?
+                    .ok_or_else(|| StorageError::corrupted("dependency source has no history"))?;
+                if Batch::dependency_outcome_state(source.outcome.as_ref(), *condition) != *state
+                    || *state == DependencyState::Waiting
+                {
+                    return Err(StorageError::corrupted(
+                        "dependency resolution precedes its authoritative outcome",
+                    ));
+                }
+            }
+            ExecutionEventKind::Created { .. }
+            | ExecutionEventKind::PhaseChanged { .. }
+            | ExecutionEventKind::AllocationStarted
+            | ExecutionEventKind::AllocationPhaseChanged { .. }
+            | ExecutionEventKind::AllocationStopConfirmed { .. }
+            | ExecutionEventKind::JobOutcome { .. }
+            | ExecutionEventKind::Closing { .. }
+            | ExecutionEventKind::ClosingRunningChanged { .. }
+            | ExecutionEventKind::HoldChanged { .. }
+            | ExecutionEventKind::VisibilityChanged { .. }
+            | ExecutionEventKind::PrerequisitesChanged { .. } => {}
+        }
+    }
+    sequences.sort_unstable();
+    if sequences.len() as u128 != u128::from(last_commit)
+        || sequences
+            .iter()
+            .enumerate()
+            .any(|(index, seq)| u128::from(*seq) != index as u128 + 1)
+    {
+        return Err(StorageError::corrupted(
+            "execution event order has a gap or duplicate",
+        ));
+    }
+    for entry in tx.open_table(REQUEST_EVENTS)?.iter()? {
+        let (key, _) = entry?;
+        if !request_refs.remove(&key.value()) {
+            return Err(StorageError::corrupted(
+                "request evidence has no execution event",
+            ));
+        }
+    }
+    for entry in tx.open_table(JOB_OUTPUTS)?.iter()? {
+        let (key, _) = entry?;
+        if !output_refs.remove(&key.value()) {
+            return Err(StorageError::corrupted("output has no execution event"));
+        }
+    }
+    for entry in tx.open_table(TOOL_CALLS)?.iter()? {
+        let (key, bytes) = entry?;
+        let key = key.value();
+        let evidence = rows::decode_tool_evidence(rows::tool_call_ref(key)?, bytes.value())?;
+        if tool_refs.remove(&key) != Some(evidence.outcome.is_some()) {
+            return Err(StorageError::corrupted(
+                "tool evidence disagrees with execution history",
+            ));
+        }
+    }
+    for entry in tx.open_table(DEPENDENCY_WAITERS)?.iter()? {
+        let (key, value) = entry?;
+        if dependency_refs
+            .remove(&key.value())
+            .map(|condition| condition.code())
+            != Some(value.value())
+        {
+            return Err(StorageError::corrupted(
+                "dependency index disagrees with execution history",
+            ));
+        }
+    }
+    if !dependency_refs.is_empty() {
+        return Err(StorageError::corrupted(
+            "execution history has an unindexed dependency",
+        ));
+    }
+    for entry in tx.open_table(JOB_INPUTS)?.iter()? {
+        let (key, _) = entry?;
+        let (job, revision) = key.value();
+        if !input_refs.remove(&(job, u64::from(revision))) {
+            return Err(StorageError::corrupted(
+                "input revision has no execution event",
+            ));
+        }
+    }
+    if !request_refs.is_empty() || !output_refs.is_empty() || !tool_refs.is_empty() {
+        return Err(StorageError::corrupted(
+            "execution history references missing evidence",
+        ));
+    }
+
+    for entry in jobs.iter()?.chain(conversations.iter()?) {
+        let (key, _) = entry?;
+        let id = JobId::new(key.value());
+        let snapshot = execution::replay_job(tx, id, None)?
+            .ok_or_else(|| StorageError::corrupted("Job has no execution history"))?;
+        let row = states
+            .get(id.get())?
+            .ok_or_else(|| StorageError::corrupted("Job state projection is missing"))?;
+        let runtime = JobRuntime::decode_at(id.get(), row.value())?;
+        let state = &runtime.state;
+        if snapshot.outcome != state.outcome {
+            return Err(StorageError::corrupted(
+                "Job state projection disagrees with execution history",
+            ));
+        }
+        let mutable = jobs
+            .get(id.get())?
+            .map(|bytes| transactions::decode_mutable_job(id.get(), bytes.value()))
+            .transpose()?;
+        let phase = mutable.as_ref().map(|job| job.phase);
+        if snapshot.input_revision != mutable.as_ref().map(|job| job.revision)
+            || mutable
+                .as_ref()
+                .is_some_and(|job| !input_refs.remove(&(id.get(), job.revision)))
+        {
+            return Err(StorageError::corrupted(
+                "current input revision disagrees with execution history",
+            ));
+        }
+        if let Some(job) = mutable.as_ref() {
+            let expected = if job.phase != MutableJobPhase::Unsubmitted
+                && snapshot
+                    .outcome
+                    .as_ref()
+                    .is_none_or(|outcome| outcome.kind == OutcomeKind::Unknown)
+            {
+                let waiting = u32::try_from(snapshot.dependencies.len())
+                    .map_err(|_| StorageError::corrupted("native dependency count overflow"))?;
+                Some((waiting, 0))
+            } else {
+                None
+            };
+            if runtime.pending != expected {
+                return Err(StorageError::corrupted(
+                    "native Job unsettled counters disagree with execution history",
+                ));
+            }
+        }
+        let allocation = allocations
+            .get(id.get())?
+            .map(|bytes| transactions::decode_pool_allocation(id.get(), bytes.value()))
+            .transpose()?;
+        if phase != snapshot.phase
+            || allocation != snapshot.allocation
+            || allocation.is_some() != reserved.contains(&id.get())
+        {
+            return Err(StorageError::corrupted(
+                "Job phase or Allocation projection disagrees with execution history",
+            ));
+        }
+        if let Some(allocation) = allocation.as_ref()
+            && snapshot
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.kind != OutcomeKind::Unknown)
+        {
+            if allocation.holds_capacity() {
+                return Err(StorageError::corrupted(
+                    "settled Job still holds an Allocation",
+                ));
+            }
+            check_settled_job_effects(tx, id)?;
+        }
+        let lifecycle = &runtime.lifecycle;
+        if snapshot.closing != lifecycle.closing
+            || snapshot.on_hold != lifecycle.on_hold
+            || snapshot.hidden_at != lifecycle.hidden_at
+            || snapshot.prerequisites != lifecycle.after
+        {
+            return Err(StorageError::corrupted(
+                "Job lifecycle projection disagrees with execution history",
+            ));
+        }
+        for (prerequisite, condition) in &snapshot.dependencies {
+            let source = states.get(prerequisite.get())?.ok_or_else(|| {
+                StorageError::corrupted("unresolved dependency source is missing")
+            })?;
+            let source = state::decode_state(prerequisite.get(), source.value())?;
+            if Batch::dependency_outcome_state(source.outcome.as_ref(), *condition)
+                != DependencyState::Waiting
+            {
+                return Err(StorageError::corrupted(
+                    "settled dependency has no resolution event",
+                ));
+            }
+        }
+    }
+    if !input_refs.is_empty() {
+        return Err(StorageError::corrupted(
+            "execution history references missing input revisions",
+        ));
+    }
+    Ok(())
+}
+
+fn check_settled_job_effects(tx: &ReadTransaction, job: JobId) -> Result<(), StorageError> {
+    use crate::db::entities::{
+        AvailabilityClassification, AvailabilityObservation, RequestNumber, RequestPayload,
+    };
+
+    let mut requests = std::collections::BTreeMap::<u32, (bool, bool)>::new();
+    for entry in tx
+        .open_table(REQUEST_EVENTS)?
+        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, row) = entry?;
+        let (_, request, seq) = key.value();
+        let number = RequestNumber::new(request)
+            .ok_or_else(|| StorageError::corrupted("zero request identity"))?;
+        let state = requests.entry(request).or_default();
+        match rows::decode_request_event(job, number, seq, row.value())?.payload {
+            RequestPayload::Sent { .. } => state.0 = true,
+            RequestPayload::Received { .. } => state.1 = true,
+            RequestPayload::Availability {
+                status_code,
+                finish_reason,
+                raw_finish_reason,
+                failure,
+            } => {
+                let observation = AvailabilityObservation {
+                    status_code,
+                    finish_reason,
+                    raw_finish_reason,
+                    failure,
+                };
+                state.1 |= matches!(
+                    observation.classification(),
+                    AvailabilityClassification::Rejected(_)
+                );
+            }
+            RequestPayload::ApprovedCalls => *state = (true, true),
+            RequestPayload::Measurement { .. } | RequestPayload::Token { .. } => {}
+        }
+    }
+    if requests
+        .values()
+        .any(|&(sent, confirmed)| !sent || !confirmed)
+    {
+        return Err(StorageError::corrupted(
+            "settled Job contains an unconfirmed provider request",
+        ));
+    }
+    for entry in tx
+        .open_table(TOOL_CALLS)?
+        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, row) = entry?;
+        let tool = rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, row.value())?;
+        if tool.admission().is_some()
+            && tool.reconciliation.is_none()
+            && tool
+                .outcome
+                .as_ref()
+                .is_none_or(|outcome| !outcome.fact.is_definite())
+        {
+            return Err(StorageError::corrupted(
+                "settled Job contains an unconfirmed admitted tool",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError> {
+    if !ExecutionFeature::RecoveryAndRedispatch.is_enabled() {
+        let mut held = 0u64;
+        for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
+            let (key, value) = entry?;
+            if transactions::decode_pool_allocation(key.value(), value.value())?.holds_capacity() {
+                held += 1;
+            }
         }
         let mut unknown = 0u64;
-        match tx.open_table(JOB_STATES) {
-            Ok(table) => {
-                for entry in table.iter()? {
-                    let (key, value) = entry?;
-                    let state = JobState::decode_at(key.value(), value.value())?;
-                    if state
-                        .outcome
-                        .as_ref()
-                        .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-                        && !resolved_unknown_ownership(tx, &state)?
-                    {
-                        unknown += 1;
-                    }
-                }
+        for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
+            let (key, value) = entry?;
+            let state = state::decode_state(key.value(), value.value())?;
+            if state
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+                && !resolved_unknown_ownership(tx, &state)?
+            {
+                unknown += 1;
             }
-            Err(TableError::TableDoesNotExist(_)) => {}
-            Err(error) => return Err(error.into()),
         }
         if held > 0 || unknown > 0 {
             return Err(held_ownership(held, unknown));
@@ -768,22 +1136,16 @@ fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError>
 }
 
 fn unknown_outcomes_exist(tx: &ReadTransaction) -> Result<bool, StorageError> {
-    match tx.open_table(JOB_STATES) {
-        Ok(table) => {
-            for entry in table.iter()? {
-                let (key, value) = entry?;
-                if JobState::decode_at(key.value(), value.value())?
-                    .outcome
-                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-                {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
+    for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
+        let (key, value) = entry?;
+        if state::decode_state(key.value(), value.value())?
+            .outcome
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+        {
+            return Ok(true);
         }
-        Err(TableError::TableDoesNotExist(_)) => Ok(false),
-        Err(error) => Err(error.into()),
     }
+    Ok(false)
 }
 
 fn resolved_unknown_ownership(
@@ -799,9 +1161,6 @@ fn resolved_unknown_ownership(
     else {
         return Ok(false);
     };
-    if state.stop_confirmed_at.is_some() || state.stop_confirmed_by.is_some() {
-        return Ok(false);
-    }
     let Some(row) = tx.open_table(POOL_ALLOCATIONS)?.get(state.job_id.get())? else {
         return Ok(false);
     };
@@ -849,19 +1208,6 @@ pub(super) fn check_preflight_header(bytes: &[u8], tags: &[u8]) -> Result<(), St
     }
 }
 
-fn check_preflight_table<K: Key + 'static>(
-    tx: &ReadTransaction,
-    definition: TableDefinition<K, &'static [u8]>,
-    tags: &[u8],
-) -> Result<(), StorageError> {
-    let table = tx.open_table(definition)?;
-    for row in table.iter()? {
-        let (_, value) = row?;
-        check_preflight_header(value.value(), tags)?;
-    }
-    Ok(())
-}
-
 fn require_job_exists(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
     job_id: u128,
@@ -892,45 +1238,42 @@ fn check_pair_job_refs(
 
 fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
     let jobs = tx.open_table(JOBS)?;
-    let states = tx.open_table(JOB_STATES)?;
+    let conversations = tx.open_table(CONVERSATIONS)?;
+    let states = tx.open_table(JOB_RUNTIME)?;
     let configs = tx.open_table(CONFIGS)?;
+    let pools = tx.open_table(POOLS)?;
+    let executors = tx.open_table(EXECUTORS)?;
     for entry in configs.iter()? {
         let (key, value) = entry?;
-        match value.value().first() {
-            Some(&codec::TAG_CONFIG) => {
-                ConfigRow::decode_at(key.value(), value.value())?;
-            }
-            Some(&40) => {
-                transactions::decode_allocation_pool(key.value(), value.value())?;
-            }
-            Some(&41) => {
-                transactions::decode_allocation_executor(key.value(), value.value())?;
-            }
-            _ => {
-                return Err(StorageError::corrupted("unexpected config record tag"));
-            }
+        ConfigRow::decode_at(key.value(), value.value())?;
+    }
+    for entry in pools.iter()? {
+        let (key, value) = entry?;
+        transactions::decode_allocation_pool(key.value(), value.value())?;
+        if configs.get(key.value())?.is_some() {
+            return Err(StorageError::corrupted(
+                "Pool and config identities overlap",
+            ));
+        }
+    }
+    for entry in executors.iter()? {
+        let (key, value) = entry?;
+        let executor = transactions::decode_allocation_executor(key.value(), value.value())?;
+        if pools.get(executor.pool.get())?.is_none() {
+            return Err(StorageError::corrupted(
+                "Executor references a missing Pool",
+            ));
+        }
+        if configs.get(key.value())?.is_some() || pools.get(key.value())?.is_some() {
+            return Err(StorageError::corrupted(
+                "Executor identity overlaps another resource",
+            ));
         }
     }
     for entry in jobs.iter()? {
         let (key, value) = entry?;
         let job_id = key.value();
-        match value.value().first() {
-            Some(&JobSpec::MUTABLE_CONVERSATION_TAG) => {
-                JobSpec::decode_at(job_id, value.value())?;
-            }
-            Some(&codec::TAG_JOB) => {
-                transactions::decode_mutable_job(job_id, value.value())
-                    .map(|_| ())
-                    .or_else(|err| {
-                        JobSpec::decode_at(job_id, value.value())
-                            .map(|_| ())
-                            .map_err(|_| err)
-                    })?;
-            }
-            _ => {
-                return Err(StorageError::corrupted("unexpected job record tag"));
-            }
-        }
+        transactions::decode_mutable_job(job_id, value.value())?;
         if states.get(job_id)?.is_none() {
             return Err(StorageError::corrupted(format!(
                 "job {job_id} has no matching job_state record"
@@ -947,14 +1290,14 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
             )));
         };
         transactions::decode_mutable_job(allocation.token.job.get(), job_row.value())?;
-        if configs.get(allocation.token.pool.get())?.is_none() {
+        if pools.get(allocation.token.pool.get())?.is_none() {
             return Err(StorageError::corrupted(
-                "pool_allocation references missing pool config",
+                "pool_allocation references missing Pool",
             ));
         }
-        if configs.get(allocation.token.executor.get())?.is_none() {
+        if executors.get(allocation.token.executor.get())?.is_none() {
             return Err(StorageError::corrupted(
-                "pool_allocation references missing executor config",
+                "pool_allocation references missing Executor",
             ));
         }
     }
@@ -972,7 +1315,7 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
             let state = states
                 .get(output_key.0)?
                 .ok_or_else(|| StorageError::corrupted("result Job state is missing"))?;
-            let state = JobState::decode_at(output_key.0, state.value())?;
+            let state = state::decode_state(output_key.0, state.value())?;
             if !state
                 .outcome
                 .as_ref()
@@ -1017,40 +1360,16 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
         let (key, value) = entry?;
         rows::decode_project(key.value(), value.value())?;
     }
-    for entry in tx.open_table(JOB_CONTROLS)?.iter()? {
-        let (key, value) = entry?;
-        super::JobControl::decode(value.value())?;
-        require_job_exists(&jobs, key.value(), "job_control")?;
-    }
     for entry in tx.open_table(JOB_INPUTS)?.iter()? {
         let (key, value) = entry?;
         let (job_u128, second) = key.value();
         require_job_exists(&jobs, job_u128, "job_input")?;
-        match value.value().first() {
-            Some(&codec::TAG_JOB_INPUT) => {
-                super::JobInputEntry::decode(value.value())?;
-            }
-            Some(&52) => {
-                transactions::decode_mutable_input_revision(
-                    JobId::new(job_u128),
-                    second,
-                    value.value(),
-                )?;
-            }
-            _ => {
-                return Err(StorageError::corrupted("unexpected job_input record tag"));
-            }
-        }
-    }
-    for entry in tx.open_table(NOTICES)?.iter()? {
-        let (key, value) = entry?;
-        super::Notice::decode(value.value())?;
-        require_job_exists(&jobs, key.value().0, "notice")?;
+        transactions::decode_mutable_input_revision(JobId::new(job_u128), second, value.value())?;
     }
     for entry in tx.open_table(RECURRENCES)?.iter()? {
         let (key, value) = entry?;
         let recurrence = Recurrence::decode(value.value())?;
-        require_job_exists(&jobs, key.value(), "recurrence conversation")?;
+        require_job_exists(&conversations, key.value(), "recurrence conversation")?;
         require_job_exists(&jobs, recurrence.current_turn.get(), "recurrence turn")?;
     }
     for entry in tx.open_table(APPROVALS)?.iter()? {
@@ -1083,10 +1402,12 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
             ));
         }
     }
-    let conversations = tx.open_table(CONVERSATIONS)?;
     for entry in conversations.iter()? {
-        let (key, _) = entry?;
-        require_job_exists(&jobs, key.value(), "conversation")?;
+        let (key, bytes) = entry?;
+        JobSpec::decode_at(key.value(), bytes.value())?;
+        if states.get(key.value())?.is_none() {
+            return Err(StorageError::corrupted("conversation state is missing"));
+        }
     }
     for entry in tx.open_table(TURNS)?.iter()? {
         let (key, _) = entry?;
@@ -1098,25 +1419,24 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
         }
         require_job_exists(&jobs, turn, "turn")?;
     }
-    for entry in tx.open_table(ACTIVE_JOBS)?.iter()? {
-        let (conv, turn) = entry?;
-        require_job_exists(&jobs, conv.value(), "active_job conversation")?;
-        require_job_exists(&jobs, turn.value(), "active_job turn")?;
-    }
-    check_pair_job_refs(&jobs, tx, CHILD_GROUPS, "child_group")?;
-    check_pair_job_refs(&jobs, tx, LIVE_CHILDREN, "live_child")?;
+    check_pair_job_refs(&conversations, tx, CHILD_GROUPS, "child_group")?;
+    check_pair_job_refs(&conversations, tx, LIVE_CHILDREN, "live_child")?;
     for entry in tx.open_table(CHILDREN)?.iter()? {
         let (key, _) = entry?;
         let (parent, child) = key.value();
         if parent != 0 {
-            require_job_exists(&jobs, parent, "children parent")?;
+            require_job_exists(&conversations, parent, "children parent")?;
         }
-        require_job_exists(&jobs, child, "children child")?;
+        if jobs.get(child)?.is_none() {
+            require_job_exists(&conversations, child, "children child")?;
+        }
     }
     for entry in tx.open_table(DEPENDENCY_WAITERS)?.iter()? {
         let (key, _) = entry?;
         let (dep, waiter) = key.value();
-        require_job_exists(&jobs, dep, "dependency_waiter dependency")?;
+        if jobs.get(dep)?.is_none() {
+            require_job_exists(&conversations, dep, "dependency_waiter dependency")?;
+        }
         require_job_exists(&jobs, waiter, "dependency_waiter waiter")?;
     }
     Ok(())
@@ -1213,96 +1533,45 @@ fn preflight(
     }
 }
 
-pub(super) fn initialize(
-    database: &Database,
-    verification: Verification,
-) -> Result<(u64, JobId, Vec<JobId>), StorageError> {
-    let mut tx = database.begin_write().map_err(StorageError::from)?;
-    tx.set_durability(Durability::Immediate)
-        .map_err(StorageError::from)?;
-    use ::redb::TableHandle;
-    let existing: Vec<_> = tx
-        .list_tables()
-        .map_err(StorageError::from)?
-        .map(|table| table.name().to_owned())
-        .collect();
-    let indexes_missing = [
-        "job_observation",
-        "content_reference",
-        "content_reclaim",
-        "request_timeline",
-    ]
-    .iter()
-    .any(|name| !existing.iter().any(|table| table == name));
-    let empty = existing.is_empty() && tx.list_multimap_tables()?.next().is_none();
-    let now = Timestamp::now();
-    init_promotion_clock(now.as_unix_micros());
+fn initialize(database: &Database, fresh: bool) -> Result<u64, StorageError> {
+    let mut tx = database.begin_write()?;
+    tx.set_durability(Durability::Immediate)?;
+    init_promotion_clock(Timestamp::now().as_unix_micros());
 
-    let (epoch, clean_shutdown) = {
-        let mut meta = tx.open_table(META).map_err(StorageError::from)?;
-        if empty {
-            meta.insert(DATABASE_FORMAT_KEY, FORMAT_VERSION.to_le_bytes().as_slice())?;
-            let settings = crate::db::entities::GlobalCompactionSettings::default();
-            let mut encoded = Enc::new(TAG_GLOBAL_COMPACTION);
-            encoded.u64(settings.revision);
-            encoded.bool(settings.prediction_enabled);
-            encoded.compaction_policy(&settings.policy);
-            meta.insert("compaction_settings", encoded.0.as_slice())
-                .map_err(StorageError::from)?;
-            meta.insert("open_epoch", 0u64.to_le_bytes().as_slice())
-                .map_err(StorageError::from)?;
-            meta.insert("clean_shutdown", [1u8].as_slice())
-                .map_err(StorageError::from)?;
-        } else {
-            check_identity(&meta)?;
-        }
-        let previous_epoch = meta
-            .get("open_epoch")
-            .map_err(StorageError::from)?
+    if fresh {
+        create_tables(&tx)?;
+        let settings = crate::db::entities::GlobalCompactionSettings::default();
+        let mut encoded = Enc::new(TAG_GLOBAL_COMPACTION);
+        encoded.u64(settings.revision);
+        encoded.bool(settings.prediction_enabled);
+        encoded.compaction_policy(&settings.policy);
+        let mut meta = tx.open_table(META)?;
+        meta.insert(DATABASE_FORMAT_KEY, FORMAT_VERSION.to_le_bytes().as_slice())?;
+        meta.insert("compaction_settings", encoded.0.as_slice())?;
+        meta.insert("open_epoch", 0u64.to_le_bytes().as_slice())?;
+        meta.insert("clean_shutdown", [1u8].as_slice())?;
+    }
+
+    let epoch = {
+        let mut meta = tx.open_table(META)?;
+        check_identity(&meta)?;
+        let previous = meta
+            .get("open_epoch")?
             .and_then(|value| <[u8; 8]>::try_from(value.value()).ok())
             .map(u64::from_le_bytes)
             .ok_or_else(|| StorageError::corrupted("missing or invalid open epoch"))?;
-        let epoch = previous_epoch
+        let epoch = previous
             .checked_add(1)
             .ok_or_else(|| StorageError::corrupted("open epoch overflow"))?;
-        meta.insert("open_epoch", epoch.to_le_bytes().as_slice())
-            .map_err(StorageError::from)?;
-        let clean_shutdown = match meta.get("clean_shutdown").map_err(StorageError::from)? {
-            Some(value) if value.value() == [1] => true,
-            Some(value) if value.value() == [0] => false,
-            _ => return Err(StorageError::corrupted("invalid shutdown marker")),
-        };
-        meta.insert("clean_shutdown", [0u8].as_slice())
-            .map_err(StorageError::from)?;
-        (epoch, clean_shutdown)
+        meta.insert("open_epoch", epoch.to_le_bytes().as_slice())?;
+        meta.insert("clean_shutdown", [0u8].as_slice())?;
+        epoch
     };
-    create_tables(&tx)?;
-    let mut batch = Batch::new(tx, epoch);
-    if empty {
-        use crate::db::entities::{AllocationExecutor, AllocationPool};
-        let pool_id =
-            ExecutionPoolId::new(
-                batch
-                    .next_id()
-                    .map_err(|BatchError(failure)| match failure {
-                        Failure::Storage(error) => error,
-                        Failure::Rejected(violation) => {
-                            StorageError::corrupted(format!("default Pool ID refused: {violation}"))
-                        }
-                    })?,
-            );
-        let executor_id =
-            ExecutorId::new(
-                batch
-                    .next_id()
-                    .map_err(|BatchError(failure)| match failure {
-                        Failure::Storage(error) => error,
-                        Failure::Rejected(violation) => StorageError::corrupted(format!(
-                            "default Executor ID refused: {violation}"
-                        )),
-                    })?,
-            );
-        let pool = AllocationPool {
+
+    if fresh {
+        let pool_id = ExecutionPoolId::new(allocate(&tx)?);
+        let executor_id = ExecutorId::new(allocate(&tx)?);
+        let pool = crate::db::entities::AllocationPool {
             id: pool_id,
             name: "Default".to_owned(),
             capacity: std::num::NonZeroU32::MIN,
@@ -1310,7 +1579,7 @@ pub(super) fn initialize(
             archived: false,
             revision: 1,
         };
-        let executor = AllocationExecutor {
+        let executor = crate::db::entities::AllocationExecutor {
             id: executor_id,
             pool: pool_id,
             name: "Local Executor".to_owned(),
@@ -1326,497 +1595,41 @@ pub(super) fn initialize(
             .map(|protocol| (ExecutionOperation::LlmRequest, Some(protocol)))
             .collect(),
         };
-        batch
-            .step(|tx| {
-                let mut configs = tx.open_table(CONFIGS)?;
-                configs.insert(
-                    pool_id.get(),
-                    transactions::encode_allocation_pool(&pool).as_slice(),
-                )?;
-                configs.insert(
-                    executor_id.get(),
-                    transactions::encode_allocation_executor(&executor).as_slice(),
-                )?;
-                Ok(())
-            })
-            .map_err(|BatchError(failure)| match failure {
-                Failure::Storage(error) => error,
-                Failure::Rejected(violation) => StorageError::corrupted(format!(
-                    "default execution resources refused: {violation}"
-                )),
-            })?;
+        tx.open_table(POOLS)?.insert(
+            pool_id.get(),
+            transactions::encode_allocation_pool(&pool).as_slice(),
+        )?;
+        tx.open_table(EXECUTORS)?.insert(
+            executor_id.get(),
+            transactions::encode_allocation_executor(&executor).as_slice(),
+        )?;
+        tx.open_table(POOL_EXECUTORS)?
+            .insert((pool_id.get(), executor_id.get()), ())?;
     }
-    let abandoned = {
-        let rebuild = match verification {
-            Verification::Full => true,
-            Verification::Quick => !clean_shutdown || indexes_missing,
-        };
-        if rebuild {
-            rebuild_mutable_jobs(&mut batch).map_err(|BatchError(failure)| match failure {
-                Failure::Storage(error) => error,
-                Failure::Rejected(violation) => {
-                    StorageError::corrupted(format!("new-model recovery refused: {violation}"))
-                }
-            })?;
-        } else {
-            settle_rebuilt_chunk_groups(&mut batch, false).map_err(|BatchError(failure)| {
-                match failure {
-                    Failure::Storage(error) => error,
-                    Failure::Rejected(violation) => StorageError::corrupted(format!(
-                        "Chunk Group recovery refused: {violation}"
-                    )),
-                }
-            })?;
-        }
-        Vec::new()
-    };
-    batch.tx.commit().map_err(StorageError::from)?;
-    Ok((epoch, JobId::new(0), abandoned))
-}
 
-pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
-    tx.open_table(META)?;
-    tx.open_table(SEQUENCES)?;
-    tx.open_table(JOB_OBSERVATIONS)?;
-    tx.open_table(CONTENT_REFERENCES)?;
-    tx.open_table(CONTENT_RECLAIM)?;
-    tx.open_table(CONFIGS)?;
-    tx.open_table(CREDENTIALS)?;
-    tx.open_table(JOBS)?;
-    tx.open_table(JOB_ALLOCATIONS)?;
-    tx.open_table(CONVERSATIONS)?;
-    tx.open_table(TURNS)?;
-    tx.open_table(JOB_STATES)?;
-    tx.open_table(JOB_OUTPUTS)?;
-    tx.open_table(SUBMISSIONS)?;
-    tx.open_table(ATTACHMENTS)?;
-    tx.open_table(TOOL_CALLS)?;
-    tx.open_table(REQUEST_EVENTS)?;
-    tx.open_table(MESSAGES)?;
-    tx.open_table(PROJECTS)?;
-    tx.open_table(JOB_CONTROLS)?;
-    tx.open_table(PENDING)?;
-    tx.open_table(MUTABLE_READY)?;
-    tx.open_table(DELAYED)?;
-    tx.open_table(DEPENDENCY_WAITERS)?;
-    tx.open_table(UNSETTLED)?;
-    tx.open_table(POOL_ALLOCATIONS)?;
-    tx.open_table(ACTIVE_ALLOCATIONS)?;
-    tx.open_table(ALLOCATION_REQUESTS)?;
-    tx.open_table(DRAFT_CONTEXTS)?;
-    tx.open_table(CHILDREN)?;
-    tx.open_table(SUCCESSORS)?;
-    tx.open_table(JOB_INPUTS)?;
-    tx.open_table(NOTICES)?;
-    tx.open_table(CONVERSATION_SEARCH)?;
-    tx.open_table(CHILD_GROUPS)?;
-    tx.open_table(LIVE_CHILDREN)?;
-    tx.open_table(USER_INPUT_AT)?;
-    tx.open_table(NOTICE_READ)?;
-    tx.open_table(GROUP_RESULTS)?;
-    tx.open_table(ACTIVE_JOBS)?;
-    tx.open_table(TOOL_CALL_IDS)?;
-    tx.open_table(TOOL_STATS)?;
-    tx.open_table(USAGE_TOTALS)?;
-    tx.open_table(RETRIES)?;
-    tx.open_table(APPROVALS)?;
-    tx.open_table(OPEN_APPROVALS)?;
-    tx.open_table(APPROVAL_CALLS)?;
-    tx.open_table(RECURRENCES)?;
-    tx.open_table(RECURRENCE_DUE)?;
-    tx.open_table(USAGE_MODEL)?;
-    tx.open_table(REQUEST_TIMELINE)?;
-    tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
-    tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
-    Ok(())
-}
-
-fn rebuild_mutable_jobs(batch: &mut Batch) -> Result<(), BatchError> {
-    use crate::db::entities::MutableJobPhase;
-    batch.step(|tx| {
-        indexes::rebuild_allocation_indexes(tx)?;
-        tx.delete_table(DRAFT_CONTEXTS)?;
-        tx.open_table(DRAFT_CONTEXTS)?;
-        for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
-            let (key, value) = entry?;
-            if transactions::decode_pool_allocation(key.value(), value.value())?.holds_capacity() {
-                return Err(StorageError::corrupted(
-                    "recovery is disabled and this database holds Allocations; run `ocg inspect-held`",
-                ));
-            }
+    let mut batch = Batch::new(tx, epoch);
+    batch.commit_mode = Some(Commit::Durable);
+    finish_closing_groups(&mut batch).map_err(|BatchError(failure)| match failure {
+        Failure::Storage(error) => error,
+        Failure::Rejected(violation) => {
+            StorageError::corrupted(format!("group settlement refused: {violation}"))
         }
-        tx.delete_table(MUTABLE_READY)?;
-        tx.delete_table(PENDING)?;
-        tx.delete_table(CONVERSATIONS)?;
-        tx.delete_table(TURNS)?;
-        tx.delete_table(CHILDREN)?;
-        tx.delete_table(CHILD_GROUPS)?;
-        tx.delete_table(LIVE_CHILDREN)?;
-        tx.delete_table(SUCCESSORS)?;
-        tx.delete_table(UNSETTLED)?;
-        tx.delete_table(CONVERSATION_SEARCH)?;
-        tx.delete_table(GROUP_RESULTS)?;
-        tx.open_table(MUTABLE_READY)?;
-        tx.open_table(PENDING)?;
-        tx.open_table(CONVERSATIONS)?;
-        tx.open_table(TURNS)?;
-        tx.open_table(CHILDREN)?;
-        tx.open_table(CHILD_GROUPS)?;
-        tx.open_table(LIVE_CHILDREN)?;
-        tx.open_table(SUCCESSORS)?;
-        tx.open_table(UNSETTLED)?;
-        tx.open_table(CONVERSATION_SEARCH)?;
-        tx.open_table(GROUP_RESULTS)?;
-        Ok(())
     })?;
-    let mut after = None;
-    loop {
-        let next = batch.step(|tx| {
-            use std::ops::Bound::{Excluded, Unbounded};
-            let jobs = tx.open_table(JOBS)?;
-            let mut range = jobs.range((after.map_or(Unbounded, Excluded), Unbounded))?;
-            let Some(entry) = range.next() else {
-                return Ok(None);
-            };
-            let (key, value) = entry?;
-            let state = tx
-                .open_table(JOB_STATES)?
-                .get(key.value())?
-                .map(|row| JobState::decode_at(key.value(), row.value()))
-                .transpose()?
-                .ok_or_else(|| StorageError::corrupted("Job state is missing"))?;
-            if value.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
-                let spec = JobSpec::decode_at(key.value(), value.value())?;
-                return Ok(Some((
-                    key.value(),
-                    Err((spec.parent_id, state.outcome.is_none())),
-                )));
-            }
-            let job = transactions::decode_mutable_job(key.value(), value.value())?;
-            Ok(Some((key.value(), Ok((job, state)))))
-        })?;
-        let Some((id, row)) = next else {
-            break;
-        };
-        after = Some(id);
-        let (job, state) = match row {
-            Ok(turn) => turn,
-            Err((parent, live)) => {
-                batch.insert(CONVERSATIONS, id, ())?;
-                batch.insert(CHILDREN, (parent.map_or(0, JobId::get), id), ())?;
-                batch.insert(UNSETTLED, id, (0, 0))?;
-                if let Some(parent) = parent {
-                    batch.insert(CHILD_GROUPS, (parent.get(), id), ())?;
-                    if live {
-                        batch.insert(LIVE_CHILDREN, (parent.get(), id), ())?;
-                    }
-                }
-                continue;
-            }
-        };
-        if job.phase != MutableJobPhase::Unsubmitted {
-            if !batch.is_summary_work(&job)? {
-                batch.insert(TURNS, (job.parent_id.get(), job.id.get()), ())?;
-                batch.step(|tx| {
-                    indexes::update_mutable_turn_search(tx, job.parent_id, job.id, None, &job.input)
-                })?;
-            }
-            if let Some(outcome) = &state.outcome {
-                batch.step(|tx| {
-                    let outputs = tx.open_table(JOB_OUTPUTS)?;
-                    let mut result = None;
-                    for entry in outputs.range((job.id.get(), 0)..=(job.id.get(), u32::MAX))? {
-                        let (key, value) = entry?;
-                        if rows::output_kind(value.value())? == OutputKind::Result {
-                            result = Some(decode_output(key.value(), value.value())?);
-                        }
-                    }
-                    if let Some(result) = result {
-                        indexes::append_output_search_index(
-                            tx,
-                            job.parent_id,
-                            job.id,
-                            &result,
-                            outcome.kind == OutcomeKind::Completed,
-                        )?;
-                        let mut results = tx.open_table(GROUP_RESULTS)?;
-                        let old = results
-                            .get(job.parent_id.get())?
-                            .map_or((0, 0), |v| v.value());
-                        let latest = if outcome.kind == OutcomeKind::Cancelled {
-                            old.0
-                        } else {
-                            old.0.max(job.id.get())
-                        };
-                        results.insert(job.parent_id.get(), (latest, old.1.max(job.id.get())))?;
-                    }
-                    Ok(())
-                })?;
-            }
-            batch.insert(CHILDREN, (job.parent_id.get(), job.id.get()), ())?;
-            if let Some(previous) = job.previous {
-                batch.insert(SUCCESSORS, previous.get(), ())?;
-            }
-            if state
-                .outcome
-                .as_ref()
-                .is_none_or(|outcome| outcome.kind == OutcomeKind::Unknown)
-            {
-                batch.insert(UNSETTLED, job.id.get(), (0, 0))?;
-                batch.step(|tx| {
-                    let mut unsettled = tx.open_table(UNSETTLED)?;
-                    let (dependencies, children) = unsettled
-                        .get(job.parent_id.get())?
-                        .map(|v| v.value())
-                        .ok_or_else(|| {
-                            StorageError::corrupted("conversation unsettled row missing")
-                        })?;
-                    unsettled.insert(job.parent_id.get(), (dependencies, children + 1))?;
-                    Ok(())
-                })?;
-            }
-        }
-        if state.outcome.is_some() {
-            continue;
-        }
-        match job.phase {
-            MutableJobPhase::Unsubmitted => {
-                let duplicate = batch.step(|tx| {
-                    Ok(tx
-                        .open_table(DRAFT_CONTEXTS)?
-                        .insert(job.composer_context.get(), job.id.get())?
-                        .is_some())
-                })?;
-                if duplicate {
-                    return batch.corrupted("duplicate unsubmitted Composer context".to_owned());
-                }
-            }
-            MutableJobPhase::Queued => {
-                if matches!(
-                    &job.input.content,
-                    crate::db::entities::MutableJobContent::Generative { .. }
-                ) {
-                    match batch.require_generative_predecessors(&job) {
-                        Err(BatchError(Failure::Rejected(
-                            crate::db::entities::Violation::InvalidValue(
-                                "execution_context",
-                                "Generative Jobs cannot follow Decision history",
-                            ),
-                        ))) => {
-                            batch.insert(PENDING, job.id.get(), ())?;
-                            continue;
-                        }
-                        Err(BatchError(Failure::Rejected(_))) | Ok(()) => {}
-                        Err(error) => return Err(error),
-                    }
-                }
-                let requirement = match &job.frozen {
-                    Some(crate::db::entities::MutableFrozenConfiguration::Decision(_)) => {
-                        transactions::decision_requirement()
-                    }
-                    Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) => {
-                        transactions::execution_requirement(frozen)
-                    }
-                    None => {
-                        return batch
-                            .corrupted("queued Job has no frozen configuration".to_owned());
-                    }
-                };
-                let submitted = job.submitted_at.ok_or_else(|| {
-                    BatchError(Failure::Storage(StorageError::corrupted(
-                        "queued Job missing submission time",
-                    )))
-                })?;
-                batch.step(|tx| {
-                    tx.open_table(MUTABLE_READY)?.insert(
-                        (
-                            transactions::mutable_priority(job.input.priority),
-                            submitted.as_unix_micros(),
-                            job.id.get(),
-                            requirement,
-                        ),
-                        (),
-                    )?;
-                    tx.open_table(PENDING)?.insert(job.id.get(), ())?;
-                    Ok(())
-                })?;
-            }
-            MutableJobPhase::Executing => {
-                return batch.corrupted("executing Job requires allocation recovery".to_owned());
-            }
-        }
-    }
-    settle_rebuilt_conversations(batch)?;
-    rebuild_native_dependencies(batch)?;
-    settle_rebuilt_chunk_groups(batch, true)
+    batch.tx.commit()?;
+    Ok(epoch)
 }
 
-fn rebuild_native_dependencies(batch: &mut Batch) -> Result<(), BatchError> {
-    use crate::db::entities::{
-        DependencyCondition, DependencyState, MutableJobPhase, OutcomeCause,
-    };
-
-    let mut impossible_waiters = Vec::new();
-    let mut after: Option<(u128, u128)> = None;
-    loop {
-        let next = batch.step(|tx| {
-            use std::ops::Bound::{Excluded, Unbounded};
-            let waiters = tx.open_table(DEPENDENCY_WAITERS)?;
-            let mut range = waiters.range((after.map_or(Unbounded, Excluded), Unbounded))?;
-            let Some(entry) = range.next() else {
-                return Ok(None);
-            };
-            let (key, value) = entry?;
-            let (prereq_raw, waiter_raw) = key.value();
-            let condition = DependencyCondition::from_code(value.value())
-                .ok_or_else(|| StorageError::corrupted("invalid dependency condition code"))?;
-            Ok(Some(((prereq_raw, waiter_raw), condition)))
-        })?;
-        let Some(((prereq_raw, waiter_raw), condition)) = next else {
-            break;
-        };
-        after = Some((prereq_raw, waiter_raw));
-        let waiter_id = JobId::new(waiter_raw);
-        let Some(waiter_job) = batch.mutable_job(waiter_id)? else {
-            continue;
-        };
-        let waiter_state = batch.require_job_state(waiter_id)?;
-        if waiter_job.phase != MutableJobPhase::Queued || waiter_state.outcome.is_some() {
-            continue;
-        }
-        let prereq_id = JobId::new(prereq_raw);
-        let prereq_outcome = batch.step(|tx| {
-            let states = tx.open_table(JOB_STATES)?;
-            Ok(states
-                .get(prereq_id.get())?
-                .map(|row| JobState::decode_at(prereq_id.get(), row.value()))
-                .transpose()?
-                .and_then(|state| state.outcome))
-        })?;
-        match Batch::dependency_outcome_state(prereq_outcome.as_ref(), condition) {
-            DependencyState::Satisfied => {}
-            DependencyState::Waiting => {
-                let submitted = waiter_job.submitted_at.ok_or_else(|| {
-                    BatchError(Failure::Storage(StorageError::corrupted(
-                        "queued Job missing submission time",
-                    )))
-                })?;
-                let prefix = (
-                    transactions::mutable_priority(waiter_job.input.priority),
-                    submitted.as_unix_micros(),
-                    waiter_id.get(),
-                );
-                batch.step(|tx| {
-                    let mut unsettled = tx.open_table(UNSETTLED)?;
-                    let (dependencies, children) = unsettled
-                        .get(waiter_id.get())?
-                        .map(|row| row.value())
-                        .ok_or_else(|| {
-                            StorageError::corrupted("waiting Job unsettled row missing")
-                        })?;
-                    let dependencies = dependencies.checked_add(1).ok_or_else(|| {
-                        StorageError::corrupted("waiting Job dependency count overflow")
-                    })?;
-                    unsettled.insert(waiter_id.get(), (dependencies, children))?;
-
-                    let mut ready = tx.open_table(MUTABLE_READY)?;
-                    let keys = ready
-                        .range(
-                            (prefix.0, prefix.1, prefix.2, 0)
-                                ..=(prefix.0, prefix.1, prefix.2, u16::MAX),
-                        )?
-                        .map(|entry| Ok(entry?.0.value()))
-                        .collect::<Result<Vec<_>, StorageError>>()?;
-                    for key in keys {
-                        ready.remove(key)?;
-                    }
-                    Ok(())
-                })?;
-            }
-            DependencyState::Impossible => {
-                impossible_waiters.push(waiter_id);
-            }
-        }
-    }
-    for waiter_id in impossible_waiters {
-        let Some(waiter_job) = batch.mutable_job(waiter_id)? else {
-            continue;
-        };
-        let waiter_state = batch.require_job_state(waiter_id)?;
-        if waiter_job.phase == MutableJobPhase::Queued && waiter_state.outcome.is_none() {
-            batch.end_queued_native_job(&waiter_job, OutcomeCause::DependencyImpossible)?;
-        }
-    }
-    Ok(())
-}
-
-fn settle_rebuilt_conversations(batch: &mut Batch) -> Result<(), BatchError> {
-    let mut before: Option<u128> = None;
-    loop {
-        let next = batch.step(|tx| {
-            use std::ops::Bound::{Excluded, Unbounded};
-            let conversations = tx.open_table(CONVERSATIONS)?;
-            let mut range =
-                conversations.range::<u128>((Unbounded, before.map_or(Unbounded, Excluded)))?;
-            let Some(entry) = range.next_back() else {
-                return Ok(None);
-            };
-            let id = entry?.0.value();
-            let spec = {
-                let jobs = tx.open_table(JOBS)?;
-                let row = jobs
-                    .get(id)?
-                    .ok_or_else(|| StorageError::corrupted("conversation row is missing"))?;
-                JobSpec::decode_at(id, row.value())?
-            };
-            let outcome = tx
-                .open_table(JOB_STATES)?
-                .get(id)?
-                .map(|row| JobState::decode_at(id, row.value()))
-                .transpose()?
-                .ok_or_else(|| StorageError::corrupted("conversation state is missing"))?
-                .outcome
-                .is_some();
-            let mut unsettled = tx.open_table(UNSETTLED)?;
-            let (_, children) = unsettled
-                .get(id)?
-                .map(|row| row.value())
-                .ok_or_else(|| StorageError::corrupted("conversation unsettled row missing"))?;
-            if outcome && children == 0 {
-                unsettled.remove(id)?;
-            } else if let Some(parent) = spec.parent_id {
-                let (dependencies, count) = unsettled
-                    .get(parent.get())?
-                    .map(|row| row.value())
-                    .ok_or_else(|| StorageError::corrupted("parent unsettled row missing"))?;
-                let count = count
-                    .checked_add(1)
-                    .ok_or_else(|| StorageError::corrupted("conversation child count overflow"))?;
-                unsettled.insert(parent.get(), (dependencies, count))?;
-            }
-            Ok(Some(id))
-        })?;
-        let Some(id) = next else {
-            return Ok(());
-        };
-        before = Some(id);
-    }
-}
-
-fn settle_rebuilt_chunk_groups(batch: &mut Batch, rebuilt: bool) -> Result<(), BatchError> {
+fn finish_closing_groups(batch: &mut Batch) -> Result<(), BatchError> {
     use std::ops::Bound::{Excluded, Unbounded};
-
     let mut after = None;
     loop {
         let next = batch.step(|tx| {
-            let groups = tx.open_table(CHILD_GROUPS)?;
-            let Some(entry) = groups
+            let groups = tx.open_table(LIVE_CHILDREN)?;
+            let entry = groups
                 .range((after.map_or(Unbounded, Excluded), Unbounded))?
                 .next()
-            else {
-                return Ok(None);
-            };
-            Ok(Some(entry?.0.value()))
+                .transpose()?;
+            Ok(entry.map(|(key, _)| key.value()))
         })?;
         let Some(key) = next else {
             return Ok(());
@@ -1824,7 +1637,7 @@ fn settle_rebuilt_chunk_groups(batch: &mut Batch, rebuilt: bool) -> Result<(), B
         after = Some(key);
         let spec = batch.require_mutable_conversation(JobId::new(key.1))?;
         if spec.is_chunk_group() {
-            batch.recover_chunk_group(&spec, rebuilt)?;
+            batch.recover_chunk_group(&spec)?;
         }
     }
 }
@@ -2046,6 +1859,12 @@ fn reserved_preflight_in(
         ));
     }
     let token = allocation.token;
+    let recorded = execution::replay_job(&tx, job, None)?.and_then(|snapshot| snapshot.allocation);
+    if recorded.as_ref() != Some(&allocation) {
+        return Err(audit_delta(
+            "the reserved Allocation differs from its Job history",
+        ));
+    }
     if token.epoch != epoch {
         return Err(ReservedRefusal::new(
             "epoch_mismatch",
@@ -2105,15 +1924,16 @@ fn reserved_preflight_in(
         ));
     }
 
-    let configs = tx.open_table(CONFIGS).map_err(StorageError::from)?;
-    let pool = match configs.get(token.pool.get()).map_err(StorageError::from)? {
+    let pools = tx.open_table(POOLS).map_err(StorageError::from)?;
+    let executors = tx.open_table(EXECUTORS).map_err(StorageError::from)?;
+    let pool = match pools.get(token.pool.get()).map_err(StorageError::from)? {
         Some(bytes) => Some(transactions::decode_allocation_pool(
             token.pool.get(),
             bytes.value(),
         )?),
         None => None,
     };
-    let executor = match configs
+    let executor = match executors
         .get(token.executor.get())
         .map_err(StorageError::from)?
     {
@@ -2200,7 +2020,7 @@ fn reserved_preflight_in(
         return Err(ReservedRefusal::new(
             "evidence_present",
             format!(
-                "the Job has {} evidence; an unstarted reservation has none",
+                "the reserved Job has {} evidence; an unstarted reservation has none",
                 evidence.join(", ")
             ),
         ));
@@ -2385,15 +2205,25 @@ pub(crate) fn verify_reserved_publication_delta(
                 ));
             }
             let residual = verify_reserved_residual_against(&*database, &residual)?;
-            verify_unrelated_recovery_rows(
-                &*source_database,
-                &*database,
-                &std::collections::BTreeSet::from([job.get()]),
-            )?;
             let source_tx = source_database.begin_read().map_err(StorageError::from)?;
             let source_record = reader::mutable_job_record_in(&source_tx, job)?
                 .ok_or_else(|| audit_delta("the rollback source Job vanished"))?;
             let parent = source_record.job.parent_id;
+            let parent_row = source_tx
+                .open_table(CONVERSATIONS)
+                .map_err(StorageError::from)?
+                .get(parent.get())
+                .map_err(StorageError::from)?
+                .ok_or_else(|| audit_delta("the rollback parent Group vanished"))?;
+            let standalone = JobSpec::decode_at(parent.get(), parent_row.value())?
+                .is_standalone_decision_group();
+            drop(parent_row);
+            verify_unrelated_recovery_rows(
+                &*source_database,
+                &*database,
+                &std::collections::BTreeSet::from([job.get()]),
+                Some((parent, standalone)),
+            )?;
             let source_allocation_row = source_tx
                 .open_table(POOL_ALLOCATIONS)
                 .map_err(StorageError::from)?
@@ -2404,12 +2234,12 @@ pub(crate) fn verify_reserved_publication_delta(
                 transactions::decode_pool_allocation(job.get(), source_allocation_row.value())?;
             drop(source_allocation_row);
             let source_state_row = source_tx
-                .open_table(JOB_STATES)
+                .open_table(JOB_RUNTIME)
                 .map_err(StorageError::from)?
                 .get(job.get())
                 .map_err(StorageError::from)?
                 .ok_or_else(|| audit_delta("the rollback source Job state vanished"))?;
-            let source_state = JobState::decode_at(job.get(), source_state_row.value())?;
+            let source_runtime = JobRuntime::decode_at(job.get(), source_state_row.value())?;
             drop(source_state_row);
 
             let tx = database.begin_read().map_err(StorageError::from)?;
@@ -2424,23 +2254,24 @@ pub(crate) fn verify_reserved_publication_delta(
             let released = transactions::decode_pool_allocation(job.get(), row.value())?;
             drop(row);
             let state_row = tx
-                .open_table(JOB_STATES)
+                .open_table(JOB_RUNTIME)
                 .map_err(StorageError::from)?
                 .get(job.get())
                 .map_err(StorageError::from)?
                 .ok_or_else(|| audit_delta("the published Job state vanished"))?;
-            let published_state = JobState::decode_at(job.get(), state_row.value())?;
+            let published_runtime = JobRuntime::decode_at(job.get(), state_row.value())?;
             drop(state_row);
-            let outcome = published_state
-                .outcome
-                .as_ref()
-                .ok_or_else(|| audit_delta("the published Job has no OfflineReconciled outcome"))?;
+            let outcome =
+                published_runtime.state.outcome.as_ref().ok_or_else(|| {
+                    audit_delta("the published Job has no OfflineReconciled outcome")
+                })?;
             let mut expected_allocation = source_allocation;
             expected_allocation.phase = AllocationPhase::Released;
-            let mut expected_state = source_state;
-            expected_state.outcome = published_state.outcome.clone();
+            let mut expected_runtime = source_runtime;
+            expected_runtime.state.outcome = published_runtime.state.outcome.clone();
+            expected_runtime.pending = None;
             if released != expected_allocation
-                || published_state != expected_state
+                || published_runtime != expected_runtime
                 || outcome.kind != OutcomeKind::Failed
                 || outcome.cause.is_some()
             {
@@ -2463,14 +2294,14 @@ pub(crate) fn verify_reserved_publication_delta(
                     job.get(),
                 )]),
             )?;
-            verify_reserved_settlement_delta(&source_tx, &tx, job, parent)?;
+            verify_reserved_settlement_delta(&source_tx, &tx, job, parent, standalone, outcome)?;
             facts["result"] = json!({
                 "allocation_phase": "released",
                 "job_outcome": "failed",
                 "failure_code": UnstartedCause::OfflineReconciled.code(),
                 "result_output_sequence": output.seq,
                 "result_output_id": output.id.to_string(),
-                "settlement_indexes": "exact Job removal, conversation child decrement and group-result advance",
+                "settlement_state": "exact Job settlement, parent child decrement and result advance",
                 "page_checksums": "every page checksum verified",
                 "logical_checks": "every record header, derived index and ownership row verified",
                 "unrelated_allocations_and_jobs": "byte-identical to the rollback source",
@@ -2491,11 +2322,11 @@ pub(crate) struct RecoveryAction {
     pub(super) reason: crate::db::entities::UncertaintyReason,
     pub(super) preserve_unknown: bool,
     pub(super) expected_allocation: Vec<u8>,
-    pub(super) expected_state: Vec<u8>,
+    pub(super) expected_runtime: Vec<u8>,
 }
 
 pub(crate) struct HeldRecoveryPlan {
-    pub(crate) canonical: serde_json::Value,
+    pub(crate) evidence: serde_json::Value,
     pub(crate) digest: String,
     actions: Vec<RecoveryAction>,
     epoch: u64,
@@ -2595,7 +2426,7 @@ fn held_recovery_plan_in(
     for (allocation, allocation_bytes) in held {
         let job = allocation.token.job;
         let state_bytes = match tx
-            .open_table(JOB_STATES)
+            .open_table(JOB_RUNTIME)
             .map_err(StorageError::from)?
             .get(job.get())
             .map_err(StorageError::from)?
@@ -2633,7 +2464,7 @@ fn held_recovery_plan_in(
                     "unknown": if action.preserve_unknown { "preserve_exact" } else { "record_unknown" },
                     "uncertainty_reason": action.reason.as_str(),
                     "allocation_sha256": sha256_bytes(&action.expected_allocation),
-                    "job_state_sha256": sha256_bytes(&action.expected_state),
+                    "job_runtime_sha256": sha256_bytes(&action.expected_runtime),
                 }));
                 actions.push(action);
             }
@@ -2645,7 +2476,7 @@ fn held_recovery_plan_in(
             })),
         }
     }
-    let canonical = json!({
+    let evidence = json!({
         "kind": "ocg-held-recovery-plan-v1",
         "database_format": FORMAT_VERSION,
         "record_version": FORMAT_VERSION,
@@ -2657,9 +2488,9 @@ fn held_recovery_plan_in(
         "actions": action_facts,
         "refused": refusals,
     });
-    let digest = sha256_json(&canonical)?;
+    let digest = sha256_json(&evidence)?;
     Ok(HeldRecoveryPlan {
-        canonical,
+        evidence,
         digest,
         actions,
         epoch,
@@ -2759,14 +2590,14 @@ fn recovery_action_in(
         );
     }
     let pool = tx
-        .open_table(CONFIGS)
+        .open_table(POOLS)
         .map_err(StorageError::from)?
         .get(allocation.token.pool.get())
         .map_err(StorageError::from)?
         .map(|row| transactions::decode_allocation_pool(allocation.token.pool.get(), row.value()))
         .transpose()?;
     let executor = tx
-        .open_table(CONFIGS)
+        .open_table(EXECUTORS)
         .map_err(StorageError::from)?
         .get(allocation.token.executor.get())
         .map_err(StorageError::from)?
@@ -2874,13 +2705,7 @@ fn recovery_action_in(
         .get(job_id.get())
         .map_err(StorageError::from)?
         .is_some()
-        || tx
-            .open_table(UNSETTLED)
-            .map_err(StorageError::from)?
-            .get(job_id.get())
-            .map_err(StorageError::from)?
-            .map(|row| row.value())
-            != Some((0, 0))
+        || state::pending(tx, job_id)? != Some((0, 0))
     {
         ineligible!(
             "derived_state",
@@ -2978,7 +2803,7 @@ fn recovery_action_in(
         reason,
         preserve_unknown,
         expected_allocation: allocation_bytes,
-        expected_state: state_bytes,
+        expected_runtime: state_bytes,
     }))
 }
 
@@ -3040,7 +2865,7 @@ pub(crate) fn reconcile_held_apply(
         }
         let audit = audit_held_recovery(&*database, &plan)?;
         Ok(json!({
-            "plan": plan.canonical,
+            "plan": plan.evidence,
             "plan_digest": plan.digest,
             "result": audit,
             "page_checksums": "every page checksum verified",
@@ -3072,20 +2897,21 @@ fn audit_held_recovery(
         let allocation = transactions::decode_pool_allocation(job.get(), allocation_row.value())?;
         drop(allocation_row);
         let state_row = tx
-            .open_table(JOB_STATES)
+            .open_table(JOB_RUNTIME)
             .map_err(StorageError::from)?
             .get(job.get())
             .map_err(StorageError::from)?
             .ok_or_else(|| {
                 ReservedRefusal::new("inconsistent_or_corrupt", "recovered Job state vanished")
             })?;
-        let state = JobState::decode_at(job.get(), state_row.value())?;
+        let runtime = JobRuntime::decode_at(job.get(), state_row.value())?;
+        let state = &runtime.state;
         let exact_state = if action.preserve_unknown {
-            state_row.value() == action.expected_state
+            state_row.value() == action.expected_runtime
         } else {
-            let mut expected = JobState::decode_at(job.get(), &action.expected_state)?;
-            expected.outcome = state.outcome.clone();
-            expected == state
+            let mut expected = JobRuntime::decode_at(job.get(), &action.expected_runtime)?;
+            expected.state.outcome = state.outcome.clone();
+            expected == runtime
                 && state
                     .outcome
                     .as_ref()
@@ -3133,7 +2959,7 @@ fn audit_held_recovery(
             || !exact_state
             || ready
             || result_present
-            || !resolved_unknown_ownership(&tx, &state)?
+            || !resolved_unknown_ownership(&tx, state)?
         {
             return Err(ReservedRefusal::new(
                 "audit_failed",
@@ -3164,13 +2990,7 @@ fn audit_held_recovery(
                 .get(job.get())
                 .map_err(StorageError::from)?
                 .is_some()
-            || tx
-                .open_table(UNSETTLED)
-                .map_err(StorageError::from)?
-                .get(job.get())
-                .map_err(StorageError::from)?
-                .map(|row| row.value())
-                != Some((0, 0))
+            || runtime.pending != Some((0, 0))
         {
             return Err(ReservedRefusal::new(
                 "audit_failed",
@@ -3202,13 +3022,13 @@ fn audit_held_recovery(
     let mut unresolved_unknown = 0u64;
     let mut resolved_unknown = 0u64;
     for entry in tx
-        .open_table(JOB_STATES)
+        .open_table(JOB_RUNTIME)
         .map_err(StorageError::from)?
         .iter()
         .map_err(StorageError::from)?
     {
         let (key, value) = entry.map_err(StorageError::from)?;
-        let state = JobState::decode_at(key.value(), value.value())?;
+        let state = state::decode_state(key.value(), value.value())?;
         if state
             .outcome
             .as_ref()
@@ -3286,7 +3106,7 @@ pub(crate) fn verify_held_publication_delta(
             ));
         }
         let plan = held_recovery_plan_in(&*source_database, source_sha256)?;
-        if plan.digest != expected_digest || &plan.canonical != expected_plan {
+        if plan.digest != expected_digest || &plan.evidence != expected_plan {
             return Err(ReservedRefusal::new(
                 "plan_digest_mismatch",
                 "the prepared plan is not the exact plan authorized by the rollback source",
@@ -3316,7 +3136,7 @@ pub(crate) fn verify_held_publication_delta(
                     )
                 })
                 .collect::<std::collections::BTreeSet<_>>();
-            verify_unrelated_recovery_rows(&*source_database, &*database, &targets)?;
+            verify_unrelated_recovery_rows(&*source_database, &*database, &targets, None)?;
             verify_held_publication_preservation(&*source_database, &*database, &released)?;
             let mut audit = audit_held_recovery(&*database, &plan)?;
             audit["unrelated_allocations_and_jobs"] =
@@ -3325,7 +3145,7 @@ pub(crate) fn verify_held_publication_delta(
                 "byte-identical to the rollback source except authorized target and active-index deltas"
             );
             Ok(json!({
-                "plan": plan.canonical,
+                "plan": plan.evidence,
                 "plan_digest": plan.digest,
                 "result": audit,
                 "page_checksums": "every page checksum verified",
@@ -3392,6 +3212,7 @@ fn verify_unrelated_recovery_rows(
     source: &impl ReadableDatabase,
     published: &impl ReadableDatabase,
     targets: &std::collections::BTreeSet<u128>,
+    settlement: Option<(JobId, bool)>,
 ) -> Result<(), ReservedRefusal> {
     use ::redb::{MultimapTableHandle, TableHandle};
 
@@ -3432,6 +3253,9 @@ fn verify_unrelated_recovery_rows(
     unchanged!(
         META,
         CONFIGS,
+        POOLS,
+        EXECUTORS,
+        POOL_EXECUTORS,
         CREDENTIALS,
         JOBS,
         SUBMISSIONS,
@@ -3440,9 +3264,7 @@ fn verify_unrelated_recovery_rows(
         MESSAGES,
         REQUEST_EVENTS,
         PROJECTS,
-        JOB_CONTROLS,
         JOB_INPUTS,
-        NOTICES,
         APPROVALS,
         RECURRENCES,
         SCHEDULED_EXTERNAL_POLICY,
@@ -3452,33 +3274,32 @@ fn verify_unrelated_recovery_rows(
         CONTENT_RECLAIM,
         ALLOCATION_REQUESTS,
         DRAFT_CONTEXTS,
-        JOB_ALLOCATIONS,
         CONVERSATIONS,
         TURNS,
         PENDING,
         MUTABLE_READY,
-        DELAYED,
         DEPENDENCY_WAITERS,
         CHILDREN,
         SUCCESSORS,
         CONVERSATION_SEARCH,
         CHILD_GROUPS,
         LIVE_CHILDREN,
-        USER_INPUT_AT,
-        ACTIVE_JOBS,
-        NOTICE_READ,
         TOOL_CALL_IDS,
         TOOL_STATS,
         USAGE_TOTALS,
-        RETRIES,
+        RETRY_JOBS,
         USAGE_MODEL,
         REQUEST_TIMELINE,
         OPEN_APPROVALS,
         APPROVAL_CALLS,
         RECURRENCE_DUE,
     );
-
-    for definition in [POOL_ALLOCATIONS, JOB_STATES] {
+    let mut history_targets = targets.clone();
+    if let Some((parent, true)) = settlement {
+        history_targets.insert(parent.get());
+    }
+    verify_execution_publication_delta(&source_tx, &published_tx, &history_targets)?;
+    for definition in [POOL_ALLOCATIONS, JOB_RUNTIME] {
         let source_table = source_tx
             .open_table(definition)
             .map_err(StorageError::from)?;
@@ -3489,7 +3310,10 @@ fn verify_unrelated_recovery_rows(
         for entry in source_table.iter().map_err(StorageError::from)? {
             let (key, value) = entry.map_err(StorageError::from)?;
             source_count += 1;
-            if targets.contains(&key.value()) {
+            if targets.contains(&key.value())
+                || (definition.name() == JOB_RUNTIME.name()
+                    && settlement.map(|(parent, _)| parent.get()) == Some(key.value()))
+            {
                 continue;
             }
             let current = published_table
@@ -3520,6 +3344,167 @@ fn verify_unrelated_recovery_rows(
             return Err(audit_delta(
                 "publication changed the number of Allocation or Job state rows",
             ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_execution_publication_delta(
+    source_tx: &ReadTransaction,
+    published_tx: &ReadTransaction,
+    targets: &std::collections::BTreeSet<u128>,
+) -> Result<(), ReservedRefusal> {
+    use crate::db::entities::{AllocationPhase, ExecutionEventKind};
+
+    let previous = source_tx
+        .open_table(SEQUENCES)
+        .map_err(StorageError::from)?
+        .get(execution::EVENT_SEQUENCE_KEY)
+        .map_err(StorageError::from)?
+        .map_or(0, |row| row.value());
+    let source = source_tx
+        .open_table(JOB_EVENTS)
+        .map_err(StorageError::from)?;
+    let published = published_tx
+        .open_table(JOB_EVENTS)
+        .map_err(StorageError::from)?;
+    for entry in source.iter().map_err(StorageError::from)? {
+        let (key, value) = entry.map_err(StorageError::from)?;
+        if published
+            .get(key.value())
+            .map_err(StorageError::from)?
+            .as_ref()
+            .map(|row| row.value())
+            != Some(value.value())
+        {
+            return Err(audit_delta(
+                "publication rewrote or removed execution history",
+            ));
+        }
+    }
+    for entry in published.iter().map_err(StorageError::from)? {
+        let (key, value) = entry.map_err(StorageError::from)?;
+        if source
+            .get(key.value())
+            .map_err(StorageError::from)?
+            .is_some()
+        {
+            continue;
+        }
+        let event = execution::decode_event(key.value(), value.value())?;
+        if u128::from(event.seq) <= previous || !targets.contains(&event.job.get()) {
+            return Err(audit_delta(
+                "publication introduced an unrelated execution event",
+            ));
+        }
+        let allowed = match event.kind {
+            ExecutionEventKind::AllocationPhaseChanged { phase } => {
+                phase == AllocationPhase::Released
+            }
+            ExecutionEventKind::JobOutcome { outcome } => {
+                matches!(outcome.kind, OutcomeKind::Failed | OutcomeKind::Unknown)
+            }
+            ExecutionEventKind::AllocationStopConfirmed { .. }
+            | ExecutionEventKind::Closing { .. }
+            | ExecutionEventKind::OutputRecorded { .. } => true,
+            ExecutionEventKind::Created { .. }
+            | ExecutionEventKind::PhaseChanged { .. }
+            | ExecutionEventKind::InputRevisionRecorded { .. }
+            | ExecutionEventKind::AllocationReserved { .. }
+            | ExecutionEventKind::AllocationStarted
+            | ExecutionEventKind::ClosingRunningChanged { .. }
+            | ExecutionEventKind::HoldChanged { .. }
+            | ExecutionEventKind::VisibilityChanged { .. }
+            | ExecutionEventKind::PrerequisitesChanged { .. }
+            | ExecutionEventKind::DependencyAdded { .. }
+            | ExecutionEventKind::DependencyResolved { .. }
+            | ExecutionEventKind::RequestRecorded { .. }
+            | ExecutionEventKind::ToolRecorded { .. } => false,
+        };
+        if !allowed {
+            return Err(audit_delta(
+                "publication introduced an unauthorized execution transition",
+            ));
+        }
+    }
+    let source = source_tx
+        .open_table(EXECUTION_COMMITS)
+        .map_err(StorageError::from)?;
+    let published = published_tx
+        .open_table(EXECUTION_COMMITS)
+        .map_err(StorageError::from)?;
+    for entry in source.iter().map_err(StorageError::from)? {
+        let (key, value) = entry.map_err(StorageError::from)?;
+        if published
+            .get(key.value())
+            .map_err(StorageError::from)?
+            .map(|row| row.value())
+            != Some(value.value())
+        {
+            return Err(audit_delta(
+                "publication rewrote a historical execution commit",
+            ));
+        }
+    }
+    for entry in published.iter().map_err(StorageError::from)? {
+        let (key, _) = entry.map_err(StorageError::from)?;
+        if source
+            .get(key.value())
+            .map_err(StorageError::from)?
+            .is_none()
+            && u128::from(key.value()) <= previous
+        {
+            return Err(audit_delta(
+                "publication inserted an execution commit into old history",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_recovery_sequences(
+    source_tx: &ReadTransaction,
+    published_tx: &ReadTransaction,
+    entity: Option<u128>,
+) -> Result<(), ReservedRefusal> {
+    let source = source_tx
+        .open_table(SEQUENCES)
+        .map_err(StorageError::from)?;
+    let published = published_tx
+        .open_table(SEQUENCES)
+        .map_err(StorageError::from)?;
+    for entry in source.iter().map_err(StorageError::from)? {
+        let (key, value) = entry.map_err(StorageError::from)?;
+        let current = published
+            .get(key.value())
+            .map_err(StorageError::from)?
+            .map(|row| row.value());
+        if key.value() == execution::EVENT_SEQUENCE_KEY {
+            if current.is_none_or(|current| current < value.value()) {
+                return Err(audit_delta(
+                    "publication regressed the execution event sequence",
+                ));
+            }
+            continue;
+        }
+        let expected = if key.value() == "entity" {
+            entity.unwrap_or(value.value())
+        } else {
+            value.value()
+        };
+        if current != Some(expected) {
+            return Err(audit_delta("publication changed an unrelated sequence"));
+        }
+    }
+    for entry in published.iter().map_err(StorageError::from)? {
+        let (key, _) = entry.map_err(StorageError::from)?;
+        if source
+            .get(key.value())
+            .map_err(StorageError::from)?
+            .is_none()
+            && key.value() != execution::EVENT_SEQUENCE_KEY
+        {
+            return Err(audit_delta("publication introduced an unrelated sequence"));
         }
     }
     Ok(())
@@ -3578,10 +3563,8 @@ fn verify_held_publication_preservation(
 ) -> Result<(), ReservedRefusal> {
     let source_tx = source.begin_read().map_err(StorageError::from)?;
     let published_tx = published.begin_read().map_err(StorageError::from)?;
-    verify_identical_table(&source_tx, &published_tx, SEQUENCES)?;
+    verify_recovery_sequences(&source_tx, &published_tx, None)?;
     verify_identical_table(&source_tx, &published_tx, JOB_OUTPUTS)?;
-    verify_identical_table(&source_tx, &published_tx, UNSETTLED)?;
-    verify_identical_table(&source_tx, &published_tx, GROUP_RESULTS)?;
     verify_active_allocation_delta(&source_tx, &published_tx, released)
 }
 
@@ -3598,7 +3581,16 @@ fn verify_reserved_output_delta(
     let published = published_tx
         .open_table(JOB_OUTPUTS)
         .map_err(StorageError::from)?;
-    let output_key = (job.get(), 1);
+    let next = source
+        .range((job.get(), 0)..=(job.get(), u32::MAX))
+        .map_err(StorageError::from)?
+        .next_back()
+        .transpose()
+        .map_err(StorageError::from)?
+        .map_or(0, |(key, _)| key.value().1)
+        .checked_add(1)
+        .ok_or_else(|| audit_delta("the Result output sequence is exhausted"))?;
+    let output_key = (job.get(), next);
     let output_row = published
         .get(output_key)
         .map_err(StorageError::from)?
@@ -3606,7 +3598,7 @@ fn verify_reserved_output_delta(
     let output = rows::decode_output(output_key, output_row.value())?;
     drop(output_row);
     if output.job != job
-        || output.seq != 1
+        || output.seq != i64::from(next)
         || output.kind != OutputKind::Result
         || output.summary.as_deref() != Some(UnstartedCause::OfflineReconciled.summary())
         || output.code.as_deref() != Some(UnstartedCause::OfflineReconciled.code())
@@ -3671,32 +3663,7 @@ fn verify_reserved_output_delta(
             "the Result identity and entity sequence are not the authorized allocation",
         ));
     }
-    for entry in source_sequences.iter().map_err(StorageError::from)? {
-        let (key, value) = entry.map_err(StorageError::from)?;
-        let expected = if key.value() == "entity" {
-            output.id.get()
-        } else {
-            value.value()
-        };
-        if published_sequences
-            .get(key.value())
-            .map_err(StorageError::from)?
-            .map(|row| row.value())
-            != Some(expected)
-        {
-            return Err(audit_delta("publication changed an unrelated sequence"));
-        }
-    }
-    for entry in published_sequences.iter().map_err(StorageError::from)? {
-        let (key, _) = entry.map_err(StorageError::from)?;
-        if source_sequences
-            .get(key.value())
-            .map_err(StorageError::from)?
-            .is_none()
-        {
-            return Err(audit_delta("publication introduced a sequence"));
-        }
-    }
+    verify_recovery_sequences(source_tx, published_tx, Some(output.id.get()))?;
     Ok(output)
 }
 
@@ -3705,112 +3672,48 @@ fn verify_reserved_settlement_delta(
     published_tx: &ReadTransaction,
     job: JobId,
     parent: JobId,
+    standalone: bool,
+    outcome: &OutcomeRecord,
 ) -> Result<(), ReservedRefusal> {
-    let source = source_tx
-        .open_table(UNSETTLED)
-        .map_err(StorageError::from)?;
-    let published = published_tx
-        .open_table(UNSETTLED)
-        .map_err(StorageError::from)?;
-    if source
-        .get(job.get())
-        .map_err(StorageError::from)?
-        .map(|row| row.value())
-        != Some((0, 0))
-        || published
-            .get(job.get())
-            .map_err(StorageError::from)?
-            .is_some()
+    if state::pending(source_tx, job)? != Some((0, 0))
+        || state::pending(published_tx, job)?.is_some()
     {
         return Err(audit_delta(
-            "the recovered Job's unsettled row was not removed exactly",
+            "the recovered Job's pending work was not cleared exactly",
         ));
     }
-    let (dependencies, children) = source
-        .get(parent.get())
-        .map_err(StorageError::from)?
-        .map(|row| row.value())
-        .ok_or_else(|| audit_delta("the source conversation unsettled row is missing"))?;
+    let mut expected = state::require(source_tx, parent)?;
+    let (dependencies, children) = expected
+        .pending
+        .ok_or_else(|| audit_delta("the source parent has no pending work"))?;
     let expected_children = children
         .checked_sub(1)
-        .ok_or_else(|| audit_delta("the source conversation child count underflows"))?;
-    for entry in source.iter().map_err(StorageError::from)? {
-        let (key, value) = entry.map_err(StorageError::from)?;
-        if key.value() == job.get() {
-            continue;
-        }
-        let expected = if key.value() == parent.get() {
-            (dependencies, expected_children)
-        } else {
-            value.value()
-        };
-        if published
-            .get(key.value())
-            .map_err(StorageError::from)?
-            .map(|row| row.value())
-            != Some(expected)
-        {
+        .ok_or_else(|| audit_delta("the source parent child count underflows"))?;
+    expected.pending = Some((dependencies, expected_children));
+    expected.record_result(job);
+    if standalone {
+        if dependencies != 0 || expected_children != 0 {
             return Err(audit_delta(
-                "publication changed an unrelated unsettled row",
+                "the standalone Decision root is not fully settled",
             ));
         }
-    }
-    for entry in published.iter().map_err(StorageError::from)? {
-        let (key, _) = entry.map_err(StorageError::from)?;
-        if source
-            .get(key.value())
-            .map_err(StorageError::from)?
-            .is_none()
-        {
-            return Err(audit_delta("publication introduced an unsettled row"));
+        if expected.state.outcome.is_some() {
+            return Err(audit_delta("standalone Decision root was already settled"));
+        }
+        expected.pending = None;
+        expected.state.outcome = Some(outcome.clone());
+        if expected.lifecycle.closing.is_none() {
+            expected.lifecycle.closing = Some(crate::db::entities::JobClosing {
+                at: outcome.at,
+                by: crate::db::entities::Actor::Auto,
+                running: false,
+            });
         }
     }
-
-    let source = source_tx
-        .open_table(GROUP_RESULTS)
-        .map_err(StorageError::from)?;
-    let published = published_tx
-        .open_table(GROUP_RESULTS)
-        .map_err(StorageError::from)?;
-    let previous = source
-        .get(parent.get())
-        .map_err(StorageError::from)?
-        .map_or((0, 0), |row| row.value());
-    let expected = (previous.0.max(job.get()), previous.1.max(job.get()));
-    if published
-        .get(parent.get())
-        .map_err(StorageError::from)?
-        .map(|row| row.value())
-        != Some(expected)
-    {
+    if state::require(published_tx, parent)? != expected {
         return Err(audit_delta(
-            "the conversation settlement result is not the authorized delta",
+            "the parent runtime is not the exact authorized settlement",
         ));
-    }
-    for entry in source.iter().map_err(StorageError::from)? {
-        let (key, value) = entry.map_err(StorageError::from)?;
-        if key.value() != parent.get()
-            && published
-                .get(key.value())
-                .map_err(StorageError::from)?
-                .map(|row| row.value())
-                != Some(value.value())
-        {
-            return Err(audit_delta(
-                "publication changed an unrelated conversation result",
-            ));
-        }
-    }
-    for entry in published.iter().map_err(StorageError::from)? {
-        let (key, _) = entry.map_err(StorageError::from)?;
-        if key.value() != parent.get()
-            && source
-                .get(key.value())
-                .map_err(StorageError::from)?
-                .is_none()
-        {
-            return Err(audit_delta("publication introduced a conversation result"));
-        }
     }
     Ok(())
 }

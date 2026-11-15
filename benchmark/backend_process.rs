@@ -211,8 +211,8 @@ fn command(binary: &Path, config: &BackendConfig) -> Command {
     }
     command
         .env("OCG_DATA_DIR", &config.data_dir)
-        .env("OCG_CONTROL_PORT", config.port.to_string())
-        .env("OCG_CONTROL_TOKEN", &config.token);
+        .env("OCG_API_PORT", config.port.to_string())
+        .env("OCG_API_TOKEN", &config.token);
     let excluded = match std::env::var("NO_PROXY") {
         Ok(existing) if !existing.trim().is_empty() => format!("{existing},127.0.0.1,localhost"),
         _ => "127.0.0.1,localhost".to_owned(),

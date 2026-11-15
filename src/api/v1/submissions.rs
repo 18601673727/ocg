@@ -11,8 +11,8 @@ use serde_json::Value;
 use super::{DATABASE_BUSY, DATABASE_UNAVAILABLE, INTERNAL, Refusal, Reply, SHUTTING_DOWN, Shared};
 use crate::db::DatabaseError;
 use crate::db::entities::{
-    ConfigId, ExecutionConfiguration, JobExecution, JobId, JobKind, ProfileId, RequestFingerprint,
-    Submission, SubmissionKey, SubmissionRecord, Violation,
+    ConfigId, ExecutionConfiguration, JobId, ProfileId, RequestFingerprint, Submission,
+    SubmissionKey, SubmissionRecord, Violation,
 };
 
 pub(super) const IDEMPOTENCY_KEY: &str = "idempotency-key";
@@ -21,8 +21,8 @@ pub(super) const MAX_KEY_CHARS: usize = 128;
 pub(super) const MAX_NAME_BYTES: usize = 128;
 const MAX_UNRESOLVED: usize = 256;
 
-const KEY_DOMAIN: &[u8] = b"ocg.control-plane.idempotency-key.v1\n";
-const DECISION_REQUEST_DOMAIN: &[u8] = b"ocg.control-plane.decision-submission.v2\n";
+const KEY_DOMAIN: &[u8] = b"ocg.api.idempotency-key.v1\n";
+const DECISION_REQUEST_DOMAIN: &[u8] = b"ocg.api.decision-submission.v2\n";
 
 pub(super) const KEY_REQUIRED: Refusal = Refusal::new(
     StatusCode::BAD_REQUEST,
@@ -53,6 +53,11 @@ const KEY_CONFLICT: Refusal = Refusal::new(
     StatusCode::CONFLICT,
     "idempotency_key_conflict",
     "the Idempotency-Key was used for a different request; nothing was submitted",
+);
+const DRAFT_NOT_ADMISSION: Refusal = Refusal::new(
+    StatusCode::BAD_REQUEST,
+    "draft_receipt_not_admission",
+    "this key identifies draft creation, not execution admission; replay POST /api/v1/jobs with the original body and Composer context, or read the draft through the Jobs endpoint",
 );
 const UNCERTAIN: Refusal = Refusal::new(
     StatusCode::INTERNAL_SERVER_ERROR,
@@ -469,7 +474,7 @@ pub(super) async fn submit_decision(
 ) -> Result<Reply, Refusal> {
     let fingerprint = request.fingerprint();
     let admission_value =
-        move |job: JobId| async move { admitted_decision_value(shared, key, job).await };
+        move |job: JobId| async move { admitted_job_value(shared, key, job).await };
     for _ in 0..2 {
         let (outcome, owner) = match shared.submissions.claim(key, fingerprint) {
             Claim::Conflict => return Err(KEY_CONFLICT),
@@ -540,25 +545,11 @@ pub(super) async fn lookup(shared: &Shared, key: SubmissionKey) -> Result<Reply,
         }
         None => shared.database.submission(key).await?,
     };
+    if found.as_ref().is_some_and(|record| record.seq == 0) {
+        return Err(DRAFT_NOT_ADMISSION);
+    }
     Ok(Reply::ok(match found {
-        Some(record) => {
-            let job = shared.database.job(record.job).await?.ok_or(INTERNAL)?;
-            match job.kind {
-                JobKind::Execution {
-                    execution: JobExecution::Decision(_),
-                    ..
-                } => admitted_decision_value(shared, key, record.job).await?,
-                JobKind::Execution {
-                    execution: JobExecution::Frozen(_) | JobExecution::Ref(_),
-                    ..
-                } => admitted_value(shared, key, record.job).await?,
-                JobKind::Group { .. }
-                | JobKind::Execution {
-                    execution: JobExecution::Summarization(_),
-                    ..
-                } => return Err(INTERNAL),
-            }
-        }
+        Some(record) => admitted_job_value(shared, key, record.job).await?,
         None => admission(AdmissionView::NotFound { job: None }),
     }))
 }
@@ -809,7 +800,6 @@ async fn admit_decision(
     let admitted = shared
         .database
         .submit_decision(
-            None,
             crate::db::entities::JobGroup {
                 name: request.name.clone(),
                 agent: Some(request.decision_agent.into()),
@@ -894,7 +884,7 @@ fn not_admitted(error: &DatabaseError) -> Refusal {
         | DatabaseError::ReadPoolStopped
         | DatabaseError::Read(_) => DATABASE_UNAVAILABLE,
         DatabaseError::StartupPolicy(_)
-        | DatabaseError::ControlQueueFull
+        | DatabaseError::MaintenanceQueueFull
         | DatabaseError::StorageUnavailable(_)
         | DatabaseError::OutcomeUnknown { .. }
         | DatabaseError::UnknownOperation(_)
@@ -1089,25 +1079,7 @@ fn action_error(error: DatabaseError) -> Refusal {
     }
 }
 
-async fn admitted_value(shared: &Shared, key: SubmissionKey, job: JobId) -> Result<Value, Refusal> {
-    let record = shared.database.submission(key).await?.ok_or(INTERNAL)?;
-    let turn = shared.database.job(job).await?.ok_or(INTERNAL)?;
-    let frozen = shared
-        .database
-        .job_configuration(job)
-        .await?
-        .ok_or(INTERNAL)?;
-    Ok(admission(AdmissionView::Admitted {
-        job: job.to_string(),
-        conversation: turn.group.map(|id| id.to_string()),
-        seq: record.seq,
-        joined: record.seq > 1,
-        model: frozen.frozen.llm.config.model,
-        kept: turn.cancelled_at.is_some(),
-    }))
-}
-
-async fn admitted_decision_value(
+async fn admitted_job_value(
     shared: &Shared,
     key: SubmissionKey,
     job: JobId,

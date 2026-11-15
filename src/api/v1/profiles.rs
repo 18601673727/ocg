@@ -16,8 +16,8 @@ use crate::db::entities::{
     Violation,
 };
 use crate::db::entities::{
-    FrozenHeaders, HeaderError, HeaderScope, OutboundHeader, OutboundHeaderValue, canonical_name,
-    merge, validate_fields, validate_value,
+    FrozenHeaders, HeaderError, HeaderScope, OutboundHeader, OutboundHeaderValue, merge,
+    normalize_header_name, validate_fields, validate_value,
 };
 use crate::db::mutations::{
     HeaderChange, HeaderEdit, HeaderEditValue, ImportModelsSave, ModelProfileDefinition,
@@ -460,10 +460,9 @@ async fn previous_model_connection(
     let connection_id = match &record.body {
         ConfigBody::Model(model) => model.connection_id,
         ConfigBody::DecisionModel(model) => model.connection_id,
-        ConfigBody::Connection(_)
-        | ConfigBody::Agent(_)
-        | ConfigBody::DecisionAgent(_)
-        | ConfigBody::Pool(_) => return Err(WRONG_PROFILE_KIND),
+        ConfigBody::Connection(_) | ConfigBody::Agent(_) | ConfigBody::DecisionAgent(_) => {
+            return Err(WRONG_PROFILE_KIND);
+        }
     };
     let connection_record = database
         .config(connection_id)
@@ -614,7 +613,8 @@ async fn plan_headers(
             let mut edits = Vec::with_capacity(inputs.len());
             let mut fields = Vec::with_capacity(inputs.len());
             for (index, input) in inputs.into_iter().enumerate() {
-                let name = canonical_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
+                let name =
+                    normalize_header_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
                 let value = input.value.filter(|value| !value.is_empty());
                 if let Some(value) = &value {
                     validate_value(value).map_err(|e| invalid_headers(&e))?;
@@ -1080,7 +1080,6 @@ fn build_profiles_page(
                     break;
                 }
             }
-            ConfigBody::Pool(_) => return Err(INCONSISTENT_RECORD),
             ConfigBody::Connection(_) => {}
             ConfigBody::DecisionModel(model) => {
                 let (_, connection, _, has_credential) =
@@ -2011,7 +2010,7 @@ pub(super) async fn global_outbound_headers(
             if input.secret {
                 return Err(invalid_headers(&HeaderError::GlobalSecret));
             }
-            let name = canonical_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
+            let name = normalize_header_name(input.name.trim()).map_err(|e| invalid_headers(&e))?;
             let value = input
                 .value
                 .filter(|value| !value.is_empty())

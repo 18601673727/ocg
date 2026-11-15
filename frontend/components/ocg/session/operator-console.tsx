@@ -8,11 +8,7 @@ import { LoaderCircle, RotateCw } from "lucide-react";
 
 import { AccessScreen } from "../login/access-screen";
 import { Button } from "@/components/ui/button";
-import {
-  ControlTransportError,
-  createHttpCanonicalControlClient,
-  type HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/control-client";
+import { ApiError, createApiClient, type ApiClient } from "@/components/ocg/runtime/api-client";
 import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/operator-login";
 import { OcgRuntimeProvider } from "../runtime/runtime-context";
 import { SessionActions } from "../login/access-boundary";
@@ -25,7 +21,7 @@ type Health = Api.Health;
 
 export function OperatorConsole() {
   const { t } = useI18n();
-  const [client, setClient] = useState<HttpCanonicalControlClient | null>(null);
+  const [client, setClient] = useState<ApiClient | null>(null);
   const [phase, setPhase] = useState<Phase>("checking");
   const [session, setSession] = useState<OperatorSession | null>(null);
   const [health, setHealth] = useState<Health | null>(null);
@@ -34,7 +30,7 @@ export function OperatorConsole() {
   const csrf = useRef("");
 
   useEffect(() => {
-    const created = createHttpCanonicalControlClient({
+    const created = createApiClient({
       baseUrl: window.location.origin,
       fetch: window.fetch.bind(window),
       csrfToken: () => csrf.current,
@@ -48,7 +44,7 @@ export function OperatorConsole() {
         setPhase("in");
       })
       .catch((error: unknown) => {
-        if (error instanceof ControlTransportError && error.status === 401) {
+        if (error instanceof ApiError && error.status === 401) {
           setPhase("out");
         } else {
           setPhase("unreachable");
@@ -61,8 +57,7 @@ export function OperatorConsole() {
     if (phase !== "in" || !client) return;
     let alive = true;
     let reading = false;
-    const unauthorized = (error: unknown) =>
-      error instanceof ControlTransportError && error.status === 401;
+    const unauthorized = (error: unknown) => error instanceof ApiError && error.status === 401;
     const signedOut = () => {
       csrf.current = "";
       setSession(null);
@@ -127,8 +122,8 @@ export function OperatorConsole() {
     try {
       await client.deleteSession();
     } catch (error: unknown) {
-      if (!(error instanceof ControlTransportError && error.status === 401)) {
-        const code = error instanceof ControlTransportError ? error.code : "invalid_response";
+      if (!(error instanceof ApiError && error.status === 401)) {
+        const code = error instanceof ApiError ? error.code : "invalid_response";
         setSignOutError(t("session.signOutUnconfirmed", { code }));
         return;
       }
@@ -172,7 +167,7 @@ export function OperatorConsole() {
 
   return (
     <SessionActions onSignOut={signOut}>
-      <OcgRuntimeProvider controlClient={client}>
+      <OcgRuntimeProvider apiClient={client}>
         <AppShell
           client={client}
           health={health}

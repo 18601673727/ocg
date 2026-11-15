@@ -11,7 +11,6 @@ import type {
   ToolCallMessagePart,
 } from "@assistant-ui/react";
 import type { ChatMessage, MessageRole } from "../types";
-import type { JobExecution } from "../execution/domain";
 import { retryInput } from "../chat/retry";
 import type { TranslateFn } from "../i18n";
 import { en } from "../i18n/dictionaries";
@@ -64,7 +63,7 @@ function metadataFor(message: ChatMessage, context: MessageContext): OcgMetadata
     failureReason: message.failureReason,
     failureAt: message.failureAt,
     failureCode: message.failureCode,
-    canRetry: message.id === context.retryId && message.execution?.actionsSupported !== false,
+    canRetry: message.id === context.retryId && message.execution?.retrySupported === true,
   };
 }
 
@@ -242,7 +241,6 @@ export type OcgConversationState = {
   messages: ChatMessage[];
   hasEarlier: boolean;
   isRunning: boolean;
-  execution: JobExecution | null;
   sessionId: string | null;
   projectId: string | null;
 };
@@ -260,7 +258,7 @@ export function createOcgExternalStoreAdapter(
     },
   ) => Promise<void>,
   onCancel?: () => Promise<void>,
-  controlBaseUrl?: string | null,
+  apiBaseUrl?: string | null,
   onLoadEarlier?: () => Promise<void>,
   t?: TranslateFn,
 ): import("@assistant-ui/react").ExternalStoreAdapter<ChatMessage> {
@@ -279,7 +277,7 @@ export function createOcgExternalStoreAdapter(
         contextMessages = current.messages;
         context = messageContext(current.messages);
       }
-      return convertOcgMessage(message, idx, current.messages, controlBaseUrl ?? null, t, context);
+      return convertOcgMessage(message, idx, current.messages, apiBaseUrl ?? null, t, context);
     },
     onNew,
     onEdit,

@@ -1,4 +1,4 @@
-import type { ControlProviderResponse, ControlToolCall } from "@/components/ocg/contracts";
+import type { ProviderResponse, ToolCall } from "@/components/ocg/contracts";
 import type { OutputSequence, OutputView } from "../runtime/output-history";
 
 export type TranscriptSettlement = {
@@ -19,7 +19,7 @@ export type TranscriptTurn = {
   status: "completed" | "streaming" | "pending" | "failed" | "cancelled" | "unknown";
   detail: string | null;
   createdAtUs: number | null;
-  tools?: readonly ControlToolCall[];
+  tools?: readonly ToolCall[];
 };
 
 export function outputText(output: OutputView | null | undefined): string | null {
@@ -67,8 +67,8 @@ type ReasoningInterval = {
 
 class ProviderProjection {
   readonly recorded: string;
-  readonly byRequest: Map<number, ControlProviderResponse>;
-  readonly toolsByRequest = new Map<number, ControlToolCall[]>();
+  readonly byRequest: Map<number, ProviderResponse>;
+  readonly toolsByRequest = new Map<number, ToolCall[]>();
   readonly requests: number[];
   readonly intervals: ReasoningInterval[];
   readonly through: number[];
@@ -78,8 +78,8 @@ class ProviderProjection {
   private compatible = true;
 
   constructor(
-    readonly responses: readonly ControlProviderResponse[],
-    readonly tools: readonly ControlToolCall[] | undefined,
+    readonly responses: readonly ProviderResponse[],
+    readonly tools: readonly ToolCall[] | undefined,
     readonly completed: boolean,
     readonly answerId: string,
     readonly titleMetadata: boolean,
@@ -140,9 +140,9 @@ export function jobTranscript(
   settlement: TranscriptSettlement | null,
   streaming: boolean,
   attachments?: readonly string[],
-  tools?: readonly ControlToolCall[],
+  tools?: readonly ToolCall[],
   titleMetadata = false,
-  responses?: readonly ControlProviderResponse[],
+  responses?: readonly ProviderResponse[],
   partialOutput = false,
   partialToolBoundaries?: readonly PartialToolBoundary[] | null,
   accumulated?: TranscriptAccumulator,
@@ -201,7 +201,7 @@ export function jobTranscript(
         },
       ];
   let answer: TranscriptTurn;
-  const strippedPending = new Set<ControlToolCall>();
+  const strippedPending = new Set<ToolCall>();
   if (state === "completed") {
     answer = {
       ...base,
@@ -262,8 +262,8 @@ function providerFailureDetail(result: OutputView | null): string | null {
 
 function approvalAnswer(
   text: string,
-  tools: readonly ControlToolCall[],
-  strippedPending: Set<ControlToolCall>,
+  tools: readonly ToolCall[],
+  strippedPending: Set<ToolCall>,
 ): string {
   let answer = text;
   const pending = tools
@@ -304,12 +304,12 @@ function approvalAnswer(
 function providerMessages(
   answer: TranscriptTurn,
   progress: string,
-  responses: readonly ControlProviderResponse[] | undefined,
+  responses: readonly ProviderResponse[] | undefined,
   visible: (text: string) => string,
   outputs: OutputSequence,
   partialOutput: boolean,
   partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
-  strippedPending: ReadonlySet<ControlToolCall>,
+  strippedPending: ReadonlySet<ToolCall>,
   aggregate: TranscriptAccumulator,
   titleMetadata: boolean,
 ): TranscriptTurn[] {
@@ -503,7 +503,7 @@ function fallbackMessages(
   outputs: OutputSequence,
   partialOutput: boolean,
   partialToolBoundaries: readonly PartialToolBoundary[] | null | undefined,
-  strippedPending: ReadonlySet<ControlToolCall>,
+  strippedPending: ReadonlySet<ToolCall>,
 ): TranscriptTurn[] {
   if (answer.status !== "completed") return [answer];
   const text = visible(progress);
@@ -531,9 +531,9 @@ function partialMessages(
   outputs: OutputSequence,
   visible: (text: string) => string,
   boundaries: readonly PartialToolBoundary[],
-  strippedPending: ReadonlySet<ControlToolCall>,
+  strippedPending: ReadonlySet<ToolCall>,
 ): TranscriptTurn[] {
-  const tools = new Map<number, ControlToolCall[]>();
+  const tools = new Map<number, ToolCall[]>();
   for (const call of answer.tools ?? []) {
     const group = tools.get(call.request) ?? [];
     group.push(call);

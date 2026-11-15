@@ -1,7 +1,7 @@
 use super::*;
 
-pub const PORT_VARIABLE: &str = "OCG_CONTROL_PORT";
-pub const TOKEN_VARIABLE: &str = "OCG_CONTROL_TOKEN";
+pub const PORT_VARIABLE: &str = "OCG_API_PORT";
+pub const TOKEN_VARIABLE: &str = "OCG_API_TOKEN";
 pub const UI_VARIABLE: &str = "OCG_UI_DIR";
 
 pub const API_VERSION: u32 = 1;
@@ -47,9 +47,9 @@ impl Token {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
-    #[error("{PORT_VARIABLE} is set but {TOKEN_VARIABLE} is not; the control plane needs both")]
+    #[error("{PORT_VARIABLE} is set but {TOKEN_VARIABLE} is not; the API server needs both")]
     TokenMissing,
-    #[error("{TOKEN_VARIABLE} is set but {PORT_VARIABLE} is not; the control plane needs both")]
+    #[error("{TOKEN_VARIABLE} is set but {PORT_VARIABLE} is not; the API server needs both")]
     PortMissing,
     #[error("{PORT_VARIABLE} must be a TCP port from 1 to 65535")]
     InvalidPort,
@@ -62,7 +62,7 @@ pub enum ConfigError {
 }
 
 #[derive(Clone, Debug)]
-pub struct ControlPlaneConfig {
+pub struct ServerConfig {
     pub(super) port: u16,
     pub(super) token: Token,
     pub(super) ui_dir: Option<PathBuf>,
@@ -71,7 +71,7 @@ pub struct ControlPlaneConfig {
     pub(super) stream_limits: events::StreamLimits,
 }
 
-impl ControlPlaneConfig {
+impl ServerConfig {
     pub fn from_environment() -> Result<Option<Self>, ConfigError> {
         Self::from_source(|name| std::env::var_os(name).map(|value| value.into_string()))
     }

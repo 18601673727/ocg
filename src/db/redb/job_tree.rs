@@ -1,14 +1,14 @@
 use super::*;
 use crate::db::entities::{
     AllocationPhase, AllocationToken, ComposerContextId, DependencyState, ExecutionConfiguration,
-    JobAction, JobClosing, JobControl, JobQueuePriority, MutableFrozenConfiguration, MutableJob,
+    JobAction, JobClosing, JobLifecycle, JobQueuePriority, MutableFrozenConfiguration, MutableJob,
     MutableJobContent, MutableJobInput, NativeStopRequest, OutcomeCause, OutcomeRecord,
     RequestFingerprint, Submission, ToolCallRef, Violation,
 };
 
 const MAX_LIVE_CHILDREN: usize = 16;
 const MAX_LIVE_SUBTREE: usize = 64;
-const MAX_AGENT_RETRIES: usize = 2;
+pub(super) const MAX_AGENT_RETRIES: usize = 2;
 const RETURNED_RESULT_CHARS: usize = 4000;
 const MAX_CHILD_SCAN: usize = 256;
 
@@ -62,7 +62,7 @@ impl Batch {
         let mut effective = JobLimits::CEILING;
         for depth in 0..=crate::db::entities::MAX_JOB_DEPTH {
             let row = self.require_mutable_conversation(current)?;
-            let own = self.job_control(current)?.limits;
+            let own = self.job_lifecycle(current)?.limits;
             if let Some(limits) = own {
                 effective = effective.intersect(limits);
             }
@@ -105,9 +105,9 @@ impl Batch {
                 ));
             }
         }
-        let mut control = self.job_control(conversation)?;
-        control.limits = Some(limits);
-        self.put_job_control(conversation, &control)
+        let mut lifecycle = self.job_lifecycle(conversation)?;
+        lifecycle.limits = Some(limits);
+        self.put_job_lifecycle(conversation, &lifecycle)
     }
 
     pub(crate) fn unsettled_turns(
@@ -213,11 +213,10 @@ impl Batch {
 
     fn require_room_for_child(&mut self, parent: JobId) -> Result<(), BatchError> {
         let row = self.require_mutable_conversation(parent)?;
-        if !row.kind.is_group()
-            || row.is_chunk_group()
+        if row.is_chunk_group()
             || row.is_standalone_decision_group()
             || self.require_job_state(parent)?.outcome.is_some()
-            || self.job_control(parent)?.closing.is_some()
+            || self.job_lifecycle(parent)?.closing.is_some()
         {
             return self.reject(Violation::ParentClosed(parent));
         }
@@ -253,25 +252,21 @@ impl Batch {
             id,
             created_at: self.now,
             parent_id: Some(parent),
-            allocation: None,
-            kind: JobKind::Group {
-                agent,
-                project,
-                origin: Origin::Agent { call },
-                keep_open,
-            },
+            agent,
+            project,
+            origin: Origin::Agent { call },
+            keep_open,
         };
-        self.insert(JOBS, id.get(), row.encode_mutable_conversation().as_slice())?;
+        self.insert(CONVERSATIONS, id.get(), row.encode().as_slice())?;
         self.put_job_state(id, &JobState::new(id))?;
-        self.put_job_control(
+        self.put_job_lifecycle(
             id,
-            &JobControl {
+            &JobLifecycle {
                 after,
-                ..JobControl::default()
+                ..JobLifecycle::default()
             },
         )?;
-        self.insert(CONVERSATIONS, id.get(), ())?;
-        self.insert(UNSETTLED, id.get(), (0, 0))?;
+        self.step(|tx| state::set_pending(tx, id, Some((0, 0))))?;
         self.insert(CHILDREN, (parent.get(), id.get()), ())?;
         self.adjust_open_children(parent, 1)?;
         self.link_job_group(parent, id)?;
@@ -299,7 +294,7 @@ impl Batch {
             ));
         }
         for conversation in self.live_subtree(target)? {
-            if self.job_control(conversation)?.user_input
+            if self.job_lifecycle(conversation)?.user_input
                 && !self.unsettled_turns(conversation)?.is_empty()
             {
                 return self.reject(Violation::InvalidValue(
@@ -342,16 +337,16 @@ impl Batch {
             let Some(conversation) = current else {
                 return Ok(false);
             };
-            let control = self.job_control(conversation)?;
-            if control.on_hold.is_some()
+            let lifecycle = self.job_lifecycle(conversation)?;
+            if lifecycle.on_hold.is_some()
                 || (summary
-                    && (control.closing.is_some()
+                    && (lifecycle.closing.is_some()
                         || self.require_job_state(conversation)?.outcome.is_some()))
             {
                 return Ok(true);
             }
             if own {
-                for (prerequisite, condition) in &control.after {
+                for (prerequisite, condition) in &lifecycle.after {
                     if self.prerequisite_state(*prerequisite, *condition)?
                         != DependencyState::Satisfied
                     {
@@ -393,7 +388,10 @@ impl Batch {
             if self.require_job_state(turn)?.outcome.is_some() {
                 continue;
             }
-            let Some(allocation) = self.pool_allocation(turn)? else {
+            let Some(allocation) = self
+                .pool_allocation(turn)?
+                .filter(|allocation| allocation.holds_capacity())
+            else {
                 let Some(job) = self.mutable_job(turn)? else {
                     return self.corrupted("turn is not a native Job".into());
                 };
@@ -440,17 +438,17 @@ impl Batch {
         by: Actor,
     ) -> Result<JobAction, BatchError> {
         self.require_mutable_conversation(conversation)?;
-        let already = self.job_control(conversation)?.closing.is_some();
+        let already = self.job_lifecycle(conversation)?.closing.is_some();
         let subtree = self.live_subtree(conversation)?;
         for current in &subtree {
-            let mut control = self.job_control(*current)?;
-            if control.closing.is_none() {
-                control.closing = Some(JobClosing {
+            let mut lifecycle = self.job_lifecycle(*current)?;
+            if lifecycle.closing.is_none() {
+                lifecycle.closing = Some(JobClosing {
                     at: self.now,
                     by: by.clone(),
                     running: false,
                 });
-                self.put_job_control(*current, &control)?;
+                self.put_job_lifecycle(*current, &lifecycle)?;
                 self.void_approvals(*current, by.clone())?;
             }
         }
@@ -460,10 +458,10 @@ impl Batch {
             let (tokens, never_ran) = self.stop_unsettled_turns(*current, &OutcomeCause::Closed)?;
             all_ended.extend(never_ran);
             if !tokens.is_empty() {
-                let mut control = self.job_control(*current)?;
-                if let Some(closing) = &mut control.closing {
+                let mut lifecycle = self.job_lifecycle(*current)?;
+                if let Some(closing) = &mut lifecycle.closing {
                     closing.running = true;
-                    self.put_job_control(*current, &control)?;
+                    self.put_job_lifecycle(*current, &lifecycle)?;
                 }
             }
             running.extend(tokens);
@@ -482,8 +480,8 @@ impl Batch {
     }
 
     fn settle_closing(&mut self, conversation: JobId) -> Result<(), BatchError> {
-        let control = self.job_control(conversation)?;
-        let Some(closing) = control.closing else {
+        let lifecycle = self.job_lifecycle(conversation)?;
+        let Some(closing) = lifecycle.closing else {
             return Ok(());
         };
         let spec = self.require_mutable_conversation(conversation)?;
@@ -536,12 +534,12 @@ impl Batch {
             self.remove(LIVE_CHILDREN, (parent.get(), conversation.get()))?;
         }
         let released = self.step(|tx| {
-            let mut unsettled = tx.open_table(UNSETTLED)?;
-            let open = unsettled.get(conversation.get())?.map(|row| row.value());
-            Ok(match open {
-                Some((_, 0)) => unsettled.remove(conversation.get())?.is_some(),
-                Some(_) | None => false,
-            })
+            if matches!(state::pending(tx, conversation)?, Some((_, 0))) {
+                state::set_pending(tx, conversation, None)?;
+                Ok(true)
+            } else {
+                Ok(false)
+            }
         })?;
         if released && let Some(parent) = spec.parent_id {
             self.adjust_open_children(parent, -1)?;
@@ -569,12 +567,7 @@ impl Batch {
         let Some(outcome) = self.require_job_state(job.id)?.outcome else {
             return Ok(());
         };
-        let counts = self.step(|tx| {
-            Ok(tx
-                .open_table(UNSETTLED)?
-                .get(spec.id.get())?
-                .map(|row| row.value()))
-        })?;
+        let counts = self.step(|tx| state::pending(tx, spec.id))?;
         let Some(counts) = counts else {
             return self.corrupted("standalone Decision Group unsettled row missing".into());
         };
@@ -589,14 +582,14 @@ impl Batch {
         {
             return Ok(());
         }
-        let mut control = self.job_control(spec.id)?;
-        if control.closing.is_none() {
-            control.closing = Some(JobClosing {
+        let mut lifecycle = self.job_lifecycle(spec.id)?;
+        if lifecycle.closing.is_none() {
+            lifecycle.closing = Some(JobClosing {
                 at: outcome.at,
                 by: Actor::Auto,
                 running: false,
             });
-            self.put_job_control(spec.id, &control)?;
+            self.put_job_lifecycle(spec.id, &lifecycle)?;
         }
         self.record_conversation_outcome(&spec, outcome.clone())?;
         self.settle_native_dependents(spec.id, outcome.kind)?;
@@ -618,11 +611,10 @@ impl Batch {
         conversation: JobId,
     ) -> Result<Vec<JobId>, BatchError> {
         self.step(|tx| {
-            let unsettled = tx.open_table(UNSETTLED)?;
-            let Some(counts) = unsettled.get(conversation.get())? else {
+            let Some(counts) = state::pending(tx, conversation)? else {
                 return Ok(Vec::new());
             };
-            if counts.value().1 == 0 {
+            if counts.1 == 0 {
                 return Ok(Vec::new());
             }
             let children = tx.open_table(CHILDREN)?;
@@ -632,16 +624,15 @@ impl Batch {
                 children.range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
             {
                 let id = entry?.0.value().1;
-                if unsettled.get(id)?.is_none() {
+                if state::pending(tx, JobId::new(id))?.is_none() {
                     continue;
                 }
-                let row = jobs
-                    .get(id)?
-                    .ok_or_else(|| StorageError::corrupted("child Job missing"))?;
-                if row.value().first() == Some(&TAG_JOB)
-                    && transactions::decode_mutable_job(id, row.value())?
-                        .summary_source
-                        .is_some()
+                let Some(row) = jobs.get(id)? else {
+                    continue;
+                };
+                if transactions::decode_mutable_job(id, row.value())?
+                    .summary_source
+                    .is_some()
                 {
                     producers.push(JobId::new(id));
                 }
@@ -666,26 +657,21 @@ impl Batch {
             return Ok(());
         }
         // Chunk Jobs are parallel members in CHILDREN. They have no sequential head in TURNS.
-        let counts = self.step(|tx| {
-            Ok(tx
-                .open_table(UNSETTLED)?
-                .get(group.get())?
-                .map(|row| row.value()))
-        })?;
+        let counts = self.step(|tx| state::pending(tx, group))?;
         if counts != Some((0, 0)) {
             return Ok(());
         }
         let Some(outcome) = self.chunk_group_outcome(group)? else {
             return Ok(());
         };
-        let mut control = self.job_control(group)?;
-        if control.closing.is_none() {
-            control.closing = Some(JobClosing {
+        let mut lifecycle = self.job_lifecycle(group)?;
+        if lifecycle.closing.is_none() {
+            lifecycle.closing = Some(JobClosing {
                 at: outcome.at,
                 by: Actor::Auto,
                 running: false,
             });
-            self.put_job_control(group, &control)?;
+            self.put_job_lifecycle(group, &lifecycle)?;
         }
         self.record_conversation_outcome(spec, outcome)?;
         if let Some(parent) = spec.parent_id {
@@ -729,31 +715,23 @@ impl Batch {
         Ok(aggregate)
     }
 
-    pub(super) fn recover_chunk_group(
-        &mut self,
-        spec: &JobSpec,
-        rebuilt: bool,
-    ) -> Result<(), BatchError> {
+    pub(super) fn recover_chunk_group(&mut self, spec: &JobSpec) -> Result<(), BatchError> {
         let group = spec.id;
         let Some(parent) = spec.parent_id else {
             return self.corrupted("Chunk Group has no parent".into());
         };
         let state = self.require_job_state(group)?;
-        let control = self.job_control(group)?;
-        let unsettled =
-            self.step(|tx| Ok(tx.open_table(UNSETTLED)?.get(group.get())?.is_some()))?;
+        let lifecycle = self.job_lifecycle(group)?;
+        let unsettled = self.step(|tx| Ok(state::pending(tx, group)?.is_some()))?;
         if state.outcome.is_some() {
             if !unsettled {
-                if rebuilt && self.chunk_group_outcome(group)?.as_ref() != state.outcome.as_ref() {
-                    return self.corrupted("settled Chunk Group contradicts its members".into());
-                }
                 return Ok(());
             }
             return self.corrupted("settled Chunk Group still has unsettled members".into());
         }
-        let parent_closed = self.job_control(parent)?.closing.is_some()
+        let parent_closed = self.job_lifecycle(parent)?.closing.is_some()
             || self.require_job_state(parent)?.outcome.is_some();
-        if control.closing.is_some() || parent_closed {
+        if lifecycle.closing.is_some() || parent_closed {
             // Startup has already refused Held Allocations. Only queued work can be ended here.
             self.stop_unsettled_turns(group, &OutcomeCause::Closed)?;
         }
@@ -767,19 +745,19 @@ impl Batch {
         unhold: bool,
     ) -> Result<JobAction, BatchError> {
         self.require_mutable_conversation(conversation)?;
-        let mut control = self.job_control(conversation)?;
-        if matches!(by, Actor::Agent { .. }) && control.on_hold == Some(HELD_BY_USER) {
+        let mut lifecycle = self.job_lifecycle(conversation)?;
+        if matches!(by, Actor::Agent { .. }) && lifecycle.on_hold == Some(HELD_BY_USER) {
             return self.reject(Violation::InvalidValue(
                 "hold",
                 "actor cannot lift this hold",
             ));
         }
-        control.on_hold = (!unhold).then_some(match by {
+        lifecycle.on_hold = (!unhold).then_some(match by {
             Actor::Agent { .. } => HELD_BY_AGENT,
             Actor::User | Actor::Auto | Actor::Loop => HELD_BY_USER,
         });
-        control.loop_count = 0;
-        self.put_job_control(conversation, &control)?;
+        lifecycle.loop_count = 0;
+        self.put_job_lifecycle(conversation, &lifecycle)?;
         if unhold
             && matches!(by, Actor::User)
             && let Some(rec) = self.get(RECURRENCES, conversation.get(), Recurrence::decode)?
@@ -817,10 +795,40 @@ impl Batch {
                 "not a turn of this conversation",
             ));
         }
-        if self.require_job_state(turn)?.outcome.is_none() {
+        if original.summary_source.is_some()
+            || self.group_head(conversation)? != Some(turn)
+            || !self.step(|tx| {
+                Ok(tx
+                    .open_table(TURNS)?
+                    .get((conversation.get(), turn.get()))?
+                    .is_some())
+            })?
+        {
             return self.reject(Violation::InvalidValue(
                 "turn",
-                "cannot retry an unfinished turn",
+                "only the latest regular turn can be retried",
+            ));
+        }
+        if !self
+            .require_job_state(turn)?
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| {
+                matches!(outcome.kind, OutcomeKind::Failed | OutcomeKind::Cancelled)
+            })
+        {
+            return self.reject(Violation::InvalidValue(
+                "turn",
+                "only a failed or cancelled turn can be retried; uncertain work must be reconciled",
+            ));
+        }
+        if self
+            .pool_allocation(turn)?
+            .is_some_and(|allocation| allocation.holds_capacity())
+        {
+            return self.reject(Violation::InvalidValue(
+                "turn",
+                "the original Job still holds execution capacity",
             ));
         }
         if !self.unsettled_turns(conversation)?.is_empty() {
@@ -829,19 +837,50 @@ impl Batch {
                 "a waiting turn already follows",
             ));
         }
-        let mut control = self.job_control(conversation)?;
-        if matches!(by, Actor::Agent { .. })
-            && control
-                .retried
-                .iter()
-                .filter(|prior| **prior == turn)
-                .count()
-                >= MAX_AGENT_RETRIES
-        {
-            return self.reject(Violation::InvalidValue(
-                "retry_limit",
-                "at most two agent retries per original turn",
-            ));
+        let source = original.retry.as_ref().map_or(turn, |retry| retry.original);
+        if original.retry.is_some() {
+            let root = self.mutable_job(source)?.ok_or_else(|| {
+                BatchError(Failure::Storage(StorageError::corrupted(
+                    "retry source missing",
+                )))
+            })?;
+            transactions::validate_retry_source(&original, &root)
+                .map_err(|error| BatchError(Failure::Storage(error)))?;
+        }
+        if matches!(by, Actor::Agent { .. }) {
+            let count = self.step(|tx| {
+                let jobs = tx.open_table(JOBS)?;
+                let mut count = 0;
+                for entry in tx
+                    .open_table(RETRY_JOBS)?
+                    .range((source.get(), 0)..=(source.get(), u128::MAX))?
+                {
+                    let id = entry?.0.value().1;
+                    let row = jobs
+                        .get(id)?
+                        .ok_or_else(|| StorageError::corrupted("retry Job missing"))?;
+                    let job = transactions::decode_mutable_job(id, row.value())?;
+                    let retry = job.retry.ok_or_else(|| {
+                        StorageError::corrupted("retry index names an ordinary Job")
+                    })?;
+                    if retry.original != source || job.parent_id != conversation {
+                        return Err(StorageError::corrupted("retry index names another source"));
+                    }
+                    if matches!(retry.by, Actor::Agent { .. }) {
+                        count += 1;
+                        if count == MAX_AGENT_RETRIES {
+                            break;
+                        }
+                    }
+                }
+                Ok(count)
+            })?;
+            if count >= MAX_AGENT_RETRIES {
+                return self.reject(Violation::InvalidValue(
+                    "retry_limit",
+                    "at most two agent retries per original turn",
+                ));
+            }
         }
         let MutableJobContent::Generative {
             text,
@@ -854,12 +893,12 @@ impl Batch {
                 "only a Generative turn can be retried",
             ));
         };
-        let nth = u32::try_from(control.retried.len()).unwrap_or(u32::MAX);
+        let context = ComposerContextId::new(self.next_id()?);
         let identity = |step: &[u8]| {
             let mut identity = b"ocg retry ".to_vec();
             identity.extend_from_slice(step);
             identity.extend_from_slice(&turn.get().to_le_bytes());
-            identity.extend_from_slice(&nth.to_le_bytes());
+            identity.extend_from_slice(&context.get().to_le_bytes());
             let digest = *ContentDigest::of(&identity).as_bytes();
             Submission {
                 key: SubmissionKey::from_digest(digest),
@@ -874,7 +913,6 @@ impl Batch {
                 configuration,
             },
         };
-        let context = ComposerContextId::new(self.next_id()?);
         let user = matches!(by, Actor::User);
         let id = self.create_job_as(
             context,
@@ -884,10 +922,17 @@ impl Batch {
             None,
             user,
         )?;
+        let mut job = self.mutable_job(id)?.ok_or_else(|| {
+            BatchError(Failure::Storage(StorageError::corrupted(
+                "new retry Job missing",
+            )))
+        })?;
+        job.retry = Some(crate::db::entities::JobRetry {
+            original: source,
+            by,
+        });
+        self.store_mutable_job(&job)?;
         self.submit_mutable_job(id, 1, identity(b"submit"))?;
-        control = self.job_control(conversation)?;
-        control.retried.push(turn);
-        self.put_job_control(conversation, &control)?;
         self.wake_scheduler();
         Ok(Appended {
             turn: id,
@@ -914,26 +959,23 @@ impl Batch {
         if outcome.kind == OutcomeKind::Unknown || self.group_head(conversation)? != Some(job) {
             return Ok(false);
         }
-        let JobKind::Group { keep_open, .. } = spec.kind else {
-            return Ok(false);
-        };
-        let control = self.job_control(conversation)?;
-        if control.closing.is_some() {
+        let lifecycle = self.job_lifecycle(conversation)?;
+        if lifecycle.closing.is_some() {
             self.settle_closing(conversation)?;
-        } else if !keep_open
+        } else if !spec.keep_open
             && outcome.kind == OutcomeKind::Completed
-            && !control.user_input
+            && !lifecycle.user_input
             && self.live_children(conversation)?.is_empty()
             && self.unsettled_summary_producers(conversation)?.is_empty()
             && !self.has_open_job_approvals(conversation)?
         {
-            let mut control = control;
-            control.closing = Some(JobClosing {
+            let mut lifecycle = lifecycle;
+            lifecycle.closing = Some(JobClosing {
                 at: self.now,
                 by: Actor::Auto,
                 running: false,
             });
-            self.put_job_control(conversation, &control)?;
+            self.put_job_lifecycle(conversation, &lifecycle)?;
             self.settle_closing(conversation)?;
         }
         self.end_impossible_dependents(parent, conversation)?;
@@ -953,12 +995,12 @@ impl Batch {
                 if sibling == settled || ended.contains(&sibling) {
                     continue;
                 }
-                let control = self.job_control(sibling)?;
-                if control.closing.is_some() {
+                let lifecycle = self.job_lifecycle(sibling)?;
+                if lifecycle.closing.is_some() {
                     continue;
                 }
                 let mut impossible = false;
-                for (prerequisite, condition) in &control.after {
+                for (prerequisite, condition) in &lifecycle.after {
                     if self.prerequisite_state(*prerequisite, *condition)?
                         == DependencyState::Impossible
                     {
@@ -969,13 +1011,13 @@ impl Batch {
                 if impossible {
                     let _ =
                         self.stop_unsettled_turns(sibling, &OutcomeCause::DependencyImpossible)?;
-                    let mut control = control;
-                    control.closing = Some(JobClosing {
+                    let mut lifecycle = lifecycle;
+                    lifecycle.closing = Some(JobClosing {
                         at: self.now,
                         by: Actor::Auto,
                         running: false,
                     });
-                    self.put_job_control(sibling, &control)?;
+                    self.put_job_lifecycle(sibling, &lifecycle)?;
                     self.settle_closing(sibling)?;
                     ended.push(sibling);
                     progressed = true;
@@ -1012,11 +1054,7 @@ impl Batch {
     }
 
     fn return_child_results(&mut self, parent: JobId, child: JobId) -> Result<(), BatchError> {
-        let JobKind::Group {
-            origin: Origin::Agent { call },
-            ..
-        } = self.require_mutable_conversation(child)?.kind
-        else {
+        let Origin::Agent { call } = self.require_mutable_conversation(child)?.origin else {
             return Ok(());
         };
         let siblings = self.step(|tx| {
@@ -1029,8 +1067,7 @@ impl Batch {
         let mut report = Vec::new();
         for sibling in siblings {
             let spec = self.require_mutable_conversation(sibling)?;
-            if !matches!(spec.kind, JobKind::Group { origin: Origin::Agent { call: opened }, .. } if opened == call)
-            {
+            if !matches!(spec.origin, Origin::Agent { call: opened } if opened == call) {
                 continue;
             }
             let Some(head) = self.group_head(sibling)? else {
@@ -1043,7 +1080,7 @@ impl Batch {
             if outcome.kind == OutcomeKind::Unknown {
                 return Ok(());
             }
-            if self.job_control(sibling)?.reported != Some(head) {
+            if self.job_lifecycle(sibling)?.reported != Some(head) {
                 report.push((sibling, head, outcome.kind));
             }
         }
@@ -1056,7 +1093,7 @@ impl Batch {
         ];
         for (sibling, head, kind) in &report {
             let title = self
-                .job_control(*sibling)?
+                .job_lifecycle(*sibling)?
                 .title
                 .unwrap_or_else(|| sibling.to_string());
             let answer = self.returned_answer(*head)?.unwrap_or_default();
@@ -1071,15 +1108,15 @@ impl Batch {
             ));
         }
         for (sibling, head, _) in &report {
-            let mut control = self.job_control(*sibling)?;
-            control.reported = Some(*head);
-            self.put_job_control(*sibling, &control)?;
+            let mut lifecycle = self.job_lifecycle(*sibling)?;
+            lifecycle.reported = Some(*head);
+            self.put_job_lifecycle(*sibling, &lifecycle)?;
         }
-        let mut control = self.job_control(parent)?;
+        let mut lifecycle = self.job_lifecycle(parent)?;
         let parent_state = self.require_job_state(parent)?;
-        if control.closing.is_some()
+        if lifecycle.closing.is_some()
             || parent_state.outcome.is_some()
-            || control.loop_count >= self.group_limits(parent)?.0.max_auto_turns
+            || lifecycle.loop_count >= self.group_limits(parent)?.0.max_auto_turns
         {
             return Ok(());
         }
@@ -1095,9 +1132,9 @@ impl Batch {
             tool_submission(call, b"results create", marker),
             tool_submission(call, b"results submit", marker),
         )?;
-        control = self.job_control(parent)?;
-        control.loop_count = control.loop_count.saturating_add(1);
-        self.put_job_control(parent, &control)
+        lifecycle = self.job_lifecycle(parent)?;
+        lifecycle.loop_count = lifecycle.loop_count.saturating_add(1);
+        self.put_job_lifecycle(parent, &lifecycle)
     }
 
     pub(crate) fn unreported_child_turns(&mut self) -> Result<Vec<JobId>, BatchError> {
@@ -1117,7 +1154,7 @@ impl Batch {
                 .require_job_state(head)?
                 .outcome
                 .is_some_and(|outcome| outcome.kind != OutcomeKind::Unknown);
-            if settled && self.job_control(child)?.reported != Some(head) {
+            if settled && self.job_lifecycle(child)?.reported != Some(head) {
                 turns.push(head);
             }
         }
@@ -1143,21 +1180,15 @@ impl Batch {
     pub(crate) fn idle_worker(&mut self, caller: JobId, worker: JobId) -> Result<bool, BatchError> {
         let row = self.require_mutable_conversation(worker)?;
         if row.parent_id != Some(caller)
-            || !matches!(
-                row.kind,
-                JobKind::Group {
-                    origin: Origin::Agent { .. },
-                    keep_open: true,
-                    ..
-                }
-            )
+            || !matches!(row.origin, Origin::Agent { .. })
+            || !row.keep_open
         {
             return Ok(false);
         }
-        let control = self.job_control(worker)?;
-        if control.closing.is_some()
-            || control.on_hold.is_some()
-            || control.user_input
+        let lifecycle = self.job_lifecycle(worker)?;
+        if lifecycle.closing.is_some()
+            || lifecycle.on_hold.is_some()
+            || lifecycle.user_input
             || self.require_job_state(worker)?.outcome.is_some()
             || !self.unsettled_turns(worker)?.is_empty()
         {

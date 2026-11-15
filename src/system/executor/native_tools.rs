@@ -8,7 +8,8 @@ use super::tools::{ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegis
 use super::workspace_read::{self, Workspace};
 use crate::db::entities::{FrozenExecutionConfig, ModelCapability, ProjectRecord, ToolEffect};
 use crate::db::{DevelopmentToolContext, DevelopmentToolOffer, DevelopmentTooling};
-use crate::system::execution_controls::ExecutionControl;
+use crate::service::ai::providers::CancellationToken;
+use crate::system::execution_features::ExecutionFeature;
 
 fn offered_grant(mutation: bool) -> &'static str {
     if mutation { "code" } else { "read" }
@@ -20,20 +21,20 @@ pub(crate) struct NativeTooling<'a> {
     data_directory: Option<&'a crate::system::data_directory::DataDirectory>,
     stops: crate::system::native_scheduler::NativeStops,
     built: RefCell<Option<ToolExecution>>,
-    permit: RefCell<Option<blocking::Permit>>,
+    cancellation: CancellationToken,
 }
 
 impl<'a> NativeTooling<'a> {
     pub(crate) fn new(
         data_directory: Option<&'a crate::system::data_directory::DataDirectory>,
         stops: crate::system::native_scheduler::NativeStops,
-        permit: Option<blocking::Permit>,
+        cancellation: CancellationToken,
     ) -> Self {
         Self {
             data_directory,
             stops,
             built: RefCell::new(None),
-            permit: RefCell::new(permit),
+            cancellation,
         }
     }
 
@@ -58,11 +59,11 @@ impl DevelopmentTooling for NativeTooling<'_> {
             .contains(&ModelCapability::Tools);
         let jobs = agent.is_some_and(|agent| agent.manages_jobs())
             && tools
-            && ExecutionControl::ToolsAndChildJobs.is_enabled();
+            && ExecutionFeature::ToolsAndChildJobs.is_enabled();
         if !workspace && !jobs {
             return Ok(None);
         }
-        if workspace && !ExecutionControl::ToolsAndChildJobs.is_enabled() {
+        if workspace && !ExecutionFeature::ToolsAndChildJobs.is_enabled() {
             return Err("tools_disabled");
         }
         let project = if workspace {
@@ -77,21 +78,22 @@ impl DevelopmentTooling for NativeTooling<'_> {
         let wiring = Wiring {
             ask,
             decider: context.decider,
-            mutation: ExecutionControl::WorkspaceMutation.is_enabled(),
+            mutation: ExecutionFeature::WorkspaceMutation.is_enabled(),
             jobs,
             plan: !context.plan_step,
         };
-        let permit = self.permit.borrow_mut().take();
-        let (execution, offer, permit) = build(
-            self.data_directory,
-            project,
-            wiring,
-            self.stops.clone(),
-            permit,
+        use ntex::util::{Either, select};
+
+        let (execution, offer) = match select(
+            self.cancellation.cancelled(),
+            build(self.data_directory, project, wiring, self.stops.clone()),
         )
-        .await?;
+        .await
+        {
+            Either::Left(()) => return Err("preparation_cancelled"),
+            Either::Right(result) => result?,
+        };
         *self.built.borrow_mut() = Some(execution);
-        *self.permit.borrow_mut() = permit;
         Ok(Some(offer))
     }
 }
@@ -138,19 +140,18 @@ fn register_ask_user(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
 async fn authorize_workspace(
     root: &std::path::Path,
     data_directory: &crate::system::data_directory::DataDirectory,
-    permit: blocking::Permit,
-) -> Result<(Workspace, Option<String>, blocking::Permit), &'static str> {
+) -> Result<(Workspace, Option<String>), &'static str> {
     let root = root.to_path_buf();
     let directory = data_directory.clone();
-    match blocking::run_permitted_retained(permit, move || {
+    match blocking::run(blocking::Kind::File, move || {
         let workspace = Workspace::authorize(&root, &directory)?;
         let agents_md = read_agents_md(&workspace);
         Ok::<_, workspace_read::WorkspaceError>((workspace, agents_md))
     })
     .await
     {
-        Ok((permit, Ok((workspace, agents_md)))) => Ok((workspace, agents_md, permit)),
-        Ok((_, Err(error))) => {
+        Ok(Ok((workspace, agents_md))) => Ok((workspace, agents_md)),
+        Ok(Err(error)) => {
             log::warn!("the Project's root no longer authorizes: {error}");
             Err("workspace_unauthorized")
         }
@@ -167,23 +168,12 @@ async fn build(
     project: Option<&ProjectRecord>,
     wiring: Wiring,
     stops: crate::system::native_scheduler::NativeStops,
-    mut permit: Option<blocking::Permit>,
-) -> Result<
-    (
-        ToolExecution,
-        DevelopmentToolOffer,
-        Option<blocking::Permit>,
-    ),
-    &'static str,
-> {
+) -> Result<(ToolExecution, DevelopmentToolOffer), &'static str> {
     let mut agents_md = None;
     let workspace = match (data_directory, project) {
         (Some(data_directory), Some(project)) => {
             let root = std::path::PathBuf::from(&project.root);
-            let held = permit.take().ok_or("workspace_unchecked")?;
-            let (workspace, content, held) =
-                authorize_workspace(&root, data_directory, held).await?;
-            permit = Some(held);
+            let (workspace, content) = authorize_workspace(&root, data_directory).await?;
             if workspace.root() != std::path::Path::new(&project.root) {
                 return Err("workspace_root_changed");
             }
@@ -209,7 +199,6 @@ async fn build(
             grant: granted.then(|| offered_grant(mutation)),
             agents_md,
         },
-        permit,
     ))
 }
 
@@ -219,15 +208,7 @@ async fn build(
     _project: Option<&ProjectRecord>,
     _wiring: Wiring,
     _stops: crate::system::native_scheduler::NativeStops,
-    _permit: Option<blocking::Permit>,
-) -> Result<
-    (
-        ToolExecution,
-        DevelopmentToolOffer,
-        Option<blocking::Permit>,
-    ),
-    &'static str,
-> {
+) -> Result<(ToolExecution, DevelopmentToolOffer), &'static str> {
     Err("workspace_unsupported")
 }
 

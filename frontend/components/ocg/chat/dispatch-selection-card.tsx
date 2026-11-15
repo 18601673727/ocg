@@ -12,8 +12,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ControlProfilesSnapshot, ControlProject } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ProfilesSnapshot, Project } from "../contracts";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 
 type Selection = { agent: string | null; model: string; projects: string[] };
@@ -24,15 +24,15 @@ export function DispatchSelectionCard({
   disabled,
   onSelect,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   arguments: string;
   disabled: boolean;
   onSelect: (selection: Selection) => void;
 }) {
   const { t } = useI18n();
   const [catalog, setCatalog] = useState<{
-    profiles: ControlProfilesSnapshot;
-    projects: ControlProject[];
+    profiles: ProfilesSnapshot;
+    projects: Project[];
   } | null>(null);
   const [target, setTarget] = useState("");
   const [modelId, setModelId] = useState("");

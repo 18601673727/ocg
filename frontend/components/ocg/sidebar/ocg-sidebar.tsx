@@ -43,8 +43,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Skeleton } from "@/components/ui/skeleton";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ChatSession, RuntimeStatus } from "../types";
-import type { RuntimeAuthority } from "../runtime/runtime-types";
-import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
+import { ApiError, type ApiClient } from "../runtime/api-client";
 import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
 import { AccountMenu } from "./account-menu";
 import { ConversationSearch } from "./conversation-search";
@@ -52,7 +51,7 @@ import { useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
 import { OcgLogo } from "../primitives/ocg-logo";
 import { SELECTED_ROW } from "../primitives/selection";
-import type { ControlProject } from "../contracts";
+import type { Project } from "../contracts";
 import { usePinnedConversations } from "./sidebar-preferences";
 import { SidebarConversationChildren } from "./conversation-children";
 import { HoverMarquee } from "./hover-marquee";
@@ -85,12 +84,10 @@ const WORKSPACE_NAV: {
     | "nav.home"
     | "nav.attention"
     | "nav.chat"
-    | "nav.controlCenter"
     | "nav.ledger"
     | "nav.jobExecution"
     | "nav.health"
-    | "nav.logs"
-    | "nav.canonical";
+    | "nav.logs";
   icon: typeof Search;
 }[] = [
   { target: "chat", labelKey: "nav.chat", icon: MessageSquare },
@@ -108,7 +105,7 @@ type OcgSidebarProps = {
   drawer?: boolean;
   onToggle: () => void;
   onSelect: (id: string) => void;
-  control?: HttpCanonicalControlClient;
+  api?: ApiClient;
   activeAncestors?: string[];
   onOpenConversation?: (conversation: string) => void;
   onNewChat: () => void;
@@ -117,7 +114,6 @@ type OcgSidebarProps = {
   onRenameChild?: (conversation: string, title: string) => Promise<void>;
   onHide?: (id: string) => Promise<void>;
   runtimeStatus: RuntimeStatus;
-  runtimeAuthority: RuntimeAuthority;
   activeView?: WorkspaceView;
   attentionCount?: number;
   onNavigate?: (view: WorkspaceView) => void;
@@ -174,7 +170,7 @@ export function OcgSidebar({
   drawer = false,
   onToggle,
   onSelect,
-  control,
+  api,
   activeAncestors,
   onOpenConversation,
   onNewChat,
@@ -182,7 +178,6 @@ export function OcgSidebar({
   onRename,
   onRenameChild,
   onHide,
-  runtimeAuthority,
   activeView = "chat",
   attentionCount = 0,
   onNavigate,
@@ -197,7 +192,7 @@ export function OcgSidebar({
   const newChatShortcut = `${modifier}+${alt}+N`;
   const searchShortcut = `${modifier}+K`;
   const { pinned, toggle: togglePinned } = usePinnedConversations();
-  const [projects, setProjects] = useState<ControlProject[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [projectError, setProjectError] = useState<string | null>(null);
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -221,15 +216,15 @@ export function OcgSidebar({
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [onNewChat]);
   useEffect(() => {
-    if (!control) return;
-    return control.subscribeProjects(
+    if (!api) return;
+    return api.subscribeProjects(
       (value) => {
         setProjects(value.projects);
         setProjectError(null);
       },
       (cause) => setProjectError(cause instanceof Error ? cause.message : String(cause)),
     );
-  }, [control]);
+  }, [api]);
   useEffect(() => {
     const timer = setInterval(() => setNow(Date.now()), 60000);
     return () => clearInterval(timer);
@@ -293,7 +288,7 @@ export function OcgSidebar({
   const logout = useRemoteLogout();
 
   const conversationError = (error: unknown, action: "rename" | "hide"): string => {
-    if (error instanceof ControlTransportError) {
+    if (error instanceof ApiError) {
       if (error.code === "not_found") return t("sidebar.conversationNotFound");
       if (error.code === "invalid_request" && action === "rename") return t("sidebar.titleInvalid");
     }
@@ -340,9 +335,7 @@ export function OcgSidebar({
       setHiding(false);
     }
   };
-  const canonicalMode = runtimeAuthority === "canonical";
-  const workspaceNav = WORKSPACE_NAV;
-  const workbenchNav = canonicalMode ? workspaceNav.filter((item) => item.target !== "chat") : [];
+  const workbenchNav = WORKSPACE_NAV.filter((item) => item.target !== "chat");
   const hasNav = Boolean(onNavigate);
   const navLabel = (item: (typeof WORKSPACE_NAV)[number]) =>
     item.target === "jobs" ? t("nav.jobExecution") : t(item.labelKey);
@@ -417,7 +410,7 @@ export function OcgSidebar({
             activeSessionId={activeSessionId}
             onSelect={onSelect}
             onOpenConversation={onOpenConversation}
-            control={control}
+            api={api}
             conversationList={conversationList}
             onRetryConversations={onRetryConversations}
             trigger={
@@ -435,7 +428,7 @@ export function OcgSidebar({
           {hasNav && (
             <>
               <div className="my-2 h-px w-8 bg-border" aria-hidden="true" />
-              {workspaceNav.map((item) => {
+              {WORKSPACE_NAV.map((item) => {
                 const Icon = item.icon;
                 if (!onNavigate) return null;
                 const label = navLabel(item);
@@ -575,7 +568,7 @@ export function OcgSidebar({
             activeSessionId={activeSessionId}
             onSelect={onSelect}
             onOpenConversation={onOpenConversation}
-            control={control}
+            api={api}
             conversationList={conversationList}
             onRetryConversations={onRetryConversations}
             trigger={
@@ -616,34 +609,6 @@ export function OcgSidebar({
                 </summary>
                 <ul className="mt-0.5 space-y-px">{workbenchNav.map(renderWorkspaceItem)}</ul>
               </details>
-            </div>
-          )}
-          {hasNav && !canonicalMode && (
-            <div className="px-2 pb-2">
-              <ul className="flex flex-col gap-px">
-                {workspaceNav.slice(0, 4).map(renderWorkspaceItem)}
-              </ul>
-              {runtimeAuthority === "mock" && (
-                <details
-                  open={
-                    workspaceNav.slice(4).some((item) => item.target === activeView) || undefined
-                  }
-                  className="mt-1"
-                >
-                  <summary
-                    className={cn(
-                      "cursor-pointer rounded-md px-2 py-1.5",
-                      TYPOGRAPHY_SCALE.caption,
-                      "text-muted-foreground hover:bg-muted/60",
-                    )}
-                  >
-                    {t("nav.tools")}
-                  </summary>
-                  <ul className="flex flex-col gap-px pl-2">
-                    {workspaceNav.slice(4).map(renderWorkspaceItem)}
-                  </ul>
-                </details>
-              )}
             </div>
           )}
           {projectError && (
@@ -694,7 +659,7 @@ export function OcgSidebar({
                         const isMenuOpen = openMenuId === session.id;
                         const expanded = expandedSessions[session.id] ?? active;
                         const canLoadChildren = Boolean(
-                          control && onOpenConversation && session.conversationId,
+                          api && onOpenConversation && session.conversationId,
                         );
                         const canExpand =
                           canLoadChildren &&
@@ -858,13 +823,13 @@ export function OcgSidebar({
                             </div>
                             {canExpand &&
                               expanded &&
-                              control &&
+                              api &&
                               onOpenConversation &&
                               session.conversationId && (
                                 <SidebarConversationChildren
                                   key={session.conversationId}
                                   conversation={session.conversationId}
-                                  control={control}
+                                  api={api}
                                   activeChild={activeAncestors?.[1]}
                                   expanded
                                   sessionId={session.id}

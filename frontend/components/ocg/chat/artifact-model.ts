@@ -1,4 +1,4 @@
-import type { ControlToolCall } from "../contracts";
+import type { ToolCall } from "../contracts";
 
 export type FileArtifact = {
   path: string;
@@ -21,7 +21,7 @@ export function toolObject(text: string | null): Record<string, unknown> | null 
   }
 }
 
-export function isArtifactCall(call: ControlToolCall): boolean {
+export function isArtifactCall(call: ToolCall): boolean {
   if (call.outcome_kind !== "completed") return false;
   return (
     call.name === "workspace_write_file" ||
@@ -29,7 +29,7 @@ export function isArtifactCall(call: ControlToolCall): boolean {
   );
 }
 
-export function fileArtifact(call: ControlToolCall): FileArtifact | null {
+export function fileArtifact(call: ToolCall): FileArtifact | null {
   if (call.outcome_kind !== "completed" || call.arguments_cut || call.result_cut) return null;
   const args = toolObject(call.arguments);
   if (call.name === "workspace_write_file" && args && typeof args.path === "string") {
@@ -66,7 +66,7 @@ export function fileArtifact(call: ControlToolCall): FileArtifact | null {
     : null;
 }
 
-export function artifactTitle(call: ControlToolCall): string {
+export function artifactTitle(call: ToolCall): string {
   const args = toolObject(call.arguments);
   const result = toolObject(call.result);
   return typeof args?.path === "string"

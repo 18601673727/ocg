@@ -6,12 +6,16 @@ use super::*;
 use crate::db::derived::ActivityProjection;
 use crate::db::entities::{
     AllocationPhase, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConnectionConfig,
-    DependencyState, ExecutionConfiguration, ExecutionOperation, JobInputRecord, OutcomeKind,
-    SubmittedConfiguration, ToolCallRef,
+    DependencyState, ExecutionConfiguration, ExecutionOperation, OutcomeKind, ToolCallRef,
 };
 
 pub(super) fn read(database: &Database) -> Result<ReadTransaction, StorageError> {
     Ok(database.begin_read()?)
+}
+
+pub(crate) fn check_readable(database: &Database) -> Result<(), StorageError> {
+    let tx = read(database)?;
+    recovery::check_identity(&tx.open_table(META)?)
 }
 
 enum OfflineAccess<'a> {
@@ -622,12 +626,12 @@ fn inspect_held_in(
     }
 
     let allocation_indexes = match (
-        tx.open_table(CONFIGS),
+        tx.open_table(POOLS),
         tx.open_table(ACTIVE_ALLOCATIONS),
         tx.open_table(ALLOCATION_REQUESTS),
     ) {
-        (Ok(configs), Ok(active), Ok(requests)) => {
-            match indexes::allocation_indexes_agree(&allocations, &configs, &active, &requests) {
+        (Ok(pools), Ok(active), Ok(requests)) => {
+            match indexes::allocation_indexes_agree(&allocations, &pools, &active, &requests) {
                 Ok(true) => "consistent".to_owned(),
                 Ok(false) => "the stored indexes differ from their source rows".to_owned(),
                 Err(error) => format!("inconsistent: {error}"),
@@ -635,9 +639,9 @@ fn inspect_held_in(
         }
         _ => "an index table is missing".to_owned(),
     };
-    let controls: Vec<_> = crate::system::execution_controls::ExecutionControl::ALL
+    let features: Vec<_> = crate::system::execution_features::ExecutionFeature::ALL
         .iter()
-        .map(|control| json!({"control": control.name(), "state": text(&control.state())}))
+        .map(|feature| json!({"feature": feature.name(), "state": text(&feature.state())}))
         .collect();
     Ok(json!({
         "database": {
@@ -651,30 +655,26 @@ fn inspect_held_in(
         "held_reported": reports.len(),
         "held": reports,
         "allocation_indexes": allocation_indexes,
-        "execution_controls": controls,
+        "execution_features": features,
         "note": "Read-only. Nothing was adopted, released, cancelled, retried or finalized.",
     }))
 }
 
-fn read_job_row(rx: &ReadTransaction, id: JobId) -> Result<Option<JobSpec>, StorageError> {
-    rx.open_table(JOBS)?
+fn read_conversation_row(rx: &ReadTransaction, id: JobId) -> Result<Option<JobSpec>, StorageError> {
+    rx.open_table(CONVERSATIONS)?
         .get(id.get())?
         .map(|bytes| JobSpec::decode_at(id.get(), bytes.value()))
         .transpose()
 }
 
-fn read_job_control(rx: &ReadTransaction, id: JobId) -> Result<JobControl, StorageError> {
-    rx.open_table(JOB_CONTROLS)?
-        .get(id.get())?
-        .map(|bytes| JobControl::decode(bytes.value()))
-        .transpose()?
-        .ok_or_else(|| StorageError::corrupted(format!("{id} has no conversation row")))
+fn read_job_lifecycle(rx: &ReadTransaction, id: JobId) -> Result<JobLifecycle, StorageError> {
+    Ok(state::require(rx, id)?.lifecycle)
 }
 
 fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobState, StorageError> {
-    rx.open_table(JOB_STATES)?
+    rx.open_table(JOB_RUNTIME)?
         .get(id.get())?
-        .map(|bytes| JobState::decode_at(id.get(), bytes.value()))
+        .map(|bytes| state::decode_state(id.get(), bytes.value()))
         .transpose()?
         .ok_or_else(|| StorageError::corrupted(format!("{id} has no job_state")))
 }
@@ -701,69 +701,10 @@ fn turn_first(
         .map(|(key, _)| JobId::new(key.value().1)))
 }
 
-pub(super) fn job_execution(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    row: &JobSpec,
-) -> Result<(FrozenExecutionConfig, Option<ProjectId>, Option<ConfigId>), StorageError> {
-    let JobKind::Execution {
-        execution,
-        plan_source,
-        ..
-    } = &row.kind
-    else {
-        return Err(StorageError::corrupted("expected a turn"));
-    };
-    let execution = match execution {
-        JobExecution::Frozen(execution) => execution.clone(),
-        JobExecution::Summarization(work) => work.frozen.clone(),
-        JobExecution::Decision(_) => {
-            return Err(StorageError::corrupted(
-                "decision work cannot use the generative context reader",
-            ));
-        }
-        JobExecution::Ref(owner) => {
-            let bytes = jobs
-                .get(owner.get())?
-                .ok_or_else(|| StorageError::corrupted("missing execution owner"))?;
-            let owner = JobSpec::decode_at(owner.get(), bytes.value())?;
-            match owner.kind {
-                JobKind::Execution {
-                    execution: JobExecution::Frozen(execution),
-                    ..
-                } if owner.parent_id == row.parent_id => execution,
-                JobKind::Group { .. } | JobKind::Execution { .. } => {
-                    return Err(StorageError::corrupted(
-                        "execution reference must name a Frozen turn in this conversation",
-                    ));
-                }
-            }
-        }
-    };
-    let (project, agent) = match plan_source {
-        PlanSource::Process { project, .. } => {
-            (*project, execution.agent_ref.map(|agent| agent.id))
-        }
-        PlanSource::Stored { .. } => {
-            let conversation = row
-                .parent_id
-                .ok_or_else(|| StorageError::corrupted("stored turn has no conversation"))?;
-            let bytes = jobs
-                .get(conversation.get())?
-                .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
-            match JobSpec::decode_at(conversation.get(), bytes.value())?.kind {
-                JobKind::Group { project, agent, .. } => (project, agent),
-                JobKind::Execution { .. } => {
-                    return Err(StorageError::corrupted(
-                        "stored turn parent must be a conversation",
-                    ));
-                }
-            }
-        }
-    };
-    Ok((execution, project, agent))
-}
-
-pub(super) fn job_record(rx: &ReadTransaction, row: JobSpec) -> Result<JobRecord, StorageError> {
+pub(super) fn conversation_record(
+    rx: &ReadTransaction,
+    row: JobSpec,
+) -> Result<JobRecord, StorageError> {
     let id = row.id;
     let state = read_state(rx, id)?;
     let at = |kind: OutcomeKind| {
@@ -773,64 +714,54 @@ pub(super) fn job_record(rx: &ReadTransaction, row: JobSpec) -> Result<JobRecord
             .filter(|outcome| outcome.kind == kind)
             .map(|outcome| outcome.at)
     };
-    let subtree_settled = rx.open_table(UNSETTLED)?.get(id.get())?.is_none();
-    let execution = turn_config(rx, &row)?;
-    let configuration = execution.as_ref().map(|execution| ExecutionConfiguration {
-        reasoning_effort: execution
-            .llm
-            .config
-            .parameters
-            .reasoning_effort
-            .as_deref()
-            .and_then(crate::db::entities::ReasoningEffort::parse),
-        agent_profile: execution.agent_ref.map(|agent| agent.id.into()),
-        llm_profile: execution.llm.model.id.into(),
-    });
+    let subtree_settled = state::pending(rx, id)?.is_none();
     let updated_at = [
         Some(row.created_at),
         state.outcome.as_ref().map(|outcome| outcome.at),
-        state.stop_confirmed_at,
     ]
     .into_iter()
     .flatten()
     .max()
     .unwrap_or(row.created_at);
-    let children_closed_at = if row.kind.is_group() {
-        read_job_control(rx, id)?.closing.map(|closing| closing.at)
-    } else {
-        state.outcome.as_ref().map(|outcome| outcome.at)
-    };
+    let children_closed_at = read_job_lifecycle(rx, id)?
+        .closing
+        .map(|closing| closing.at);
     Ok(JobRecord {
         id,
-        name: row.kind.name().map(str::to_owned),
+        name: None,
         started_at: None,
         completed_at: at(OutcomeKind::Completed),
         failed_at: at(OutcomeKind::Failed),
         cancelled_at: at(OutcomeKind::Cancelled),
         unknown_at: at(OutcomeKind::Unknown),
-        stop_confirmed_at: state.stop_confirmed_at,
-        stop_confirmed_by: state.stop_confirmed_by,
+        stop_confirmed_at: None,
+        stop_confirmed_by: None,
         created_at: row.created_at,
         updated_at,
         input: JobInputId::new(id.get()),
         parent: row.parent_id.unwrap_or(JobId::new(0)),
         parent_id: row.parent_id,
-        group: row.kind.is_persistent().then_some(row.parent_id).flatten(),
-        objective: row.kind.objective().map(str::to_owned),
-        configuration,
+        group: None,
+        objective: None,
+        configuration: None,
         assigned_executor: None,
-        previous: row.kind.previous(),
+        previous: None,
         outcome: state.outcome,
         children_closed_at,
-        kind: row.kind,
+        kind: JobKind::Group {
+            agent: row.agent,
+            project: row.project,
+            origin: row.origin,
+            keep_open: row.keep_open,
+        },
         subtree_settled,
     })
 }
 
 pub(crate) fn read_job(database: &Database, id: JobId) -> Result<Option<JobRecord>, StorageError> {
     let rx = read(database)?;
-    read_job_row(&rx, id)?
-        .map(|row| job_record(&rx, row))
+    read_conversation_row(&rx, id)?
+        .map(|row| conversation_record(&rx, row))
         .transpose()
 }
 
@@ -842,36 +773,19 @@ pub(super) fn mutable_job_record_in(
     let Some(bytes) = jobs.get(id.get())? else {
         return Ok(None);
     };
-    if bytes.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
-        JobSpec::decode_at(id.get(), bytes.value())?;
-        return Ok(None);
-    }
     let job = transactions::decode_mutable_job(id.get(), bytes.value())?;
-    let states = rx.open_table(JOB_STATES)?;
+    let states = rx.open_table(JOB_RUNTIME)?;
     let state = states
         .get(id.get())?
         .ok_or_else(|| StorageError::corrupted("mutable Job state is missing"))?;
-    if !matches!(state.value(), [TAG_JOB_STATE, version, ..] if u64::from(*version) == FORMAT_VERSION)
-    {
-        return Err(StorageError::corrupted("invalid mutable Job state version"));
-    }
-    let state = JobState::decode_at(id.get(), state.value())?;
-    if state.stop_confirmed_at.is_some() || state.stop_confirmed_by.is_some() {
-        return Err(StorageError::corrupted(
-            "mutable Job has legacy ownership evidence",
-        ));
-    }
-    let parent = read_job_row(rx, job.parent_id)?
+    let state = state::decode_state(id.get(), state.value())?;
+    let parent = read_conversation_row(rx, job.parent_id)?
         .ok_or_else(|| StorageError::corrupted("mutable Job conversation missing"))?;
-    let JobKind::Group { project, .. } = parent.kind else {
-        return Err(StorageError::corrupted(
-            "mutable Job parent is not a conversation",
-        ));
-    };
     Ok(Some(crate::db::entities::MutableJobRecord {
         job,
         outcome: state.outcome,
-        project,
+        project: parent.project,
+        event_seq: execution::latest_seq(rx, id)?,
     }))
 }
 
@@ -883,7 +797,7 @@ pub(crate) struct DevelopmentExecutionContext {
     pub executor: crate::db::entities::AllocationExecutor,
     pub configuration: FrozenExecutionConfig,
     pub conversation: JobSpec,
-    pub conversation_control: JobControl,
+    pub conversation_lifecycle: JobLifecycle,
     pub plan_step: bool,
     pub project: Option<ProjectRecord>,
     pub compaction: crate::db::entities::GlobalCompactionSettings,
@@ -908,7 +822,7 @@ pub(crate) struct DevelopmentDecisionContext {
     pub executor: crate::db::entities::AllocationExecutor,
     pub configuration: crate::db::entities::FrozenDecisionConfig,
     pub conversation: JobSpec,
-    pub conversation_control: JobControl,
+    pub conversation_lifecycle: JobLifecycle,
     pub project: Option<ProjectRecord>,
 }
 
@@ -1032,14 +946,15 @@ fn native_summary_frame(
 }
 
 fn native_summary_owner(
-    configs: &impl ReadableTable<u128, &'static [u8]>,
+    pools: &impl ReadableTable<u128, &'static [u8]>,
+    executors: &impl ReadableTable<u128, &'static [u8]>,
     allocation: &crate::db::entities::PoolAllocation,
     budget: &mut SummaryBudget,
 ) -> Result<(), StorageError> {
-    let pool = configs
+    let pool = pools
         .get(allocation.token.pool.get())?
         .ok_or_else(|| StorageError::corrupted("summary allocation Pool missing"))?;
-    let executor = configs
+    let executor = executors
         .get(allocation.token.executor.get())?
         .ok_or_else(|| StorageError::corrupted("summary allocation Executor missing"))?;
     budget.bytes(pool.value().len())?;
@@ -1063,18 +978,19 @@ fn native_summary_owner(
     Ok(())
 }
 
-pub(super) struct NativeSummaryTables<J, S, A, O, AT, T, C> {
+pub(super) struct NativeSummaryTables<J, S, A, O, AT, T, P, E> {
     pub jobs: J,
     pub states: S,
     pub allocations: A,
     pub outputs: O,
     pub attachments: AT,
     pub tools: T,
-    pub configs: C,
+    pub pools: P,
+    pub executors: E,
 }
 
-pub(super) fn native_source_boundary<J, S, A, O, AT, T, C>(
-    tables: &NativeSummaryTables<J, S, A, O, AT, T, C>,
+pub(super) fn native_source_boundary<J, S, A, O, AT, T, P, E>(
+    tables: &NativeSummaryTables<J, S, A, O, AT, T, P, E>,
     id: JobId,
     conversation: JobId,
     budget: &mut SummaryBudget,
@@ -1086,7 +1002,8 @@ where
     O: ReadableTable<(u128, u32), &'static [u8]>,
     AT: ReadableTable<u128, &'static [u8]>,
     T: ReadableTable<(u128, u32, u32), &'static [u8]>,
-    C: ReadableTable<u128, &'static [u8]>,
+    P: ReadableTable<u128, &'static [u8]>,
+    E: ReadableTable<u128, &'static [u8]>,
 {
     use crate::db::entities::MutableJobPhase;
     use aws_lc_rs::digest::{Context, SHA256};
@@ -1117,14 +1034,12 @@ where
             "Decision Jobs cannot be summary sources",
         ));
     }
-    let state = JobState::decode_at(id.get(), state_bytes.value())?;
+    let state = state::decode_state(id.get(), state_bytes.value())?;
     let allocation = transactions::decode_pool_allocation(id.get(), allocation_bytes.value())?;
     if job.parent_id != conversation
         || job.phase != MutableJobPhase::Executing
         || job.summary_source.is_some()
         || job.context_selection != crate::db::entities::MutableContextSelection::FullHistory
-        || state.stop_confirmed_at.is_some()
-        || state.stop_confirmed_by.is_some()
         || !state.outcome.as_ref().is_some_and(|o| {
             matches!(
                 o.kind,
@@ -1152,7 +1067,7 @@ where
             "summary source is not a settled conversation Job",
         ));
     }
-    native_summary_owner(&tables.configs, &allocation, budget)?;
+    native_summary_owner(&tables.pools, &tables.executors, &allocation, budget)?;
     if tools
         .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
         .next()
@@ -1243,7 +1158,7 @@ pub(super) fn verify_native_summary_in(
 ) -> Result<VerifiedNativeSummary, StorageError> {
     verify_native_summary_tables(
         &rx.open_table(JOBS)?,
-        &rx.open_table(JOB_STATES)?,
+        &rx.open_table(JOB_RUNTIME)?,
         &rx.open_table(JOB_OUTPUTS)?,
         &rx.open_table(MESSAGES)?,
         conversation,
@@ -1279,7 +1194,7 @@ where
         .get(producer.get())?
         .ok_or_else(|| StorageError::corrupted("summary producer missing"))?;
     let producer_job = transactions::decode_mutable_job(producer.get(), producer_bytes.value())?;
-    let state = JobState::decode_at(
+    let state = state::decode_state(
         producer.get(),
         states
             .get(producer.get())?
@@ -1428,13 +1343,14 @@ fn development_candidate_in(
             verify_native_summary_in(rx, record.job.parent_id, record.job.id, producer, source)?,
         ),
     };
-    let configs = rx.open_table(CONFIGS)?;
-    let pool = configs
+    let pools = rx.open_table(POOLS)?;
+    let executors = rx.open_table(EXECUTORS)?;
+    let pool = pools
         .get(token.pool.get())?
         .map(|v| transactions::decode_allocation_pool(token.pool.get(), v.value()))
         .transpose()?
         .ok_or_else(|| context_unavailable("Pool is missing"))?;
-    let executor = configs
+    let executor = executors
         .get(token.executor.get())?
         .map(|v| transactions::decode_allocation_executor(token.executor.get(), v.value()))
         .transpose()?
@@ -1452,10 +1368,10 @@ fn development_candidate_in(
             "Pool or Executor configuration changed",
         ));
     }
-    let conversation = read_job_row(rx, record.job.parent_id)?
+    let conversation = read_conversation_row(rx, record.job.parent_id)?
         .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
-    let conversation_control = read_job_control(rx, conversation.id)?;
-    if conversation_control.on_hold.is_some() || conversation_control.closing.is_some() {
+    let conversation_lifecycle = read_job_lifecycle(rx, conversation.id)?;
+    if conversation_lifecycle.on_hold.is_some() || conversation_lifecycle.closing.is_some() {
         return Err(context_unavailable("conversation is not eligible"));
     }
     let project = record
@@ -1488,7 +1404,7 @@ fn development_candidate_in(
             executor,
             configuration,
             conversation,
-            conversation_control,
+            conversation_lifecycle,
             project,
         }));
     }
@@ -1497,12 +1413,9 @@ fn development_candidate_in(
     else {
         return Err(context_unavailable("Job operation is unsupported"));
     };
-    let plan_step = match &conversation.kind {
-        crate::db::entities::JobKind::Group {
-            origin: crate::db::entities::Origin::Agent { call },
-            ..
-        } => tool_call_name(rx, *call)?.as_deref() == Some("job_plan"),
-        _ => false,
+    let plan_step = match conversation.origin {
+        Origin::Agent { call } => tool_call_name(rx, call)?.as_deref() == Some("job_plan"),
+        Origin::User | Origin::System => false,
     };
     let attachments = context_attachments(rx, record.job.input.attachments())?;
     let compaction = global_compaction_settings(meta)?;
@@ -1670,8 +1583,7 @@ fn development_candidate_in(
                     .map(|row| transactions::decode_pool_allocation(id.get(), row.value()))
                     .transpose()?
                     .as_ref(),
-            )?
-            .is_some();
+            )?;
         if !ended_unstarted
             && (prior.job.parent_id != record.job.parent_id
                 || prior.job.phase != MutableJobPhase::Executing
@@ -1737,9 +1649,10 @@ fn development_candidate_in(
             prior_outputs.push(decode_output(key.value(), value.value())?);
             output_count += 1;
         }
-        if prior_outputs
-            .last()
-            .is_none_or(|output| output.kind != OutputKind::Result)
+        if !ended_unstarted
+            && prior_outputs
+                .last()
+                .is_none_or(|output| output.kind != OutputKind::Result)
         {
             return Err(StorageError::corrupted(
                 "settled predecessor has no final output",
@@ -1793,7 +1706,7 @@ fn development_candidate_in(
             executor,
             configuration,
             conversation,
-            conversation_control,
+            conversation_lifecycle,
             plan_step,
             project,
             compaction,
@@ -1835,11 +1748,7 @@ pub(crate) fn read_mutable_job_details(
 ) -> Result<MutableJobDetailsLookup, StorageError> {
     let rx = read(database)?;
     let jobs = rx.open_table(JOBS)?;
-    let Some(bytes) = jobs.get(id.get())? else {
-        return Ok(MutableJobDetailsLookup::NotMutable);
-    };
-    if bytes.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
-        JobSpec::decode_at(id.get(), bytes.value())?;
+    if jobs.get(id.get())?.is_none() {
         return Ok(MutableJobDetailsLookup::NotMutable);
     }
     match mutable_job_details_in(&rx, id, context, true)? {
@@ -1900,26 +1809,86 @@ pub(super) fn unstarted_settlement_in(
     rx: &ReadTransaction,
     record: &crate::db::entities::MutableJobRecord,
     allocation: Option<&crate::db::entities::PoolAllocation>,
-) -> Result<Option<JobOutputRecord>, StorageError> {
+) -> Result<bool, StorageError> {
     use crate::db::entities::MutableJobPhase;
-    let Some(allocation) = allocation.filter(|allocation| {
-        record.job.phase == MutableJobPhase::Queued && allocation.phase == AllocationPhase::Released
-    }) else {
-        return Ok(None);
-    };
-    if record.outcome.is_none() || allocation.started_at.is_some() {
-        return Err(StorageError::corrupted(format!(
-            "{} was released before its start without an exact unstarted settlement",
-            record.job.id
-        )));
+    if record.job.phase != MutableJobPhase::Queued
+        || allocation.is_some_and(|allocation| allocation.holds_capacity())
+    {
+        return Ok(false);
     }
+    let invalid = || {
+        StorageError::corrupted(format!(
+            "{} has inconsistent unstarted settlement evidence",
+            record.job.id
+        ))
+    };
+    let Some(outcome) = &record.outcome else {
+        return if allocation.is_none() {
+            Ok(false)
+        } else {
+            Err(invalid())
+        };
+    };
+    match outcome.kind {
+        OutcomeKind::Unknown => return Ok(false),
+        OutcomeKind::Completed => return Err(invalid()),
+        OutcomeKind::Failed | OutcomeKind::Cancelled => {}
+    }
+    if allocation.is_none() && outcome.kind != OutcomeKind::Cancelled {
+        return Err(invalid());
+    }
+    if allocation.is_some_and(|allocation| {
+        allocation.token.job != record.job.id
+            || allocation.job_revision != record.job.revision
+            || allocation.started_at.is_some()
+    }) {
+        return Err(invalid());
+    }
+
     let id = record.job.id.get();
-    rx.open_table(JOB_OUTPUTS)?
-        .range((id, 0)..=(id, u32::MAX))?
+    for table in [REQUEST_EVENTS, TOOL_CALLS, APPROVALS] {
+        if rx
+            .open_table(table)?
+            .range((id, 0, 0)..=(id, u32::MAX, u32::MAX))?
+            .next()
+            .transpose()?
+            .is_some()
+        {
+            return Err(invalid());
+        }
+    }
+    if rx
+        .open_table(JOB_OBSERVATIONS)?
+        .range((id, 0, 0)..=(id, u8::MAX, u128::MAX))?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(invalid());
+    }
+    let outputs = rx.open_table(JOB_OUTPUTS)?;
+    let mut rows = outputs.range((id, 0)..=(id, u32::MAX))?;
+    let output = rows
         .next()
         .transpose()?
         .map(|(key, value)| decode_output(key.value(), value.value()))
-        .transpose()
+        .transpose()?;
+    if rows.next().transpose()?.is_some() {
+        return Err(invalid());
+    }
+    match (allocation, output) {
+        (None, None) => Ok(true),
+        (Some(_), Some(output))
+            if output.seq == 1
+                && output.kind == OutputKind::Result
+                && output.created_at == outcome.at
+                && output.goal_reached == Some(false)
+                && output.value.is_none() =>
+        {
+            Ok(true)
+        }
+        _ => Err(invalid()),
+    }
 }
 
 pub(super) fn mutable_job_details_in(
@@ -2059,14 +2028,7 @@ pub(crate) fn read_mutable_conversation_turn_page(
     limit: usize,
 ) -> Result<Option<MutableConversationPage>, StorageError> {
     let rx = read(database)?;
-    if !rx
-        .open_table(JOBS)?
-        .get(conversation.get())?
-        .is_some_and(|row| row.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG))
-    {
-        return Ok(None);
-    }
-    if !read_job_row(&rx, conversation)?.is_some_and(|row| row.kind.is_group()) {
+    if read_conversation_row(&rx, conversation)?.is_none() {
         return Ok(None);
     }
     if let Some(before) = before {
@@ -2239,12 +2201,9 @@ pub(crate) fn read_job_search(
             next_before = last_examined;
             break;
         }
-        let (key, bytes) = entry?;
+        let (key, _) = entry?;
         let id = JobId::new(key.value());
         last_examined = Some(id);
-        if bytes.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
-            continue;
-        }
         let Some(record) = mutable_job_record_in(&rx, id)? else {
             continue;
         };
@@ -2390,7 +2349,7 @@ fn has_children(rx: &ReadTransaction, parent: JobId) -> Result<bool, StorageErro
 
 fn read_ancestors(rx: &ReadTransaction, root: JobId) -> Result<Vec<JobId>, StorageError> {
     let mut ancestors = Vec::new();
-    let mut current = read_job_row(rx, root)?.and_then(|row| row.parent_id);
+    let mut current = read_conversation_row(rx, root)?.and_then(|row| row.parent_id);
     while let Some(id) = current {
         if id.get() == 0 {
             break;
@@ -2399,7 +2358,7 @@ fn read_ancestors(rx: &ReadTransaction, root: JobId) -> Result<Vec<JobId>, Stora
         if ancestors.len() > TREE_ANCESTORS_MAX {
             return Err(StorageError::corrupted("too many ancestors"));
         }
-        current = match read_job_row(rx, id)? {
+        current = match read_conversation_row(rx, id)? {
             Some(row) => row.parent_id,
             None => return Err(StorageError::corrupted(format!("{id} has no job row"))),
         };
@@ -2426,19 +2385,45 @@ fn agent_name(
     Ok(name)
 }
 
+pub(super) fn active_job_in(
+    rx: &impl TxRead,
+    conversation: JobId,
+) -> Result<Option<crate::db::entities::MutableJob>, StorageError> {
+    let jobs = rx.table(JOBS)?;
+    for entry in rx.table(ACTIVE_ALLOCATIONS)?.iter()? {
+        let (_, _, id) = entry?.0.value();
+        let row = jobs
+            .get(id)?
+            .ok_or_else(|| StorageError::corrupted("active Allocation references a missing Job"))?;
+        let job = transactions::decode_mutable_job(id, row.value())?;
+        if job.parent_id == conversation && job.summary_source.is_none() {
+            return Ok(Some(job));
+        }
+    }
+    Ok(None)
+}
+
 fn active_job(
     rx: &ReadTransaction,
     conversation: JobId,
 ) -> Result<Option<(JobId, ConfigId, String)>, StorageError> {
-    let Some(turn) = rx
-        .open_table(ACTIVE_JOBS)?
-        .get(conversation.get())?
-        .map(|id| JobId::new(id.value()))
-    else {
+    let Some(job) = active_job_in(rx, conversation)? else {
         return Ok(None);
     };
-    let _ = turn;
-    Ok(None)
+    let (model, name) = match job.frozen {
+        Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) => {
+            (frozen.llm.model.id, frozen.llm.config.model)
+        }
+        Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)) => {
+            (frozen.model_ref.id, frozen.model.model)
+        }
+        None => {
+            return Err(StorageError::corrupted(
+                "active Job has no frozen configuration",
+            ));
+        }
+    };
+    Ok(Some((job.id, model, name)))
 }
 
 fn turn_state(rx: &ReadTransaction, id: JobId) -> Result<&'static str, StorageError> {
@@ -2451,11 +2436,7 @@ fn turn_state(rx: &ReadTransaction, id: JobId) -> Result<&'static str, StorageEr
             OutcomeKind::Unknown => "unknown",
         });
     }
-    let open = rx
-        .open_table(UNSETTLED)?
-        .get(id.get())?
-        .map(|counts| counts.value().0)
-        .unwrap_or(0);
+    let open = state::pending(rx, id)?.map_or(0, |counts| counts.0);
     Ok(if open > 0 { "waiting" } else { "queued" })
 }
 
@@ -2464,7 +2445,7 @@ fn dependency_state(
     dependency: JobId,
     condition: DependencyCondition,
 ) -> Result<DependencyState, StorageError> {
-    let target = match read_job_row(rx, dependency)? {
+    let target = match read_conversation_row(rx, dependency)? {
         Some(row) if !row.is_chunk_group() => {
             match turn_head(&rx.open_table(TURNS)?, dependency)? {
                 Some(head) => head,
@@ -2474,9 +2455,9 @@ fn dependency_state(
         Some(_) | None => dependency,
     };
     let state = rx
-        .open_table(JOB_STATES)?
+        .open_table(JOB_RUNTIME)?
         .get(target.get())?
-        .map(|bytes| JobState::decode_at(target.get(), bytes.value()))
+        .map(|bytes| state::decode_state(target.get(), bytes.value()))
         .transpose()?;
     Ok(Batch::dependency_outcome_state(
         state.as_ref().and_then(|state| state.outcome.as_ref()),
@@ -2509,17 +2490,10 @@ impl TreeRow {
 }
 
 fn tree_row(rx: &ReadTransaction, id: JobId) -> Result<Option<TreeRow>, StorageError> {
-    let is_conversation = rx
-        .open_table(JOBS)?
-        .get(id.get())?
-        .map(|bytes| bytes.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG));
-    match is_conversation {
-        None => Ok(None),
-        Some(true) => Ok(read_job_row(rx, id)?.map(|row| TreeRow::Conversation(Box::new(row)))),
-        Some(false) => {
-            Ok(mutable_job_record_in(rx, id)?.map(|record| TreeRow::Turn(Box::new(record))))
-        }
+    if let Some(row) = read_conversation_row(rx, id)? {
+        return Ok(Some(TreeRow::Conversation(Box::new(row))));
     }
+    Ok(mutable_job_record_in(rx, id)?.map(|record| TreeRow::Turn(Box::new(record))))
 }
 
 fn tree_node(
@@ -2529,12 +2503,6 @@ fn tree_node(
 ) -> Result<TreeNode, StorageError> {
     let (parent_id, created_at, facts, agent) = match row {
         TreeRow::Conversation(row) => {
-            let JobKind::Group {
-                origin, keep_open, ..
-            } = &row.kind
-            else {
-                return Err(StorageError::corrupted("conversation row is not a group"));
-            };
             let summary = conversation_summary(rx, row, conversation_tip(rx, row)?)?;
             let state = match summary.state.as_str() {
                 "open" => "open",
@@ -2542,7 +2510,7 @@ fn tree_node(
                 "settled" => "settled",
                 _ => return Err(StorageError::corrupted("unknown conversation state")),
             };
-            let origin = match origin {
+            let origin = match row.origin {
                 Origin::User => "user",
                 Origin::Agent { .. } => "agent",
                 Origin::System => "system",
@@ -2553,7 +2521,7 @@ fn tree_node(
                 .map(|bytes| Recurrence::decode(bytes.value()))
                 .transpose()?;
             let mut depends_on = Vec::new();
-            for (dependency, condition) in read_job_control(rx, row.id)?
+            for (dependency, condition) in read_job_lifecycle(rx, row.id)?
                 .after
                 .iter()
                 .take(TREE_DEPENDENCIES_MAX)
@@ -2572,7 +2540,7 @@ fn tree_node(
                     state,
                     on_hold: summary.on_hold,
                     origin,
-                    keep_open: *keep_open,
+                    keep_open: row.keep_open,
                     active_turn: active_job(rx, row.id)?,
                     recurrence,
                     depends_on,
@@ -2714,7 +2682,26 @@ pub(crate) fn read_retries(
     limit: usize,
 ) -> Result<CursorPage<JobId, JobId>, StorageError> {
     let rx = read(database)?;
-    let table = rx.open_table(RETRIES)?;
+    let jobs = rx.open_table(JOBS)?;
+    let Some(row) = jobs.get(original.get())? else {
+        return Ok(CursorPage {
+            records: Vec::new(),
+            next: None,
+        });
+    };
+    let source = transactions::decode_mutable_job(original.get(), row.value())?;
+    let original = if let Some(retry) = &source.retry {
+        let root = jobs
+            .get(retry.original.get())?
+            .map(|row| transactions::decode_mutable_job(retry.original.get(), row.value()))
+            .transpose()?
+            .ok_or_else(|| StorageError::corrupted("retry source missing"))?;
+        transactions::validate_retry_source(&source, &root)?;
+        root.id
+    } else {
+        original
+    };
+    let table = rx.open_table(RETRY_JOBS)?;
     let limit = limit.clamp(1, MAX_PAGE);
     let mut records = Vec::new();
     let mut more = false;
@@ -2742,17 +2729,7 @@ pub(crate) fn read_outputs(
 }
 
 fn output_is_group(rx: &ReadTransaction, job: JobId) -> Result<bool, StorageError> {
-    {
-        let jobs = rx.open_table(JOBS)?;
-        let Some(row) = jobs.get(job.get())? else {
-            return Ok(false);
-        };
-        if row.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG) {
-            return Ok(JobSpec::decode_at(job.get(), row.value())?.kind.is_group());
-        }
-        transactions::decode_mutable_job(job.get(), row.value())?;
-        Ok(false)
-    }
+    Ok(read_conversation_row(rx, job)?.is_some())
 }
 
 fn outputs(
@@ -2818,7 +2795,7 @@ fn conversation_result(
     };
     let mut summary = String::new();
     let mut value = None;
-    let row = read_job_row(rx, conversation)?
+    let row = read_conversation_row(rx, conversation)?
         .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
     if row.is_chunk_group() {
         summary = match outcome.kind {
@@ -2828,11 +2805,9 @@ fn conversation_result(
             OutcomeKind::Unknown => "The summary chunks have an unknown outcome.",
         }
         .to_owned();
-    } else if let Some(turn) = rx
-        .open_table(GROUP_RESULTS)?
-        .get(conversation.get())?
-        .map(|tips| tips.value().1)
-        .filter(|turn| *turn != 0)
+    } else if let Some(turn) = state::require(rx, conversation)?
+        .last_result
+        .map(JobId::get)
         && let Some((key, bytes)) = rx
             .open_table(JOB_OUTPUTS)?
             .range((turn, 0)..=(turn, u32::MAX))?
@@ -2842,21 +2817,6 @@ fn conversation_result(
         let output = decode_output(key.value(), bytes.value())?;
         summary = output.summary.unwrap_or_default();
         value = output.value;
-    }
-    let after = rx
-        .open_table(NOTICE_READ)?
-        .get(conversation.get())?
-        .map_or(0, |seq| seq.value());
-    if after < u32::MAX {
-        for entry in rx
-            .open_table(NOTICES)?
-            .range((conversation.get(), after + 1)..=(conversation.get(), u32::MAX))?
-        {
-            let notice = Notice::decode(entry?.1.value())?;
-            if matches!(notice.class, NoticeClass::Attention | NoticeClass::Progress) {
-                summary.push_str(&format!("\nUnread notice: {:?}", notice.body));
-            }
-        }
     }
     for call in approved_calls(rx, conversation)? {
         summary.push_str(&format!(
@@ -2926,183 +2886,10 @@ fn tool_call_name(rx: &ReadTransaction, call: ToolCallRef) -> Result<Option<Stri
         .transpose()
 }
 
-fn input_of(rx: &ReadTransaction, row: JobSpec) -> Result<JobInputRecord, StorageError> {
-    let execution = turn_config(rx, &row)?;
-    let mut objective = row.kind.objective().map(str::to_owned);
-    let mut attachments = row.kind.attachments().to_vec();
-    if row.kind.is_persistent() {
-        let mut messages = Vec::new();
-        for (_, entry) in turn_entries(rx, row.id)? {
-            match entry.entry {
-                Entry::UserMessage {
-                    text,
-                    attachments: images,
-                } => {
-                    messages.push(text);
-                    attachments.extend(images);
-                }
-                Entry::AgentMessage { text, .. } => messages.push(text),
-                Entry::UserMessageEdit { .. }
-                | Entry::UserMessageWithdraw { .. }
-                | Entry::Notice { .. }
-                | Entry::Decision { .. }
-                | Entry::RetryOf { .. }
-                | Entry::Iteration { .. }
-                | Entry::ResponseFormat { .. }
-                | Entry::ContextPreparation { .. }
-                | Entry::ContextUse { .. } => {}
-            }
-        }
-        if !messages.is_empty() {
-            objective = Some(messages.join("\n"));
-        }
-    }
-    Ok(JobInputRecord {
-        id: JobInputId::new(row.id.get()),
-        objective,
-        submitted_at: Some(row.created_at),
-        created_at: row.created_at,
-        updated_at: row.created_at,
-        configuration: execution,
-        attachments,
-    })
-}
-
-pub(crate) fn read_job_input(
-    database: &Database,
-    id: JobInputId,
-) -> Result<Option<JobInputRecord>, StorageError> {
-    read_job_input_for_job(database, JobId::new(id.get()))
-}
-
-pub(crate) fn read_job_input_for_job(
-    database: &Database,
-    job: JobId,
-) -> Result<Option<JobInputRecord>, StorageError> {
-    let rx = read(database)?;
-    read_job_row(&rx, job)?
-        .map(|row| input_of(&rx, row))
-        .transpose()
-}
-
-pub(super) fn turn_config(
-    tx: &impl TxRead,
-    row: &JobSpec,
-) -> Result<Option<FrozenExecutionConfig>, StorageError> {
-    let jobs = tx.table(JOBS)?;
-    if matches!(
-        &row.kind,
-        JobKind::Execution {
-            execution: JobExecution::Decision(_),
-            ..
-        }
-    ) || row.kind.is_group()
-    {
-        return Ok(None);
-    }
-    Ok(Some(job_execution(&jobs, row)?.0))
-}
-
 #[derive(Clone)]
 pub(super) struct UsageIdentity {
     pub(super) provider: u128,
     pub(super) model: String,
-}
-
-pub(super) fn turn_usage_identity_of(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    row: &JobSpec,
-) -> Result<Option<UsageIdentity>, StorageError> {
-    match &row.kind {
-        JobKind::Group { .. } => Ok(None),
-        JobKind::Execution {
-            execution: JobExecution::Decision(work),
-            ..
-        } => Ok(Some(UsageIdentity {
-            provider: work.frozen.connection_ref().id.get(),
-            model: work.frozen.model_name().to_owned(),
-        })),
-        JobKind::Execution { .. } => {
-            let (execution, _, _) = job_execution(jobs, row)?;
-            Ok(Some(UsageIdentity {
-                provider: execution.llm.provider.id.get(),
-                model: execution.llm.config.model,
-            }))
-        }
-    }
-}
-
-pub(super) fn turn_target(
-    tx: &impl TxRead,
-    row: &JobSpec,
-) -> Result<Option<crate::db::entities::LlmTarget>, StorageError> {
-    let jobs = tx.table(JOBS)?;
-    turn_target_of(&jobs, row)
-}
-
-pub(super) fn turn_target_of(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    row: &JobSpec,
-) -> Result<Option<crate::db::entities::LlmTarget>, StorageError> {
-    if matches!(
-        &row.kind,
-        JobKind::Execution {
-            execution: JobExecution::Decision(_),
-            ..
-        }
-    ) || row.kind.is_group()
-    {
-        return Ok(None);
-    }
-    let (execution, _, _) = job_execution(jobs, row)?;
-    Ok(Some(crate::db::entities::LlmTarget {
-        llm_profile: execution.llm.model.id.into(),
-        frozen: execution.llm,
-    }))
-}
-
-pub(crate) fn read_job_configuration(
-    database: &Database,
-    job: JobId,
-) -> Result<Option<SubmittedConfiguration>, StorageError> {
-    job_configuration(&read(database)?, job)
-}
-
-fn job_configuration(
-    rx: &ReadTransaction,
-    job: JobId,
-) -> Result<Option<SubmittedConfiguration>, StorageError> {
-    let Some(row) = read_job_row(rx, job)? else {
-        return Ok(None);
-    };
-    if row.kind.is_group() {
-        return Ok(None);
-    }
-    let Some(execution) = turn_config(rx, &row)? else {
-        return Ok(None);
-    };
-    Ok(Some(SubmittedConfiguration {
-        agent_profile: execution.agent_ref.map(|agent| agent.id.into()),
-        llm_profile: execution.llm.model.id.into(),
-        frozen: execution,
-    }))
-}
-
-pub(crate) fn read_decision_work(
-    database: &Database,
-    job: JobId,
-) -> Result<Option<crate::db::entities::DecisionWork>, StorageError> {
-    let rx = read(database)?;
-    let Some(row) = read_job_row(&rx, job)? else {
-        return Ok(None);
-    };
-    match row.kind {
-        JobKind::Execution {
-            execution: JobExecution::Decision(work),
-            ..
-        } => Ok(Some(work)),
-        JobKind::Group { .. } | JobKind::Execution { .. } => Ok(None),
-    }
 }
 
 pub(crate) fn read_submission(
@@ -3195,9 +2982,9 @@ pub(crate) fn read_config(
 fn config(rx: &ReadTransaction, id: ConfigId) -> Result<Option<ConfigRecord>, StorageError> {
     rx.open_table(CONFIGS)?
         .get(id.get())?
-        .map(|bytes| ConfigRow::scan_at(id.get(), bytes.value()))
+        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
         .transpose()
-        .map(|row| row.flatten().map(config_record))
+        .map(|row| row.map(config_record))
 }
 
 pub(crate) fn read_credential_ref_in_use(
@@ -3209,9 +2996,7 @@ pub(crate) fn read_credential_ref_in_use(
     let mut live_connections = std::collections::BTreeSet::new();
     for entry in rx.open_table(CONFIGS)?.iter()? {
         let (key, bytes) = entry?;
-        let Some(row) = ConfigRow::scan_at(key.value(), bytes.value())? else {
-            continue;
-        };
+        let row = ConfigRow::decode_at(key.value(), bytes.value())?;
         match &row.body {
             ConfigBody::Connection(connection) => {
                 if connection.credential_refs().any(|used| used == reference) {
@@ -3227,8 +3012,7 @@ pub(crate) fn read_credential_ref_in_use(
             ConfigBody::Model(_)
             | ConfigBody::DecisionModel(_)
             | ConfigBody::Agent(_)
-            | ConfigBody::DecisionAgent(_)
-            | ConfigBody::Pool(_) => {}
+            | ConfigBody::DecisionAgent(_) => {}
         }
     }
     Ok(!matching_connections.is_disjoint(&live_connections))
@@ -3240,15 +3024,6 @@ pub(crate) fn read_configs(
     before: Option<ConfigId>,
     limit: usize,
 ) -> Result<CursorPage<ConfigRecord, ConfigId>, StorageError> {
-    if kind.is_none() || kind == Some(ConfigKind::Pool) {
-        return Err(StorageError {
-            kind: super::StorageErrorKind::Other,
-            os_error: None,
-            detail:
-                "legacy configuration projection cannot represent independent Pools and Executors"
-                    .to_owned(),
-        });
-    }
     let rx = read(database)?;
     let table = rx.open_table(CONFIGS)?;
     let end = before.map_or(u128::MAX, ConfigId::get);
@@ -3263,14 +3038,7 @@ pub(crate) fn read_configs(
         }
         let (key, bytes) = entry?;
         last = Some(ConfigId::new(key.value()));
-        let row = if kind.is_some_and(|kind| kind != ConfigKind::Pool) {
-            let Some(row) = ConfigRow::scan_at(key.value(), bytes.value())? else {
-                continue;
-            };
-            row
-        } else {
-            ConfigRow::decode_at(key.value(), bytes.value())?
-        };
+        let row = ConfigRow::decode_at(key.value(), bytes.value())?;
         if kind.is_none_or(|kind| kind == row.kind) {
             records.push(config_record(row));
         }
@@ -3299,7 +3067,11 @@ pub(crate) fn read_native_resources(
     kind: NativeResourceKind,
 ) -> Result<CursorPage<NativeResource, ConfigId>, StorageError> {
     let tx = read(database)?;
-    let table = tx.open_table(CONFIGS)?;
+    let table = tx.open_table(match kind {
+        NativeResourceKind::Pool => POOLS,
+        NativeResourceKind::Executor => EXECUTORS,
+    })?;
+    let pools = tx.open_table(POOLS)?;
     let end = before.map_or(u128::MAX, ConfigId::get);
     let mut records = Vec::new();
     let mut last = None;
@@ -3312,31 +3084,21 @@ pub(crate) fn read_native_resources(
         let (key, bytes) = entry?;
         let id = key.value();
         last = Some(ConfigId::new(id));
-        match bytes.value().first() {
-            Some(&transactions::TAG_ALLOCATION_POOL) => {
+        match kind {
+            NativeResourceKind::Pool => {
                 let pool = transactions::decode_allocation_pool(id, bytes.value())?;
-                if matches!(kind, NativeResourceKind::Pool) && !pool.archived {
+                if !pool.archived {
                     records.push(NativeResource::Pool(pool));
                 }
             }
-            Some(&transactions::TAG_ALLOCATION_EXECUTOR) => {
+            NativeResourceKind::Executor => {
                 let executor = transactions::decode_allocation_executor(id, bytes.value())?;
-                let pool = table
+                let pool = pools
                     .get(executor.pool.get())?
                     .ok_or_else(|| StorageError::corrupted("Executor references a missing Pool"))?;
                 transactions::decode_allocation_pool(executor.pool.get(), pool.value())?;
-                if matches!(kind, NativeResourceKind::Executor) && !executor.archived {
+                if !executor.archived {
                     records.push(NativeResource::Executor(executor));
-                }
-            }
-            _ => {
-                let row = ConfigRow::decode_at(id, bytes.value())?;
-                if matches!(row.body, ConfigBody::Pool(_)) {
-                    return Err(StorageError {
-                        kind: super::StorageErrorKind::Other,
-                        os_error: None,
-                        detail: "legacy combined Pool/Executor cannot be projected as an independent resource".to_owned(),
-                    });
                 }
             }
         }
@@ -3400,13 +3162,10 @@ pub(crate) fn read_pool_allocations(
     use crate::db::entities::AllocationPhase;
     let tx = read(database)?;
     let pool = {
-        let configs = tx.open_table(CONFIGS)?;
-        let Some(bytes) = configs.get(pool_id.get())? else {
+        let pools = tx.open_table(POOLS)?;
+        let Some(bytes) = pools.get(pool_id.get())? else {
             return Ok(None);
         };
-        if bytes.value().first() != Some(&transactions::TAG_ALLOCATION_POOL) {
-            return Ok(None);
-        }
         transactions::decode_allocation_pool(pool_id.get(), bytes.value())?
     };
     let active = tx.open_table(ACTIVE_ALLOCATIONS)?;
@@ -3541,23 +3300,44 @@ pub(crate) fn read_profile_page(
 ) -> Result<ProfilePageRecords, StorageError> {
     let rx = read(database)?;
     let configs = rx.open_table(CONFIGS)?;
+    let executors = rx.open_table(EXECUTORS)?;
+    let pools = rx.open_table(POOLS)?;
     let end = before.map_or(u128::MAX, ConfigId::get);
     let limit = limit.max(1);
     let scan = scan.max(limit);
     let mut records = Vec::new();
     let mut last = None;
-    let mut more = false;
-    for (examined, entry) in configs.range(..end)?.rev().enumerate() {
-        if examined >= scan {
-            more = true;
+    let mut config_rows = configs.range(..end)?.rev();
+    let mut executor_rows = executors.range(..end)?.rev();
+    let mut next_config = config_rows.next().transpose()?;
+    let mut next_executor = executor_rows.next().transpose()?;
+    for _ in 0..scan {
+        if records.len() >= limit {
             break;
         }
-        let (key, bytes) = entry?;
+        let is_executor = match (&next_config, &next_executor) {
+            (Some((config, _)), Some((executor, _))) => executor.value() > config.value(),
+            (None, Some(_)) => true,
+            (Some(_), None) => false,
+            (None, None) => break,
+        };
+        let Some((key, bytes)) = (if is_executor {
+            next_executor.take()
+        } else {
+            next_config.take()
+        }) else {
+            break;
+        };
+        if is_executor {
+            next_executor = executor_rows.next().transpose()?;
+        } else {
+            next_config = config_rows.next().transpose()?;
+        }
         let id = key.value();
         last = Some(ConfigId::new(id));
-        if bytes.value().first() == Some(&transactions::TAG_ALLOCATION_EXECUTOR) {
+        if is_executor {
             let executor = transactions::decode_allocation_executor(id, bytes.value())?;
-            let pool_bytes = configs
+            let pool_bytes = pools
                 .get(executor.pool.get())?
                 .ok_or_else(|| StorageError::corrupted("Executor references a missing Pool"))?;
             let pool =
@@ -3565,37 +3345,21 @@ pub(crate) fn read_profile_page(
             if executor.enabled && !executor.archived && pool.enabled && !pool.archived {
                 records.push(ProfilePageRecord::Executor(executor));
             }
-            if records.len() >= limit {
-                more = true;
-                break;
-            }
             continue;
         }
-        let Some(row) = ConfigRow::scan_at(id, bytes.value())? else {
-            continue;
-        };
+        let row = ConfigRow::decode_at(id, bytes.value())?;
         if matches!(
             row.body,
             ConfigBody::Model(_)
                 | ConfigBody::Agent(_)
-                | ConfigBody::Pool(_)
                 | ConfigBody::DecisionModel(_)
                 | ConfigBody::DecisionAgent(_)
         ) && row.archived_at.is_none()
         {
             records.push(ProfilePageRecord::Config(config_record(row)));
         }
-        if records.len() >= limit {
-            more = true;
-            break;
-        }
     }
-    if more
-        && let Some(last) = last
-        && configs.range(..last.get())?.next().is_none()
-    {
-        more = false;
-    }
+    let more = next_config.is_some() || next_executor.is_some();
     let next_before = more.then_some(last).flatten();
 
     let mut connections = BTreeMap::new();
@@ -3607,10 +3371,9 @@ pub(crate) fn read_profile_page(
         let connection_id = match &record.body {
             ConfigBody::Model(model) => model.connection_id,
             ConfigBody::DecisionModel(model) => model.connection_id,
-            ConfigBody::Agent(_)
-            | ConfigBody::DecisionAgent(_)
-            | ConfigBody::Pool(_)
-            | ConfigBody::Connection(_) => continue,
+            ConfigBody::Agent(_) | ConfigBody::DecisionAgent(_) | ConfigBody::Connection(_) => {
+                continue;
+            }
         };
         if connections.contains_key(&connection_id) {
             continue;
@@ -3670,35 +3433,29 @@ fn pools_offering_capability(
     operation: ExecutionOperation,
     protocol: Option<LlmTransport>,
 ) -> Result<Vec<ExecutorId>, StorageError> {
-    {
-        let configs = rx.table(CONFIGS)?;
-        let mut executors = Vec::new();
-        for entry in configs.iter()? {
-            let (key, bytes) = entry?;
-            if bytes.value().first() == Some(&transactions::TAG_ALLOCATION_EXECUTOR) {
-                let executor =
-                    transactions::decode_allocation_executor(key.value(), bytes.value())?;
-                let pool = configs
-                    .get(executor.pool.get())?
-                    .ok_or_else(|| StorageError::corrupted("Executor references a missing Pool"))?;
-                let pool = transactions::decode_allocation_pool(executor.pool.get(), pool.value())?;
-                if executor.enabled
-                    && !executor.archived
-                    && pool.enabled
-                    && !pool.archived
-                    && executor.capabilities.contains(&(operation, protocol))
-                {
-                    executors.push(executor.id);
-                    if executors.len() >= MAX_PAGE {
-                        break;
-                    }
-                }
-            } else {
-                ConfigRow::scan_at(key.value(), bytes.value())?;
+    let pools = rx.table(POOLS)?;
+    let table = rx.table(EXECUTORS)?;
+    let mut executors = Vec::new();
+    for entry in table.iter()? {
+        let (key, bytes) = entry?;
+        let executor = transactions::decode_allocation_executor(key.value(), bytes.value())?;
+        let pool = pools
+            .get(executor.pool.get())?
+            .ok_or_else(|| StorageError::corrupted("Executor references a missing Pool"))?;
+        let pool = transactions::decode_allocation_pool(executor.pool.get(), pool.value())?;
+        if executor.enabled
+            && !executor.archived
+            && pool.enabled
+            && !pool.archived
+            && executor.capabilities.contains(&(operation, protocol))
+        {
+            executors.push(executor.id);
+            if executors.len() >= MAX_PAGE {
+                break;
             }
         }
-        Ok(executors)
     }
+    Ok(executors)
 }
 
 #[derive(Clone, Debug)]
@@ -3753,24 +3510,16 @@ pub(crate) fn read_native_resource_catalog(
     database: &Database,
 ) -> Result<NativeResourceCatalog, StorageError> {
     let rx = read(database)?;
-    let configs = rx.open_table(CONFIGS)?;
     let mut catalog = NativeResourceCatalog::default();
-    for entry in configs.iter()? {
+    for entry in rx.open_table(POOLS)?.iter()? {
         let (key, bytes) = entry?;
-        match bytes.value().first() {
-            Some(&transactions::TAG_ALLOCATION_POOL) => {
-                let pool = transactions::decode_allocation_pool(key.value(), bytes.value())?;
-                catalog.apply(super::NativeResourceDelta::Pool(pool));
-            }
-            Some(&transactions::TAG_ALLOCATION_EXECUTOR) => {
-                let executor =
-                    transactions::decode_allocation_executor(key.value(), bytes.value())?;
-                catalog.apply(super::NativeResourceDelta::Executor(executor));
-            }
-            _ => {
-                ConfigRow::scan_at(key.value(), bytes.value())?;
-            }
-        }
+        let pool = transactions::decode_allocation_pool(key.value(), bytes.value())?;
+        catalog.apply(super::NativeResourceDelta::Pool(pool));
+    }
+    for entry in rx.open_table(EXECUTORS)?.iter()? {
+        let (key, bytes) = entry?;
+        let executor = transactions::decode_allocation_executor(key.value(), bytes.value())?;
+        catalog.apply(super::NativeResourceDelta::Executor(executor));
     }
     for entry in catalog.executors.values() {
         if !catalog.pools.contains_key(&entry.pool) {
@@ -3947,11 +3696,21 @@ pub(crate) fn probe_committed(database: &Database, probe: Probe) -> Result<bool,
             .transpose()?
             .is_some_and(|record| record.outcome.is_some()),
         Probe::Outcome(job) => rx
-            .open_table(JOB_STATES)?
+            .open_table(JOB_RUNTIME)?
             .get(job.get())?
-            .map(|bytes| JobState::decode_at(job.get(), bytes.value()))
+            .map(|bytes| state::decode_state(job.get(), bytes.value()))
             .transpose()?
             .is_some_and(|state| state.outcome.is_some()),
+        Probe::ExecutionEvent(job, seq) => {
+            let table = rx.open_table(JOB_EVENTS)?;
+            match table.get((job.get(), seq))? {
+                Some(row) => {
+                    let event = execution::decode_event((job.get(), seq), row.value())?;
+                    event.seq <= execution::commit_end(&rx, event.transaction)?
+                }
+                None => false,
+            }
+        }
     })
 }
 
@@ -4009,11 +3768,8 @@ fn has_visible_child(rx: &ReadTransaction, conversation: JobId) -> Result<bool, 
         .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
     {
         let child = JobId::new(entry?.0.value().1);
-        if let Some(row) = read_job_row(rx, child)?
-            && let JobKind::Group {
-                origin: Origin::User | Origin::Agent { .. },
-                ..
-            } = row.kind
+        if let Some(row) = read_conversation_row(rx, child)?
+            && matches!(row.origin, Origin::User | Origin::Agent { .. })
         {
             return Ok(true);
         }
@@ -4024,7 +3780,7 @@ fn has_visible_child(rx: &ReadTransaction, conversation: JobId) -> Result<bool, 
 fn conversation_title(
     rx: &ReadTransaction,
     conversation: JobId,
-    metadata: &JobControl,
+    metadata: &JobLifecycle,
 ) -> Result<String, StorageError> {
     Ok(match &metadata.title {
         Some(title) => title.clone(),
@@ -4041,17 +3797,7 @@ fn conversation_summary(
     tip: Option<JobId>,
 ) -> Result<ConversationEntry, StorageError> {
     let conversation = row.id;
-    let JobKind::Group { agent, project, .. } = row.kind else {
-        return Err(StorageError::corrupted(
-            "recent entry is not a conversation",
-        ));
-    };
-    let metadata = rx
-        .open_table(JOB_CONTROLS)?
-        .get(conversation.get())?
-        .map(|bytes| JobControl::decode(bytes.value()))
-        .transpose()?
-        .ok_or_else(|| StorageError::corrupted("missing conversation state"))?;
+    let metadata = state::require(rx, conversation)?.lifecycle;
     let title = conversation_title(rx, conversation, &metadata)?;
     let state = read_state(rx, conversation)?;
     let on_hold = metadata.on_hold.map(|code| {
@@ -4076,8 +3822,8 @@ fn conversation_summary(
     Ok(ConversationEntry {
         root_job: conversation,
         tip_job: tip.unwrap_or(conversation),
-        agent,
-        project,
+        agent: row.agent,
+        project: row.project,
         title,
         state: if state.outcome.is_some() {
             "settled"
@@ -4134,20 +3880,14 @@ pub(crate) fn read_conversation_children(
         .take(limit.min(MAX_PAGE))
     {
         let child = JobId::new(entry?.0.value().1);
-        let row = read_job_row(&rx, child)?
+        let row = read_conversation_row(&rx, child)?
             .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
         let conversation = conversation_summary(&rx, &row, conversation_tip(&rx, &row)?)?;
-        let JobKind::Group {
-            origin, keep_open, ..
-        } = row.kind
-        else {
-            return Err(StorageError::corrupted("child is not a conversation"));
-        };
         children.push(ChildConversationEntry {
             job_state: conversation.job_state.clone(),
             conversation,
-            origin,
-            keep_open,
+            origin: row.origin,
+            keep_open: row.keep_open,
             recurrence: rx
                 .open_table(RECURRENCES)?
                 .get(child.get())?
@@ -4198,14 +3938,14 @@ fn conversation_page(
             last = last_examined;
             break;
         }
-        let conversation = JobId::new(item?.0.value());
+        let (key, bytes) = item?;
+        let conversation = JobId::new(key.value());
         last_examined = Some(conversation);
-        let row = read_job_row(&rx, conversation)?
-            .ok_or_else(|| StorageError::corrupted("missing conversation"))?;
+        let row = JobSpec::decode_at(key.value(), bytes.value())?;
         if !indexes::searchable_conversation(&row) {
             continue;
         }
-        let metadata = read_job_control(&rx, conversation)?;
+        let metadata = read_job_lifecycle(&rx, conversation)?;
         if metadata.hidden_at.is_some() {
             continue;
         }
@@ -4214,13 +3954,9 @@ fn conversation_page(
         };
         let matches = if terms.is_empty() {
             true
-        } else if let JobKind::Group { .. } = &row.kind {
+        } else {
             let title = conversation_title(&rx, conversation, &metadata)?;
             conversation_matches(&rx, conversation, &title, terms)?
-        } else {
-            return Err(StorageError::corrupted(
-                "recent entry is not a conversation",
-            ));
         };
         if matches {
             if conversations.len() == limit {
@@ -4250,6 +3986,7 @@ fn conversation_matches(
 ) -> Result<bool, StorageError> {
     let title = title.to_lowercase();
     let index = rx.open_table(CONVERSATION_SEARCH)?;
+    let outputs = rx.open_table(JOB_OUTPUTS)?;
     for term in terms {
         if title.contains(term) {
             continue;
@@ -4282,6 +4019,23 @@ fn conversation_matches(
                     matched = true;
                     break;
                 }
+                let completed = job
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+                for output in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
+                    let (key, bytes) = output?;
+                    let output = rows::decode_output(key.value(), bytes.value())?;
+                    if indexes::search_output_text(&output, completed)
+                        .is_some_and(|text| text.to_lowercase().contains(term))
+                    {
+                        matched = true;
+                        break;
+                    }
+                }
+                if matched {
+                    break;
+                }
             }
         }
         if !matched {
@@ -4309,33 +4063,16 @@ pub(crate) fn queue_counts(
 fn queue_counts_in(rx: &ReadTransaction, for_update: bool) -> Result<QueueCounts, StorageError> {
     use crate::db::entities::AllocationPhase;
     let pending_table = rx.open_table(PENDING)?;
-    let delayed_table = rx.open_table(DELAYED)?;
-    let (pending, delayed) = if for_update {
-        let clock = recovery::promotion_clock();
-        let jobs = rx.open_table(JOBS)?;
-        let mut pending = 0;
-        for entry in pending_table.iter()? {
-            let id = entry?.0.value();
-            if jobs.get(id)?.is_none() {
-                return Err(StorageError::corrupted("pending Job missing"));
-            }
-            pending += 1;
-        }
-        let mut delayed = 0;
-        for entry in delayed_table.range(..=(clock, u128::MAX))? {
-            entry?;
-            delayed += 1;
-        }
-        if rx
-            .open_table(RECURRENCE_DUE)?
-            .first()?
-            .is_some_and(|(key, _)| key.value().0 <= clock)
-        {
-            delayed += 1;
-        }
-        (pending, delayed)
+    let pending = pending_table.len()?;
+    let schedules = rx.open_table(RECURRENCE_DUE)?;
+    let delayed = if for_update {
+        u64::from(
+            schedules
+                .first()?
+                .is_some_and(|(key, _)| key.value().0 <= recovery::promotion_clock()),
+        )
     } else {
-        (pending_table.len()?, delayed_table.len()?)
+        schedules.len()?
     };
     let ready = rx.open_table(MUTABLE_READY)?.len()?;
     let allocations = rx.open_table(POOL_ALLOCATIONS)?;
@@ -4404,9 +4141,11 @@ fn resolve_model_name(
     else {
         return Ok(None);
     };
-    if let Some(value) = rx.open_table(JOBS)?.get(job.get())?
-        && matches!(value.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION)
     {
+        let jobs = rx.open_table(JOBS)?;
+        let value = jobs
+            .get(job.get())?
+            .ok_or_else(|| StorageError::corrupted("usage model references a missing Job"))?;
         let row = transactions::decode_mutable_job(job.get(), value.value())?;
         let (actual_provider, model) = match row.frozen {
             Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) => {
@@ -4424,17 +4163,8 @@ fn resolve_model_name(
                 "usage model references a different identity",
             ));
         }
-        return Ok(Some(model));
+        Ok(Some(model))
     }
-    let row = read_job_row(rx, job)?
-        .ok_or_else(|| StorageError::corrupted("usage model references a missing job"))?;
-    let identity = turn_usage_identity_of(&rx.open_table(JOBS)?, &row)?
-        .filter(|identity| {
-            identity.provider == provider
-                && ContentDigest::of(identity.model.as_bytes()).as_bytes() == &model_hash
-        })
-        .ok_or_else(|| StorageError::corrupted("usage model references a different identity"))?;
-    Ok(Some(identity.model))
 }
 
 type UsageGroupKey = (i64, u128, u128, [u8; 32]);
@@ -4627,10 +4357,7 @@ fn scan_usage_totals(
         let generative = match ConfigRow::decode_at(agent, bytes.value())?.kind {
             ConfigKind::Agent => true,
             ConfigKind::DecisionAgent => false,
-            ConfigKind::Connection
-            | ConfigKind::Model
-            | ConfigKind::Pool
-            | ConfigKind::DecisionModel => {
+            ConfigKind::Connection | ConfigKind::Model | ConfigKind::DecisionModel => {
                 return Err(StorageError::corrupted(
                     "usage Agent has an incompatible kind",
                 ));
@@ -4791,52 +4518,6 @@ fn scan_usage_totals(
     })
 }
 
-fn turn_entries(
-    rx: &ReadTransaction,
-    turn: JobId,
-) -> Result<Vec<(u32, JobInputEntry)>, StorageError> {
-    effective_entries(job_entries_of(&rx.open_table(JOB_INPUTS)?, turn)?)
-}
-
-pub(super) fn job_entries_of(
-    inputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
-    turn: JobId,
-) -> Result<Vec<(u32, JobInputEntry)>, StorageError> {
-    inputs
-        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
-        .map(|entry| {
-            let (key, value) = entry?;
-            Ok((key.value().1, JobInputEntry::decode(value.value())?))
-        })
-        .collect()
-}
-
-pub(super) fn effective_entries(
-    entries: Vec<(u32, JobInputEntry)>,
-) -> Result<Vec<(u32, JobInputEntry)>, StorageError> {
-    crate::db::entities::effective_entries(entries).map_err(StorageError::corrupted)
-}
-
-pub(crate) fn read_notices(
-    database: &Database,
-    conversation: JobId,
-    after: u32,
-    limit: usize,
-) -> Result<Vec<(u32, Notice)>, StorageError> {
-    let rx = read(database)?;
-    if after == u32::MAX {
-        return Ok(Vec::new());
-    }
-    rx.open_table(NOTICES)?
-        .range((conversation.get(), after + 1)..=(conversation.get(), u32::MAX))?
-        .take(limit.min(MAX_PAGE))
-        .map(|entry| {
-            let (key, value) = entry?;
-            Ok((key.value().1, Notice::decode(value.value())?))
-        })
-        .collect()
-}
-
 const TURN_PAGE_OUTPUTS: usize = 1000;
 
 pub(crate) fn read_conversation_limits(
@@ -4847,13 +4528,10 @@ pub(crate) fn read_conversation_limits(
     let mut current = conversation;
     let mut limits = JobLimits::CEILING;
     for depth in 0..=crate::db::entities::MAX_JOB_DEPTH {
-        let Some(row) = read_job_row(&rx, current)? else {
+        let Some(row) = read_conversation_row(&rx, current)? else {
             return Ok(None);
         };
-        if !row.kind.is_group() {
-            return Ok(None);
-        }
-        let own = read_job_control(&rx, current)?.limits;
+        let own = read_job_lifecycle(&rx, current)?.limits;
         if let Some(own) = own {
             limits = limits.intersect(own);
         }
@@ -4970,8 +4648,7 @@ fn mutable_context_usage(
                     .map(|row| transactions::decode_pool_allocation(turn.get(), row.value()))
                     .transpose()?
                     .as_ref(),
-            )?
-            .is_some();
+            )?;
         for entry in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
             if record.job.phase != MutableJobPhase::Executing && !ended_unstarted {
                 return Err(StorageError::corrupted("Job has output before execution"));
@@ -5057,12 +4734,9 @@ pub(crate) fn read_context_state(
     limit: usize,
 ) -> Result<Option<ContextState>, StorageError> {
     let rx = read(database)?;
-    let Some(owner) = read_job_row(&rx, conversation)? else {
+    let Some(owner) = read_conversation_row(&rx, conversation)? else {
         return Ok(None);
     };
-    if !owner.kind.is_group() {
-        return Ok(None);
-    }
     let (mut policy, revision, _profile) = effective_context_policy(&rx.open_table(META)?)?;
     let tip = turn_head(&rx.open_table(TURNS)?, conversation)?;
     let tip_details = tip
@@ -5083,10 +4757,7 @@ pub(crate) fn read_context_state(
         .transpose()?
         .unwrap_or_default();
     let settings = global_compaction_settings(&rx.open_table(META)?)?;
-    let project = match owner.kind {
-        JobKind::Group { project, .. } => project,
-        JobKind::Execution { .. } => None,
-    };
+    let project = owner.project;
     let decision = project
         .map(|id| {
             rx.open_table(PROJECTS)?
@@ -5153,9 +4824,6 @@ pub(crate) fn read_context_state(
         let Some(bytes) = rx.open_table(JOBS)?.get(child_id.get())? else {
             continue;
         };
-        if bytes.value().first() != Some(&TAG_JOB) {
-            continue;
-        }
         let job = transactions::decode_mutable_job(child_id.get(), bytes.value())?;
         let Some(source) = job.summary_source else {
             continue;
@@ -5397,14 +5065,9 @@ pub(crate) fn read_cards(
                 "live conversation tree exceeds its bound",
             ));
         }
-        let row = read_job_row(&rx, conversation)?
+        let row = read_conversation_row(&rx, conversation)?
             .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
-        let JobKind::Group {
-            origin, project, ..
-        } = row.kind
-        else {
-            return Err(StorageError::corrupted("expected a conversation"));
-        };
+        let (origin, project) = (row.origin, row.project);
         let parent = row.parent_id.map(|id| id.to_string());
         if origin != Origin::System {
             for entry in rx.open_table(OPEN_APPROVALS)?.range(
@@ -5473,7 +5136,8 @@ pub(crate) fn read_usage_retries(
     limit: usize,
 ) -> Result<UsageRetriesPage, StorageError> {
     let rx = read(database)?;
-    let retries = rx.open_table(RETRIES)?;
+    let retries = rx.open_table(RETRY_JOBS)?;
+    let jobs = rx.open_table(JOBS)?;
     let start = after.map_or(std::ops::Bound::Unbounded, std::ops::Bound::Excluded);
     let mut entries = retries.range((start, std::ops::Bound::Unbounded))?;
     let mut grouped: BTreeMap<UsageGroupKey, (String, u64)> = BTreeMap::new();
@@ -5482,29 +5146,35 @@ pub(crate) fn read_usage_retries(
         let Some(entry) = entries.next() else { break };
         let key = entry?.0.value();
         last = Some(key);
-        let retry = read_job_row(&rx, JobId::new(key.1))?
-            .ok_or_else(|| StorageError::corrupted("retry has no job row"))?;
+        let retry = jobs
+            .get(key.1)?
+            .map(|row| transactions::decode_mutable_job(key.1, row.value()))
+            .transpose()?
+            .ok_or_else(|| StorageError::corrupted("retry has no Job row"))?;
         let at = retry.created_at.as_unix_micros();
         if filter.from_us.is_some_and(|from| at < from)
             || filter.until_us.is_some_and(|until| at >= until)
         {
             continue;
         }
-        let original = read_job_row(&rx, JobId::new(key.0))?
-            .ok_or_else(|| StorageError::corrupted("retry names a missing turn"))?;
-        let parent = original
-            .parent_id
-            .map(|id| read_job_row(&rx, id))
+        let original = jobs
+            .get(key.0)?
+            .map(|row| transactions::decode_mutable_job(key.0, row.value()))
             .transpose()?
-            .flatten();
-        let agent = usage_agent(&original, parent.as_ref());
+            .ok_or_else(|| StorageError::corrupted("retry names a missing Job"))?;
+        transactions::validate_retry_source(&retry, &original)?;
+        let Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) =
+            retry.frozen
+        else {
+            return Err(StorageError::corrupted(
+                "retry has no generative configuration",
+            ));
+        };
+        let agent = frozen.agent_ref.map_or(0, |reference| reference.id.get());
         if filter.agent.is_some_and(|target| agent != target) {
             continue;
         }
-        let Some(target) = turn_target(&rx, &original)? else {
-            continue;
-        };
-        let config = target.frozen;
+        let config = frozen.llm;
         let bucket = bucketing
             .start_of(at)
             .ok_or_else(|| StorageError::corrupted("retry bucket overflows"))?;
@@ -5601,4 +5271,95 @@ pub(crate) fn read_scheduled_external_binding_with_policy(
     };
     let policy = decode_scheduled_external_policy(binding.policy.get(), policy_row.value())?;
     Ok(Some((binding, policy)))
+}
+
+pub(crate) struct ExecutionHistoryItem {
+    pub event: crate::db::entities::ExecutionEvent,
+    pub committed_seq: u64,
+}
+
+pub(crate) struct ExecutionHistoryPage {
+    pub events: Vec<ExecutionHistoryItem>,
+    pub next_after: Option<u64>,
+    pub head_seq: u64,
+}
+
+fn execution_job_visible(
+    rx: &ReadTransaction,
+    job: JobId,
+    context: Option<crate::db::entities::ComposerContextId>,
+) -> Result<bool, StorageError> {
+    if read_conversation_row(rx, job)?.is_some() {
+        return Ok(true);
+    }
+    let jobs = rx.open_table(JOBS)?;
+    let Some(row) = jobs.get(job.get())? else {
+        return Ok(false);
+    };
+    let record = transactions::decode_mutable_job(job.get(), row.value())?;
+    Ok(
+        !context.is_some_and(|context| context != record.composer_context)
+            && (record.phase != crate::db::entities::MutableJobPhase::Unsubmitted
+                || context.is_some()),
+    )
+}
+
+pub(crate) fn read_execution_history(
+    database: &Database,
+    job: JobId,
+    after: Option<u64>,
+    limit: usize,
+    context: Option<crate::db::entities::ComposerContextId>,
+) -> Result<Option<ExecutionHistoryPage>, StorageError> {
+    let rx = read(database)?;
+    if !execution_job_visible(&rx, job, context)? {
+        return Ok(None);
+    }
+    let table = rx.open_table(JOB_EVENTS)?;
+    let limit = limit.clamp(1, MAX_PAGE);
+    let mut events = Vec::new();
+    let mut more = false;
+    let mut transaction_end = None;
+    for entry in table.range((
+        std::ops::Bound::Excluded((job.get(), after.unwrap_or(0))),
+        std::ops::Bound::Included((job.get(), u64::MAX)),
+    ))? {
+        if events.len() == limit {
+            more = true;
+            break;
+        }
+        let (key, value) = entry?;
+        let event = execution::decode_event(key.value(), value.value())?;
+        let committed_seq = match transaction_end {
+            Some((transaction, end)) if transaction == event.transaction => end,
+            _ => {
+                let end = execution::commit_end(&rx, event.transaction)?;
+                transaction_end = Some((event.transaction, end));
+                end
+            }
+        };
+        events.push(ExecutionHistoryItem {
+            event,
+            committed_seq,
+        });
+    }
+    let next_after = events.last().map(|item| item.event.seq).filter(|_| more);
+    Ok(Some(ExecutionHistoryPage {
+        events,
+        next_after,
+        head_seq: execution::latest_seq(&rx, job)?,
+    }))
+}
+
+pub(crate) fn read_execution_snapshot(
+    database: &Database,
+    job: JobId,
+    at_seq: Option<u64>,
+    context: Option<crate::db::entities::ComposerContextId>,
+) -> Result<Option<crate::db::entities::ExecutionSnapshot>, StorageError> {
+    let rx = read(database)?;
+    if !execution_job_visible(&rx, job, context)? {
+        return Ok(None);
+    }
+    execution::replay_job(&rx, job, at_seq)
 }

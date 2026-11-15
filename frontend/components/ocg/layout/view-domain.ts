@@ -5,12 +5,10 @@ export type WorkspaceView =
   | "usage"
   | "attention"
   | "ledger"
-  | "control-center"
   | "job-execution"
   | "health"
   | "logs"
-  | "settings"
-  | "canonical";
+  | "settings";
 
 export function isJobIdentity(value: unknown): value is string {
   return (

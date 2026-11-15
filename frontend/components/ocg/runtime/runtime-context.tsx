@@ -10,13 +10,13 @@ import {
   useSyncExternalStore,
 } from "react";
 import type { ReactNode } from "react";
-import { CanonicalOcgRuntimeClient } from "./canonical-launch-client";
+import { ConversationRuntimeClient } from "./conversation-client";
 import type { CreateSessionInput, OcgRuntimeClient, RuntimeSnapshot } from "./runtime-types";
 import type { ChatSession } from "../types";
-import type { HttpCanonicalControlClient } from "./control-client";
+import type { ApiClient } from "./api-client";
 
 type RuntimeContextValue = {
-  control: HttpCanonicalControlClient | null;
+  api: ApiClient;
   client: OcgRuntimeClient;
   snapshot: RuntimeSnapshot;
   createSession: (input: CreateSessionInput) => Promise<ChatSession>;
@@ -33,15 +33,15 @@ const serverHydrated = () => false;
 
 export function OcgRuntimeProvider({
   children,
-  controlClient,
+  apiClient,
 }: {
   children: ReactNode;
-  controlClient: HttpCanonicalControlClient;
+  apiClient: ApiClient;
 }) {
   const hydrated = useSyncExternalStore(subscribeHydration, browserHydrated, serverHydrated);
   const client = useMemo<OcgRuntimeClient>(
-    () => new CanonicalOcgRuntimeClient(controlClient),
-    [controlClient],
+    () => new ConversationRuntimeClient(apiClient),
+    [apiClient],
   );
   const leases = useRef(new Map<OcgRuntimeClient, symbol>());
   useEffect(() => {
@@ -89,15 +89,14 @@ export function OcgRuntimeProvider({
   const value = useMemo(
     () => ({
       client,
-      control:
-        controlClient ?? (client instanceof CanonicalOcgRuntimeClient ? client.control : null),
+      api: apiClient,
       snapshot,
       createSession,
       deleteSession,
       retryMessage,
       cancel,
     }),
-    [cancel, client, controlClient, createSession, deleteSession, retryMessage, snapshot],
+    [cancel, client, apiClient, createSession, deleteSession, retryMessage, snapshot],
   );
   if (!hydrated) return null;
   return <RuntimeContext.Provider value={value}>{children}</RuntimeContext.Provider>;

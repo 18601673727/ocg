@@ -12,9 +12,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import type { ControlProfilesSnapshot } from "../contracts";
-import type { ProviderModel as ControlProviderModel } from "../contracts/api";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ProfilesSnapshot } from "../contracts";
+import type { ProviderModel } from "../contracts/api";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
 import { describeError } from "./settings-parts";
@@ -30,8 +30,8 @@ export function ProviderModelImport({
   snapshot,
   onImported,
 }: {
-  client: HttpCanonicalControlClient;
-  snapshot: ControlProfilesSnapshot | null;
+  client: ApiClient;
+  snapshot: ProfilesSnapshot | null;
   onImported: (message: string) => void;
 }) {
   return <ImportContent client={client} snapshot={snapshot} onImported={onImported} />;
@@ -42,8 +42,8 @@ function ImportContent({
   snapshot,
   onImported,
 }: {
-  client: HttpCanonicalControlClient;
-  snapshot: ControlProfilesSnapshot | null;
+  client: ApiClient;
+  snapshot: ProfilesSnapshot | null;
   onImported: (message: string) => void;
 }) {
   const { t } = useI18n();
@@ -75,15 +75,13 @@ function ImportContent({
         }
       : null;
   const provider = providers.find((entry) => entry.id === sourceId);
-  const [models, setModels] = useState<ControlProviderModel[]>([]);
+  const [models, setModels] = useState<ProviderModel[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [query, setQuery] = useState("");
   const [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(Boolean(provider?.endpoint));
   const [saving, setSaving] = useState(false);
-  const [removing, setRemoving] = useState<ControlProfilesSnapshot["providers"][number] | null>(
-    null,
-  );
+  const [removing, setRemoving] = useState<ProfilesSnapshot["providers"][number] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [removeError, setRemoveError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);

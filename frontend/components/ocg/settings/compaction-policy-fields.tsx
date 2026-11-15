@@ -1,9 +1,9 @@
 "use client";
 
-import type { ControlProfilesSnapshot } from "../contracts";
+import type { ProfilesSnapshot } from "../contracts";
 import type {
-  CompactionPolicy as ControlCompactionPolicy,
-  PredictiveCompaction as ControlPredictiveCompaction,
+  CompactionPolicy as CompactionPolicy,
+  PredictiveCompaction as PredictiveCompaction,
 } from "../contracts/api";
 import { useI18n, type I18nKey } from "../i18n";
 import { selectableLlmProfiles } from "./settings-parts";
@@ -16,7 +16,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
-const off: ControlCompactionPolicy = {
+const off: CompactionPolicy = {
   mode: { kind: "off" },
   summarization_model: null,
   predictive: null,
@@ -28,16 +28,16 @@ export function CompactionPolicyFields({
   profiles,
   disabled = false,
 }: {
-  value: ControlCompactionPolicy | null;
-  onChange(value: ControlCompactionPolicy | null): void;
-  profiles: ControlProfilesSnapshot;
+  value: CompactionPolicy | null;
+  onChange(value: CompactionPolicy | null): void;
+  profiles: ProfilesSnapshot;
   disabled?: boolean;
 }) {
   const { t } = useI18n();
   const policy = value ?? off;
   const prediction = policy.predictive;
-  const change = (patch: Partial<ControlCompactionPolicy>) => onChange({ ...policy, ...patch });
-  const updatePrediction = (patch: Partial<ControlPredictiveCompaction>) => {
+  const change = (patch: Partial<CompactionPolicy>) => onChange({ ...policy, ...patch });
+  const updatePrediction = (patch: Partial<PredictiveCompaction>) => {
     if (prediction) change({ predictive: { ...prediction, ...patch } });
   };
   const number = (

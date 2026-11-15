@@ -4,8 +4,8 @@ use super::*;
 pub enum DatabaseError {
     #[error("invalid startup policy: {0}")]
     StartupPolicy(#[source] SystemPolicyError),
-    #[error("the control queue is full; the space check was not accepted")]
-    ControlQueueFull,
+    #[error("the maintenance queue is full; the space check was not accepted")]
+    MaintenanceQueueFull,
     #[error(
         "database command queue is full ({COMMAND_QUEUE_CAPACITY} pending commands); the command was not accepted"
     )]
@@ -147,8 +147,8 @@ pub enum CompactionOutcome {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MaintenanceError {
-    #[error("the control queue is full; the compaction was not accepted")]
-    ControlQueueFull,
+    #[error("the maintenance queue is full; the compaction was not accepted")]
+    MaintenanceQueueFull,
     #[error("the database is shutting down; the compaction was not accepted")]
     ShuttingDown,
     #[error("the database worker stopped; the compaction did not run")]

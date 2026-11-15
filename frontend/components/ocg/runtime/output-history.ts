@@ -1,7 +1,7 @@
-import type { ControlOutput } from "../contracts";
+import type { Output } from "../contracts";
 
 export type OutputView = Pick<
-  ControlOutput,
+  Output,
   "seq" | "kind" | "created_at_us" | "summary" | "code" | "value"
 >;
 export type OutputSequence = Iterable<OutputView> & {
@@ -14,7 +14,7 @@ const RAW_TAIL_LIMIT = 256;
 export class OutputHistory implements OutputSequence {
   private readonly sequences: number[] = [];
   private readonly times: number[] = [];
-  private readonly kinds: ControlOutput["kind"][] = [];
+  private readonly kinds: Output["kind"][] = [];
   private readonly codes: (string | null)[] = [];
   private readonly textStarts: number[] = [];
   private readonly textEnds: number[] = [];

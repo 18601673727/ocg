@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { JobTree } from "./job-tree";
 import { JobWatch } from "./job-watch";
@@ -13,7 +13,7 @@ export function JobDetailsDialog({
   onJob,
   onOpenChat,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   job: string | null;
   onJob: (job: string | null) => void;
   onOpenChat: (job: string) => void;

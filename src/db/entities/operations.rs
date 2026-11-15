@@ -126,9 +126,7 @@ pub enum Violation {
     InvalidValue(&'static str, &'static str),
     #[error("the Profile changed while it was being validated; reload and retry")]
     ProfileChanged,
-    #[error("{0} is the Genesis Job, which ordinary work cannot finalize, cancel or retry")]
-    GenesisProtected(JobId),
-    #[error("only the Genesis Job is its own parent; {0} cannot be")]
+    #[error("{0} cannot be its own parent")]
     SelfParent(JobId),
     #[error("the parent of {0} was fixed when it was submitted")]
     ParentFixed(JobId),

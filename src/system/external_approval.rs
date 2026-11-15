@@ -189,7 +189,9 @@ pub(crate) fn parse_trusted_proxy(text: &str) -> Result<LoopbackProxy, ApprovalR
         invalid("the proxy must be a literal loopback address with a port, such as http://127.0.0.1:6152")
     })?;
     if address.to_string() != authority {
-        return Err(invalid("the proxy address must be written canonically"));
+        return Err(invalid(
+            "the proxy address must be written in normalized form",
+        ));
     }
     LoopbackProxy::new(address).ok_or_else(|| {
         invalid("only a literal loopback proxy address with a nonzero port is eligible")
@@ -286,9 +288,9 @@ impl ExternalApproval {
     }
 
     fn authorized(&self) -> Result<(), ApprovalRefusal> {
-        let control = self.authority.control();
-        if !control.is_enabled() {
-            return Err(refuse("control_disabled", control.refusal()));
+        let feature = self.authority.feature();
+        if !feature.is_enabled() {
+            return Err(refuse("feature_disabled", feature.refusal()));
         }
         if !self.authority.admits_route(&self.route) {
             return Err(refuse(

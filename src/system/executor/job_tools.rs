@@ -54,7 +54,7 @@ pub(crate) fn register(
         "job_limits",
         json!({"conversation":conversation,"max_depth":{"type":"integer","minimum":0,"maximum":16},"max_auto_turns":{"type":"integer","minimum":0,"maximum":255},"max_iterations":{"type":"integer","minimum":0,"maximum":10000}}),
         vec![],
-        "Read your conversation limits or tighten limits on your own conversation or its descendants. max_depth is the absolute tree depth (root=0); defaults are 3 child levels, 8 automatic follow-up turns and 100 scheduled iterations. Agents cannot raise effective limits; the user controls the ceiling. Omit settings to read only. A limit of 0 disables that kind of new work.",
+        "Read your conversation limits or tighten limits on your own conversation or its descendants. max_depth is the absolute tree depth (root=0); defaults are 3 child levels, 8 automatic follow-up turns and 100 scheduled iterations. Agents cannot raise effective limits; the user sets the ceiling. Omit settings to read only. A limit of 0 disables that kind of new work.",
     ));
     specs.push((
         "job_agents",

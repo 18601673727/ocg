@@ -3,9 +3,9 @@
 import Link from "next/link";
 
 import { useEffect, useState } from "react";
-import type { ControlProfilesSnapshot } from "../contracts";
-import type { GlobalCompactionSettings as ControlGlobalCompactionSettings } from "../contracts/api";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ProfilesSnapshot } from "../contracts";
+import type { GlobalCompactionSettings } from "../contracts/api";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { Section, describeError } from "./settings-parts";
 import { Button } from "@/components/ui/button";
@@ -16,13 +16,13 @@ export function GlobalCompactionSection({
   client,
   profiles,
 }: {
-  client: HttpCanonicalControlClient;
-  profiles: ControlProfilesSnapshot | null;
+  client: ApiClient;
+  profiles: ProfilesSnapshot | null;
 }) {
   const { t } = useI18n();
-  const [draft, setDraft] = useState<ControlGlobalCompactionSettings>();
+  const [draft, setDraft] = useState<GlobalCompactionSettings>();
   const [active, setActive] =
-    useState<Awaited<ReturnType<HttpCanonicalControlClient["readActiveSystemSettings"]>>>();
+    useState<Awaited<ReturnType<ApiClient["readActiveSystemSettings"]>>>();
   const [configError, setConfigError] = useState<string>();
   const [error, setError] = useState<string>();
   const [saved, setSaved] = useState(false);

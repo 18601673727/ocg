@@ -13,7 +13,7 @@ pub const COMMAND: &str = "register-llm";
 pub const ENDPOINT_VARIABLE: &str = "OCG_PROVIDER_ENDPOINT";
 pub const MODEL_VARIABLE: &str = "OCG_PROVIDER_MODEL";
 pub const CREDENTIAL_REF_VARIABLE: &str = "OCG_PROVIDER_CREDENTIAL_REF";
-const CONTROL_PLANE: &str = "control-plane";
+const DEFAULT_AGENT_NAME: &str = "default";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -199,7 +199,7 @@ pub async fn agent_profile(
     };
     let existing = database
         .find_config(ConfigKind::Agent, |config| {
-            config.name == CONTROL_PLANE
+            config.name == DEFAULT_AGENT_NAME
                 && matches!(&config.body, ConfigBody::Agent(found) if *found == agent)
         })
         .await?;
@@ -208,7 +208,7 @@ pub async fn agent_profile(
     }
     database
         .create_config(Config {
-            name: CONTROL_PLANE.to_owned(),
+            name: DEFAULT_AGENT_NAME.to_owned(),
             body: ConfigBody::Agent(agent),
         })
         .await
@@ -242,8 +242,8 @@ pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Er
     Ok(())
 }
 
-pub fn control_plane_target() -> Result<Target, Error> {
-    Target::from_environment(CONTROL_PLANE, BTreeSet::from([ModelCapability::Chat]))
+pub fn default_target() -> Result<Target, Error> {
+    Target::from_environment(DEFAULT_AGENT_NAME, BTreeSet::from([ModelCapability::Chat]))
 }
 
 pub(crate) fn protocol_from_environment() -> Result<LlmTransport, Error> {

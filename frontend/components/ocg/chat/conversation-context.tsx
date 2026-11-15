@@ -1,12 +1,12 @@
 "use client";
 
-import type { ControlContextStatus } from "../contracts";
+import type { ContextStatus } from "../contracts";
 
 import Link from "next/link";
 
 import { useEffect, useRef, useState } from "react";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import type { ControlDecisionAnswer, ControlProfilesSnapshot } from "../contracts";
+import type { DecisionAnswer, ProfilesSnapshot } from "../contracts";
 import { describeError, selectableLlmProfiles } from "../settings/settings-parts";
 import { useI18n } from "../i18n";
 import { Button } from "@/components/ui/button";
@@ -27,7 +27,7 @@ import {
 } from "@/components/ui/dialog";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
 
-type Status = ControlContextStatus;
+type Status = ContextStatus;
 
 function formatShare(value: number): string {
   return Number.isInteger(value)
@@ -42,7 +42,7 @@ function formatTokens(value: number): string {
 }
 
 function describeDecisionAnswer(
-  answer: ControlDecisionAnswer,
+  answer: DecisionAnswer,
   t: ReturnType<typeof useI18n>["t"],
 ): string {
   if (answer.kind === "choice") {
@@ -96,10 +96,10 @@ export function ConversationContext({
   agentProfile?: string;
   actionsSupported?: boolean;
 }) {
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
-  const [profiles, setProfiles] = useState<ControlProfilesSnapshot>();
+  const [profiles, setProfiles] = useState<ProfilesSnapshot>();
   const [status, setStatus] = useState<Status>();
   const [model, setModel] = useState("");
   const [error, setError] = useState<string>();
@@ -112,14 +112,14 @@ export function ConversationContext({
   const request = useRef<{ model: string; key: string } | null>(null);
   const initialized = useRef(false);
   useEffect(() => {
-    if (!control) return;
+    if (!api) return;
     const controller = new AbortController();
     let reading = false;
     async function tick() {
       if (reading) return;
       reading = true;
       try {
-        const state = await control!.readContextStatus(conversation, { signal: controller.signal });
+        const state = await api!.readContextStatus(conversation, { signal: controller.signal });
         if (controller.signal.aborted) return;
         setStatus(state);
         if (!initialized.current) {
@@ -133,7 +133,7 @@ export function ConversationContext({
         reading = false;
       }
     }
-    void control.readProfiles(controller.signal).then(
+    void api.readProfiles(controller.signal).then(
       (value) => {
         if (!controller.signal.aborted) setProfiles(value);
       },
@@ -141,7 +141,7 @@ export function ConversationContext({
         if (!controller.signal.aborted) setError(describeError(cause, t));
       },
     );
-    const unsubscribe = control.subscribeCatalog(
+    const unsubscribe = api.subscribeCatalog(
       () => void tick(),
       (cause) => {
         if (!controller.signal.aborted) setError(describeError(cause, t));
@@ -152,7 +152,7 @@ export function ConversationContext({
       controller.abort();
       unsubscribe();
     };
-  }, [control, conversation, refresh, t]);
+  }, [api, conversation, refresh, t]);
   async function act(action: () => Promise<void>) {
     setBusy(true);
     setError(undefined);
@@ -188,16 +188,16 @@ export function ConversationContext({
       )
     : [];
   async function compact() {
-    if (!control || !model) return;
+    if (!api || !model) return;
     await act(async () => {
       if (!request.current || request.current.model !== model)
         request.current = { model, key: crypto.randomUUID() };
       setRetrying(true);
-      const result = await control.compactConversation(conversation, model, request.current.key);
+      const result = await api.compactConversation(conversation, model, request.current.key);
       request.current = null;
       setRetrying(false);
       setNotice(result.reason ?? undefined);
-      setStatus(await control.readContextStatus(conversation));
+      setStatus(await api.readContextStatus(conversation));
     });
   }
   return (
@@ -211,7 +211,7 @@ export function ConversationContext({
           <button
             type="button"
             className="text-foreground underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:text-muted-foreground"
-            disabled={!control || !status || running || !actionsSupported}
+            disabled={!api || !status || running || !actionsSupported}
             title={actionsSupported ? undefined : t("context.nativeUnsupported")}
             onClick={() => (model ? void compact() : setOpen(true))}
           >
@@ -390,7 +390,7 @@ export function ConversationContext({
                           title={actionsSupported ? undefined : t("context.nativeUnsupported")}
                           onClick={() =>
                             void act(async () => {
-                              await control!.stopConversation(work.conversation);
+                              await api!.stopConversation(work.conversation);
                             })
                           }
                         >
@@ -407,7 +407,7 @@ export function ConversationContext({
                 disabled={busy}
                 onClick={() =>
                   void act(async () => {
-                    const page = await control!.readContextStatus(conversation, { before });
+                    const page = await api!.readContextStatus(conversation, { before });
                     if (page.next_before && page.next_before >= before)
                       throw new Error("Context cursor did not advance");
                     setOlder((items) => [...items, ...page.work]);

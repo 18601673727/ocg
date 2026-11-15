@@ -5,7 +5,7 @@ import type * as Api from "@/components/ocg/contracts/api";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Clock, FileText } from "lucide-react";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { LoadMore } from "../primitives/load-more";
@@ -26,7 +26,7 @@ const levelTone: Record<string, Tone> = {
   WARN: "amber",
 };
 
-export function LogsSurface({ client }: { client: HttpCanonicalControlClient }) {
+export function LogsSurface({ client }: { client: ApiClient }) {
   const { t, locale } = useI18n();
   const [file, setFile] = useState("");
   const [timeZone, setTimeZone] = useState(() =>

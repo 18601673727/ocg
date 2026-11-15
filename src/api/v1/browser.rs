@@ -31,7 +31,7 @@ const ID_BYTES: usize = 32;
 const PAIRING_BYTES: usize = 24;
 pub(super) const MAX_LOGIN_BYTES: usize = 1024;
 
-const SESSION_DOMAIN: &[u8] = b"ocg.control-plane.browser-session.v1\n";
+const SESSION_DOMAIN: &[u8] = b"ocg.api.browser-session.v1\n";
 
 pub(super) const LOGIN_NOT_ACCEPTED: Refusal = LENGTH_REQUIRED
     .with_message("a sign-in must declare its one Content-Length and no Transfer-Encoding");

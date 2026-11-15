@@ -13,8 +13,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import type { ControlExecutionPhase } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ExecutionPhase } from "../contracts";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { SELECTED_ROW } from "../primitives/selection";
@@ -30,7 +30,7 @@ export function JobsSurface({
   onJob,
   onOpenChat,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   job: string | null;
   active: boolean;
   onJob: (job: string | null) => void;
@@ -43,7 +43,7 @@ export function JobsSurface({
   );
   const [query, setQuery] = useState("");
   const searchInput = useRef<HTMLInputElement>(null);
-  const [status, setStatus] = useState<ControlExecutionPhase | "all">("all");
+  const [status, setStatus] = useState<ExecutionPhase | "all">("all");
   const [records, setRecords] = useState<Awaited<ReturnType<typeof client.readJobs>>["jobs"]>([]);
   const visibleRecords =
     status === "all" ? records : records.filter((record) => record.execution_phase === status);
@@ -169,7 +169,7 @@ export function JobsSurface({
   const filtered = status !== "all" || query.length > 0;
   const options = [
     { value: "all" as const, label: t("jobs.statusAll") },
-    ...(Object.keys(EXECUTION_PHASE_KEYS) as ControlExecutionPhase[]).map((value) => ({
+    ...(Object.keys(EXECUTION_PHASE_KEYS) as ExecutionPhase[]).map((value) => ({
       value,
       label: t(EXECUTION_PHASE_KEYS[value]),
     })),
@@ -198,7 +198,7 @@ export function JobsSurface({
               onChange={(event) => updateQuery(event.target.value)}
             />
           </div>
-          <Select<ControlExecutionPhase | "all">
+          <Select<ExecutionPhase | "all">
             value={status}
             items={options}
             onValueChange={(value) => {

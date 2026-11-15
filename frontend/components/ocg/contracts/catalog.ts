@@ -1,6 +1,6 @@
 import type * as Api from "./api";
 
-export type ControlCapability = "chat" | "tools" | "vision" | "reasoning";
+export type Capability = "chat" | "tools" | "vision" | "reasoning";
 export type NativePoolV2 = {
   id: string;
   name: string;
@@ -9,33 +9,33 @@ export type NativePoolV2 = {
   archived: boolean;
   revision: number;
 };
-export type ControlPool = NativePoolV2 & {
+export type Pool = NativePoolV2 & {
   operations: ("llm_request" | "decision")[] | undefined;
 };
-export type ControlPools = {
+export type Pools = {
   resource_model: "independent";
-  pools: ControlPool[];
+  pools: Pool[];
   has_more: boolean;
   next_before: string | null;
 };
-export type ControlProject = Omit<Api.Project, "commands"> & {
+export type Project = Omit<Api.Project, "commands"> & {
   commands: (Omit<Api.ProjectCommand, "owner" | "status"> & {
     owner: "user" | "decision";
     status: "allowed" | "review" | "blocked";
   })[];
 };
-export type ControlProjects = Omit<Api.Projects, "projects"> & { projects: ControlProject[] };
-export type ControlAgentProfile = Omit<Api.AgentProfile, "llm_targets"> & {
+export type Projects = Omit<Api.Projects, "projects"> & { projects: Project[] };
+export type AgentProfile = Omit<Api.AgentProfile, "llm_targets"> & {
   llm_targets: (Omit<Api.LlmTarget, "parameters" | "declared_capabilities"> & {
     default_effort: string | null;
-    declared_capabilities: ControlCapability[];
+    declared_capabilities: Capability[];
   })[];
 };
-export type ControlAgentProfiles = Omit<Api.AgentProfiles, "agent_profiles"> & {
-  agent_profiles: ControlAgentProfile[];
+export type AgentProfiles = Omit<Api.AgentProfiles, "agent_profiles"> & {
+  agent_profiles: AgentProfile[];
 };
 type Protocol = "openai_chat_completions" | "openai_responses" | "anthropic_messages";
-export type ControlProfilesSnapshot = Omit<
+export type ProfilesSnapshot = Omit<
   Api.Profiles,
   | "profile_id"
   | "llm_profiles"
@@ -47,7 +47,7 @@ export type ControlProfilesSnapshot = Omit<
   profile_id: string | null;
   llm_profiles: (Omit<Api.LlmProfile, "protocol" | "declared_capabilities"> & {
     protocol: Protocol;
-    declared_capabilities: ControlCapability[];
+    declared_capabilities: Capability[];
     executors: string[];
   })[];
   providers: (Omit<Api.Provider, "protocol"> & { protocol: Protocol })[];
@@ -55,35 +55,35 @@ export type ControlProfilesSnapshot = Omit<
   decision_profiles: Api.DecisionProfile[];
   decision_agent_profiles: Api.DecisionAgentProfile[];
 };
-export type ControlLlmProfile = ControlProfilesSnapshot["llm_profiles"][number];
-export type ControlManagedAgentProfile = ControlProfilesSnapshot["agent_profiles"][number];
+export type LlmProfile = ProfilesSnapshot["llm_profiles"][number];
+export type ManagedAgentProfile = ProfilesSnapshot["agent_profiles"][number];
 
-export function projectAgentProfiles(page: Api.AgentProfiles): ControlAgentProfiles {
+export function projectAgentProfiles(page: Api.AgentProfiles): AgentProfiles {
   return {
     ...page,
     agent_profiles: page.agent_profiles.map((agent) => ({
       ...agent,
       llm_targets: agent.llm_targets.map(({ parameters, ...target }) => ({
         ...target,
-        declared_capabilities: target.declared_capabilities as ControlCapability[],
+        declared_capabilities: target.declared_capabilities as Capability[],
         default_effort: parameters.reasoning_effort,
       })),
     })),
   };
 }
 
-export function projectProfiles(page: Api.Profiles): ControlProfilesSnapshot {
+export function projectProfiles(page: Api.Profiles): ProfilesSnapshot {
   return {
     ...page,
     profile_id: page.profile_id ?? null,
     llm_profiles: page.llm_profiles.map((profile) => ({
       ...profile,
       protocol: profile.protocol as Protocol,
-      declared_capabilities: profile.declared_capabilities as ControlCapability[],
+      declared_capabilities: profile.declared_capabilities as Capability[],
       executors: [],
     })),
-    providers: page.providers as ControlProfilesSnapshot["providers"],
-    executor_protocols: page.executor_protocols as ControlProfilesSnapshot["executor_protocols"],
+    providers: page.providers as ProfilesSnapshot["providers"],
+    executor_protocols: page.executor_protocols as ProfilesSnapshot["executor_protocols"],
     decision_profiles: page.decision_profiles ?? [],
     decision_agent_profiles: page.decision_agent_profiles ?? [],
   };

@@ -3,8 +3,7 @@
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { ExternalLink } from "lucide-react";
 import { useEffect, useState } from "react";
-import type { ChatModelSelection, ControlAgentProfile, ControlProject } from "../contracts";
-import type { ActiveExecutionTarget, ActivityStep, ExecutionPhase } from "./execution-status";
+import type { ChatModelSelection, AgentProfile, Project } from "../contracts";
 import { ModelSelectorView } from "./model-selector-view";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
@@ -12,7 +11,7 @@ import { settingsPath } from "../settings/settings-sections";
 
 const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
-type Catalog = { agents: ControlAgentProfile[]; projects: ControlProject[] };
+type Catalog = { agents: AgentProfile[]; projects: Project[] };
 
 export type ModelImageSupport = { llmProfile: string | undefined; supported: boolean };
 
@@ -36,26 +35,24 @@ export function ModelSelector({
   projectLocked?: boolean;
   lockedProject?: string | null;
   statusText?: string;
-  active?: ActiveExecutionTarget | null;
-  activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
 }) {
-  const { control, client, snapshot } = useOcgRuntime();
+  const { api, client, snapshot } = useOcgRuntime();
   const { t } = useI18n();
   const [catalog, setCatalog] = useState<Catalog | null>(null);
   const [error, setError] = useState<string>();
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
-    if (!control) return;
+    if (!api) return;
     const controller = new AbortController();
     const load = async () => {
       const [profiles, projects] = await Promise.all([
-        control.readProfiles(controller.signal),
-        control.readAllProjects(controller.signal),
+        api.readProfiles(controller.signal),
+        api.readAllProjects(controller.signal),
       ]);
-      const agents: ControlAgentProfile[] = [];
+      const agents: AgentProfile[] = [];
       let before: string | undefined;
       for (;;) {
-        const page = await control.readAgentProfiles({
+        const page = await api.readAgentProfiles({
           before,
           limit: 100,
           signal: controller.signal,
@@ -81,8 +78,8 @@ export function ModelSelector({
       }
     });
     return () => controller.abort();
-  }, [control, attempt]);
-  useEffect(() => control?.onProfilesChanged(() => setAttempt((value) => value + 1)), [control]);
+  }, [api, attempt]);
+  useEffect(() => api?.onProfilesChanged(() => setAttempt((value) => value + 1)), [api]);
 
   const session = snapshot.sessions.find((session) => session.id === sessionId);
   const fixedAgent = session?.agentProfile;

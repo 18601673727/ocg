@@ -44,7 +44,7 @@ const ChatComposerContext = createContext<ChatComposerContextValue | null>(null)
 
 const ChatComposerSlot: FC = () => {
   const value = useContext(ChatComposerContext);
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const [model, setModel] = useState<"checking" | "mutable" | "error">("checking");
   const [probeError, setProbeError] = useState("");
   const [composerContext, setComposerContext] = useState("");
@@ -52,7 +52,7 @@ const ChatComposerSlot: FC = () => {
   const sessionId = value?.session.id;
   const conversationId = value?.session.conversationId;
   useEffect(() => {
-    if (!control || !sessionId) return;
+    if (!api || !sessionId) return;
     const abort = new AbortController();
     void Promise.resolve()
       .then(() => {
@@ -61,7 +61,7 @@ const ChatComposerSlot: FC = () => {
       })
       .then((context) => {
         if (!abort.signal.aborted) setComposerContext(context);
-        return control.currentMutableJob(context, abort.signal);
+        return api.currentMutableJob(context, abort.signal);
       })
       .then(() => {
         if (!abort.signal.aborted) {
@@ -77,7 +77,7 @@ const ChatComposerSlot: FC = () => {
       });
     return () => abort.abort();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [control, sessionId]);
+  }, [api, sessionId]);
   if (!value) return null;
   if (model === "checking" || probedSession !== sessionId)
     return <p role="status">Checking Composer availability…</p>;

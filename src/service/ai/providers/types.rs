@@ -95,13 +95,13 @@ pub enum ExternalAuthority {
 }
 
 impl ExternalAuthority {
-    pub(crate) const fn control(self) -> crate::system::execution_controls::ExecutionControl {
-        use crate::system::execution_controls::ExecutionControl;
+    pub(crate) const fn feature(self) -> crate::system::execution_features::ExecutionFeature {
+        use crate::system::execution_features::ExecutionFeature;
         match self {
-            ExternalAuthority::ManualExternalTrial => ExecutionControl::ManualExternalTrial,
-            ExternalAuthority::ManualExternalExecution => ExecutionControl::ManualExternalExecution,
+            ExternalAuthority::ManualExternalTrial => ExecutionFeature::ManualExternalTrial,
+            ExternalAuthority::ManualExternalExecution => ExecutionFeature::ManualExternalExecution,
             ExternalAuthority::ScheduledExternalTransport => {
-                ExecutionControl::ScheduledExternalTransport
+                ExecutionFeature::ScheduledExternalTransport
             }
         }
     }
@@ -123,7 +123,7 @@ impl ExternalAuthority {
     }
 
     pub(crate) const fn name(self) -> &'static str {
-        self.control().name()
+        self.feature().name()
     }
 }
 

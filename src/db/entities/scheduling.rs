@@ -70,6 +70,8 @@ pub enum UnstartedCause {
     FrozenSecretUnavailable,
     InputUnavailable,
     StartRefused,
+    ExecutorUnavailable,
+    Cancelled,
     OfflineReconciled,
 }
 
@@ -79,6 +81,8 @@ impl UnstartedCause {
             Self::FrozenSecretUnavailable => "frozen_secret_unavailable",
             Self::InputUnavailable => "input_unavailable",
             Self::StartRefused => "start_refused",
+            Self::ExecutorUnavailable => "executor_unavailable_before_start",
+            Self::Cancelled => "cancelled_before_start",
             Self::OfflineReconciled => "reconciled_unstarted_reservation",
         }
     }
@@ -93,6 +97,12 @@ impl UnstartedCause {
             }
             Self::StartRefused => {
                 "This Job could not be started safely. Nothing was sent to the Provider."
+            }
+            Self::ExecutorUnavailable => {
+                "The selected Executor became unavailable before execution started. Nothing was sent to the Provider."
+            }
+            Self::Cancelled => {
+                "This execution was cancelled before it started. Nothing was sent to the Provider."
             }
             Self::OfflineReconciled => {
                 "OCG stopped after reserving capacity for this Job and before it started; an offline reconciliation ended it. Nothing was sent to the Provider."
@@ -130,7 +140,6 @@ pub struct DevelopmentFreshReservation {
     request: DevelopmentReservationRequest,
 }
 
-#[allow(dead_code)]
 impl DevelopmentFreshReservation {
     pub(crate) fn new(
         pool: ExecutionPoolId,
@@ -149,10 +158,6 @@ impl DevelopmentFreshReservation {
 
     pub(crate) fn request(&self) -> DevelopmentReservationRequest {
         self.request
-    }
-
-    pub(crate) fn matches(&self, request: DevelopmentReservationRequest) -> bool {
-        self.request == request
     }
 }
 
@@ -176,12 +181,6 @@ pub enum NativeStopRequest {
     EndedBeforeStart(AllocationToken),
     Requested(AllocationToken),
     AlreadyRequested(AllocationToken),
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum DevelopmentReservationAttempt {
-    New(DevelopmentFreshReservation),
-    Replay,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

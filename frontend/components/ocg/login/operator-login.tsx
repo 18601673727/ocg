@@ -5,10 +5,7 @@ import { ArrowRight, KeyRound, LoaderCircle } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import {
-  ControlTransportError,
-  type HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/control-client";
+import { ApiError, type ApiClient } from "@/components/ocg/runtime/api-client";
 import { ContractError } from "@/components/ocg/contracts";
 import { useI18n, type I18nKey } from "../i18n";
 import { AccessScreen } from "./access-screen";
@@ -22,7 +19,7 @@ export function OperatorLogin({
   client,
   onSignedIn,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   onSignedIn: (session: OperatorSession) => void;
 }) {
   const { t } = useI18n();
@@ -37,7 +34,7 @@ export function OperatorLogin({
       onSignedIn(await client.createSession(pairingCode.trim()));
       setPairingCode("");
     } catch (error) {
-      if (error instanceof ControlTransportError) {
+      if (error instanceof ApiError) {
         if (error.code === "invalid_pairing_code") {
           setFailure({ key: "login.pairing.invalid" });
         } else if (error.code === "pairing_disabled") {

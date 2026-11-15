@@ -19,10 +19,10 @@ use crate::service::ai::providers::ProviderExecutionError;
 static PROXY: OnceLock<Result<Option<Proxy>, String>> = OnceLock::new();
 
 pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
-    use crate::system::execution_controls::{ControlState, ExecutionControl};
-    match ExecutionControl::ExternalProviderTransport.state() {
-        ControlState::Disabled => literal_direct_loopback(endpoint),
-        ControlState::Enabled => false,
+    use crate::system::execution_features::{ExecutionFeature, FeatureState};
+    match ExecutionFeature::ExternalProviderTransport.state() {
+        FeatureState::Disabled => literal_direct_loopback(endpoint),
+        FeatureState::Enabled => false,
     }
 }
 
@@ -224,9 +224,9 @@ pub(crate) async fn provider_client_for(
             route,
             authority,
         } => {
-            if !authority.control().is_enabled() {
+            if !authority.feature().is_enabled() {
                 return Err(ProviderExecutionError::Build {
-                    message: authority.control().refusal(),
+                    message: authority.feature().refusal(),
                 });
             }
             if !authority.admits_route(route) {
@@ -258,10 +258,10 @@ pub(crate) enum DiscoveryClientError {
 }
 
 pub(crate) fn discovery_permitted(endpoint: &str) -> bool {
-    use crate::system::execution_controls::{ControlState, ExecutionControl};
-    match ExecutionControl::ProviderDiscovery.state() {
-        ControlState::Enabled => true,
-        ControlState::Disabled => literal_direct_loopback(endpoint),
+    use crate::system::execution_features::{ExecutionFeature, FeatureState};
+    match ExecutionFeature::ProviderDiscovery.state() {
+        FeatureState::Enabled => true,
+        FeatureState::Disabled => literal_direct_loopback(endpoint),
     }
 }
 

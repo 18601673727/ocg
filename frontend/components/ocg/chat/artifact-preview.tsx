@@ -4,29 +4,27 @@ import { useEffect, useState } from "react";
 import Image from "next/image";
 import { Button } from "@/components/ui/button";
 import { DiffViewer } from "@/components/ui/diff-viewer";
-import type { ControlToolCall } from "../contracts";
+import type { ToolCall } from "../contracts";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
 import { fileArtifact } from "./artifact-model";
 
 export type Artifact = { id: string; title: string } & (
-  | { job: string; call: ControlToolCall }
+  | { job: string; call: ToolCall }
   | { url: string }
 );
 
 export function ArtifactPreview({ artifact }: { artifact: Artifact }) {
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const { t } = useI18n();
-  const [call, setCall] = useState<ControlToolCall | null>(
-    "call" in artifact ? artifact.call : null,
-  );
+  const [call, setCall] = useState<ToolCall | null>("call" in artifact ? artifact.call : null);
   const [error, setError] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
   const needsRead = "call" in artifact && (artifact.call.arguments_cut || artifact.call.result_cut);
   useEffect(() => {
-    if (!needsRead || !("call" in artifact) || !control) return;
+    if (!needsRead || !("call" in artifact) || !api) return;
     const controller = new AbortController();
-    void control
+    void api
       .readJobTool(artifact.job, artifact.call.request, artifact.call.index, controller.signal)
       .then((value) => {
         if (!controller.signal.aborted) {
@@ -39,7 +37,7 @@ export function ArtifactPreview({ artifact }: { artifact: Artifact }) {
           setError(cause instanceof Error ? cause.message : String(cause));
       });
     return () => controller.abort();
-  }, [artifact, control, needsRead, attempt]);
+  }, [artifact, api, needsRead, attempt]);
   if ("url" in artifact)
     return (
       <div className="min-w-0">

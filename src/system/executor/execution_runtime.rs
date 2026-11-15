@@ -354,8 +354,8 @@ async fn capture_file_snapshots(
             let rel_path = if path_obj.is_absolute() {
                 if let Ok(relative) = path_obj.strip_prefix(workspace.root()) {
                     relative
-                } else if let Ok(canonical) = path_obj.canonicalize() {
-                    let Ok(relative) = canonical.strip_prefix(workspace.root()) else {
+                } else if let Ok(resolved_path) = path_obj.canonicalize() {
+                    let Ok(relative) = resolved_path.strip_prefix(workspace.root()) else {
                         continue;
                     };
                     relative_owned = relative.to_path_buf();

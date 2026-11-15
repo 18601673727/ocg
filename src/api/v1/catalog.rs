@@ -313,11 +313,6 @@ pub(crate) enum TurnEntryKindView {
         text: String,
         call: String,
     },
-    Notice {
-        child: String,
-        event: String,
-        reference: String,
-    },
     Decision {
         approval: (String, u32, u32),
     },
@@ -800,64 +795,6 @@ pub(super) fn bound_conversation_turns(shared: &Shared, mut body: Value) -> Resu
     body["has_more"] = Value::Bool(has_more);
     body["next_before"] = if has_more { next_before } else { Value::Null };
     dashboard::bounded(shared, body)
-}
-
-pub(super) async fn conversation_notices(
-    database: &DatabaseHandle,
-    conversation: JobId,
-    after: u32,
-    limit: usize,
-) -> Result<Reply, Refusal> {
-    if !database
-        .job(conversation)
-        .await?
-        .is_some_and(|record| record.kind.is_group())
-    {
-        return Err(Refusal::new(
-            ntex::http::StatusCode::NOT_FOUND,
-            "conversation_not_found",
-            "conversation does not exist",
-        ));
-    }
-    let records = database.notices(conversation, after, limit + 1).await?;
-    let notices = records
-        .iter()
-        .take(limit)
-        .map(|(seq, notice)| {
-            use crate::db::entities::{NoticeBody, NoticeClass};
-            let body = match &notice.body {
-                NoticeBody::Event {
-                    child,
-                    event,
-                    reference,
-                } => serde_json::json!({
-                    "child": child.to_string(),
-                    "event": format!("{event:?}"),
-                    "reference": reference.to_string(),
-                }),
-                NoticeBody::Record { event, by, at } => serde_json::json!({
-                    "event": format!("{event:?}").to_lowercase(),
-                    "by": actor_view(by),
-                    "at_us": at.as_unix_micros(),
-                }),
-            };
-            serde_json::json!({
-                "seq": *seq,
-                "class": match notice.class {
-                    NoticeClass::Attention => "attention",
-                    NoticeClass::Progress => "progress",
-                    NoticeClass::Record => "record",
-                }
-                .to_owned(),
-                "body": body,
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(Reply::ok(envelope(serde_json::json!({
-        "conversation": conversation.to_string(),
-        "notices": notices,
-        "has_more": records.len() > limit,
-    }))))
 }
 
 fn capability(capability: ModelCapability) -> &'static str {

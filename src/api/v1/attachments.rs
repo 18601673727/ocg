@@ -26,7 +26,7 @@ const UNSUPPORTED_IMAGE_TYPE: Refusal = Refusal::new(
 const MALFORMED_IMAGE_DATA: Refusal = Refusal::new(
     StatusCode::BAD_REQUEST,
     "malformed_image_data",
-    "data_base64 is not canonical standard base64; nothing was stored",
+    "data_base64 is not standard padded base64; nothing was stored",
 );
 const IMAGE_TOO_LARGE: Refusal = Refusal::new(
     StatusCode::PAYLOAD_TOO_LARGE,
@@ -138,7 +138,7 @@ pub(super) async fn upload(database: &DatabaseHandle, body: &[u8]) -> Result<Rep
         .await
         .map_err(attachment_refusal)?;
     let record = database.attachment(id).await?.ok_or(INTERNAL)?;
-    log::info!("control plane stored {id} ({} bytes)", record.byte_length);
+    log::info!("API server stored {id} ({} bytes)", record.byte_length);
     Ok(Reply::new(
         StatusCode::CREATED,
         envelope(serde_json::json!({

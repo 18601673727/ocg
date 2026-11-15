@@ -4,460 +4,23 @@ import { useEffect, useRef, useState } from "react";
 import { Pause, Play, Square, X } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useI18n } from "../i18n";
-import type { RuntimeStatus } from "../types";
-import { ModelSelector, type ModelImageSupport } from "./model-selector";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
-import type { ControlConversationCard } from "../contracts";
-import type { ChatModelSelection } from "../contracts";
-import type { ControlChildConversation, ControlTaskPlan } from "../contracts";
-import {
-  type ActiveExecutionTarget,
-  type ActivityStep,
-  type ExecutionPhase,
-} from "./execution-status";
-import { ChatComposerInput, ChatComposerView } from "./chat-composer-view";
-import { AttachmentStaging, useImageAttachments } from "./image-attachments";
+import { ApiError, type ApiClient } from "../runtime/api-client";
+import type { ConversationCard, ChildConversation, TaskPlan } from "../contracts";
 import { useConversationError } from "./conversation-errors";
 import { ApprovalRequest } from "./approval-request";
 import { outputDisplayText } from "./job-transcript-model";
 import { DispatchSelectionCard } from "./dispatch-selection-card";
-import {
-  applyComposerSuggestion,
-  matchComposerSuggestions,
-  moveComposerSuggestionIndex,
-  parseComposerIntent,
-  type ComposerIntent,
-  type ComposerSuggestion,
-} from "../composer/domain";
-
-export function ChatComposer({
-  sessionId,
-  conversationId,
-  projectId,
-  draft,
-  onDraftChange,
-  onIntent,
-  runtimeStatus,
-  busy,
-  queueing,
-  steerAfterCompletion,
-  selection,
-  onSelectionChange,
-  onPreference,
-  active,
-  activity,
-  onCancel,
-  autoFocus = false,
-  projectSelector,
-}: {
-  sessionId?: string;
-  conversationId?: string;
-  projectId?: string;
-  busy: boolean;
-  queueing: boolean;
-  steerAfterCompletion: boolean;
-  selection?: ChatModelSelection;
-  onSelectionChange: (selection: ChatModelSelection) => void;
-  onPreference: (selection: ChatModelSelection) => void;
-  active: ActiveExecutionTarget | null;
-  activity?: { current: ActivityStep | ExecutionPhase | null; steps: ActivityStep[] };
-  onCancel?: () => Promise<void>;
-  autoFocus?: boolean;
-  projectSelector?: React.ReactNode;
-  draft: string;
-  onDraftChange: (v: string) => void;
-  onIntent: (intent: ComposerIntent) => void | Promise<void>;
-  runtimeStatus: RuntimeStatus;
-}) {
-  const { control } = useOcgRuntime();
-  const [steerGate, setSteerGate] = useState<{
-    conversation: string;
-    blocked: boolean;
-    kind?: "rule_based" | "manual";
-  }>();
-  const steerBlocked = Boolean(
-    control && conversationId && (steerGate?.conversation !== conversationId || steerGate.blocked),
-  );
-  const defaultQueueing =
-    queueing || Boolean(steerGate?.conversation === conversationId && steerGate?.kind);
-  useEffect(() => {
-    if (!control || !conversationId) return;
-    const abort = new AbortController();
-    let reading = false;
-    const refresh = async () => {
-      if (reading) return;
-      reading = true;
-      try {
-        const status = await control.readContextStatus(conversationId, {
-          limit: 1,
-          signal: abort.signal,
-        });
-        if (!abort.signal.aborted)
-          setSteerGate({
-            conversation: conversationId,
-            blocked: Boolean(status.steer_blocked_by),
-            kind: status.steer_blocked_by,
-          });
-      } catch {
-        if (!abort.signal.aborted) setSteerGate({ conversation: conversationId, blocked: true });
-      } finally {
-        reading = false;
-      }
-    };
-    const unsubscribe = control.subscribeCatalog(
-      () => void refresh(),
-      () => {
-        if (!abort.signal.aborted) setSteerGate({ conversation: conversationId, blocked: true });
-      },
-    );
-    void refresh();
-    return () => {
-      abort.abort();
-      unsubscribe();
-    };
-  }, [control, conversationId]);
-  const ref = useRef<HTMLTextAreaElement>(null);
-  const fileInput = useRef<HTMLInputElement>(null);
-  const [modelImageSupport, setModelImageSupport] = useState<ModelImageSupport | null>(null);
-  const supportsImages = Boolean(
-    selection?.llmProfile &&
-      modelImageSupport?.llmProfile === selection.llmProfile &&
-      modelImageSupport.supported,
-  );
-  const imagesUnsupported = Boolean(
-    selection?.llmProfile &&
-      modelImageSupport?.llmProfile === selection.llmProfile &&
-      !modelImageSupport.supported,
-  );
-  const images = useImageAttachments(projectId, supportsImages);
-  const [dragging, setDragging] = useState(false);
-  const dragDepth = useRef(0);
-  const { t } = useI18n();
-  const [highlight, setHighlight] = useState<{ raw: string; index: number } | null>(null);
-  const [dismissedFor, setDismissedFor] = useState<string | null>(null);
-  const [commandError, setCommandError] = useState<{ raw: string; message: string } | null>(null);
-  const chatReady = runtimeStatus.state === "connected";
-  const actionLock = useRef(false);
-  const [submitting, setSubmitting] = useState(false);
-
-  useEffect(() => {
-    const block = (event: DragEvent) => {
-      if (event.dataTransfer?.types.includes("Files")) event.preventDefault();
-    };
-    window.addEventListener("dragover", block);
-    window.addEventListener("drop", block);
-    return () => {
-      window.removeEventListener("dragover", block);
-      window.removeEventListener("drop", block);
-    };
-  }, []);
-  const [cancelling, setCancelling] = useState(false);
-  const imageInputDisabled = !supportsImages || submitting || cancelling;
-
-  useEffect(() => {
-    const el = ref.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 160)}px`;
-  }, [draft]);
-
-  useEffect(() => {
-    if (autoFocus) ref.current?.focus();
-  }, [autoFocus]);
-
-  const suggestions = matchComposerSuggestions(draft).filter(
-    (suggestion) => suggestion.kind !== "job" && suggestion.kind !== "job.create",
-  );
-  const suggestionsOpen = suggestions.length > 0 && dismissedFor !== draft;
-  const activeIndex =
-    suggestionsOpen && highlight?.raw === draft && highlight.index < suggestions.length
-      ? highlight.index
-      : -1;
-  const error = commandError && commandError.raw === draft ? commandError.message : null;
-  const canSend = (draft.trim().length > 0 || images.attachments.length > 0) && images.ready;
-
-  const closeSuggestions = () => {
-    setHighlight(null);
-    setDismissedFor(draft);
-  };
-
-  const applySuggestion = (suggestion: ComposerSuggestion) => {
-    const applied = applyComposerSuggestion(suggestion);
-    setHighlight(null);
-    setDismissedFor(null);
-    setCommandError(null);
-    if (applied.action === "create-job") {
-      onDraftChange("");
-      onIntent(parseComposerIntent(applied.text));
-      return;
-    }
-    onDraftChange(applied.text);
-    ref.current?.focus();
-  };
-
-  const submit = async (mode?: "queue" | "steer") => {
-    if (
-      actionLock.current ||
-      !images.ready ||
-      (mode === "steer" && steerBlocked) ||
-      (!mode && steerAfterCompletion && steerBlocked && !steerGate?.kind)
-    )
-      return;
-    const intent = parseComposerIntent(draft);
-    const effectiveMode = mode ?? (steerAfterCompletion && !steerBlocked ? "steer" : undefined);
-    if (intent.kind === "unknown-command") {
-      setDismissedFor(draft);
-      setCommandError({ raw: draft, message: intent.reason });
-      return;
-    }
-    if (intent.kind !== "chat" && images.attachments.length) {
-      setCommandError({ raw: draft, message: t("chat.imagesRequireChat") });
-      return;
-    }
-    if (intent.kind === "chat" && intent.text.length === 0 && !images.images.length) return;
-    if (intent.kind === "chat" && !chatReady) return;
-    actionLock.current = true;
-    setSubmitting(true);
-    setCommandError(null);
-    try {
-      await onIntent(
-        intent.kind === "chat"
-          ? { ...intent, selection, mode: effectiveMode, images: images.images }
-          : intent,
-      );
-      onDraftChange("");
-      images.clear();
-    } catch (cause) {
-      setCommandError({
-        raw: draft,
-        message: cause instanceof Error ? cause.message : String(cause),
-      });
-    } finally {
-      actionLock.current = false;
-      setSubmitting(false);
-    }
-  };
-
-  const cancel = async () => {
-    if (!onCancel || actionLock.current) return;
-    actionLock.current = true;
-    setCancelling(true);
-    try {
-      await onCancel();
-    } catch (cause) {
-      setCommandError({
-        raw: draft,
-        message: cause instanceof Error ? cause.message : String(cause),
-      });
-    } finally {
-      actionLock.current = false;
-      setCancelling(false);
-    }
-  };
-
-  return (
-    <ChatComposerView
-      form={{
-        onSubmit: (e) => {
-          e.preventDefault();
-          void submit();
-        },
-        onDragEnter: (event) => {
-          if (!event.dataTransfer.types.includes("Files")) return;
-          event.preventDefault();
-          if (imageInputDisabled) return;
-          dragDepth.current += 1;
-          setDragging(true);
-        },
-        onDragOver: (event) => {
-          if (!event.dataTransfer.types.includes("Files")) return;
-          event.preventDefault();
-          event.dataTransfer.dropEffect = imageInputDisabled ? "none" : "copy";
-        },
-        onDragLeave: (event) => {
-          event.preventDefault();
-          dragDepth.current = Math.max(0, dragDepth.current - 1);
-          if (dragDepth.current === 0) setDragging(false);
-        },
-        onDrop: (event) => {
-          if (!event.dataTransfer.types.includes("Files")) return;
-          event.preventDefault();
-          dragDepth.current = 0;
-          setDragging(false);
-          if (!imageInputDisabled) images.add(Array.from(event.dataTransfer.files));
-        },
-      }}
-      dragging={!imageInputDisabled && dragging}
-      attachmentInput={
-        <input
-          ref={fileInput}
-          type="file"
-          accept="image/png,image/jpeg,image/gif,image/webp"
-          multiple
-          hidden
-          disabled={imageInputDisabled}
-          aria-label={t("chat.attachFile")}
-          onChange={(event) => {
-            images.add(Array.from(event.target.files ?? []));
-            event.target.value = "";
-          }}
-        />
-      }
-      runtimeStatus={runtimeStatus}
-    >
-      <div className="rounded-xl border border-border bg-card shadow-sm transition-shadow focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/15 motion-reduce:transition-none">
-        <AttachmentStaging
-          state={images}
-          disabled={submitting || cancelling}
-          uploadDisabled={imageInputDisabled}
-          unsupported={imagesUnsupported}
-        />
-        <ChatComposerInput
-          textarea={{
-            ref,
-            value: draft,
-            readOnly: submitting || cancelling,
-            onChange: (e) => {
-              setDismissedFor(null);
-              onDraftChange(e.target.value);
-            },
-            onPaste: (e) => {
-              if (imageInputDisabled) return;
-              const clipboard = e.clipboardData;
-              if (!clipboard) return;
-              const pasted = [
-                ...Array.from(clipboard.items).flatMap((item) =>
-                  item.type.startsWith("image/") ? [item.getAsFile()] : [],
-                ),
-                ...Array.from(clipboard.files),
-              ].filter((file): file is File => file !== null && file.type.startsWith("image/"));
-              if (pasted.length > 0) {
-                e.preventDefault();
-                images.add(pasted);
-              }
-            },
-            onKeyDown: (e) => {
-              if (e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) return;
-              if (e.key === "`" && !e.shiftKey && !e.ctrlKey && !e.metaKey && !e.altKey) {
-                const input = e.currentTarget;
-                const start = input.selectionStart;
-                const end = input.selectionEnd;
-                const value = draft;
-                if (value.slice(Math.max(0, start - 2), start) === "``" && start === end) {
-                  e.preventDefault();
-                  const insertion = "`\n\n```";
-                  const next = value.slice(0, start) + insertion + value.slice(end);
-                  onDraftChange(next);
-                  requestAnimationFrame(() => {
-                    input.setSelectionRange(start + 2, start + 2);
-                    input.focus();
-                  });
-                  return;
-                }
-              }
-              if (e.key === "Escape" && suggestionsOpen) {
-                e.preventDefault();
-                closeSuggestions();
-                return;
-              }
-              if (suggestionsOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
-                e.preventDefault();
-                setHighlight({
-                  raw: draft,
-                  index: moveComposerSuggestionIndex(
-                    activeIndex,
-                    e.key === "ArrowDown" ? 1 : -1,
-                    suggestions.length,
-                  ),
-                });
-                return;
-              }
-              if (e.key === "Enter" && !e.shiftKey) {
-                if (suggestionsOpen && activeIndex >= 0) {
-                  e.preventDefault();
-                  applySuggestion(suggestions[activeIndex]);
-                  return;
-                }
-                if (window.matchMedia("(pointer: coarse)").matches && !e.ctrlKey && !e.metaKey)
-                  return;
-                e.preventDefault();
-                void submit();
-              }
-            },
-            "aria-describedby": chatReady ? undefined : "composer-status",
-          }}
-          suggestions={
-            suggestionsOpen
-              ? {
-                  items: suggestions.map((suggestion) => ({
-                    id: suggestion.id,
-                    label: suggestion.label,
-                    description: suggestion.description,
-                    command: suggestion.command,
-                    icon: suggestion.action === "create-job" ? "job" : "command",
-                  })),
-                  activeIndex,
-                  onSelect: (index) => applySuggestion(suggestions[index]),
-                }
-              : undefined
-          }
-          error={error}
-          selectors={
-            <div className="flex min-w-0 flex-1 items-center gap-1.5">
-              {projectSelector && (
-                <div className="flex min-w-0 max-w-[min(18rem,40%)] shrink items-stretch">
-                  {projectSelector}
-                </div>
-              )}
-              <ModelSelector
-                sessionId={sessionId}
-                selection={selection}
-                onChange={onSelectionChange}
-                onPreference={onPreference}
-                onImageSupportChange={setModelImageSupport}
-                busy={busy || submitting || cancelling}
-                active={active}
-                activity={activity}
-              />
-            </div>
-          }
-          actions={{
-            busy,
-            queueing: defaultQueueing,
-            submitting,
-            cancelling,
-            attachDisabled: imageInputDisabled,
-            attachUnsupported: imagesUnsupported,
-            sendDisabled:
-              !canSend ||
-              submitting ||
-              cancelling ||
-              (steerAfterCompletion && steerBlocked && !steerGate?.kind) ||
-              (!chatReady && parseComposerIntent(draft).kind === "chat"),
-            steerDisabled: !canSend || !chatReady || submitting || cancelling || steerBlocked,
-            steerTitle: steerBlocked
-              ? t(steerGate?.kind ? "chat.compactionQueueOnly" : "chat.steerStatusPending")
-              : t("chat.steer"),
-            onAttach: () => fileInput.current?.click(),
-            onSteer: () => void submit("steer"),
-            onCancel: onCancel ? () => void cancel() : undefined,
-          }}
-        />
-      </div>
-    </ChatComposerView>
-  );
-}
 
 function useConversation(turn?: string) {
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const [conversation, setConversation] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   useConversationError(error);
   useEffect(() => {
-    if (!control || !turn) return;
+    if (!api || !turn) return;
     const controller = new AbortController();
-    void control
+    void api
       .readJob(turn, controller.signal)
       .then((record) => {
         if (!controller.signal.aborted)
@@ -468,32 +31,29 @@ function useConversation(turn?: string) {
           setError(cause instanceof Error ? cause.message : String(cause));
       });
     return () => controller.abort();
-  }, [control, turn]);
+  }, [api, turn]);
   return { conversation, error };
 }
 
 function ChildConversationCard({
   child,
   agentName,
-  control,
+  api,
   pending,
   onOpen,
   onAct,
 }: {
-  child: ControlChildConversation;
+  child: ChildConversation;
   agentName?: string;
-  control: HttpCanonicalControlClient;
+  api: ApiClient;
   pending: boolean;
   onOpen: (conversation: string) => void;
-  onAct: (
-    child: ControlChildConversation,
-    action: "stop" | "close" | "hold" | "unhold",
-  ) => Promise<void>;
+  onAct: (child: ChildConversation, action: "stop" | "close" | "hold" | "unhold") => Promise<void>;
 }) {
   const { t, locale } = useI18n();
-  const [detail, setDetail] = useState<Awaited<
-    ReturnType<HttpCanonicalControlClient["readJobDetails"]>
-  > | null>(null);
+  const [detail, setDetail] = useState<Awaited<ReturnType<ApiClient["readJobDetails"]>> | null>(
+    null,
+  );
   const [model, setModel] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [modelError, setModelError] = useState<string | null>(null);
@@ -503,7 +63,7 @@ function ChildConversationCard({
   const due = child.recurrence?.due_us;
   useEffect(() => {
     const controller = new AbortController();
-    void control
+    void api
       .readJobDetails(child.id, controller.signal)
       .then((result) => {
         if (!controller.signal.aborted) {
@@ -516,10 +76,10 @@ function ChildConversationCard({
           setError(cause instanceof Error ? cause.message : String(cause));
       });
     return () => controller.abort();
-  }, [control, child.id, child.state, phase, due]);
+  }, [api, child.id, child.state, phase, due]);
   useEffect(() => {
     const controller = new AbortController();
-    void control
+    void api
       .readConversationTurns(child.id, undefined, 1, controller.signal)
       .then((result) => {
         if (!controller.signal.aborted) {
@@ -532,7 +92,7 @@ function ChildConversationCard({
           setModelError(cause instanceof Error ? cause.message : String(cause));
       });
     return () => controller.abort();
-  }, [control, child.id, child.state, child.job_state, phase, due]);
+  }, [api, child.id, child.state, child.job_state, phase, due]);
   const state = detail?.settlement.state;
   const status =
     state && state !== "unsettled" ? t(`state.${state}`) : t(`chat.child.${child.state}`);
@@ -621,13 +181,13 @@ export function ConversationChildrenStrip({
   onOpen,
 }: {
   turn?: string;
-  plan?: ControlTaskPlan | null;
+  plan?: TaskPlan | null;
   onOpen: (conversation: string) => void;
 }) {
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const { t } = useI18n();
   const { conversation } = useConversation(turn);
-  const [children, setChildren] = useState<ControlChildConversation[]>([]);
+  const [children, setChildren] = useState<ChildConversation[]>([]);
   const [hasMore, setHasMore] = useState(false);
   const [pages, setPages] = useState(1);
   const [revision, setRevision] = useState(0);
@@ -638,10 +198,10 @@ export function ConversationChildrenStrip({
   const lock = useRef(false);
   const hasChildren = children.length > 0;
   useEffect(() => {
-    if (!control || !hasChildren) return;
+    if (!api || !hasChildren) return;
     const controller = new AbortController();
     const refresh = () => {
-      void control
+      void api
         .readProfiles(controller.signal)
         .then((profiles) => {
           if (!controller.signal.aborted)
@@ -655,15 +215,15 @@ export function ConversationChildrenStrip({
         });
     };
     refresh();
-    const unsubscribe = control.onProfilesChanged(refresh);
+    const unsubscribe = api.onProfilesChanged(refresh);
     return () => {
       controller.abort();
       unsubscribe();
     };
-  }, [control, hasChildren]);
+  }, [api, hasChildren]);
   useEffect(() => {
-    if (!control || !conversation) return;
-    return control.subscribeChildren(
+    if (!api || !conversation) return;
+    return api.subscribeChildren(
       conversation,
       pages,
       (reply) => {
@@ -673,21 +233,18 @@ export function ConversationChildrenStrip({
       },
       (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
     );
-  }, [control, conversation, pages, revision]);
+  }, [api, conversation, pages, revision]);
 
-  async function act(
-    child: ControlChildConversation,
-    action: "stop" | "close" | "hold" | "unhold",
-  ) {
-    if (!control || lock.current) return;
+  async function act(child: ChildConversation, action: "stop" | "close" | "hold" | "unhold") {
+    if (!api || lock.current) return;
     lock.current = true;
     setPending(child.id);
     setError(null);
     try {
-      if (action === "stop") await control.stopConversation(child.id);
-      else if (action === "close") await control.closeConversation(child.id);
-      else if (action === "hold") await control.holdConversation(child.id);
-      else await control.unholdConversation(child.id);
+      if (action === "stop") await api.stopConversation(child.id);
+      else if (action === "close") await api.closeConversation(child.id);
+      else if (action === "hold") await api.holdConversation(child.id);
+      else await api.unholdConversation(child.id);
       setRevision((value) => value + 1);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -696,7 +253,7 @@ export function ConversationChildrenStrip({
       setPending(null);
     }
   }
-  if (!control || (!children.length && !hasMore)) return null;
+  if (!api || (!children.length && !hasMore)) return null;
   const stepOrder = new Map(plan?.steps.map((step, index) => [step.conversation, index]));
   const orderedChildren = [...children].sort(
     (left, right) =>
@@ -715,7 +272,7 @@ export function ConversationChildrenStrip({
             key={child.id}
             child={child}
             agentName={child.agent ? agentNames[child.agent] : undefined}
-            control={control}
+            api={api}
             pending={pending !== null}
             onOpen={onOpen}
             onAct={act}
@@ -781,11 +338,11 @@ export function ConversationCardStrip({
   conversationId?: string;
   onOpen: (conversation: string) => void;
 }) {
-  const { control, client } = useOcgRuntime();
+  const { api, client } = useOcgRuntime();
   const { t } = useI18n();
   const { conversation: loadedConversation } = useConversation(conversationId ? undefined : turn);
   const conversation = conversationId ?? loadedConversation;
-  const [cards, setCards] = useState<ControlConversationCard[]>([]);
+  const [cards, setCards] = useState<ConversationCard[]>([]);
   const [revision, setRevision] = useState(0);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -793,7 +350,7 @@ export function ConversationCardStrip({
   const lock = useRef(false);
   const actionVersion = useRef(0);
   useEffect(() => {
-    if (!control || !conversation) return;
+    if (!api || !conversation) return;
     const controller = new AbortController();
     let reading = false;
     const refresh = async () => {
@@ -801,7 +358,7 @@ export function ConversationCardStrip({
       reading = true;
       try {
         const version = actionVersion.current;
-        const reply = await control.readCards(conversation, controller.signal);
+        const reply = await api.readCards(conversation, controller.signal);
         if (!controller.signal.aborted && !lock.current && version === actionVersion.current) {
           setCards(reply.cards);
           setError(null);
@@ -813,7 +370,7 @@ export function ConversationCardStrip({
         reading = false;
       }
     };
-    const unsubscribe = control.subscribeCatalog(
+    const unsubscribe = api.subscribeCatalog(
       () => void refresh(),
       (cause) => {
         if (!controller.signal.aborted)
@@ -825,13 +382,13 @@ export function ConversationCardStrip({
       controller.abort();
       unsubscribe();
     };
-  }, [control, conversation, revision]);
+  }, [api, conversation, revision]);
 
   async function act(
-    card: ControlConversationCard,
+    card: ConversationCard,
     decision?: { decision: "approve" | "reject" } | { answer: string },
   ) {
-    if (!control || lock.current) return;
+    if (!api || lock.current) return;
     lock.current = true;
     actionVersion.current++;
     setPending(true);
@@ -839,7 +396,7 @@ export function ConversationCardStrip({
     try {
       if (card.kind === "approval" || card.kind === "question" || card.kind === "dispatch") {
         if (decision) {
-          const res = await control.decideApproval(card.approval, decision);
+          const res = await api.decideApproval(card.approval, decision);
           setCards((prev) =>
             prev.filter(
               (c) =>
@@ -860,15 +417,15 @@ export function ConversationCardStrip({
       setRevision((value) => value + 1);
     } catch (cause) {
       if (
-        cause instanceof ControlTransportError &&
+        cause instanceof ApiError &&
         (cause.code === "approval_decided" || cause.code === "approval_not_found")
       ) {
         setRevision((value) => value + 1);
       } else {
         setError(
-          cause instanceof ControlTransportError && cause.code === "command_list_bytes"
+          cause instanceof ApiError && cause.code === "command_list_bytes"
             ? t("chat.card.commandBytes")
-            : cause instanceof ControlTransportError && cause.code === "command_list_full"
+            : cause instanceof ApiError && cause.code === "command_list_full"
               ? t("chat.card.commandCapacity")
               : cause instanceof Error
                 ? cause.message
@@ -881,7 +438,7 @@ export function ConversationCardStrip({
       setPending(false);
     }
   }
-  const groups = new Map<string, { parent: string | null; cards: ControlConversationCard[] }>();
+  const groups = new Map<string, { parent: string | null; cards: ConversationCard[] }>();
   for (const card of cards) {
     let group = groups.get(card.conversation);
     if (!group) {
@@ -950,10 +507,10 @@ export function ConversationCardStrip({
                   </div>
                 </>
               )}
-              {card.kind === "dispatch" && control && (
+              {card.kind === "dispatch" && api && (
                 <>
                   <DispatchSelectionCard
-                    client={control}
+                    client={api}
                     arguments={card.arguments}
                     disabled={pending}
                     onSelect={(selection) => void act(card, { answer: JSON.stringify(selection) })}
@@ -999,7 +556,7 @@ export function ConversationCardStrip({
       </div>
     );
   }
-  if (!control || !cards.length) return null;
+  if (!api || !cards.length) return null;
   return (
     <section
       className="w-full py-2"

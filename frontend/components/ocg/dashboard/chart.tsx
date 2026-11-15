@@ -4,7 +4,7 @@ import type * as Api from "@/components/ocg/contracts/api";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useEffect, useId, useState } from "react";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { summarize, type RankedUsage } from "./usage-chart-data";
 import { summarizeReliability, type ReliabilitySummary } from "./reliability-chart-data";
@@ -54,7 +54,7 @@ async function paginateCursor<Page>({
   return result;
 }
 
-function ChartControls({
+function ChartToolbar({
   id,
   days,
   bucket,
@@ -313,13 +313,7 @@ type UsageData = ReturnType<typeof summarize> & {
 const color = (entry: RankedUsage, rank: number) =>
   entry.other ? "var(--usage-other)" : `var(--usage-${rank + 1})`;
 
-export function UsageChart({
-  client,
-  reloadKey,
-}: {
-  client: HttpCanonicalControlClient;
-  reloadKey: number;
-}) {
+export function UsageChart({ client, reloadKey }: { client: ApiClient; reloadKey: number }) {
   const [days, setDays] = useState(90);
   const [bucket, setBucket] = useState<Bucket>("day");
   const id = useId();
@@ -333,7 +327,7 @@ export function UsageChart({
         <h2 id={`${id}-title`} className="text-base font-semibold tracking-tight">
           {t("observations.chartTitle")}
         </h2>
-        <ChartControls
+        <ChartToolbar
           id={id}
           days={days}
           bucket={bucket}
@@ -358,7 +352,7 @@ function UsageChartData({
   bucket,
   reloadKey,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   days: number;
   bucket: Bucket;
   reloadKey: number;
@@ -519,13 +513,7 @@ const cacheWritesColor = "var(--usage-1)";
 const ttfbColor = "var(--usage-4)";
 const durationColor = "var(--usage-5)";
 
-export function ReliabilityChart({
-  client,
-  reloadKey,
-}: {
-  client: HttpCanonicalControlClient;
-  reloadKey: number;
-}) {
+export function ReliabilityChart({ client, reloadKey }: { client: ApiClient; reloadKey: number }) {
   const [days, setDays] = useState(30);
   const [bucket, setBucket] = useState<Bucket>("day");
   const id = useId();
@@ -539,7 +527,7 @@ export function ReliabilityChart({
         <h2 id={`${id}-title`} className="text-base font-semibold tracking-tight">
           {t("observations.reliabilityTitle")}
         </h2>
-        <ChartControls
+        <ChartToolbar
           id={id}
           days={days}
           bucket={bucket}
@@ -567,7 +555,7 @@ function ReliabilityChartData({
   bucket,
   reloadKey,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   days: number;
   bucket: Bucket;
   reloadKey: number;
@@ -940,7 +928,7 @@ export function HealthChart({
   fromUs,
   untilUs,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   fromUs: number;
   untilUs: number;
 }) {

@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::net::SocketAddr;
 
-use crate::api::v1::{ControlPlane, ControlPlaneConfig};
+use crate::api::v1::{ApiServer, ServerConfig};
 use crate::db::{DatabaseHandle, DatabaseWorker};
 use crate::system::data_directory::DataDirectory;
 use crate::system::log_cleanup;
@@ -18,7 +18,7 @@ pub enum Phase {
     Logger,
     LogCleanup,
     ExecutionRuntime,
-    ControlPlane,
+    ApiServer,
     Database,
 }
 
@@ -29,7 +29,7 @@ impl std::fmt::Display for Phase {
             Self::Logger => "logger",
             Self::LogCleanup => "log cleanup",
             Self::ExecutionRuntime => "execution runtime",
-            Self::ControlPlane => "control plane",
+            Self::ApiServer => "API server",
             Self::Database => "database",
         })
     }
@@ -91,7 +91,7 @@ impl HostReport {
 pub struct HostContext {
     database: DatabaseHandle,
     scheduler: SchedulerHandle,
-    control_plane: Option<SocketAddr>,
+    api_address: Option<SocketAddr>,
 }
 
 impl HostContext {
@@ -103,8 +103,8 @@ impl HostContext {
         &self.scheduler
     }
 
-    pub fn control_plane(&self) -> Option<SocketAddr> {
-        self.control_plane
+    pub fn api_address(&self) -> Option<SocketAddr> {
+        self.api_address
     }
 }
 
@@ -116,7 +116,7 @@ pub fn run<F>(
 where
     F: Future<Output = ()> + 'static,
 {
-    run_controlled(data_directory, signals, None, move |context| {
+    run_server(data_directory, signals, None, move |context| {
         until_stopped(context.database)
     })
 }
@@ -149,10 +149,10 @@ where
     )
 }
 
-pub fn run_controlled<F>(
+pub fn run_server<F>(
     data_directory: &DataDirectory,
     signals: bool,
-    control: Option<ControlPlaneConfig>,
+    server_config: Option<ServerConfig>,
     until_stopped: impl FnOnce(HostContext) -> F + 'static,
 ) -> Result<(), HostError>
 where
@@ -161,7 +161,7 @@ where
     run_scoped_reporting(
         data_directory,
         signals,
-        control,
+        server_config,
         crate::system::scheduler::ClaimScope::Stored,
         until_stopped,
     )
@@ -171,7 +171,7 @@ where
 fn run_scoped_reporting<F>(
     data_directory: &DataDirectory,
     signals: bool,
-    control: Option<ControlPlaneConfig>,
+    server_config: Option<ServerConfig>,
     scope: crate::system::scheduler::ClaimScope,
     until_stopped: impl FnOnce(HostContext) -> F + 'static,
 ) -> HostReport
@@ -207,7 +207,7 @@ where
             database.handle(),
             data_directory.clone(),
             scope,
-            control,
+            server_config,
             workspace_tools,
             until_stopped,
         ));
@@ -222,7 +222,7 @@ async fn serve<F>(
     handle: DatabaseHandle,
     _data_directory: DataDirectory,
     scope: crate::system::scheduler::ClaimScope,
-    control: Option<ControlPlaneConfig>,
+    server_config: Option<ServerConfig>,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     until_stopped: impl FnOnce(HostContext) -> F,
 ) -> HostReport
@@ -231,7 +231,7 @@ where
 {
     let mut report = HostReport::default();
     let autonomous_run = scope == crate::system::scheduler::ClaimScope::Stored
-        && crate::system::execution_controls::ExecutionControl::AutonomousScheduling.is_enabled();
+        && crate::system::execution_features::ExecutionFeature::AutonomousScheduling.is_enabled();
     let started = if autonomous_run {
         ExecutionRuntime::start_autonomous(handle.clone(), scope, workspace_tools.clone())
     } else {
@@ -248,7 +248,7 @@ where
     let context = HostContext {
         database: handle.clone(),
         scheduler: execution.scheduler(),
-        control_plane: None,
+        api_address: None,
     };
     let logger = match RuntimeLogger::start(handle.clone()) {
         Ok(logger) => logger,
@@ -263,11 +263,11 @@ where
         Ok(()) => {
             log::set_max_level(log_handle.active_config().level.filter());
             log::info!("OCG foundation initialized; storage is ready");
-            for control in crate::system::execution_controls::ExecutionControl::ALL {
+            for feature in crate::system::execution_features::ExecutionFeature::ALL {
                 log::info!(
-                    "execution control {}: {:?}",
-                    control.name(),
-                    control.state()
+                    "execution feature {}: {:?}",
+                    feature.name(),
+                    feature.state()
                 );
             }
             log::info!(
@@ -284,17 +284,6 @@ where
                     "{REMOVED_WORKSPACE_ROOT_VARIABLE} is ignored; a Project names the Workspace of a Job"
                 );
             }
-            let abandoned = handle.abandoned_at_open();
-            if !abandoned.is_empty() {
-                let jobs = abandoned
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                log::warn!(
-                    "Jobs left running by an earlier run were recorded as unknown and stopped: {jobs}"
-                );
-            }
         }
         Err(error) => report.fail(Phase::Logger, error),
     }
@@ -309,10 +298,10 @@ where
             None
         }
     };
-    serve_control_plane(
+    serve_api(
         &mut report,
         context,
-        control,
+        server_config,
         workspace_tools,
         until_stopped,
     )
@@ -337,20 +326,20 @@ where
     report
 }
 
-async fn serve_control_plane<F>(
+async fn serve_api<F>(
     report: &mut HostReport,
     mut context: HostContext,
-    control: Option<ControlPlaneConfig>,
+    server_config: Option<ServerConfig>,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     until_stopped: impl FnOnce(HostContext) -> F,
 ) where
     F: Future<Output = ()>,
 {
-    let listener = match control {
+    let listener = match server_config {
         None => None,
         Some(config) => {
-            report.attempted.push(Phase::ControlPlane);
-            match ControlPlane::start_with_workspace(
+            report.attempted.push(Phase::ApiServer);
+            match ApiServer::start_with_workspace(
                 config,
                 context.database.clone(),
                 context.scheduler.clone(),
@@ -359,18 +348,18 @@ async fn serve_control_plane<F>(
                 Ok(listener) => Some(listener),
                 Err(error) => {
                     log::error!("{error}");
-                    report.fail(Phase::ControlPlane, error);
+                    report.fail(Phase::ApiServer, error);
                     return;
                 }
             }
         }
     };
-    context.control_plane = listener.as_ref().map(ControlPlane::address);
-    if let Some(address) = context.control_plane {
-        log::info!("control plane listening on http://{address}");
-        eprintln!("OCG control plane listening on http://{address}");
+    context.api_address = listener.as_ref().map(ApiServer::address);
+    if let Some(address) = context.api_address {
+        log::info!("API server listening on http://{address}");
+        eprintln!("OCG API server listening on http://{address}");
     }
-    if let Some(pairing) = listener.as_ref().and_then(ControlPlane::pairing_code) {
+    if let Some(pairing) = listener.as_ref().and_then(ApiServer::pairing_code) {
         eprintln!("OCG local browser pairing code: {pairing}");
     }
     eprintln!("OCG host running");
@@ -378,6 +367,6 @@ async fn serve_control_plane<F>(
     if let Some(listener) = listener
         && let Err(error) = listener.stop().await
     {
-        report.fail(Phase::ControlPlane, error);
+        report.fail(Phase::ApiServer, error);
     }
 }

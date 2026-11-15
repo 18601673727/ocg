@@ -5,39 +5,39 @@ const STOP_TIMEOUT: Seconds = Seconds(5);
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
-    #[error("the control plane cannot listen on 127.0.0.1:{port}: {source}")]
+    #[error("the API server cannot listen on 127.0.0.1:{port}: {source}")]
     Bind {
         port: u16,
         #[source]
         source: std::io::Error,
     },
-    #[error("the control plane cannot serve the frontend in {UI_VARIABLE}: {source}")]
+    #[error("the API server cannot serve the frontend in {UI_VARIABLE}: {source}")]
     Ui {
         #[source]
         source: std::io::Error,
     },
-    #[error("the control plane could not start serving: {0}")]
+    #[error("the API server could not start serving: {0}")]
     Serve(#[source] std::io::Error),
 }
 
 #[derive(Debug, thiserror::Error)]
 pub enum StopError {
-    #[error("the control plane thread panicked")]
+    #[error("the API server thread panicked")]
     Panicked,
-    #[error("the control plane failed while serving: {0}")]
+    #[error("the API server failed while serving: {0}")]
     Serve(std::io::Error),
 }
 
-pub struct ControlPlane {
+pub struct ApiServer {
     address: SocketAddr,
     server: Server,
     finished: ntex::rt::JoinHandle<std::io::Result<()>>,
     pub(super) shared: Arc<Shared>,
 }
 
-impl ControlPlane {
+impl ApiServer {
     pub fn start(
-        config: ControlPlaneConfig,
+        config: ServerConfig,
         database: DatabaseHandle,
         scheduler: SchedulerHandle,
         data_directory: DataDirectory,
@@ -51,7 +51,7 @@ impl ControlPlane {
     }
 
     pub(crate) fn start_with_workspace(
-        config: ControlPlaneConfig,
+        config: ServerConfig,
         database: DatabaseHandle,
         scheduler: SchedulerHandle,
         workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
@@ -98,7 +98,7 @@ impl ControlPlane {
         .backlog(64)
         .shutdown_timeout(STOP_TIMEOUT)
         .config(
-            SharedCfg::new("OCG-CONTROL").add(IoConfig::new()).add(
+            SharedCfg::new("OCG-API").add(IoConfig::new()).add(
                 HttpServiceConfig::new()
                     .set_max_headers(MAX_HEADERS)
                     .set_max_buf_size(16 * 1024),

@@ -147,9 +147,9 @@ impl MeasurementContext {
                 "stream_chunks": if section == "search" { None } else { Some(options.stream_chunks) },
                 "stream_pace_ms": if section == "search" { None } else { Some(options.stream_pace.as_millis()) }}),
             )
-            .with("control_http_client", json!("ntex-loopback-tcp-nodelay-v1"))
+            .with("api_http_client", json!("ntex-loopback-tcp-nodelay-v1"))
             .with("load_model", json!("closed_loop"))
-            .with("diagnostic_controls", json!({
+            .with("diagnostic_options", json!({
                 "admission_delay_ms": std::env::var("OCG_BENCHMARK_ADMISSION_DELAY_MS").ok(),
                 "split_decoded_output_records": std::env::var_os("OCG_BENCHMARK_SPLIT_OUTPUT_RECORDS").is_some(),
                 "inject_worker_error": std::env::var_os("OCG_BENCHMARK_INJECT_WORKER_ERROR").is_some(),

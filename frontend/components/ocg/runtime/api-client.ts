@@ -1,49 +1,50 @@
-import type { ControlProjects, ControlPool, ControlPools, ControlChildren } from "../contracts";
+import type { Projects, Pool, Pools, Children } from "../contracts";
 import type * as Api from "@/components/ocg/contracts/api";
 import {
   projectJob,
+  executionSequence,
   projectContextStatus,
   ContractError,
   TREE_MAX_DEPTH,
   projectAgentProfiles,
-  type ControlApproval,
+  type Approval,
   projectJobDetails,
   projectNativeStop,
   projectConversation,
   projectJobEvent,
   projectProfiles,
-  type ControlAttachment,
-  type ControlOutput,
-  type ControlCapability,
-  type ControlJobEvent,
-  type ControlJobToolsPage,
-  type ControlProject,
-  type ControlToolCall,
-  type ControlProviderResponse,
+  type Attachment,
+  type Output,
+  type Capability,
+  type JobEvent,
+  type JobToolsPage,
+  type Project,
+  type ToolCall,
+  type ProviderResponse,
 } from "../contracts";
 import { SseParser } from "./sse";
 
-export type ControlProjectCommand = {
+export type ProjectCommand = {
   name: string;
   argv: string[];
   owner?: "user" | "decision";
   status?: "allowed" | "review" | "blocked";
 };
 
-export type ControlProjectCreate = {
+export type ProjectCreate = {
   name: string;
   root: string;
   description?: string | null;
-  commands?: ControlProjectCommand[];
+  commands?: ProjectCommand[];
 };
 
-export type ControlProjectUpdate = {
+export type ProjectUpdate = {
   name: string;
   description: string | null;
-  commands: ControlProjectCommand[];
+  commands: ProjectCommand[];
 };
 
-export type ControlPoolUpdate =
+export type PoolUpdate =
   | { concurrency_limit: number; enabled?: never }
   | { enabled: boolean; concurrency_limit?: never }
   | { decision: boolean; concurrency_limit?: never; enabled?: never };
@@ -71,7 +72,7 @@ export type NativeExecutorChange =
     };
 
 export function isExecutorConflict(error: unknown): boolean {
-  return error instanceof ControlTransportError && error.code === "executor_revision_conflict";
+  return error instanceof ApiError && error.code === "executor_revision_conflict";
 }
 
 function validateNativeExecutor(
@@ -171,7 +172,7 @@ export function configurationIdentity(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export type ControlConversationEdit =
+export type ConversationEdit =
   | { title: string; hidden?: never }
   | { hidden: true; title?: never }
   | {
@@ -180,14 +181,14 @@ export type ControlConversationEdit =
       hidden?: never;
     };
 
-export type JobStreamEvent = ControlJobEvent | { type: "heartbeat" };
+export type JobStreamEvent = JobEvent | { type: "heartbeat" };
 export type JobStreamEnd = "settled" | "stream_error" | "aborted";
 export type JobStreamSubscription = {
   closed: Promise<JobStreamEnd>;
   close(): void;
 };
 
-export class ControlTransportError extends Error {
+export class ApiError extends Error {
   constructor(
     readonly code: string,
     readonly status: number,
@@ -195,18 +196,18 @@ export class ControlTransportError extends Error {
     readonly detail: string = "",
   ) {
     super(detail ? `${detail} (${code}, ${status})` : `OCG request: ${code} (${status})`);
-    this.name = "ControlTransportError";
+    this.name = "ApiError";
   }
 }
 
 export function isProfileConflict(error: unknown): boolean {
   return (
-    error instanceof ControlTransportError &&
+    error instanceof ApiError &&
     (error.code === "profile_revision_changed" || error.code === "profile_changed")
   );
 }
 
-export type HttpCanonicalControlClientOptions = {
+export type ApiClientOptions = {
   streamIdleMs?: number;
   baseUrl: string;
   fetch: typeof fetch;
@@ -348,7 +349,7 @@ function editableJob(value: unknown): unknown {
   };
 }
 
-export type ControlProfileWriteRequest =
+export type ProfileWriteRequest =
   | {
       kind: "llm";
       name: string;
@@ -359,7 +360,7 @@ export type ControlProfileWriteRequest =
       credential_ref?: string | null;
       credential?: string | null;
       clear_credential?: boolean;
-      declared_capabilities: ControlCapability[];
+      declared_capabilities: Capability[];
       headers?: Api.OutboundHeaderInput[];
       expected_edit_seq?: number;
       parameters?: {
@@ -403,7 +404,7 @@ export type ControlProfileWriteRequest =
       expected_edit_seq?: number;
     };
 
-function controlOrigin(raw: string, browserSession: boolean): string {
+function apiOrigin(raw: string, browserSession: boolean): string {
   const url = new URL(raw);
   const loopback =
     url.protocol === "http:" &&
@@ -422,10 +423,10 @@ function controlOrigin(raw: string, browserSession: boolean): string {
     url.search ||
     url.hash
   ) {
-    throw new ControlTransportError("invalid_control_origin", 0, false);
+    throw new ApiError("invalid_api_origin", 0, false);
   }
   if (typeof window !== "undefined" && window.location.origin !== url.origin) {
-    throw new ControlTransportError("same_origin_required", 0, false);
+    throw new ApiError("same_origin_required", 0, false);
   }
   return url.origin;
 }
@@ -438,18 +439,18 @@ function sequence(value: number): number {
 
 function jobIdentity(value: string): string {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value))
-    throw new ContractError("job", "a canonical Job UUID");
+    throw new ContractError("job", "a lowercase hyphenated Job UUID");
   return value;
 }
 
 function identity(value: string, path: string): string {
   if (!/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)) {
-    throw new ContractError(path, "a canonical UUIDv7 identity");
+    throw new ContractError(path, "a lowercase hyphenated UUIDv7 identity");
   }
   return value;
 }
 
-function nativePool(value: unknown): ControlPool {
+function nativePool(value: unknown): Pool {
   if (typeof value !== "object" || value === null) throw new ContractError("pool", "a native Pool");
   const pool = value as Record<string, unknown>;
   if (
@@ -502,10 +503,10 @@ function pause(milliseconds: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-export type HttpCanonicalControlClient = ReturnType<typeof createHttpCanonicalControlClient>;
+export type ApiClient = ReturnType<typeof createApiClient>;
 
 export async function readTranscriptEvidence(
-  client: Pick<HttpCanonicalControlClient, "readAllJobTools" | "readAllProviderResponses">,
+  client: Pick<ApiClient, "readAllJobTools" | "readAllProviderResponses">,
   job: string,
   {
     signal = new AbortController().signal,
@@ -514,7 +515,7 @@ export async function readTranscriptEvidence(
     readReplies = true,
   }: {
     signal?: AbortSignal;
-    previous?: readonly ControlProviderResponse[];
+    previous?: readonly ProviderResponse[];
     settled?: boolean;
     readReplies?: boolean;
   } = {},
@@ -523,10 +524,7 @@ export async function readTranscriptEvidence(
     client.readAllJobTools(job, signal),
     readReplies
       ? client.readAllProviderResponses(job, signal, previous.at(-1)?.request).catch((error) => {
-          if (
-            error instanceof ControlTransportError &&
-            error.code === "decision_response_unavailable"
-          )
+          if (error instanceof ApiError && error.code === "decision_response_unavailable")
             return [];
           throw error;
         })
@@ -566,7 +564,7 @@ export async function readTranscriptEvidence(
 }
 
 export async function readOutputWindow(
-  client: Pick<HttpCanonicalControlClient, "readOutputs" | "readLatestOutput">,
+  client: Pick<ApiClient, "readOutputs" | "readLatestOutput">,
   job: string,
   {
     beforeSeq,
@@ -582,7 +580,7 @@ export async function readOutputWindow(
     beforeSeq === undefined
       ? ((await client.readLatestOutput(job, signal))?.seq ?? 0)
       : beforeSeq - 1;
-  const outputs: ControlOutput[] = [];
+  const outputs: Output[] = [];
   let after = Math.max(0, end - limit);
   while (after < end) {
     const page = await client.readOutputs(job, {
@@ -630,9 +628,9 @@ function observationQuery(settings: ObservationSettings): string {
   return query.length ? `?${query.join("&")}` : "";
 }
 
-export function createHttpCanonicalControlClient(options: HttpCanonicalControlClientOptions) {
+export function createApiClient(options: ApiClientOptions) {
   const programmatic = options.bearerToken !== undefined;
-  const base = controlOrigin(options.baseUrl, !programmatic);
+  const base = apiOrigin(options.baseUrl, !programmatic);
   const fetchImpl = options.fetch.bind(globalThis);
   const active = new Set<AbortController>();
   const profileListeners = new Set<(change?: { availability: string }) => void>();
@@ -850,7 +848,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     if (!options.bearerToken) return {};
     const token = await options.bearerToken();
     if (!/^[A-Za-z0-9._~+/=-]{32,512}$/.test(token)) {
-      throw new ControlTransportError("credential_unavailable", 0, false);
+      throw new ApiError("credential_unavailable", 0, false);
     }
     return { Authorization: `Bearer ${token}` };
   }
@@ -885,19 +883,19 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         redirect: "error",
       });
     } catch {
-      throw new ControlTransportError("connection_lost", 0, true);
+      throw new ApiError("connection_lost", 0, true);
     }
     if (!response.ok) {
       let code = "http_error";
       try {
         code = ((await response.json()) as Api.ErrorResponse).error.code;
       } catch {}
-      throw new ControlTransportError(code, response.status, retryable(response.status, code));
+      throw new ApiError(code, response.status, retryable(response.status, code));
     }
     const mediaType = response.headers.get("content-type")?.split(";")[0].trim().toLowerCase();
     if (mediaType !== "text/event-stream" || !response.body) {
       await response.body?.cancel();
-      throw new ControlTransportError("invalid_event_stream", response.status, false);
+      throw new ApiError("invalid_event_stream", response.status, false);
     }
     const reader = response.body.getReader();
     const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -911,15 +909,13 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             reader.read(),
             new Promise<never>((_, reject) => {
               idle = setTimeout(() => {
-                reject(new ControlTransportError("stream_idle", 0, true));
+                reject(new ApiError("stream_idle", 0, true));
                 void reader.cancel().catch(() => {});
               }, options.streamIdleMs ?? 45000);
             }),
           ]);
         } catch (error) {
-          throw error instanceof ControlTransportError
-            ? error
-            : new ControlTransportError("connection_lost", 0, true);
+          throw error instanceof ApiError ? error : new ApiError("connection_lost", 0, true);
         } finally {
           if (idle) clearTimeout(idle);
         }
@@ -1019,18 +1015,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             try {
               code = ((await response.json()) as Api.ErrorResponse).error.code;
             } catch {}
-            throw new ControlTransportError(
-              code,
-              response.status,
-              retryable(response.status, code),
-            );
+            throw new ApiError(code, response.status, retryable(response.status, code));
           }
           if (
             !response.body ||
             response.headers.get("content-type")?.split(";")[0].trim() !== "text/event-stream"
           ) {
             await response.body?.cancel();
-            throw new ControlTransportError("invalid_event_stream", response.status, false);
+            throw new ApiError("invalid_event_stream", response.status, false);
           }
           const reader = response.body.getReader();
           const parser = new SseParser();
@@ -1044,7 +1036,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
                   reader.read(),
                   new Promise<never>((_, reject) => {
                     idle = setTimeout(() => {
-                      reject(new ControlTransportError("stream_idle", 0, true));
+                      reject(new ApiError("stream_idle", 0, true));
                       void reader.cancel().catch(() => {});
                     }, options.streamIdleMs ?? 45000);
                   }),
@@ -1082,7 +1074,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
                 const data = JSON.parse(frame.data);
                 if (frame.event === "stream_error") {
                   const error = (data as Api.ErrorResponse).error;
-                  throw new ControlTransportError(error.code, 503, retryable(503, error.code));
+                  throw new ApiError(error.code, 503, retryable(503, error.code));
                 }
                 if (frame.event !== "snapshot") continue;
                 const snapshot = data as Snapshot;
@@ -1122,19 +1114,16 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             await reader.cancel().catch(() => {});
             reader.releaseLock();
           }
-          throw new ControlTransportError("connection_lost", 0, true);
+          throw new ApiError("connection_lost", 0, true);
         } catch (error) {
           if (signal.aborted) return { keepGoing: false, wait: 0 };
           if (attempt.rotated()) {
             delay = 250;
             return { keepGoing: true, wait: 100 };
           }
-          if (stalled) error = new ControlTransportError("stream_idle", 0, true);
+          if (stalled) error = new ApiError("stream_idle", 0, true);
           onError(error);
-          if (
-            error instanceof ContractError ||
-            (error instanceof ControlTransportError && !error.retryable)
-          )
+          if (error instanceof ContractError || (error instanceof ApiError && !error.retryable))
             return { keepGoing: false, wait: 0 };
           const wait = delay;
           delay = Math.min(delay * 2, 10000);
@@ -1181,8 +1170,6 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   }
 
   type Conversations = Api.Conversations;
-  type Projects = ControlProjects;
-  type Children = ControlChildren;
   type Observer<T> = {
     receive: (value: T) => void;
     error: (error: unknown) => void;
@@ -1373,14 +1360,14 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
               sidebarObservers.forEach((observer) => observer.receive(latestConversations!));
             }
           } else if (snapshot.topic === "projects") {
-            const page = snapshot.value as ControlProjects;
+            const page = snapshot.value as Projects;
             projects = snapshot.first ? page.projects : [...projects, ...page.projects];
             if (snapshot.last) {
               latestProjects = { ...page, projects };
               projectObservers.forEach((observer) => observer.receive(latestProjects!));
             }
           } else if (snapshot.topic === "children" && snapshot.key) {
-            const page = snapshot.value as ControlChildren;
+            const page = snapshot.value as Children;
             const items = snapshot.first
               ? page.children
               : [...(children.get(snapshot.key) ?? []), ...page.children];
@@ -1427,7 +1414,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     if (settings.revision !== undefined) headers["If-Match"] = String(sequence(settings.revision));
     if (settings.sign) {
       const csrf = await options.csrfToken?.();
-      if (!csrf) throw new ControlTransportError("credential_unavailable", 0, false);
+      if (!csrf) throw new ApiError("credential_unavailable", 0, false);
       headers["X-OCG-CSRF"] = csrf;
     }
     let response: Response;
@@ -1443,7 +1430,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         redirect: "error",
       });
     } catch {
-      throw new ControlTransportError("connection_lost", 0, true);
+      throw new ApiError("connection_lost", 0, true);
     }
     if (!response.ok) {
       let code = "http_error";
@@ -1453,12 +1440,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         code = decoded.code;
         detail = decoded.message;
       } catch {}
-      throw new ControlTransportError(
-        code,
-        response.status,
-        retryable(response.status, code),
-        detail,
-      );
+      throw new ApiError(code, response.status, retryable(response.status, code), detail);
     }
     let input: unknown;
     try {
@@ -1472,7 +1454,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
   const readJobToolsInternal = async (
     job: string,
     settings: { after?: string; limit?: number; signal?: AbortSignal } = {},
-  ): Promise<ControlJobToolsPage> => {
+  ): Promise<JobToolsPage> => {
     jobIdentity(job);
     const query: string[] = [];
     if (settings.after !== undefined && settings.after !== null) {
@@ -1509,7 +1491,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       await send("GET", `/api/v1/projects${suffix}`, {
         signal: settings.signal,
       })
-    ).input as ControlProjects;
+    ).input as Projects;
   }
 
   async function readProfilePage(settings: { before?: string; signal?: AbortSignal } = {}) {
@@ -1606,11 +1588,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
           context,
         );
       } catch (error) {
-        if (
-          error instanceof ControlTransportError &&
-          error.status === 404 &&
-          error.code === "not_found"
-        )
+        if (error instanceof ApiError && error.status === 404 && error.code === "not_found")
           return null;
         throw error;
       }
@@ -1790,10 +1768,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             cursor = snapshot.key ?? undefined;
           },
           (cause) => {
-            if (
-              cause instanceof ControlTransportError &&
-              cause.code === "observation_replay_lost"
-            ) {
+            if (cause instanceof ApiError && cause.code === "observation_replay_lost") {
               cursor = undefined;
               reset();
               queueMicrotask(start);
@@ -1853,7 +1828,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       ).input as Api.Conversations;
     },
 
-    async editConversation(root: string, edit: ControlConversationEdit, signal?: AbortSignal) {
+    async editConversation(root: string, edit: ConversationEdit, signal?: AbortSignal) {
       jobIdentity(root);
       const answer = await send("POST", `/api/v1/conversations/${root}`, {
         body: edit,
@@ -2022,7 +1997,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       } catch (cause) {
         if (
           !(
-            cause instanceof ControlTransportError &&
+            cause instanceof ApiError &&
             cause.status === 404 &&
             cause.code === "conversation_not_found"
           )
@@ -2042,6 +2017,44 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return projectJobDetails(
         (await send("GET", `/api/v1/jobs/${job}`, { signal })).input as Api.JobDetails,
       );
+    },
+
+    async readExecutionHistory(
+      job: string,
+      settings: { after?: string; limit?: number; context?: string; signal?: AbortSignal } = {},
+    ): Promise<Api.ExecutionHistory> {
+      jobIdentity(job);
+      const query = `?limit=${sequence(settings.limit ?? 20)}${settings.after === undefined ? "" : `&after=${executionSequence(settings.after)}`}`;
+      const answer = (await send("GET", `/api/v1/jobs/${job}/history${query}`, settings))
+        .input as Api.ExecutionHistory;
+      if (answer.job !== job || !Array.isArray(answer.events))
+        throw new ContractError("history", "execution history for the requested Job");
+      executionSequence(answer.event_seq);
+      if (answer.next_after !== null) executionSequence(answer.next_after);
+      if (answer.has_more !== (answer.next_after !== null))
+        throw new ContractError("next_after", "a valid execution history cursor");
+      for (const event of answer.events) {
+        executionSequence(event.seq);
+        executionSequence(event.previous_seq);
+        executionSequence(event.transaction);
+        executionSequence(event.committed_seq);
+      }
+      return answer;
+    },
+
+    async readExecutionState(
+      job: string,
+      settings: { atSeq?: string; context?: string; signal?: AbortSignal } = {},
+    ): Promise<Api.ExecutionState> {
+      jobIdentity(job);
+      const query =
+        settings.atSeq === undefined ? "" : `?at_seq=${executionSequence(settings.atSeq)}`;
+      const answer = (await send("GET", `/api/v1/jobs/${job}/state${query}`, settings))
+        .input as Api.ExecutionState;
+      if (answer.job !== job || answer.at_seq !== (settings.atSeq ?? null))
+        throw new ContractError("state", "the requested Job and historical cutoff");
+      executionSequence(answer.event_seq);
+      return answer;
     },
 
     async stopNativeJob(context: string, job: string, signal?: AbortSignal) {
@@ -2086,7 +2099,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const query = `?limit=${sequence(limit)}${before ? `&before=${before}` : ""}`;
       return (
         await send("GET", `/api/v1/conversations/${conversation}/children${query}`, { signal })
-      ).input as ControlChildren;
+      ).input as Children;
     },
     async readJobTree(
       job: string,
@@ -2111,7 +2124,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       const answer = await send("GET", `/api/v1/jobs/${job}/tree?${query.join("&")}`, {
         signal: settings.signal,
       });
-      return answer.input as import("../contracts").ControlJobTree;
+      return answer.input as import("../contracts").JobTree;
     },
     async readCards(conversation: string, signal?: AbortSignal) {
       jobIdentity(conversation);
@@ -2122,7 +2135,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       ).input as Api.Cards;
     },
     async decideApproval(
-      approval: ControlApproval,
+      approval: Approval,
       decision: { decision: "approve" | "reject" } | { answer: string },
       signal?: AbortSignal,
     ) {
@@ -2228,7 +2241,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     readProjects: readProjectPage,
 
     async readAllProjects(signal?: AbortSignal) {
-      const projects: ControlProject[] = [];
+      const projects: Project[] = [];
       let before: string | undefined;
       for (;;) {
         const page = await readProjectPage({ before, limit: 100, signal });
@@ -2240,23 +2253,23 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       }
     },
 
-    async createProject(body: ControlProjectCreate, signal?: AbortSignal) {
+    async createProject(body: ProjectCreate, signal?: AbortSignal) {
       const answer = await send("POST", "/api/v1/projects", {
         body,
         sign: true,
         signal,
       });
-      return (answer.input as Api.ProjectAnswer).project as ControlProject;
+      return (answer.input as Api.ProjectAnswer).project as Project;
     },
 
-    async updateProject(projectId: string, body: ControlProjectUpdate, signal?: AbortSignal) {
+    async updateProject(projectId: string, body: ProjectUpdate, signal?: AbortSignal) {
       identity(projectId, "project");
       const answer = await send("POST", `/api/v1/projects/${projectId}`, {
         body,
         sign: true,
         signal,
       });
-      return (answer.input as Api.ProjectAnswer).project as ControlProject;
+      return (answer.input as Api.ProjectAnswer).project as Project;
     },
 
     async configureProjectDecision(
@@ -2279,12 +2292,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             signal,
           })
         ).input as Api.ProjectAnswer
-      ).project as ControlProject;
+      ).project as Project;
     },
 
-    async readPools(
-      settings: { before?: string; signal?: AbortSignal } = {},
-    ): Promise<ControlPools> {
+    async readPools(settings: { before?: string; signal?: AbortSignal } = {}): Promise<Pools> {
       const query = settings.before ? `?before=${encodeURIComponent(settings.before)}` : "";
       const answer = await send("GET", `/api/v2/pools${query}`, {
         signal: settings.signal,
@@ -2329,7 +2340,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
     async updatePool(
       poolId: string,
       expectedRevision: number,
-      body: ControlPoolUpdate,
+      body: PoolUpdate,
       signal?: AbortSignal,
     ) {
       identity(poolId, "pool");
@@ -2687,7 +2698,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
             headers?: Api.OutboundHeaderInput[];
           },
       models: Api.ProviderModel[],
-      capabilities: ControlCapability[],
+      capabilities: Capability[],
     ) {
       if (typeof source === "string") identity(source, "source_profile_id");
       const connection =
@@ -2765,7 +2776,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       profileListeners.forEach((listener) => listener());
     },
 
-    async createProfile(profile: ControlProfileWriteRequest, signal?: AbortSignal) {
+    async createProfile(profile: ProfileWriteRequest, signal?: AbortSignal) {
       const answer = await send("POST", "/api/v1/profiles", {
         body: profile,
         sign: true,
@@ -2777,11 +2788,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return { ...snapshot, profile_id: saved };
     },
 
-    async updateProfile(
-      profileId: string,
-      profile: ControlProfileWriteRequest,
-      signal?: AbortSignal,
-    ) {
+    async updateProfile(profileId: string, profile: ProfileWriteRequest, signal?: AbortSignal) {
       identity(profileId, "profile");
       const answer = await send("POST", `/api/v1/profiles/${profileId}`, {
         body: profile,
@@ -2818,7 +2825,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       return answer.input as Api.Outputs;
     },
 
-    async readLatestOutput(job: string, signal?: AbortSignal): Promise<ControlOutput | null> {
+    async readLatestOutput(job: string, signal?: AbortSignal): Promise<Output | null> {
       jobIdentity(job);
       const answer = await send("GET", `/api/v1/jobs/${job}/outputs/latest`, {
         signal,
@@ -2832,7 +2839,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       request: number,
       index: number,
       signal?: AbortSignal,
-    ): Promise<ControlToolCall> {
+    ): Promise<ToolCall> {
       jobIdentity(job);
       if (sequence(request) === 0 || request > 0xffffffff || sequence(index) > 0xffffffff)
         throw new ContractError("tool", "a positive request and unsigned index");
@@ -2871,12 +2878,12 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       job: string,
       signal?: AbortSignal,
       after?: number,
-    ): Promise<ControlProviderResponse[]> {
+    ): Promise<ProviderResponse[]> {
       jobIdentity(job);
-      const responses: ControlProviderResponse[] = [];
+      const responses: ProviderResponse[] = [];
       let cursor = after;
       let offset = 0;
-      let partial: ControlProviderResponse | null = null;
+      let partial: ProviderResponse | null = null;
       let partialBytes = 0;
       for (let pageCount = 0; pageCount < 50; pageCount++) {
         const query = `?limit=100${cursor === undefined ? "" : `&after=${sequence(cursor)}`}${offset ? `&text_offset=${offset}` : ""}`;
@@ -2923,8 +2930,8 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       throw new ContractError("responses", "complete provider replies within 50 pages");
     },
 
-    async readAllJobTools(job: string, signal?: AbortSignal): Promise<ControlToolCall[]> {
-      const tools: ControlToolCall[] = [];
+    async readAllJobTools(job: string, signal?: AbortSignal): Promise<ToolCall[]> {
+      const tools: ToolCall[] = [];
       let cursor: string | undefined = undefined;
       for (let pageCount = 0; pageCount < 50; pageCount++) {
         const page = await readJobToolsInternal(job, {
@@ -2948,21 +2955,21 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         display_name?: string;
       },
       signal?: AbortSignal,
-    ): Promise<ControlAttachment> {
+    ): Promise<Attachment> {
       const answer = await send("POST", "/api/v1/attachments", {
         body: payload,
         sign: true,
         signal,
       });
-      return (answer.input as { attachment: ControlAttachment }).attachment;
+      return (answer.input as { attachment: Attachment }).attachment;
     },
 
-    async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<ControlAttachment> {
+    async readAttachment(attachmentId: string, signal?: AbortSignal): Promise<Attachment> {
       identity(attachmentId, "attachment");
       const answer = await send("GET", `/api/v1/attachments/${attachmentId}`, {
         signal,
       });
-      return (answer.input as { attachment: ControlAttachment }).attachment;
+      return (answer.input as { attachment: Attachment }).attachment;
     },
 
     attachmentContentUrl(attachmentId: string): string {
@@ -3022,10 +3029,10 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
       settings: {
         signal?: AbortSignal;
         afterSeq?: number;
-        onReconnect?: (error: ControlTransportError) => void | Promise<void>;
+        onReconnect?: (error: ApiError) => void | Promise<void>;
       } = {},
     ): JobStreamSubscription {
-      if (closed) throw new ControlTransportError("client_closed", 0, false);
+      if (closed) throw new ApiError("client_closed", 0, false);
       jobIdentity(jobId);
       const cursor = {
         sequence: settings.afterSeq === undefined ? undefined : sequence(settings.afterSeq),
@@ -3040,7 +3047,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
         let delay = 250;
         try {
           while (!signal.aborted) {
-            let failure = new ControlTransportError("premature_end", 0, true);
+            let failure = new ApiError("premature_end", 0, true);
             const attempt = streamAttempt(signal);
             try {
               const end = await connection(jobId, attempt.signal, listener, cursor);
@@ -3052,7 +3059,7 @@ export function createHttpCanonicalControlClient(options: HttpCanonicalControlCl
                 await pause(100, signal);
                 continue;
               }
-              if (!(error instanceof ControlTransportError) || !error.retryable) throw error;
+              if (!(error instanceof ApiError) || !error.retryable) throw error;
               failure = error;
             } finally {
               attempt.dispose();

@@ -116,7 +116,7 @@ impl Options {
                          makes 3 model requests, 2 real workspace reads, and one validated\n\
                          completion. JSONL is written to stdout; unsuccessful required work returns\n\
                          nonzero. `summary --concurrency N` reads JSONL on stdin. --provider-failure\n\
-                         and --child-hang are explicit negative-check controls; --child-hang uses\n\
+                         and --child-hang are explicit negative-check options; --child-hang uses\n\
                          --deadline-ms for cleanup."
                     );
                     return Ok(None);

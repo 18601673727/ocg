@@ -6,12 +6,12 @@ import { DismissibleNotice } from "../primitives/dismissible-notice";
 import { HoverMarquee } from "./hover-marquee";
 import { LoaderCircle } from "lucide-react";
 import { runtimeStateLabel, useI18n } from "../i18n";
-import type { ControlChildConversation } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ChildConversation } from "../contracts";
+import type { ApiClient } from "../runtime/api-client";
 
 export function SidebarConversationChildren({
   conversation,
-  control,
+  api,
   activeChild,
   expanded,
   sessionId,
@@ -20,22 +20,22 @@ export function SidebarConversationChildren({
   onRename,
 }: {
   conversation: string;
-  control: HttpCanonicalControlClient;
+  api: ApiClient;
   activeChild?: string;
   expanded: boolean;
   sessionId: string;
   onAvailabilityChange: (sessionId: string, available: boolean) => void;
   onOpen: (conversation: string) => void;
-  onRename?: (child: ControlChildConversation) => void;
+  onRename?: (child: ChildConversation) => void;
 }) {
   const { t } = useI18n();
-  const [children, setChildren] = useState<ControlChildConversation[]>([]);
+  const [children, setChildren] = useState<ChildConversation[]>([]);
   const [pages, setPages] = useState(1);
   const [hasMore, setHasMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
   useEffect(() => {
     if (!expanded) return;
-    return control.subscribeChildren(
+    return api.subscribeChildren(
       conversation,
       pages,
       (result) => {
@@ -47,7 +47,7 @@ export function SidebarConversationChildren({
       },
       (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
     );
-  }, [control, conversation, onAvailabilityChange, pages, sessionId, expanded]);
+  }, [api, conversation, onAvailabilityChange, pages, sessionId, expanded]);
   if (!expanded) return null;
   return (
     <>

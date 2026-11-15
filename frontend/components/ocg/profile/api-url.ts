@@ -2,7 +2,7 @@
 
 import { useSyncExternalStore } from "react";
 
-export function isLoopbackControlUrl(raw: string): boolean {
+export function isLoopbackApiUrl(raw: string): boolean {
   try {
     const url = new URL(raw);
     return (
@@ -19,8 +19,8 @@ export function isLoopbackControlUrl(raw: string): boolean {
   }
 }
 
-export function isTrustedControlUrl(raw: string): boolean {
-  if (isLoopbackControlUrl(raw)) return true;
+export function isTrustedApiUrl(raw: string): boolean {
+  if (isLoopbackApiUrl(raw)) return true;
   if (typeof window === "undefined") return false;
   try {
     const url = new URL(raw);
@@ -38,7 +38,7 @@ export function isTrustedControlUrl(raw: string): boolean {
   }
 }
 
-export function useOcgControlUrl(): string | null {
+export function useOcgApiUrl(): string | null {
   const url = useSyncExternalStore(
     (listener) => {
       window.addEventListener("popstate", listener);
@@ -46,11 +46,11 @@ export function useOcgControlUrl(): string | null {
     },
     () => {
       const origin = window.location.origin;
-      if (!isLoopbackControlUrl(origin)) {
-        return isTrustedControlUrl(origin) ? origin : null;
+      if (!isLoopbackApiUrl(origin)) {
+        return isTrustedApiUrl(origin) ? origin : null;
       }
-      const selected = process.env.NEXT_PUBLIC_OCG_CONTROL_URL ?? window.location.origin;
-      return selected && isLoopbackControlUrl(selected) ? selected.replace(/\/$/, "") : null;
+      const selected = process.env.NEXT_PUBLIC_OCG_API_URL ?? window.location.origin;
+      return selected && isLoopbackApiUrl(selected) ? selected.replace(/\/$/, "") : null;
     },
     () => null,
   );

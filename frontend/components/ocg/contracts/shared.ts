@@ -1,11 +1,11 @@
 import type * as Api from "./api";
 
-export type ControlToolOutcomeKind = Api.ToolOutcomeKind;
-export type ControlToolCall = Api.ToolCall;
-export type ControlAgentCapability = Api.AgentCapability;
+export type ToolOutcomeKind = Api.ToolOutcomeKind;
+export type ToolCall = Api.ToolCall;
+export type AgentCapability = Api.AgentCapability;
 export const POOL_OPERATIONS = ["llm_request", "decision"] as const;
-export type ControlApproval = Api.ApprovalDecision["approval"];
-export type ControlTreeState =
+export type Approval = Api.ApprovalDecision["approval"];
+export type TreeState =
   | "open"
   | "closing"
   | "settled"
@@ -17,11 +17,11 @@ export type ControlTreeState =
   | "waiting_for_user"
   | "waiting"
   | "queued";
-export type ControlTreeNode = Omit<
+export type TreeNode = Omit<
   Api.TreeNode,
   "state" | "origin" | "recurrence" | "depends_on" | "children"
 > & {
-  state: ControlTreeState;
+  state: TreeState;
   origin: "user" | "agent" | "system" | null;
   recurrence:
     | (Omit<Api.Recurrence, "phase"> & { phase: "active" | "waiting_due" | "halted" })
@@ -30,6 +30,6 @@ export type ControlTreeNode = Omit<
     condition: "settled" | "success";
     state: "waiting" | "satisfied" | "impossible";
   })[];
-  children: ControlTreeNode[] | null;
+  children: TreeNode[] | null;
 };
 export const TREE_MAX_DEPTH = 4;

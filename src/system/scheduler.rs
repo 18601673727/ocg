@@ -5,18 +5,12 @@ use ntex::util::{Either, select};
 
 use crate::db::{DatabaseError, DatabaseHandle, SchedulerWakeSubscription};
 use crate::service::ai::providers::CancellationToken;
-use crate::system::execution_controls::ExecutionControl;
+use crate::system::execution_features::ExecutionFeature;
 use crate::system::executor::execution_runtime::ExecutionRuntimeError;
 use crate::system::monitor::ProtectionWatch;
 
 const BATCH_FLOOR: Duration = Duration::from_millis(5);
 const RECONCILE: Duration = Duration::from_secs(30);
-
-pub(crate) struct DispatchBatch<G> {
-    pub(crate) grants: Vec<G>,
-    pub(crate) next_due: Option<Duration>,
-    pub(crate) wait_for_blocking: bool,
-}
 
 pub(crate) struct Scheduler {
     wake: SchedulerWakeSubscription,
@@ -37,19 +31,13 @@ impl Scheduler {
         }
     }
 
-    pub(crate) async fn run<G, Claim, ClaimFuture, Spawn, SpawnFuture>(
-        self,
-        mut claim: Claim,
-        mut spawn: Spawn,
-    ) where
-        Claim: FnMut(bool) -> ClaimFuture,
-        ClaimFuture: Future<Output = Result<DispatchBatch<G>, DatabaseError>>,
-        Spawn: FnMut(G) -> SpawnFuture,
-        SpawnFuture: Future<Output = ()>,
+    pub(crate) async fn run<Dispatch, DispatchFuture>(self, mut dispatch: Dispatch)
+    where
+        Dispatch: FnMut(bool) -> DispatchFuture,
+        DispatchFuture: Future<Output = Result<Option<Duration>, DatabaseError>>,
     {
         let mut previous_batch = None;
         let mut next_due = None;
-        let mut wait_for_blocking = false;
         loop {
             if self.shutdown.is_cancelled() {
                 return;
@@ -71,17 +59,7 @@ impl Scheduler {
                     let timer = batch_delay(previous, next_due);
                     let waking = select(
                         self.wake.recv_async(),
-                        select(
-                            self.protection.changed(),
-                            select(ntex::time::sleep(timer), async {
-                                if wait_for_blocking {
-                                    crate::system::executor::blocking::file_capacity_available()
-                                        .await;
-                                } else {
-                                    std::future::pending::<()>().await;
-                                }
-                            }),
-                        ),
+                        select(self.protection.changed(), ntex::time::sleep(timer)),
                     );
                     match select(self.shutdown.cancelled(), waking).await {
                         Either::Left(()) => return,
@@ -103,20 +81,13 @@ impl Scheduler {
             while self.wake.try_recv().is_ok() {
                 database_changed = true;
             }
-            let batch = claim(database_changed).await;
+            let result = dispatch(database_changed).await;
             previous_batch = Some(Instant::now());
-            match batch {
-                Ok(batch) => {
-                    next_due = batch.next_due;
-                    wait_for_blocking = batch.wait_for_blocking;
-                    for grant in batch.grants {
-                        spawn(grant).await;
-                    }
-                }
+            match result {
+                Ok(due) => next_due = due,
                 Err(error) => {
-                    log::error!("dispatcher claim batch failed: {error}");
+                    log::error!("scheduler dispatch failed: {error}");
                     next_due = None;
-                    wait_for_blocking = false;
                 }
             }
         }
@@ -168,7 +139,7 @@ impl ExecutionRuntime {
         workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     ) -> Result<Self, ExecutionRuntimeError> {
         let autonomous =
-            scope == ClaimScope::Stored && ExecutionControl::AutonomousScheduling.is_enabled();
+            scope == ClaimScope::Stored && ExecutionFeature::AutonomousScheduling.is_enabled();
         Self::start_with(database, scope, autonomous, Some(workspace_tools))
     }
 
@@ -180,7 +151,7 @@ impl ExecutionRuntime {
     ) -> Result<Self, ExecutionRuntimeError> {
         let autonomous = autonomous
             && scope == ClaimScope::Stored
-            && ExecutionControl::AutonomousScheduling.is_enabled();
+            && ExecutionFeature::AutonomousScheduling.is_enabled();
         let wake = if autonomous {
             Some(
                 database
@@ -241,7 +212,7 @@ async fn dispatch_runtime(
     let Some(wake) = wake.filter(|_| {
         autonomous
             && scope == ClaimScope::Stored
-            && ExecutionControl::AutonomousScheduling.is_enabled()
+            && ExecutionFeature::AutonomousScheduling.is_enabled()
     }) else {
         shutdown.cancelled().await;
         return Ok(());

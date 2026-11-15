@@ -5,6 +5,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Button } from "@/components/ui/button";
 import { TaskStatus } from "./task-status";
+import { ExecutionHistory } from "./execution-history";
 import {
   EXECUTION_PHASE_KEYS,
   executionDetail,
@@ -20,22 +21,22 @@ import {
   mergeOutputWindow,
 } from "./output-window";
 import {
-  ControlTransportError,
+  ApiError,
   readTranscriptEvidence,
   readOutputWindow,
-  type HttpCanonicalControlClient,
+  type ApiClient,
   type JobStreamEvent,
   type JobStreamSubscription,
-} from "@/components/ocg/runtime/control-client";
+} from "@/components/ocg/runtime/api-client";
 import {
   ContractError,
-  type ControlExecutionPhase,
-  type ControlJob,
-  type ControlJobDetails,
-  type ControlNativeStopRequest,
-  type ControlOutput,
-  type ControlProviderResponse,
-  type ControlToolCall,
+  type ExecutionPhase,
+  type Job,
+  type JobDetails,
+  type NativeStopRequest,
+  type Output,
+  type ProviderResponse,
+  type ToolCall,
 } from "@/components/ocg/contracts";
 import { useI18n, type I18nKey, type TranslateFn } from "@/components/ocg/i18n";
 
@@ -51,7 +52,7 @@ function formatMicros(micros: number | null): string {
   return micros === null ? "—" : new Date(micros / 1000).toLocaleString();
 }
 
-function OutputContent({ output }: { output: ControlOutput }) {
+function OutputContent({ output }: { output: Output }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const body = outputText(output);
@@ -117,7 +118,7 @@ function classifyStopFailure(t: TranslateFn, cause: unknown): StopNotice & { loc
   if (cause instanceof ContractError) {
     return { message: t("job.stop.contract"), tone: "error", locked: true };
   }
-  if (cause instanceof ControlTransportError) {
+  if (cause instanceof ApiError) {
     if (cause.code === "connection_lost") {
       return { message: t("job.stop.uncertainCommit"), tone: "warning", locked: true };
     }
@@ -160,16 +161,16 @@ const PHASE_BADGE = {
   completed: "bg-primary/10 text-primary",
   failed: "bg-destructive/10 text-destructive",
   cancelled: "bg-muted text-muted-foreground",
-} as const satisfies Record<ControlExecutionPhase, string>;
+} as const satisfies Record<ExecutionPhase, string>;
 
 export function JobWatch(props: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   jobId: string;
   presentation?: "inspector" | "chat";
   bare?: boolean;
   onStateChange?: (
     state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown",
-    job: ControlJob | null,
+    job: Job | null,
   ) => void;
 }) {
   const [attempt, setAttempt] = useState(0);
@@ -190,21 +191,21 @@ function JobWatchBody({
   onStateChange,
   onRetry,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   jobId: string;
   presentation?: "inspector" | "chat";
   bare?: boolean;
   onStateChange?: (
     state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown",
-    job: ControlJob | null,
+    job: Job | null,
   ) => void;
   onRetry: () => void;
 }) {
   const { t } = useI18n();
-  const [details, setDetails] = useState<ControlJobDetails | null>(null);
+  const [details, setDetails] = useState<JobDetails | null>(null);
   const [statusFailure, setStatusFailure] = useState(false);
-  const [job, setJob] = useState<ControlJob | null>(null);
-  const [outputs, setOutputs] = useState<ControlOutput[]>([]);
+  const [job, setJob] = useState<Job | null>(null);
+  const [outputs, setOutputs] = useState<Output[]>([]);
   const storedTotal = outputs.at(-1)?.seq ?? 0;
   const [storedOpen, setStoredOpen] = useState(false);
   const windowRef = useRef(JOB_WATCH_RESIDENT_OUTPUTS);
@@ -213,9 +214,9 @@ function JobWatchBody({
     null,
   );
   const earlierLoad = useRef<AbortController | null>(null);
-  const [tools, setTools] = useState<ControlToolCall[]>([]);
+  const [tools, setTools] = useState<ToolCall[]>([]);
   const [evidenceFailure, setEvidenceFailure] = useState<string>();
-  const [responses, setResponses] = useState<ControlProviderResponse[]>([]);
+  const [responses, setResponses] = useState<ProviderResponse[]>([]);
   const [settlement, setSettlement] = useState<Settlement | null>(null);
   const [stream, setStream] = useState<StreamState>("loading");
   const [failure, setFailure] = useState<{ code: string; scope: "read" | "stream" } | null>(null);
@@ -227,7 +228,7 @@ function JobWatchBody({
   const refreshRef = useRef<() => void>(() => {});
   const stopRequest = useRef<AbortController | null>(null);
   const [stopState, setStopState] = useState<StopState>("idle");
-  const [stopOutcome, setStopOutcome] = useState<ControlNativeStopRequest | null>(null);
+  const [stopOutcome, setStopOutcome] = useState<NativeStopRequest | null>(null);
   const [stopNotice, setStopNotice] = useState<StopNotice | null>(null);
   const statusReads = useRef(0);
   const [readCount, setReadCount] = useState(0);
@@ -238,7 +239,7 @@ function JobWatchBody({
     historyComplete: false,
     completed: false,
     reconciled: false,
-    replies: [] as ControlProviderResponse[],
+    replies: [] as ProviderResponse[],
   });
 
   useEffect(
@@ -265,13 +266,13 @@ function JobWatchBody({
     watch.reconciled = false;
     watch.replies = [];
     windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
-    let currentJob: ControlJob | null = null;
+    let currentJob: Job | null = null;
     let refreshingStatus = true;
     let statusQueued = false;
     const evidenceController = new AbortController();
 
     const fail = (error: unknown, scope: "read" | "stream") => {
-      if (error instanceof ControlTransportError) setFailure({ code: error.code, scope });
+      if (error instanceof ApiError) setFailure({ code: error.code, scope });
       else if (error instanceof ContractError) setFailure({ code: "contract", scope });
       else setFailure({ code: "unreachable", scope });
       setStream("closed");
@@ -371,14 +372,11 @@ function JobWatchBody({
         const record = await client.readJobDetails(jobId, evidenceController.signal);
         if (!alive) return;
         const reconciled = currentJob ? reconcileJob(currentJob, record) : record;
-        if (
-          reconciled === record &&
-          !(currentJob?.stop_confirmed_at_us != null && record.stop_confirmed_at_us === null)
-        ) {
+        if (reconciled === record) {
           currentJob = record;
           setDetails(record);
         } else {
-          currentJob = reconciled === record ? currentJob : reconciled;
+          currentJob = reconciled;
         }
         setJob(currentJob);
         setStatusFailure(false);
@@ -416,8 +414,10 @@ function JobWatchBody({
             ...currentJob.settlement,
             stop_confirmed_at_us: currentJob.stop_confirmed_at_us,
           });
-          setStream("settled");
+          if (currentJob.settlement.state !== "unknown") setStream("settled");
           requestReload();
+        } else {
+          setSettlement(null);
         }
       } catch {
         if (alive) setStatusFailure(true);
@@ -454,6 +454,8 @@ function JobWatchBody({
           });
           void refreshStatus();
           requestReload();
+        } else {
+          setSettlement(null);
         }
       } else if (event.type === "output") {
         if (event.output.seq <= watch.processed) return;
@@ -469,9 +471,10 @@ function JobWatchBody({
         requestReload();
       } else if (event.type === "settlement") {
         if (currentJob) {
-          const confirmed = currentJob.stop_confirmed_at_us ?? event.stop_confirmed_at_us;
-          currentJob = {
+          const confirmed = event.stop_confirmed_at_us;
+          currentJob = reconcileJob(currentJob, {
             ...currentJob,
+            event_seq: event.event_seq,
             settlement: event.settlement,
             stop_confirmed_at_us: confirmed,
             updated_at_us: Math.max(
@@ -479,7 +482,7 @@ function JobWatchBody({
               event.settlement.settled_at_us ?? 0,
               confirmed ?? 0,
             ),
-          };
+          });
           setJob(currentJob);
         }
         watch.completed = event.settlement.state === "completed";
@@ -534,7 +537,7 @@ function JobWatchBody({
         (error: unknown) => {
           if (alive)
             setInput({
-              error: error instanceof ControlTransportError ? error.code : "unreachable",
+              error: error instanceof ApiError ? error.code : "unreachable",
             });
         },
       );
@@ -596,7 +599,7 @@ function JobWatchBody({
     };
   }, [client, jobId]);
 
-  const phase: ControlExecutionPhase | null =
+  const phase: ExecutionPhase | null =
     settlement && settlement.state !== "unsettled"
       ? settlement.state
       : (job?.execution_phase ?? null);
@@ -689,7 +692,7 @@ function JobWatchBody({
       if (!controller.signal.aborted) {
         setEarlierFailure({
           code:
-            error instanceof ControlTransportError
+            error instanceof ApiError
               ? error.code
               : error instanceof ContractError
                 ? "contract"
@@ -904,7 +907,11 @@ function JobWatchBody({
         <p className="break-all text-xs text-muted-foreground">
           <code className="font-mono">{jobId}</code>
           {job ? ` · ${job.execution_mode}` : ""}
-          {job?.assigned_executor ? ` · ${job.assigned_executor}` : ""}
+          {job?.assigned_executor
+            ? ` · ${t("job.currentExecutor", { executor: job.assigned_executor })}`
+            : job?.last_executor
+              ? ` · ${t("job.lastExecutor", { executor: job.last_executor })}`
+              : ""}
         </p>
         <TaskStatus plan={details?.task_plan} />
         {statusFailure && (
@@ -955,6 +962,7 @@ function JobWatchBody({
               </summary>
               <div className="mt-3 flex flex-col gap-4">
                 {recordFacts}
+                <ExecutionHistory client={client} jobId={jobId} context={details?.context} />
                 {storedOutputs}
               </div>
             </details>
@@ -962,6 +970,7 @@ function JobWatchBody({
         ) : (
           <>
             {recordFacts}
+            <ExecutionHistory client={client} jobId={jobId} context={details?.context} />
             {answer}
             {storedOutputs}
           </>

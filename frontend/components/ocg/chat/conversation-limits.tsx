@@ -10,34 +10,32 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 
 export function ConversationLimitsEditor({ conversation }: { conversation: string }) {
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const { t } = useI18n();
   const [limits, setLimits] = useState<Api.ConversationLimits | null>(null);
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
   useEffect(() => {
-    if (!control) return;
+    if (!api) return;
     const controller = new AbortController();
-    void control
-      .readConversationLimits(conversation, controller.signal)
-      .then(setLimits, (cause) => {
-        if (!controller.signal.aborted)
-          setError(cause instanceof Error ? cause.message : String(cause));
-      });
+    void api.readConversationLimits(conversation, controller.signal).then(setLimits, (cause) => {
+      if (!controller.signal.aborted)
+        setError(cause instanceof Error ? cause.message : String(cause));
+    });
     return () => controller.abort();
-  }, [control, conversation]);
+  }, [api, conversation]);
 
   async function save(event: FormEvent) {
     event.preventDefault();
-    if (!control || !limits) return;
+    if (!api || !limits) return;
     setBusy(true);
     setError(undefined);
     try {
       const { max_depth, max_auto_turns, max_iterations } = limits;
-      await control.editConversation(conversation, {
+      await api.editConversation(conversation, {
         limits: { max_depth, max_auto_turns, max_iterations },
       });
-      setLimits(await control.readConversationLimits(conversation));
+      setLimits(await api.readConversationLimits(conversation));
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {

@@ -1,3 +1,9 @@
+use super::{
+    DEFAULT_OUTPUT_PAGE, HttpRequest, INVALID_REQUEST, JOB_NOT_FOUND, MAX_OUTPUT_PAGE, Refusal,
+    Reply, Shared, contracts::envelope, decimal,
+};
+use crate::db::entities::{JobId, MutableJobPhase, OutcomeRecord, PoolAllocation};
+
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 #[ts(rename = "SettlementState")]
@@ -43,6 +49,7 @@ pub(crate) enum ExecutionPhaseView {
 #[ts(rename = "Job")]
 pub(crate) struct JobView {
     id: String,
+    event_seq: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     parent: Option<String>,
@@ -113,31 +120,42 @@ pub(super) struct AllocationView {
 }
 
 pub(super) fn allocation_view(allocation: &crate::db::entities::PoolAllocation) -> AllocationView {
-    use crate::db::entities::AllocationPhase;
     AllocationView {
         pool: allocation.token.pool.to_string(),
         executor: allocation.token.executor.to_string(),
         generation: allocation.token.generation.get(),
         job_revision: allocation.job_revision,
-        phase: match allocation.phase {
-            AllocationPhase::Reserved => AllocationPhaseView::Reserved,
-            AllocationPhase::Running => AllocationPhaseView::Running,
-            AllocationPhase::StopRequested => AllocationPhaseView::StopRequested,
-            AllocationPhase::Uncertain => AllocationPhaseView::Uncertain,
-            AllocationPhase::Released => AllocationPhaseView::Released,
-        },
+        phase: allocation_phase_view(allocation.phase),
         holds_capacity: allocation.holds_capacity(),
     }
 }
 
+fn allocation_phase_view(phase: crate::db::entities::AllocationPhase) -> AllocationPhaseView {
+    use crate::db::entities::AllocationPhase;
+    match phase {
+        AllocationPhase::Reserved => AllocationPhaseView::Reserved,
+        AllocationPhase::Running => AllocationPhaseView::Running,
+        AllocationPhase::StopRequested => AllocationPhaseView::StopRequested,
+        AllocationPhase::Uncertain => AllocationPhaseView::Uncertain,
+        AllocationPhase::Released => AllocationPhaseView::Released,
+    }
+}
+
 impl JobView {
-    pub(super) fn lifecycle(&self) -> [Option<i64>; 4] {
-        [
-            Some(self.execution_phase as i64),
-            Some(self.settlement.state as i64),
-            self.settlement.settled_at_us,
-            self.stop_confirmed_at_us,
-        ]
+    pub(super) fn event_seq(&self) -> &str {
+        &self.event_seq
+    }
+
+    pub(super) fn lifecycle(&self) -> (String, [Option<i64>; 4]) {
+        (
+            self.event_seq.clone(),
+            [
+                Some(self.execution_phase as i64),
+                Some(self.settlement.state as i64),
+                self.settlement.settled_at_us,
+                self.stop_confirmed_at_us,
+            ],
+        )
     }
 
     pub(super) fn concluded(&self) -> bool {
@@ -145,8 +163,7 @@ impl JobView {
             SettlementState::Completed | SettlementState::Failed | SettlementState::Cancelled => {
                 true
             }
-            SettlementState::Unknown => self.stop_confirmed_at_us.is_some(),
-            SettlementState::Unsettled => false,
+            SettlementState::Unknown | SettlementState::Unsettled => false,
         }
     }
 
@@ -186,11 +203,12 @@ pub(super) fn mutable_title(job: &crate::db::entities::MutableJob) -> String {
 }
 
 fn execution_phase(
-    record: &crate::db::entities::MutableJobRecord,
-    allocation: Option<&crate::db::entities::PoolAllocation>,
+    phase: MutableJobPhase,
+    outcome: Option<&OutcomeRecord>,
+    allocation: Option<&PoolAllocation>,
 ) -> ExecutionPhaseView {
     use crate::db::entities::{AllocationPhase, MutableJobPhase, OutcomeKind};
-    if let Some(outcome) = &record.outcome {
+    if let Some(outcome) = outcome {
         return match outcome.kind {
             OutcomeKind::Completed => ExecutionPhaseView::Completed,
             OutcomeKind::Failed => ExecutionPhaseView::Failed,
@@ -203,7 +221,7 @@ fn execution_phase(
         Some(AllocationPhase::Running) => ExecutionPhaseView::Running,
         Some(AllocationPhase::StopRequested) => ExecutionPhaseView::StopRequested,
         Some(AllocationPhase::Uncertain) => ExecutionPhaseView::Unknown,
-        Some(AllocationPhase::Released) | None => match record.job.phase {
+        Some(AllocationPhase::Released) | None => match phase {
             MutableJobPhase::Unsubmitted => ExecutionPhaseView::Unsubmitted,
             MutableJobPhase::Queued => ExecutionPhaseView::Queued,
             MutableJobPhase::Executing => ExecutionPhaseView::Running,
@@ -211,14 +229,9 @@ fn execution_phase(
     }
 }
 
-pub(super) fn mutable_job_view(
-    record: &crate::db::entities::MutableJobRecord,
-    allocation: Option<&crate::db::entities::PoolAllocation>,
-    updated_at_us: i64,
-) -> JobView {
+fn settlement_view(outcome: Option<&OutcomeRecord>) -> SettlementView {
     use crate::db::entities::OutcomeKind;
-    let job = &record.job;
-    let settlement = match &record.outcome {
+    match outcome {
         None => SettlementView {
             state: SettlementState::Unsettled,
             settled_at_us: None,
@@ -232,9 +245,18 @@ pub(super) fn mutable_job_view(
             },
             settled_at_us: Some(outcome.at.as_unix_micros()),
         },
-    };
+    }
+}
+
+pub(super) fn mutable_job_view(
+    record: &crate::db::entities::MutableJobRecord,
+    allocation: Option<&crate::db::entities::PoolAllocation>,
+    updated_at_us: i64,
+) -> JobView {
+    let job = &record.job;
     JobView {
         id: job.id.to_string(),
+        event_seq: record.event_seq.to_string(),
         parent: Some(job.parent_id.to_string()),
         name: None,
         title: Some(mutable_title(job)).filter(|title| !title.is_empty()),
@@ -260,10 +282,373 @@ pub(super) fn mutable_job_view(
             .outcome
             .as_ref()
             .map(|outcome| outcome.at.as_unix_micros()),
-        settlement,
-        execution_phase: execution_phase(record, allocation),
+        settlement: settlement_view(record.outcome.as_ref()),
+        execution_phase: execution_phase(job.phase, record.outcome.as_ref(), allocation),
         stop_confirmed_at_us: allocation
             .and_then(|allocation| allocation.stop_confirmed_at)
             .map(|time| time.as_unix_micros()),
     }
+}
+fn execution_page_query(query: &str, cursor_name: &str) -> Result<(Option<u64>, usize), Refusal> {
+    let (mut cursor, mut limit) = (None, None);
+    if !query.is_empty() {
+        for pair in query.split('&') {
+            let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
+            if key == cursor_name && cursor.is_none() {
+                cursor = Some(decimal::<u64>(value).ok_or(INVALID_REQUEST)?);
+            } else if key == "limit" && limit.is_none() {
+                limit = Some(
+                    decimal::<usize>(value)
+                        .filter(|limit| (1..=MAX_OUTPUT_PAGE).contains(limit))
+                        .ok_or(INVALID_REQUEST)?,
+                );
+            } else {
+                return Err(INVALID_REQUEST);
+            }
+        }
+    }
+    Ok((cursor, limit.unwrap_or(DEFAULT_OUTPUT_PAGE)))
+}
+
+pub(super) fn history_query(query: &str) -> Result<(Option<u64>, usize), Refusal> {
+    execution_page_query(query, "after")
+}
+
+pub(super) fn state_query(query: &str) -> Result<Option<u64>, Refusal> {
+    if query.is_empty() {
+        return Ok(None);
+    }
+    query
+        .strip_prefix("at_seq=")
+        .and_then(decimal::<u64>)
+        .map(Some)
+        .ok_or(INVALID_REQUEST)
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "ExecutionHistoryKind")]
+pub(crate) enum ExecutionHistoryKindView {
+    Created,
+    PhaseChanged,
+    AllocationReserved,
+    AllocationStarted,
+    AllocationPhaseChanged,
+    AllocationStopConfirmed,
+    JobOutcome,
+    Closing,
+    ClosingRunningChanged,
+    HoldChanged,
+    VisibilityChanged,
+    PrerequisitesChanged,
+    InputRevisionRecorded,
+    DependencyAdded,
+    DependencyResolved,
+    RequestRecorded,
+    ToolRecorded,
+    OutputRecorded,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ExecutionHistoryEvent")]
+pub(crate) struct ExecutionHistoryEventView {
+    seq: String,
+    previous_seq: String,
+    transaction: String,
+    committed_seq: String,
+    at_us: i64,
+    kind: ExecutionHistoryKindView,
+    facts: serde_json::Value,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ExecutionHistory")]
+pub(crate) struct ExecutionHistoryView {
+    job: String,
+    event_seq: String,
+    events: Vec<ExecutionHistoryEventView>,
+    next_after: Option<String>,
+    has_more: bool,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ExecutionDependency")]
+pub(crate) struct ExecutionDependencyView {
+    prerequisite: String,
+    condition: String,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ExecutionState")]
+pub(crate) struct ExecutionStateView {
+    job: String,
+    at_seq: Option<String>,
+    event_seq: String,
+    execution_phase: Option<ExecutionPhaseView>,
+    input_revision: Option<String>,
+    settlement: SettlementView,
+    outcome_cause: Option<serde_json::Value>,
+    allocation: Option<AllocationView>,
+    assigned_executor: Option<String>,
+    last_executor: Option<String>,
+    stop_confirmed_at_us: Option<i64>,
+    stop_proof: Option<String>,
+    closing_at_us: Option<i64>,
+    closing_running: Option<bool>,
+    on_hold: Option<u32>,
+    hidden_at_us: Option<i64>,
+    prerequisites: Vec<ExecutionDependencyView>,
+    dependencies: Vec<ExecutionDependencyView>,
+}
+
+fn stop_proof_name(proof: crate::db::entities::StopProof) -> &'static str {
+    use crate::db::entities::StopProof;
+    match proof {
+        StopProof::Proof => "proof",
+        StopProof::Reboot => "reboot",
+        StopProof::Settled => "settled",
+        StopProof::User => "user",
+        StopProof::Operator => "operator",
+    }
+}
+
+fn dependency_condition(condition: crate::db::entities::DependencyCondition) -> &'static str {
+    use crate::db::entities::DependencyCondition;
+    match condition {
+        DependencyCondition::Success => "success",
+        DependencyCondition::Settled => "settled",
+    }
+}
+
+fn outcome_cause(cause: &crate::db::entities::OutcomeCause) -> serde_json::Value {
+    use crate::db::entities::OutcomeCause;
+    use serde_json::json;
+    match cause {
+        OutcomeCause::Code(code) => json!({"kind": "code", "code": code}),
+        OutcomeCause::Text(text) => json!({"kind": "text", "text": text}),
+        OutcomeCause::Abandoned => json!({"kind": "abandoned"}),
+        OutcomeCause::DependencyImpossible => json!({"kind": "dependency_impossible"}),
+        OutcomeCause::Stopped { record } => json!({"kind": "stopped", "record": record}),
+        OutcomeCause::Closed => json!({"kind": "closed"}),
+        OutcomeCause::Uncertain(reason) => json!({
+            "kind": "uncertain", "reason": reason.as_str(), "description": reason.description()
+        }),
+    }
+}
+
+fn history_event_view(item: &crate::db::redb::ExecutionHistoryItem) -> ExecutionHistoryEventView {
+    use crate::db::entities::{Actor, DependencyState, ExecutionEventKind};
+    use serde_json::json;
+    let event = &item.event;
+    let (kind, facts) = match &event.kind {
+        ExecutionEventKind::Created { phase } => (
+            ExecutionHistoryKindView::Created,
+            json!({"phase": phase.map(|phase| execution_phase(phase, None, None))}),
+        ),
+        ExecutionEventKind::PhaseChanged { phase } => (
+            ExecutionHistoryKindView::PhaseChanged,
+            json!({"phase": execution_phase(*phase, None, None)}),
+        ),
+        ExecutionEventKind::AllocationReserved { allocation } => (
+            ExecutionHistoryKindView::AllocationReserved,
+            json!({
+                "allocation": allocation_view(allocation),
+                "epoch": allocation.token.epoch.to_string(),
+                "claimed_at_us": allocation.claimed_at.as_unix_micros(),
+            }),
+        ),
+        ExecutionEventKind::AllocationStarted => {
+            (ExecutionHistoryKindView::AllocationStarted, json!({}))
+        }
+        ExecutionEventKind::AllocationPhaseChanged { phase } => (
+            ExecutionHistoryKindView::AllocationPhaseChanged,
+            json!({"phase": allocation_phase_view(*phase)}),
+        ),
+        ExecutionEventKind::AllocationStopConfirmed { at, proof } => (
+            ExecutionHistoryKindView::AllocationStopConfirmed,
+            json!({"at_us": at.as_unix_micros(), "proof": stop_proof_name(*proof)}),
+        ),
+        ExecutionEventKind::JobOutcome { outcome } => (
+            ExecutionHistoryKindView::JobOutcome,
+            json!({"settlement": settlement_view(Some(outcome)), "cause": outcome.cause.as_ref().map(outcome_cause)}),
+        ),
+        ExecutionEventKind::Closing { at, by, running } => {
+            let by = match by {
+                Actor::Auto => json!({"kind": "auto"}),
+                Actor::Agent { conversation } => {
+                    json!({"kind": "agent", "conversation": conversation.to_string()})
+                }
+                Actor::User => json!({"kind": "user"}),
+                Actor::Loop => json!({"kind": "loop"}),
+            };
+            (
+                ExecutionHistoryKindView::Closing,
+                json!({"at_us": at.as_unix_micros(), "by": by, "running": running}),
+            )
+        }
+        ExecutionEventKind::ClosingRunningChanged { running } => (
+            ExecutionHistoryKindView::ClosingRunningChanged,
+            json!({"running": running}),
+        ),
+        ExecutionEventKind::HoldChanged { reason } => (
+            ExecutionHistoryKindView::HoldChanged,
+            json!({"reason": reason}),
+        ),
+        ExecutionEventKind::VisibilityChanged { at } => (
+            ExecutionHistoryKindView::VisibilityChanged,
+            json!({"hidden_at_us": at.map(|at| at.as_unix_micros())}),
+        ),
+        ExecutionEventKind::PrerequisitesChanged { after } => (
+            ExecutionHistoryKindView::PrerequisitesChanged,
+            json!({"after": after.iter().map(|(job, condition)| ExecutionDependencyView {
+                prerequisite: job.to_string(),
+                condition: dependency_condition(*condition).to_owned(),
+            }).collect::<Vec<_>>()}),
+        ),
+        ExecutionEventKind::InputRevisionRecorded { revision } => (
+            ExecutionHistoryKindView::InputRevisionRecorded,
+            json!({"revision": revision.to_string()}),
+        ),
+        ExecutionEventKind::DependencyAdded {
+            prerequisite,
+            condition,
+        } => (
+            ExecutionHistoryKindView::DependencyAdded,
+            json!({"prerequisite": prerequisite.to_string(), "condition": dependency_condition(*condition)}),
+        ),
+        ExecutionEventKind::DependencyResolved {
+            prerequisite,
+            state,
+        } => {
+            let state = match state {
+                DependencyState::Waiting => "waiting",
+                DependencyState::Satisfied => "satisfied",
+                DependencyState::Impossible => "impossible",
+            };
+            (
+                ExecutionHistoryKindView::DependencyResolved,
+                json!({"prerequisite": prerequisite.to_string(), "state": state}),
+            )
+        }
+        ExecutionEventKind::RequestRecorded { request, seq } => (
+            ExecutionHistoryKindView::RequestRecorded,
+            json!({"request": request.get(), "record_seq": seq}),
+        ),
+        ExecutionEventKind::ToolRecorded { call, completed } => (
+            ExecutionHistoryKindView::ToolRecorded,
+            json!({"job": call.job.to_string(), "request": call.request.get(), "index": call.index, "completed": completed}),
+        ),
+        ExecutionEventKind::OutputRecorded { seq } => (
+            ExecutionHistoryKindView::OutputRecorded,
+            json!({"output_seq": seq}),
+        ),
+    };
+    ExecutionHistoryEventView {
+        seq: event.seq.to_string(),
+        previous_seq: event.previous_seq.to_string(),
+        transaction: event.transaction.to_string(),
+        committed_seq: item.committed_seq.to_string(),
+        at_us: event.at.as_unix_micros(),
+        kind,
+        facts,
+    }
+}
+
+fn execution_state_view(
+    snapshot: &crate::db::entities::ExecutionSnapshot,
+    at_seq: Option<u64>,
+) -> ExecutionStateView {
+    let allocation = snapshot.allocation.as_ref();
+    let current = allocation.filter(|allocation| allocation.holds_capacity());
+    let last = allocation.filter(|allocation| !allocation.holds_capacity());
+    ExecutionStateView {
+        job: snapshot.job.to_string(),
+        at_seq: at_seq.map(|seq| seq.to_string()),
+        event_seq: snapshot.seq.to_string(),
+        execution_phase: snapshot
+            .phase
+            .map(|phase| execution_phase(phase, snapshot.outcome.as_ref(), allocation)),
+        input_revision: snapshot.input_revision.map(|revision| revision.to_string()),
+        settlement: settlement_view(snapshot.outcome.as_ref()),
+        outcome_cause: snapshot
+            .outcome
+            .as_ref()
+            .and_then(|outcome| outcome.cause.as_ref())
+            .map(outcome_cause),
+        allocation: allocation.map(allocation_view),
+        assigned_executor: current.map(|allocation| allocation.token.executor.to_string()),
+        last_executor: last.map(|allocation| allocation.token.executor.to_string()),
+        stop_confirmed_at_us: allocation
+            .and_then(|allocation| allocation.stop_confirmed_at)
+            .map(|at| at.as_unix_micros()),
+        stop_proof: allocation
+            .and_then(|allocation| allocation.stop_proof)
+            .map(|proof| stop_proof_name(proof).to_owned()),
+        closing_at_us: snapshot
+            .closing
+            .as_ref()
+            .map(|closing| closing.at.as_unix_micros()),
+        closing_running: snapshot.closing.as_ref().map(|closing| closing.running),
+        on_hold: snapshot.on_hold,
+        hidden_at_us: snapshot.hidden_at.map(|at| at.as_unix_micros()),
+        prerequisites: snapshot
+            .prerequisites
+            .iter()
+            .map(|(job, condition)| ExecutionDependencyView {
+                prerequisite: job.to_string(),
+                condition: dependency_condition(*condition).to_owned(),
+            })
+            .collect(),
+        dependencies: snapshot
+            .dependencies
+            .iter()
+            .map(|(job, condition)| ExecutionDependencyView {
+                prerequisite: job.to_string(),
+                condition: dependency_condition(*condition).to_owned(),
+            })
+            .collect(),
+    }
+}
+
+pub(super) async fn history(
+    shared: &Shared,
+    job: JobId,
+    after: Option<u64>,
+    limit: usize,
+    request: &HttpRequest,
+) -> Result<Reply, Refusal> {
+    let context = super::mutable_jobs::optional_context(request)?;
+    let page = shared
+        .database
+        .execution_history(job, after, limit, context)
+        .await?
+        .ok_or(JOB_NOT_FOUND)?;
+    super::dashboard::bounded(
+        shared,
+        envelope(serde_json::json!(ExecutionHistoryView {
+            job: job.to_string(),
+            event_seq: page.head_seq.to_string(),
+            events: page.events.iter().map(history_event_view).collect(),
+            next_after: page.next_after.map(|seq| seq.to_string()),
+            has_more: page.next_after.is_some(),
+        })),
+    )
+}
+
+pub(super) async fn state(
+    shared: &Shared,
+    job: JobId,
+    at_seq: Option<u64>,
+    request: &HttpRequest,
+) -> Result<Reply, Refusal> {
+    let context = super::mutable_jobs::optional_context(request)?;
+    let snapshot = shared
+        .database
+        .execution_snapshot(job, at_seq, context)
+        .await?
+        .ok_or(JOB_NOT_FOUND)?;
+    super::dashboard::bounded(
+        shared,
+        envelope(serde_json::json!(execution_state_view(&snapshot, at_seq))),
+    )
 }

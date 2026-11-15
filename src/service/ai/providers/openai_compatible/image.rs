@@ -56,7 +56,7 @@ pub enum ImageError {
     UnsupportedType,
     #[error("only an inline base64 data: URL is supported, never a remote URL")]
     NotDataUrl,
-    #[error("the image data is not canonical base64")]
+    #[error("the image data is not standard padded base64")]
     MalformedBase64,
     #[error("the image is empty")]
     Empty,

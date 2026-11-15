@@ -19,7 +19,7 @@ import {
   bindComposerContext,
   confirmMutableComposerNavigation,
 } from "../chat/mutable-composer";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ApiClient } from "../runtime/api-client";
 import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
 import { useI18n } from "../i18n";
 import { PageTitleVisibilityContext } from "./page-title";
@@ -72,7 +72,7 @@ const LogsSurface = dynamic(
   { loading: SurfaceLoading },
 );
 const SettingsSurface = dynamic(
-  () => import("../settings/control-settings-surface").then((module) => module.SettingsSurface),
+  () => import("../settings/settings-surface").then((module) => module.SettingsSurface),
   { loading: SurfaceLoading },
 );
 
@@ -100,7 +100,7 @@ function currentLocation() {
 }
 
 type AppShellProps = {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   health: Health | null;
   sessionExpiresAtUs: number | null;
   signingOut: boolean;
@@ -403,12 +403,10 @@ function AppShellContent({
 
   const runningSessionIds = new Set(
     runtime.snapshot.sessions
-      .filter(
-        (session) =>
-          runtime.snapshot.executionBySession[session.id]?.state === "running" ||
-          (runtime.snapshot.messagesBySession[session.id] ?? []).some(
-            (message) => message.status === "pending" || message.status === "streaming",
-          ),
+      .filter((session) =>
+        (runtime.snapshot.messagesBySession[session.id] ?? []).some(
+          (message) => message.status === "pending" || message.status === "streaming",
+        ),
       )
       .map((session) => session.id),
   );
@@ -439,7 +437,7 @@ function AppShellContent({
       }
       sessions={listedSessions}
       runningSessionIds={runningSessionIds}
-      control={client}
+      api={client}
       activeAncestors={ancestors}
       onOpenConversation={(job) => void openNestedConversation(job)}
       activeSessionId={sessionId}
@@ -477,7 +475,6 @@ function AppShellContent({
           : undefined
       }
       runtimeStatus={runtime.snapshot.status}
-      runtimeAuthority="canonical"
       activeView={location.view}
       onNavigate={(view) => go(view)}
       onSettingsClick={() => go("settings")}

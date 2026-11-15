@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
-import type { ControlLlmProfile } from "../contracts";
-import { ControlTransportError } from "../runtime/control-client";
+import type { LlmProfile } from "../contracts";
+import { ApiError } from "../runtime/api-client";
 import type { I18nKey, TranslateFn } from "../i18n";
 
 export function Section({
@@ -33,7 +33,7 @@ export function Section({
 }
 
 export function describeError(error: unknown, t: TranslateFn): string {
-  if (error instanceof ControlTransportError) {
+  if (error instanceof ApiError) {
     return error.detail
       ? `${error.detail} (${error.code})`
       : t("settings.error.refused", { code: error.code, status: error.status });
@@ -46,7 +46,7 @@ export function refusalText(
   error: unknown,
   known: Partial<Record<string, I18nKey>>,
 ): string {
-  if (error instanceof ControlTransportError && error.code in known) {
+  if (error instanceof ApiError && error.code in known) {
     const key = known[error.code];
     if (key) {
       return t(key, { detail: error.detail });
@@ -56,8 +56,8 @@ export function refusalText(
 }
 
 export function selectableLlmProfiles(
-  profiles: readonly ControlLlmProfile[],
+  profiles: readonly LlmProfile[],
   ...selected: (string | null | undefined)[]
-): ControlLlmProfile[] {
+): LlmProfile[] {
   return profiles.filter((profile) => profile.enabled || selected.includes(profile.id));
 }

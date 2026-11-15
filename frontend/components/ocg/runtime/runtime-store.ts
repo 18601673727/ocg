@@ -7,7 +7,6 @@ export function emptyRuntimeSnapshot(): RuntimeSnapshot {
     status: { state: "connecting", detail: "Runtime snapshot is not loaded." },
     sessions: [],
     messagesBySession: {},
-    executionBySession: {},
     conversationList: "loading",
   };
 }

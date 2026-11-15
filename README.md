@@ -27,7 +27,7 @@ OCG combines a Rust backend, a browser interface, and an embedded database. Conn
 | Component | Technology | Responsibility |
 | --- | --- | --- |
 | [Web interface](frontend/) | Next.js, React, TypeScript | Browser UI built as a static export and served by the backend. |
-| [Control API](src/api/v1/) | Rust, ntex | Authenticated application APIs, job control, and event streams. |
+| [Application API](src/api/v1/) | Rust, ntex | Authenticated application APIs, Job operations, and event streams. |
 | [Execution runtime](src/system/) | Rust, ntex | Scheduling, job lifecycle, agent orchestration, and tool execution. |
 | [AI services](src/service/ai/) | Rust provider adapters | Model requests, streaming responses, context preparation, compaction, and decisions. |
 | [Workspace tools](src/system/executor/) | Native Rust | Authorized file access, edits, directory discovery, and command execution. |
@@ -84,8 +84,8 @@ From the repository root:
 
 ```sh
 export OCG_DATA_DIR="$HOME/.local/share/ocg"
-export OCG_CONTROL_PORT=8787
-export OCG_CONTROL_TOKEN="$(openssl rand -hex 32)"
+export OCG_API_PORT=8787
+export OCG_API_TOKEN="$(openssl rand -hex 32)"
 export OCG_UI_DIR="$PWD/frontend/out"
 
 ./target/release/ocg
@@ -93,11 +93,11 @@ export OCG_UI_DIR="$PWD/frontend/out"
 
 Open [http://127.0.0.1:8787](http://127.0.0.1:8787).
 
-The served web interface establishes its browser session automatically. The control token authenticates API clients; it does not need to be pasted into the browser.
+The served web interface establishes its browser session automatically. The API token authenticates API clients; it does not need to be pasted into the browser.
 
 > **Access control:** Anyone who can reach the served UI can obtain full operator access without a sign-in code. Keep remote access behind an SSH tunnel or [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/) (Zero Trust) with an enforced authentication policy.
 
-`OCG_DATA_DIR` is required. `OCG_CONTROL_PORT` and `OCG_CONTROL_TOKEN` enable the control API together; the token must be a random value of 32–512 accepted characters. `OCG_UI_DIR` selects the exported frontend directory. See the [control configuration](src/api/v1/config.rs) for the exact rules.
+`OCG_DATA_DIR` is required. `OCG_API_PORT` and `OCG_API_TOKEN` enable the API together; the token must be a random value of 32–512 accepted characters. `OCG_UI_DIR` selects the exported frontend directory. See the [server configuration](src/api/v1/config.rs) for the exact rules.
 
 The HTTP listener binds to `127.0.0.1`. For a remote installation, forward the same port over SSH:
 
@@ -116,7 +116,7 @@ Then open the local URL above.
 
 Keep the OCG data directory separate from project workspaces. The [data layout](src/system/data_directory.rs) places `ocg.redb` and `credentials.json` in the data root, with logs in `ocg_logs/` and attachments in `ocg_attachments/`.
 
-> **Storage compatibility:** Current `main` uses database format **18**. With `OCG_DATA_DIR` set to the data directory, `ocg migrate --check` reports whether it needs migration, and `ocg migrate --to <directory>` writes a migrated copy. `install.sh` and `ocg update` run the check before switching versions and stop if migration is needed. Back up the data directory before upgrading.
+> **Storage:** This implementation starts with **Format 1** and requires a new database. It has no historical migration or compatibility reader. `ocg verify <data-directory>` checks an existing database without modifying it; the installer runs this check before switching versions. Keep existing data separately rather than opening it as a new database.
 
 ## Performance
 

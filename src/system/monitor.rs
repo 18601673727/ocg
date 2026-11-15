@@ -222,8 +222,8 @@ pub enum ReopenFailure {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum RecoveryError {
-    #[error("the control queue is full; recovery was not accepted")]
-    ControlQueueFull,
+    #[error("the maintenance queue is full; recovery was not accepted")]
+    MaintenanceQueueFull,
     #[error("a protected filesystem does not have the resume threshold available")]
     Space(Vec<ProtectionReason>),
     #[error("reopening the database failed: {0}")]

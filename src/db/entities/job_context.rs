@@ -690,7 +690,6 @@ pub enum EntryKind {
     UserMessageEdit,
     UserMessageWithdraw,
     AgentMessage,
-    Notice,
     Decision,
     RetryOf,
     Iteration,
@@ -727,11 +726,6 @@ pub enum Entry {
         text: String,
         call: ToolCallRef,
     },
-    Notice {
-        child: JobId,
-        event: NoticeEvent,
-        reference: JobId,
-    },
     Decision {
         approval: (JobId, u32, u32),
     },
@@ -760,7 +754,6 @@ impl Entry {
             Self::UserMessageEdit { .. } => EntryKind::UserMessageEdit,
             Self::UserMessageWithdraw { .. } => EntryKind::UserMessageWithdraw,
             Self::AgentMessage { .. } => EntryKind::AgentMessage,
-            Self::Notice { .. } => EntryKind::Notice,
             Self::Decision { .. } => EntryKind::Decision,
             Self::RetryOf { .. } => EntryKind::RetryOf,
             Self::Iteration { .. } => EntryKind::Iteration,
@@ -770,59 +763,11 @@ impl Entry {
         }
     }
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JobInputEntry {
-    pub entry: Entry,
-    pub at: Timestamp,
-}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Appended {
     pub turn: JobId,
     pub seq: u32,
     pub joined: bool,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NoticeClass {
-    Attention,
-    Progress,
-    Record,
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecordEvent {
-    Hold,
-    Unhold,
-    Stop,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NoticeEvent {
-    ClosedSelf,
-    ClosedAbove,
-    StoppedAbove,
-    TurnEnded { kind: OutcomeKind },
-    Requested,
-    Stalled,
-    ObjectiveCompleted,
-    WaitersBlocked { waiting: Vec<JobId> },
-    IterationCompleted,
-    RecurrenceHalted,
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum NoticeBody {
-    Event {
-        child: JobId,
-        event: NoticeEvent,
-        reference: JobId,
-    },
-    Record {
-        event: RecordEvent,
-        by: Actor,
-        at: Timestamp,
-    },
-}
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Notice {
-    pub class: NoticeClass,
-    pub body: NoticeBody,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobAction {
@@ -878,61 +823,6 @@ pub enum JobEdit {
     Title(String),
     SuggestedTitle(String),
     Hide,
-}
-
-pub(in crate::db) fn effective_entries(
-    entries: Vec<(u32, JobInputEntry)>,
-) -> Result<Vec<(u32, JobInputEntry)>, &'static str> {
-    let mut visible: std::collections::BTreeMap<u32, JobInputEntry> =
-        std::collections::BTreeMap::new();
-    for (seq, entry) in entries {
-        match entry.entry {
-            Entry::UserMessageEdit {
-                message,
-                text,
-                attachments,
-            } => {
-                if message >= seq {
-                    return Err("queued edit does not name an earlier input");
-                }
-                let Some(original) = visible.get_mut(&message) else {
-                    return Err("queued edit names an absent input");
-                };
-                if !matches!(original.entry, Entry::UserMessage { .. }) {
-                    return Err("queued edit does not name a user message");
-                }
-                original.entry = Entry::UserMessage { text, attachments };
-            }
-            Entry::UserMessageWithdraw { message } => {
-                if message >= seq
-                    || !visible
-                        .get(&message)
-                        .is_some_and(|original| matches!(original.entry, Entry::UserMessage { .. }))
-                {
-                    return Err("queued withdrawal does not name an earlier user message");
-                }
-                visible.remove(&message);
-            }
-            other @ (Entry::UserMessage { .. }
-            | Entry::AgentMessage { .. }
-            | Entry::Notice { .. }
-            | Entry::Decision { .. }
-            | Entry::RetryOf { .. }
-            | Entry::Iteration { .. }
-            | Entry::ResponseFormat { .. }
-            | Entry::ContextPreparation { .. }
-            | Entry::ContextUse { .. }) => {
-                visible.insert(
-                    seq,
-                    JobInputEntry {
-                        entry: other,
-                        at: entry.at,
-                    },
-                );
-            }
-        }
-    }
-    Ok(visible.into_iter().collect())
 }
 
 pub(in crate::db) fn summary_chunks(

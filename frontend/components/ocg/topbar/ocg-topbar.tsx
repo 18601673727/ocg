@@ -39,12 +39,10 @@ export function OcgTopbar({
       usage: t("nav.usage"),
       attention: t("nav.attention"),
       ledger: t("ledger.title"),
-      "control-center": t("nav.controlCenter"),
       "job-execution": t("nav.jobExecution"),
       health: t("nav.health"),
       logs: t("logs.title"),
       settings: t("settings.title"),
-      canonical: t("nav.canonical"),
     };
     return viewTitleMap[view];
   };

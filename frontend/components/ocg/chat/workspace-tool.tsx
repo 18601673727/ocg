@@ -10,11 +10,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { DiffViewer } from "@/components/ui/diff-viewer";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import type { ControlToolCall } from "../contracts";
+import type { ToolCall } from "../contracts";
 import { useI18n } from "../i18n";
 import { highlightCode } from "../markdown/markdown-pipeline";
 import { sourceLanguage } from "../markdown/source-snapshot";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ApiClient } from "../runtime/api-client";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { artifactTitle, fileArtifact, toolObject } from "./artifact-model";
 import { CommandTool } from "./command-tool";
@@ -117,15 +117,15 @@ export function WorkspaceTool({
   client,
   children,
 }: {
-  call: ControlToolCall;
+  call: ToolCall;
   jobId?: string;
-  client?: Pick<HttpCanonicalControlClient, "readJobTool">;
+  client?: Pick<ApiClient, "readJobTool">;
   children: ReactNode;
 }) {
   const { t } = useI18n();
   const [loaded, setLoaded] = useState<{
     key: string;
-    call: ControlToolCall;
+    call: ToolCall;
   } | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [attempt, setAttempt] = useState(0);
@@ -261,10 +261,10 @@ export function WorkspaceTool({
 }
 
 export const WorkspaceToolFallback: ToolCallMessagePartComponent = (props) => {
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const call = useAuiState((state) => {
     const metrics = state.message.metadata.custom.toolMetrics as
-      | Record<string, { call?: ControlToolCall }>
+      | Record<string, { call?: ToolCall }>
       | undefined;
     return metrics?.[props.toolCallId]?.call;
   });
@@ -285,7 +285,7 @@ export const WorkspaceToolFallback: ToolCallMessagePartComponent = (props) => {
         <WorkspaceTool
           call={call}
           jobId={typeof jobId === "string" ? jobId : undefined}
-          client={control ?? undefined}
+          client={api ?? undefined}
         >
           <ToolFallback.Args argsText={props.argsText} />
           <ToolFallback.Result result={props.result} />

@@ -30,40 +30,6 @@ impl Batch {
         automatic: Option<crate::db::entities::ResolvedCompaction>,
         prediction: Option<JobId>,
     ) -> Result<crate::db::entities::CompactionRequest, BatchError> {
-        let is_mutable = self.step(|tx| {
-            Ok(tx
-                .open_table(JOBS)?
-                .get(conversation.get())?
-                .is_some_and(|b| b.value().first() == Some(&JobSpec::MUTABLE_CONVERSATION_TAG)))
-        })?;
-        if is_mutable {
-            return self.request_native_preparation(
-                conversation,
-                model,
-                submission,
-                automatic,
-                prediction,
-            );
-        }
-        if automatic.is_some() {
-            return Ok(crate::db::entities::CompactionRequest::Noop {
-                reason: "native conversation required",
-            });
-        }
-        self.reject(Violation::InvalidValue(
-            "conversation",
-            "native conversation required",
-        ))
-    }
-
-    fn request_native_preparation(
-        &mut self,
-        conversation: JobId,
-        model: ConfigId,
-        submission: Submission,
-        automatic: Option<crate::db::entities::ResolvedCompaction>,
-        prediction: Option<JobId>,
-    ) -> Result<crate::db::entities::CompactionRequest, BatchError> {
         use crate::db::entities::{
             AllocationPhase, ComposerContextId, JobQueuePriority, MessageBody,
             MutableContextSelection, MutableFrozenConfiguration, MutableJob, MutableJobContent,
@@ -126,19 +92,16 @@ impl Batch {
             let (policy, _, _) =
                 self.step(|tx| reader::effective_context_policy(&tx.open_table(META)?))?;
             let allowed_by_policy = policy.summarization_model == Some(model);
-            let allowed_by_agent = match row.kind {
-                JobKind::Group {
-                    agent: Some(agent_id),
-                    ..
-                } => match self.require_config_kind(agent_id, ConfigKind::Agent)?.body {
+            let allowed_by_agent = match row.agent {
+                Some(agent_id) => match self.require_config_kind(agent_id, ConfigKind::Agent)?.body
+                {
                     ConfigBody::Agent(body) => body.models.contains(&model),
                     ConfigBody::Connection(_)
                     | ConfigBody::Model(_)
-                    | ConfigBody::Pool(_)
                     | ConfigBody::DecisionModel(_)
                     | ConfigBody::DecisionAgent(_) => false,
                 },
-                JobKind::Group { .. } | JobKind::Execution { .. } => false,
+                None => false,
             };
             if !allowed_by_policy && !allowed_by_agent {
                 return self.reject(Violation::InvalidValue(
@@ -171,7 +134,7 @@ impl Batch {
         };
         let (limits, depth) = self.group_limits(conversation)?;
         let root = self.root_group(conversation)?;
-        if self.job_control(conversation)?.closing.is_some()
+        if self.job_lifecycle(conversation)?.closing.is_some()
             || self.require_job_state(conversation)?.outcome.is_some()
             || depth.saturating_add(1) > limits.max_depth
             || self.live_children(conversation)?.len() >= 16
@@ -224,12 +187,13 @@ impl Batch {
         let sealed = self.step(|tx| {
             let tables = reader::NativeSummaryTables {
                 jobs: tx.open_table(JOBS)?,
-                states: tx.open_table(JOB_STATES)?,
+                states: tx.open_table(JOB_RUNTIME)?,
                 allocations: tx.open_table(POOL_ALLOCATIONS)?,
                 outputs: tx.open_table(JOB_OUTPUTS)?,
                 attachments: tx.open_table(ATTACHMENTS)?,
                 tools: tx.open_table(TOOL_CALLS)?,
-                configs: tx.open_table(CONFIGS)?,
+                pools: tx.open_table(POOLS)?,
+                executors: tx.open_table(EXECUTORS)?,
             };
             let mut summary_budget = reader::SummaryBudget {
                 bytes: 0,
@@ -306,7 +270,7 @@ impl Batch {
         let existing = self.step(|tx| {
             let children = tx.open_table(CHILDREN)?;
             let jobs = tx.open_table(JOBS)?;
-            let states = tx.open_table(JOB_STATES)?;
+            let states = tx.open_table(JOB_RUNTIME)?;
             let allocations = tx.open_table(POOL_ALLOCATIONS)?;
             for entry in children
                 .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
@@ -316,16 +280,13 @@ impl Batch {
                 let Some(bytes) = jobs.get(child_id.get())? else {
                     continue;
                 };
-                if bytes.value().first() != Some(&TAG_JOB) {
-                    continue;
-                }
                 let job = transactions::decode_mutable_job(child_id.get(), bytes.value())?;
                 if job.summary_source != Some(source_digest) {
                     continue;
                 }
                 let state = states
                     .get(child_id.get())?
-                    .map(|b| JobState::decode_at(child_id.get(), b.value()))
+                    .map(|b| state::decode_state(child_id.get(), b.value()))
                     .transpose()?;
                 let Some(state) = state else {
                     continue;
@@ -435,23 +396,19 @@ impl Batch {
                 id: chunk_group,
                 created_at: self.now,
                 parent_id: Some(conversation),
-                allocation: None,
-                kind: JobKind::Group {
-                    agent: None,
-                    project: None,
-                    origin: Origin::System,
-                    keep_open: false,
-                },
+                agent: None,
+                project: None,
+                origin: Origin::System,
+                keep_open: false,
             };
             self.insert(
-                JOBS,
+                CONVERSATIONS,
                 chunk_group.get(),
-                group_row.encode_mutable_conversation().as_slice(),
+                group_row.encode().as_slice(),
             )?;
             self.put_job_state(chunk_group, &JobState::new(chunk_group))?;
-            self.put_job_control(chunk_group, &JobControl::default())?;
-            self.insert(CONVERSATIONS, chunk_group.get(), ())?;
-            self.insert(UNSETTLED, chunk_group.get(), (0, 0))?;
+            self.put_job_lifecycle(chunk_group, &JobLifecycle::default())?;
+            self.step(|tx| state::set_pending(tx, chunk_group, Some((0, 0))))?;
             self.insert(CHILDREN, (conversation.get(), chunk_group.get()), ())?;
             self.link_job_group(conversation, chunk_group)?;
             self.adjust_open_children(conversation, 1)?;
@@ -480,6 +437,7 @@ impl Batch {
                         id: chunk_id,
                         parent_id: chunk_group,
                         previous: None,
+                        retry: None,
                         composer_context: ComposerContextId::new(self.next_id()?),
                         created_at: self.now,
                         submitted_at: Some(self.now),
@@ -525,6 +483,7 @@ impl Batch {
             id: producer_id,
             parent_id: conversation,
             previous: None,
+            retry: None,
             composer_context: ComposerContextId::new(self.next_id()?),
             created_at: self.now,
             submitted_at: Some(self.now),
@@ -548,6 +507,15 @@ impl Batch {
             dependency_ids.len() as u32,
             dependency_ids.is_empty(),
         )?;
+        for prerequisite in &dependency_ids {
+            self.record_execution_event(
+                producer_id,
+                crate::db::entities::ExecutionEventKind::DependencyAdded {
+                    prerequisite: *prerequisite,
+                    condition: DependencyCondition::Success,
+                },
+            )?;
+        }
         self.record_mutable_submission(&SubmissionRecord {
             key: submission.key,
             fingerprint: submission.fingerprint,
@@ -573,6 +541,8 @@ impl Batch {
     ) -> Result<(), BatchError> {
         let submitted = job.submitted_at.unwrap_or(job.created_at);
         let frozen_config = crate::db::entities::FrozenConfiguration::Generative(frozen.clone());
+        self.store_mutable_job(job)?;
+        self.put_job_state(job.id, &JobState::new(job.id))?;
         self.step(|tx| {
             if ready_now {
                 tx.open_table(MUTABLE_READY)?.insert(
@@ -589,17 +559,10 @@ impl Batch {
             // Summary producers and parallel Chunks are children outside the Turn sequence.
             tx.open_table(CHILDREN)?
                 .insert((job.parent_id.get(), job.id.get()), ())?;
-            tx.open_table(UNSETTLED)?
-                .insert(job.id.get(), (unsettled_deps, 0))?;
+            state::set_pending(tx, job.id, Some((unsettled_deps, 0)))?;
             Ok(())
         })?;
         self.adjust_open_children(job.parent_id, 1)?;
-        self.insert(
-            JOBS,
-            job.id.get(),
-            transactions::encode_mutable_job(job).as_slice(),
-        )?;
-        self.put_job_state(job.id, &JobState::new(job.id))?;
         Ok(())
     }
 
@@ -607,12 +570,7 @@ impl Batch {
         self.step(|tx| reader::turn_head(&tx.open_table(TURNS)?, conversation))
     }
     pub(crate) fn active_job(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
-        self.step(|tx| {
-            Ok(tx
-                .open_table(ACTIVE_JOBS)?
-                .get(conversation.get())?
-                .map(|turn| JobId::new(turn.value())))
-        })
+        self.step(|tx| Ok(reader::active_job_in(tx, conversation)?.map(|job| job.id)))
     }
 
     pub(crate) fn live_children(&mut self, conversation: JobId) -> Result<Vec<JobId>, BatchError> {

@@ -7,11 +7,11 @@ import { ChevronDown, ChevronRight, CirclePause, Repeat2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { TONE_CLASS, type Tone } from "../primitives/tone";
-import type { ControlTreeNode, ControlTreeState } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { TreeNode, TreeState } from "../contracts";
+import type { ApiClient } from "../runtime/api-client";
 import { runtimeStateLabel, useI18n, type TranslateFn } from "../i18n";
 
-const STATE_TONE: Record<ControlTreeState, Tone> = {
+const STATE_TONE: Record<TreeState, Tone> = {
   running: "violet",
   waiting_for_user: "slate",
   queued: "slate",
@@ -31,16 +31,13 @@ const DEPENDENCY_TONE: Record<"waiting" | "satisfied" | "impossible", Tone> = {
   impossible: "red",
 };
 
-function stateLabel(t: TranslateFn, state: ControlTreeState): string {
+function stateLabel(t: TranslateFn, state: TreeState): string {
   if (state === "open") return t("jobs.tree.state.open");
   if (state === "closing") return t("jobs.tree.state.closing");
   return runtimeStateLabel(t, state);
 }
 
-export function mergeChildren(
-  existing: ControlTreeNode[],
-  incoming: ControlTreeNode[],
-): ControlTreeNode[] {
+export function mergeChildren(existing: TreeNode[], incoming: TreeNode[]): TreeNode[] {
   const merged = new Map(existing.map((child) => [child.id, child]));
   for (const child of incoming) {
     const previous = merged.get(child.id);
@@ -58,11 +55,7 @@ export function mergeChildren(
   return [...merged.values()];
 }
 
-function replaceNode(
-  node: ControlTreeNode,
-  id: string,
-  update: (node: ControlTreeNode) => ControlTreeNode,
-): ControlTreeNode {
+function replaceNode(node: TreeNode, id: string, update: (node: TreeNode) => TreeNode): TreeNode {
   if (node.id === id) return update(node);
   if (!node.children) return node;
   let changed = false;
@@ -82,7 +75,7 @@ export function JobTree({
   onReroot,
   onOpenChat,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   root: string;
   selected: string | null;
   onSelect: (job: string) => void;
@@ -90,7 +83,7 @@ export function JobTree({
   onOpenChat?: (job: string) => void;
 }) {
   const { t } = useI18n();
-  const [tree, setTree] = useState<ControlTreeNode | null>(null);
+  const [tree, setTree] = useState<TreeNode | null>(null);
   const [ancestors, setAncestors] = useState<string[]>([]);
   const [failure, setFailure] = useState<string | null>(null);
   const [loaded, setLoaded] = useState<string | null>(null);
@@ -165,7 +158,7 @@ export function JobTree({
   }, [client, root]);
 
   const loadChildren = useCallback(
-    async (node: ControlTreeNode, after?: string) => {
+    async (node: TreeNode, after?: string) => {
       if (loadingNodes.current.has(node.id)) return;
       const controller = new AbortController();
       loadingNodes.current.set(node.id, controller);
@@ -197,7 +190,7 @@ export function JobTree({
   );
 
   const toggle = useCallback(
-    (node: ControlTreeNode) => {
+    (node: TreeNode) => {
       if ((node.children?.length ?? 0) > 0) {
         setExpanded((current) => {
           const next = new Set(current);
@@ -215,7 +208,7 @@ export function JobTree({
     [loadChildren],
   );
 
-  const render = (node: ControlTreeNode, isRoot = false): ReactNode => {
+  const render = (node: TreeNode, isRoot = false): ReactNode => {
     const isExpanded = expanded.has(node.id);
     const hasChildren = (node.children?.length ?? 0) > 0 || node.has_more_children;
     const agent = node.agent_name ?? node.agent ?? t("jobs.tree.noAgent");

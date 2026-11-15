@@ -16,96 +16,41 @@ enum ObservationTarget {
     Decision(DecisionTarget),
 }
 
-fn frozen_decision_target(
-    rx: &ReadTransaction,
-    job: JobId,
-) -> Result<Option<DecisionTarget>, StorageError> {
-    let jobs = rx.open_table(JOBS)?;
-    let Some(bytes) = jobs.get(job.get())? else {
-        return Ok(None);
-    };
-    if !matches!(bytes.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION) {
-        return Ok(None);
-    }
-    let row = transactions::decode_mutable_job(job.get(), bytes.value())?;
-    let (provider, model, model_name) = match (row.frozen, &row.input.content) {
-        (
-            Some(crate::db::entities::MutableFrozenConfiguration::Decision(frozen)),
-            crate::db::entities::MutableJobContent::Decision { .. },
-        ) => (frozen.connection_ref, frozen.model_ref, frozen.model.model),
-        (
-            Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)),
-            crate::db::entities::MutableJobContent::Decision { .. },
-        ) => (
-            ConfigRef {
-                id: frozen.llm.provider.id.into(),
-                edit_seq: frozen.llm.provider.edit_seq,
-            },
-            frozen.llm.model,
-            frozen.llm.config.model,
-        ),
-        _ => return Ok(None),
-    };
-    let configs = rx.open_table(CONFIGS)?;
-    let provider_name = configs
-        .get(provider.id.get())?
-        .and_then(|bytes| {
-            ConfigRow::scan_at(provider.id.get(), bytes.value())
-                .ok()
-                .flatten()
-        })
-        .map(|row| row.name)
-        .unwrap_or_else(|| provider.id.to_string());
-    Ok(Some(DecisionTarget {
-        provider,
-        model,
-        model_name,
-        provider_name,
-    }))
-}
-
 fn frozen_observation_target(
     rx: &ReadTransaction,
     job: JobId,
 ) -> Result<Option<ObservationTarget>, StorageError> {
-    if let Some(target) = frozen_llm_target(rx, job)? {
-        return Ok(Some(ObservationTarget::Llm(Box::new(target))));
-    }
-    Ok(frozen_decision_target(rx, job)?.map(ObservationTarget::Decision))
-}
-
-pub(super) fn frozen_llm_target(
-    rx: &ReadTransaction,
-    job: JobId,
-) -> Result<Option<LlmTarget>, StorageError> {
-    {
-        let jobs = rx.open_table(JOBS)?;
-        if let Some(bytes) = jobs.get(job.get())?
-            && matches!(bytes.value(), [TAG_JOB, version, ..] if u64::from(*version) == FORMAT_VERSION)
-        {
-            let job = transactions::decode_mutable_job(job.get(), bytes.value())?;
-            return match job.frozen {
-                Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) => {
-                    Ok(Some(LlmTarget {
-                        llm_profile: frozen.llm.model.id.into(),
-                        frozen: frozen.llm,
-                    }))
-                }
-                Some(crate::db::entities::MutableFrozenConfiguration::Decision(_)) | None => {
-                    Ok(None)
-                }
-            };
-        }
-    }
-    let Some(row) = rx
-        .open_table(JOBS)?
-        .get(job.get())?
-        .map(|bytes| JobSpec::decode_at(job.get(), bytes.value()))
-        .transpose()?
-    else {
+    use crate::db::entities::MutableFrozenConfiguration;
+    let jobs = rx.open_table(JOBS)?;
+    let Some(bytes) = jobs.get(job.get())? else {
         return Ok(None);
     };
-    reader::turn_target(rx, &row)
+    let row = transactions::decode_mutable_job(job.get(), bytes.value())?;
+    match row.frozen {
+        Some(MutableFrozenConfiguration::Generative(frozen)) => {
+            Ok(Some(ObservationTarget::Llm(Box::new(LlmTarget {
+                llm_profile: frozen.llm.model.id.into(),
+                frozen: frozen.llm,
+            }))))
+        }
+        Some(MutableFrozenConfiguration::Decision(frozen)) => {
+            let provider = frozen.connection_ref;
+            let provider_name = rx
+                .open_table(CONFIGS)?
+                .get(provider.id.get())?
+                .map(|bytes| ConfigRow::decode_at(provider.id.get(), bytes.value()))
+                .transpose()?
+                .map(|row| row.name)
+                .unwrap_or_else(|| provider.id.to_string());
+            Ok(Some(ObservationTarget::Decision(DecisionTarget {
+                provider,
+                model: frozen.model_ref,
+                model_name: frozen.model.model,
+                provider_name,
+            })))
+        }
+        None => Ok(None),
+    }
 }
 
 fn event_at_key(

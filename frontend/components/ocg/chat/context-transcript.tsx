@@ -1,12 +1,12 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import type { ControlContextStatus } from "../contracts";
+import type { ContextStatus } from "../contracts";
 import { useI18n } from "../i18n";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { Button } from "@/components/ui/button";
 
-type SummaryWork = Extract<ControlContextStatus["work"][number], { kind: "summarization" }>;
+type SummaryWork = Extract<ContextStatus["work"][number], { kind: "summarization" }>;
 const states = {
   queued: "chat.contextStateQueued",
   preparing: "chat.contextStatePreparing",
@@ -22,7 +22,7 @@ const states = {
 } as const;
 
 export function ContextTranscript({ conversation }: { conversation?: string }) {
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const { t } = useI18n();
   const [pages, setPages] = useState(1);
   const [result, setResult] = useState<{
@@ -32,7 +32,7 @@ export function ContextTranscript({ conversation }: { conversation?: string }) {
   } | null>(null);
 
   useEffect(() => {
-    if (!control || !conversation) return;
+    if (!api || !conversation) return;
     const abort = new AbortController();
     let running = false;
     let again = false;
@@ -48,7 +48,7 @@ export function ContextTranscript({ conversation }: { conversation?: string }) {
         let more = false;
         let firstWorkPage: number | null = null;
         for (let page = 0; ; page++) {
-          const status = await control.readContextStatus(conversation, {
+          const status = await api.readContextStatus(conversation, {
             before,
             limit: 50,
             signal: abort.signal,
@@ -79,7 +79,7 @@ export function ContextTranscript({ conversation }: { conversation?: string }) {
         }
       }
     };
-    const unsubscribe = control.subscribeCatalog(
+    const unsubscribe = api.subscribeCatalog(
       () => void refresh(),
       () => void refresh(),
     );
@@ -88,10 +88,9 @@ export function ContextTranscript({ conversation }: { conversation?: string }) {
       abort.abort();
       unsubscribe();
     };
-  }, [control, conversation, pages]);
+  }, [api, conversation, pages]);
 
-  if (!conversation || !control || !result || (result.work.length === 0 && !result.error))
-    return null;
+  if (!conversation || !api || !result || (result.work.length === 0 && !result.error)) return null;
   return (
     <section className="my-4 text-sm" aria-label={t("chat.contextHistory")}>
       {result.error && (
@@ -114,7 +113,7 @@ export function ContextTranscript({ conversation }: { conversation?: string }) {
 }
 
 function ContextWork({ work }: { work: SummaryWork }) {
-  const { control } = useOcgRuntime();
+  const { api } = useOcgRuntime();
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
   const [result, setResult] = useState<{ summary: string; omissions: string[] } | string | null>(
@@ -136,9 +135,9 @@ function ContextWork({ work }: { work: SummaryWork }) {
   const stateKey = states[work.state as keyof typeof states];
 
   useEffect(() => {
-    if (!open || !control || !canRead) return;
+    if (!open || !api || !canRead) return;
     const abort = new AbortController();
-    void control
+    void api
       .readLatestOutput(work.job, abort.signal)
       .then((output) => {
         if (abort.signal.aborted) return;
@@ -161,7 +160,7 @@ function ContextWork({ work }: { work: SummaryWork }) {
           setResult(error instanceof Error ? error.message : String(error));
       });
     return () => abort.abort();
-  }, [open, control, canRead, work.job, t]);
+  }, [open, api, canRead, work.job, t]);
 
   return (
     <li className="text-xs text-muted-foreground">

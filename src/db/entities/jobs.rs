@@ -156,11 +156,18 @@ pub enum MutableFrozenConfiguration {
     Decision(NativeDecisionConfig),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobRetry {
+    pub original: JobId,
+    pub by: Actor,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MutableJob {
     pub id: JobId,
     pub parent_id: JobId,
     pub previous: Option<JobId>,
+    pub retry: Option<JobRetry>,
     pub composer_context: ComposerContextId,
     pub created_at: Timestamp,
     pub submitted_at: Option<Timestamp>,
@@ -177,6 +184,7 @@ pub struct MutableJobRecord {
     pub job: MutableJob,
     pub outcome: Option<OutcomeRecord>,
     pub project: Option<ProjectId>,
+    pub event_seq: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -796,17 +804,6 @@ pub struct OutcomeRecord {
     pub cause: Option<OutcomeCause>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct JobInputRecord {
-    pub id: JobInputId,
-    pub objective: Option<String>,
-    pub submitted_at: Option<Timestamp>,
-    pub created_at: Timestamp,
-    pub updated_at: Timestamp,
-    pub configuration: Option<FrozenExecutionConfig>,
-    pub attachments: Vec<AttachmentId>,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 pub struct JobOutputRecord {
     pub id: JobOutputId,
@@ -919,12 +916,6 @@ pub struct JobPlanStep {
     pub title: String,
     pub objective: String,
     pub depends_on: Vec<usize>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct JobAllocation {
-    pub owner: JobId,
-    pub synthesis: bool,
 }
 
 impl JobToolCall {
@@ -1117,20 +1108,38 @@ pub(crate) struct JobSpec {
     pub(crate) id: JobId,
     pub(crate) created_at: Timestamp,
     pub(crate) parent_id: Option<JobId>,
-    pub(crate) kind: JobKind,
-    pub(crate) allocation: Option<crate::db::entities::JobAllocation>,
+    pub(crate) agent: Option<ConfigId>,
+    pub(crate) project: Option<ProjectId>,
+    pub(crate) origin: Origin,
+    pub(crate) keep_open: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct JobState {
     pub(crate) job_id: JobId,
     pub(crate) outcome: Option<OutcomeRecord>,
-    pub(crate) stop_confirmed_at: Option<Timestamp>,
-    pub(crate) stop_confirmed_by: Option<StopProof>,
+}
+
+impl JobState {
+    pub(crate) fn new(job_id: JobId) -> Self {
+        Self {
+            job_id,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn confirmed_terminal(&self) -> bool {
+        self.outcome
+            .as_ref()
+            .is_some_and(|outcome| match outcome.kind {
+                OutcomeKind::Completed | OutcomeKind::Failed | OutcomeKind::Cancelled => true,
+                OutcomeKind::Unknown => false,
+            })
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct JobControl {
+pub(crate) struct JobLifecycle {
     pub(crate) limits: Option<JobLimits>,
     pub(crate) title: Option<String>,
     pub(crate) hidden_at: Option<Timestamp>,
@@ -1140,7 +1149,6 @@ pub(crate) struct JobControl {
     pub(crate) compaction_policy: Option<CompactionPolicy>,
     pub(crate) compaction_revision: u64,
     pub(crate) after: Vec<(JobId, DependencyCondition)>,
-    pub(crate) retried: Vec<JobId>,
     pub(crate) user_input: bool,
     pub(crate) reported: Option<JobId>,
 }

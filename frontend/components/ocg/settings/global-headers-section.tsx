@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button";
 import type { GlobalOutboundHeaders } from "../contracts/api";
 import { useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
-import { ControlTransportError, type HttpCanonicalControlClient } from "../runtime/control-client";
+import { ApiError, type ApiClient } from "../runtime/api-client";
 import {
   type HeaderDraft,
   type HeaderDraftError,
@@ -15,7 +15,7 @@ import {
 import { HeadersEditor } from "./headers-editor";
 import { Section, describeError } from "./settings-parts";
 
-export function GlobalHeadersSection({ client }: { client: HttpCanonicalControlClient }) {
+export function GlobalHeadersSection({ client }: { client: ApiClient }) {
   const { t } = useI18n();
   const [settings, setSettings] = useState<GlobalOutboundHeaders>();
   const [drafts, setDrafts] = useState<HeaderDraft[]>([]);
@@ -69,8 +69,7 @@ export function GlobalHeadersSection({ client }: { client: HttpCanonicalControlC
                 },
                 (cause) =>
                   setError(
-                    cause instanceof ControlTransportError &&
-                      cause.code === "headers_revision_changed"
+                    cause instanceof ApiError && cause.code === "headers_revision_changed"
                       ? t("headers.conflict")
                       : describeError(cause, t),
                   ),

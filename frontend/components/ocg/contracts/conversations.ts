@@ -1,6 +1,7 @@
 import type * as Api from "./api";
-import type { ControlTreeNode } from "./control-shared";
-import type { ControlDecisionAnswer } from "./control-settings";
+import type { TreeNode } from "./shared";
+import type { DecisionAnswer } from "./settings";
+import { executionSequence } from "./jobs";
 
 export type NativeDecisionTurn = {
   kind: "decision";
@@ -15,7 +16,7 @@ export type NativeDecisionTurn = {
   };
   result: null | {
     outcome:
-      | { status: "answer"; answer: ControlDecisionAnswer }
+      | { status: "answer"; answer: DecisionAnswer }
       | { status: "uncertain" | "unusable"; reason: string };
   };
   failure: string | null;
@@ -84,7 +85,7 @@ export type ProjectedEntry = {
   text: string | null;
   attachments: string[];
 };
-export type ControlConversationTurn = Omit<
+export type ConversationTurn = Omit<
   Api.Turn,
   "entries" | "configuration" | "uncertain_calls" | "native_decision"
 > & {
@@ -92,11 +93,8 @@ export type ControlConversationTurn = Omit<
   entries: ProjectedEntry[];
   input: Api.Input & { job: string };
 };
-export type ControlConversation = Omit<Api.Turns, "turns"> & { turns: ControlConversationTurn[] };
-export type ControlChildConversation = Omit<
-  Api.Child,
-  "state" | "origin" | "job_state" | "recurrence"
-> & {
+export type Conversation = Omit<Api.Turns, "turns"> & { turns: ConversationTurn[] };
+export type ChildConversation = Omit<Api.Child, "state" | "origin" | "job_state" | "recurrence"> & {
   state: "open" | "closing" | "settled";
   origin?: "user" | "system" | "agent";
   job_state:
@@ -112,11 +110,11 @@ export type ControlChildConversation = Omit<
     | (Omit<Api.Recurrence, "phase"> & { phase: "active" | "waiting_due" | "halted" })
     | null;
 };
-export type ControlChildren = Omit<Api.Children, "children"> & {
-  children: ControlChildConversation[];
+export type Children = Omit<Api.Children, "children"> & {
+  children: ChildConversation[];
 };
-export type ControlConversationCard = Api.Card;
-export type ControlJobTree = Omit<Api.Tree, "root"> & { root: ControlTreeNode };
+export type ConversationCard = Api.Card;
+export type JobTree = Omit<Api.Tree, "root"> & { root: TreeNode };
 
 export function materializeUserEntries(entries: readonly ProjectedEntry[]) {
   const visible = new Map<
@@ -144,10 +142,11 @@ export function materializeUserEntries(entries: readonly ProjectedEntry[]) {
   return [...visible.values()];
 }
 
-export function projectConversation(page: Api.Turns): ControlConversation {
+export function projectConversation(page: Api.Turns): Conversation {
   return {
     ...page,
     turns: page.turns.map((turn) => {
+      executionSequence(turn.job.event_seq);
       const decision = nativeDecision(turn.native_decision);
       if (
         (turn.content_kind === "decision" && !decision) ||

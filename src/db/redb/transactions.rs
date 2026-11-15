@@ -1,10 +1,11 @@
 use super::*;
 use crate::db::entities::{
-    ConfigId, DependencyCondition, DependencyState, ExecutionConfiguration, FrozenConfiguration,
-    FrozenDecisionConfig, MutableJobPhase, OutcomeCause, OutcomeKind, OutcomeRecord, Recorded,
-    SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome, Violation,
+    AppendedOutput, ConfigId, DependencyCondition, DependencyState, ExecutionConfiguration,
+    ExecutionEventKind, FrozenConfiguration, FrozenDecisionConfig, MutableJobPhase, OutcomeCause,
+    OutcomeKind, OutcomeRecord, Recorded, SubmissionRecord, ToolCallRef, ToolDecision,
+    ToolEvidenceRecord, ToolOutcome, Violation,
 };
-use crate::system::execution_controls::ExecutionControl;
+use crate::system::execution_features::ExecutionFeature;
 
 pub(super) const TAG_ALLOCATION_POOL: u8 = 40;
 pub(super) const TAG_ALLOCATION_EXECUTOR: u8 = 41;
@@ -111,29 +112,8 @@ pub(super) fn decode_allocation_executor(
     })
 }
 
-pub(super) const POOL_ARCHIVE_SCAN_LIMIT: usize = 4096;
-
-enum NativeConfigRow {
-    Pool(crate::db::entities::AllocationPool),
-    Executor(crate::db::entities::AllocationExecutor),
-    Other,
-}
-
-fn decode_native_config_row(key: u128, bytes: &[u8]) -> DecodeResult<NativeConfigRow> {
-    match bytes.first() {
-        Some(&TAG_ALLOCATION_POOL) => decode_allocation_pool(key, bytes).map(NativeConfigRow::Pool),
-        Some(&TAG_ALLOCATION_EXECUTOR) => {
-            decode_allocation_executor(key, bytes).map(NativeConfigRow::Executor)
-        }
-        _ => {
-            ConfigRow::decode_at(key, bytes)?;
-            Ok(NativeConfigRow::Other)
-        }
-    }
-}
-
 #[allow(dead_code)]
-fn encode_pool_allocation(allocation: &crate::db::entities::PoolAllocation) -> Vec<u8> {
+pub(super) fn encode_pool_allocation(allocation: &crate::db::entities::PoolAllocation) -> Vec<u8> {
     use crate::db::entities::AllocationPhase;
     let mut e = Enc::new(42);
     e.u128(allocation.token.job.get());
@@ -325,6 +305,10 @@ pub(super) fn encode_mutable_job(job: &crate::db::entities::MutableJob) -> Vec<u
     e.u128(job.id.get());
     e.u128(job.parent_id.get());
     e.ou128(job.previous.map(JobId::get));
+    e.opt(job.retry.as_ref(), |e, retry| {
+        e.u128(retry.original.get());
+        e.actor(&retry.by);
+    });
     e.u128(job.composer_context.get());
     e.ts(job.created_at);
     e.ots(job.submitted_at);
@@ -570,6 +554,12 @@ pub(super) fn decode_mutable_job(
     let id = JobId::new(d.u128()?);
     let parent_id = JobId::new(d.u128()?);
     let previous = d.ou128()?.map(JobId::new);
+    let retry = d.opt(|d| {
+        Ok(crate::db::entities::JobRetry {
+            original: JobId::new(d.u128()?),
+            by: d.actor()?,
+        })
+    })?;
     let composer_context = crate::db::entities::ComposerContextId::new(d.u128()?);
     let created_at = d.ts()?;
     let submitted_at = d.ots()?;
@@ -620,6 +610,9 @@ pub(super) fn decode_mutable_job(
         || parent_id.get() == 0
         || parent_id >= id
         || previous.is_some_and(|previous| previous >= id)
+        || retry
+            .as_ref()
+            .is_some_and(|retry| retry.original >= id || retry.original.get() == 0)
         || revision == 0
         || (phase != MutableJobPhase::Unsubmitted
             && matches!(
@@ -704,6 +697,7 @@ pub(super) fn decode_mutable_job(
         id,
         parent_id,
         previous,
+        retry,
         composer_context,
         created_at,
         submitted_at,
@@ -714,6 +708,31 @@ pub(super) fn decode_mutable_job(
         summary_source,
         frozen,
     })
+}
+
+pub(super) fn validate_retry_source(
+    job: &crate::db::entities::MutableJob,
+    original: &crate::db::entities::MutableJob,
+) -> Result<(), StorageError> {
+    use crate::db::entities::{MutableFrozenConfiguration, MutableJobContent};
+
+    if job.retry.as_ref().map(|retry| retry.original) != Some(original.id)
+        || original.id >= job.id
+        || original.parent_id != job.parent_id
+        || original.retry.is_some()
+        || original.submitted_at.is_none()
+        || original.summary_source.is_some()
+        || job.summary_source.is_some()
+        || !matches!(job.input.content, MutableJobContent::Generative { .. })
+        || !matches!(original.input.content, MutableJobContent::Generative { .. })
+        || !matches!(
+            original.frozen,
+            Some(MutableFrozenConfiguration::Generative(_))
+        )
+    {
+        return Err(StorageError::corrupted("invalid retry source"));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]
@@ -854,12 +873,7 @@ impl Batch {
             return self.corrupted("invalid conversation predecessor".to_owned());
         }
         let state = self.require_job_state(id)?;
-        if !state.locally_stopped()
-            || state
-                .outcome
-                .as_ref()
-                .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-        {
+        if !state.confirmed_terminal() {
             return Ok(false);
         }
         Ok(!self
@@ -888,7 +902,7 @@ impl Batch {
         self.step(|tx| {
             match reader::verify_native_summary_tables(
                 &tx.open_table(JOBS)?,
-                &tx.open_table(JOB_STATES)?,
+                &tx.open_table(JOB_RUNTIME)?,
                 &tx.open_table(JOB_OUTPUTS)?,
                 &tx.open_table(MESSAGES)?,
                 job.parent_id,
@@ -911,8 +925,41 @@ impl Batch {
     }
 
     fn put_mutable_job_state(&mut self, id: JobId, state: &JobState) -> Result<(), BatchError> {
-        let encoded = state.encode();
-        self.insert(JOB_STATES, id.get(), encoded.as_slice())
+        self.put_job_state(id, state)
+    }
+
+    pub(super) fn store_mutable_job(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+    ) -> Result<(), BatchError> {
+        let previous = self.mutable_job(job.id)?;
+        self.record_job_phase(job.id, previous.as_ref().map(|row| row.phase), job.phase)?;
+        self.record_mutable_input_revision(
+            job.id,
+            previous.as_ref().map(|row| row.revision),
+            job.revision,
+        )?;
+        if previous.as_ref().and_then(|row| row.retry.as_ref()) != job.retry.as_ref() {
+            if previous.as_ref().is_some_and(|row| {
+                row.retry.is_some()
+                    || row.phase != crate::db::entities::MutableJobPhase::Unsubmitted
+            }) || job.phase != crate::db::entities::MutableJobPhase::Unsubmitted
+            {
+                return self
+                    .corrupted("retry identity cannot be rewritten after submission".into());
+            }
+            if let Some(retry) = &job.retry {
+                let original = self.mutable_job(retry.original)?.ok_or_else(|| {
+                    BatchError(Failure::Storage(StorageError::corrupted(
+                        "retry source missing",
+                    )))
+                })?;
+                validate_retry_source(job, &original)
+                    .map_err(|error| BatchError(Failure::Storage(error)))?;
+                self.insert(RETRY_JOBS, (retry.original.get(), job.id.get()), ())?;
+            }
+        }
+        self.insert(JOBS, job.id.get(), encode_mutable_job(job).as_slice())
     }
 
     pub(super) fn record_mutable_submission(
@@ -1124,13 +1171,11 @@ impl Batch {
         };
         let outcome = self.require_job_state(id)?.outcome;
         let parent = self.require_mutable_conversation(job.parent_id)?;
-        let JobKind::Group { project, .. } = parent.kind else {
-            return self.corrupted("mutable Job parent is not a conversation".to_owned());
-        };
         Ok(Some(crate::db::entities::MutableJobRecord {
             job,
             outcome,
-            project,
+            project: parent.project,
+            event_seq: self.step(|tx| execution::latest_seq(tx, id))?,
         }))
     }
 
@@ -1216,8 +1261,7 @@ impl Batch {
             }
             if let Some(project) = project {
                 let parent = self.require_mutable_conversation(existing.parent_id)?;
-                if !matches!(parent.kind, JobKind::Group { project: Some(current), .. } if current == project)
-                {
+                if parent.project != Some(project) {
                     return self.reject(Violation::InvalidValue(
                         "project",
                         "conversation belongs to another project",
@@ -1239,19 +1283,17 @@ impl Batch {
                 let row = self.require_mutable_conversation(parent)?;
                 if let Some(project) = project {
                     self.require_project(project)?;
-                    if !matches!(&row.kind, JobKind::Group { project: Some(current), .. } if *current == project)
-                    {
+                    if row.project != Some(project) {
                         return self.reject(Violation::InvalidValue(
                             "project",
                             "conversation belongs to another project",
                         ));
                     }
                 }
-                if !row.kind.is_group()
-                    || row.is_chunk_group()
+                if row.is_chunk_group()
                     || row.is_standalone_decision_group()
                     || self.require_job_state(parent)?.outcome.is_some()
-                    || self.job_control(parent)?.closing.is_some()
+                    || self.job_lifecycle(parent)?.closing.is_some()
                 {
                     return self.reject(Violation::InvalidValue(
                         "conversation",
@@ -1268,6 +1310,7 @@ impl Batch {
             id,
             parent_id,
             previous,
+            retry: None,
             composer_context: context,
             created_at: self.now,
             submitted_at: None,
@@ -1278,14 +1321,14 @@ impl Batch {
             summary_source: None,
             frozen: None,
         };
-        self.insert(JOBS, id.get(), encode_mutable_job(&job).as_slice())?;
+        self.store_mutable_job(&job)?;
         self.put_mutable_job_state(id, &JobState::new(id))?;
         if by_user {
-            let mut control = self.job_control(parent_id)?;
-            if !control.user_input || control.loop_count != 0 {
-                control.user_input = true;
-                control.loop_count = 0;
-                self.put_job_control(parent_id, &control)?;
+            let mut lifecycle = self.job_lifecycle(parent_id)?;
+            if !lifecycle.user_input || lifecycle.loop_count != 0 {
+                lifecycle.user_input = true;
+                lifecycle.loop_count = 0;
+                self.put_job_lifecycle(parent_id, &lifecycle)?;
             }
         }
         self.insert(DRAFT_CONTEXTS, context.get(), id.get())?;
@@ -1334,6 +1377,17 @@ impl Batch {
                 "Job has an allocation that has not been safely revoked",
             ));
         }
+        if job.retry.is_some()
+            && !matches!(
+                input.content,
+                crate::db::entities::MutableJobContent::Generative { .. }
+            )
+        {
+            return self.reject(Violation::InvalidValue(
+                "input",
+                "a retry must remain a Generative Job",
+            ));
+        }
         self.validate_mutable_input(&input)?;
         let next_context = context_selection.unwrap_or(job.context_selection);
         if !self.mutable_context_valid(&job, next_context)? {
@@ -1366,9 +1420,7 @@ impl Batch {
                 ));
             }
             let parent = self.require_mutable_conversation(job.parent_id)?;
-            let JobKind::Group { agent, .. } = parent.kind else {
-                return self.corrupted("mutable Job parent is not a conversation".to_owned());
-            };
+            let agent = parent.agent;
             let compatible = match &input.content {
                 crate::db::entities::MutableJobContent::Generative { configuration, .. } => {
                     configuration.and_then(|config| config.agent_profile.map(Into::into)) == agent
@@ -1451,11 +1503,7 @@ impl Batch {
                 if let Some(key) = keys.first() {
                     ready.remove(*key)?;
                     ready.insert(new_key, ())?;
-                } else if tx
-                    .open_table(UNSETTLED)?
-                    .get(id.get())?
-                    .is_some_and(|v| v.value().0 > 0)
-                {
+                } else if state::pending(tx, id)?.is_some_and(|counts| counts.0 > 0) {
                     // Waiting on dependencies; it will enter MUTABLE_READY when dependencies settle.
                 } else {
                     return Err(StorageError::corrupted(
@@ -1468,7 +1516,7 @@ impl Batch {
         job.input = input;
         job.context_selection = next_context;
         job.revision = next;
-        self.insert(JOBS, id.get(), encode_mutable_job(&job).as_slice())?;
+        self.store_mutable_job(&job)?;
         Ok(job)
     }
 
@@ -1602,13 +1650,12 @@ impl Batch {
                 ready.remove(*key)?;
             }
             tx.open_table(PENDING)?.remove(id.get())?;
-            let mut unsettled = tx.open_table(UNSETTLED)?;
-            if !matches!(unsettled.get(id.get())?.map(|v| v.value()), Some((_, 0))) {
+            if !matches!(state::pending(tx, id)?, Some((_, 0))) {
                 return Err(StorageError::corrupted(
                     "queued Job has unsettled dependents",
                 ));
             }
-            unsettled.remove(id.get())?;
+            state::set_pending(tx, id, None)?;
             Ok(())
         })?;
         self.adjust_open_children(job.parent_id, -1)?;
@@ -1633,6 +1680,10 @@ impl Batch {
         create_state: bool,
     ) -> Result<(), BatchError> {
         let submitted_micros = job.submitted_at.unwrap_or(self.now).as_unix_micros();
+        self.store_mutable_job(job)?;
+        if create_state {
+            self.put_job_state(job.id, &JobState::new(job.id))?;
+        }
         self.step(|tx| {
             if !planning_wait {
                 tx.open_table(MUTABLE_READY)?.insert(
@@ -1650,18 +1701,13 @@ impl Batch {
                 .insert((job.parent_id.get(), job.id.get()), ())?;
             tx.open_table(CHILDREN)?
                 .insert((job.parent_id.get(), job.id.get()), ())?;
-            tx.open_table(UNSETTLED)?
-                .insert(job.id.get(), (u32::from(planning_wait), 0))?;
+            state::set_pending(tx, job.id, Some((u32::from(planning_wait), 0)))?;
             if let Some(previous) = job.previous {
                 tx.open_table(SUCCESSORS)?.insert(previous.get(), ())?;
             }
             Ok(())
         })?;
         self.adjust_open_children(job.parent_id, 1)?;
-        self.insert(JOBS, job.id.get(), encode_mutable_job(job).as_slice())?;
-        if create_state {
-            self.put_job_state(job.id, &JobState::new(job.id))?;
-        }
         Ok(())
     }
 
@@ -1710,10 +1756,9 @@ impl Batch {
             ));
         }
         let mut parent = self.require_mutable_conversation(job.parent_id)?;
-        if !parent.kind.is_group()
-            || parent.is_chunk_group()
+        if parent.is_chunk_group()
             || self.require_job_state(job.parent_id)?.outcome.is_some()
-            || self.job_control(job.parent_id)?.closing.is_some()
+            || self.job_lifecycle(job.parent_id)?.closing.is_some()
         {
             return self.reject(Violation::InvalidValue(
                 "conversation",
@@ -1735,20 +1780,13 @@ impl Batch {
         }
         let frozen = self.mutable_execution(&job.input)?;
         job.frozen = Some(self.storable_frozen(&frozen)?);
-        let JobKind::Group { agent, .. } = &mut parent.kind else {
-            return self.corrupted("mutable Job parent is not a conversation".to_owned());
-        };
         match &frozen {
             FrozenConfiguration::Generative(frozen) => {
                 let selected = frozen.agent_ref.map(|reference| reference.id);
-                if job.previous.is_none() && agent.is_none() {
-                    *agent = selected;
-                    self.insert(
-                        JOBS,
-                        parent.id.get(),
-                        parent.encode_mutable_conversation().as_slice(),
-                    )?;
-                } else if *agent != selected {
+                if job.previous.is_none() && parent.agent.is_none() {
+                    parent.agent = selected;
+                    self.insert(CONVERSATIONS, parent.id.get(), parent.encode().as_slice())?;
+                } else if parent.agent != selected {
                     return self.reject(Violation::InvalidValue(
                         "conversation",
                         "Agent differs from the conversation",
@@ -1756,7 +1794,9 @@ impl Batch {
                 }
             }
             FrozenConfiguration::Decision(frozen) => {
-                if agent.is_some() && frozen.agent_ref().map(|reference| reference.id) != *agent {
+                if parent.agent.is_some()
+                    && frozen.agent_ref().map(|reference| reference.id) != parent.agent
+                {
                     return self.reject(Violation::InvalidValue(
                         "conversation",
                         "Agent differs from the conversation",
@@ -1786,7 +1826,6 @@ impl Batch {
 
     pub(crate) fn submit_native_decision(
         &mut self,
-        parent: Option<JobId>,
         spec: JobGroup,
         configuration: ExecutionConfiguration,
         request: crate::db::entities::DecisionRequest,
@@ -1857,35 +1896,27 @@ impl Batch {
         let conversation_row = JobSpec {
             id: conversation_id,
             created_at: self.now,
-            parent_id: parent,
-            allocation: None,
-            kind: JobKind::Group {
-                agent: spec.agent,
-                project: spec.project,
-                origin: spec.origin,
-                keep_open: spec.keep_open,
-            },
+            parent_id: None,
+            agent: spec.agent,
+            project: spec.project,
+            origin: spec.origin,
+            keep_open: spec.keep_open,
         };
         self.insert(
-            JOBS,
+            CONVERSATIONS,
             conversation_id.get(),
-            conversation_row.encode_mutable_conversation().as_slice(),
+            conversation_row.encode().as_slice(),
         )?;
         self.put_job_state(conversation_id, &JobState::new(conversation_id))?;
-        self.put_job_control(
+        self.put_job_lifecycle(
             conversation_id,
-            &JobControl {
+            &JobLifecycle {
                 title: spec.name,
-                ..JobControl::default()
+                ..JobLifecycle::default()
             },
         )?;
-        self.insert(CONVERSATIONS, conversation_id.get(), ())?;
-        self.insert(UNSETTLED, conversation_id.get(), (0, 0))?;
-        self.insert(
-            CHILDREN,
-            (parent.map_or(0, JobId::get), conversation_id.get()),
-            (),
-        )?;
+        self.step(|tx| state::set_pending(tx, conversation_id, Some((0, 0))))?;
+        self.insert(CHILDREN, (0, conversation_id.get()), ())?;
 
         let job_id = JobId::new(self.next_id()?);
         let profile = frozen.profile_ref().id;
@@ -1902,6 +1933,7 @@ impl Batch {
             id: job_id,
             parent_id: conversation_id,
             previous: None,
+            retry: None,
             composer_context: ComposerContextId::new(self.next_id()?),
             created_at: submitted,
             submitted_at: Some(submitted),
@@ -1968,7 +2000,7 @@ impl Batch {
                 "invalid Pool configuration",
             ));
         }
-        let existing = self.step(|tx| Ok(tx.open_table(CONFIGS)?.get(pool.id.get())?.is_some()))?;
+        let existing = self.resource_identity_exists(pool.id.get())?;
         if existing {
             return self.reject(Violation::InvalidValue(
                 "pool",
@@ -1977,7 +2009,7 @@ impl Batch {
         }
         self.observe_configuration_id(pool.id.get())?;
         self.insert(
-            CONFIGS,
+            POOLS,
             pool.id.get(),
             encode_allocation_pool(&pool).as_slice(),
         )?;
@@ -2011,26 +2043,13 @@ impl Batch {
                 "invalid Executor configuration",
             ));
         }
-        let pool = self
-            .get(CONFIGS, executor.pool.get(), |bytes| match bytes.first() {
-                Some(&TAG_ALLOCATION_POOL) => {
-                    decode_allocation_pool(executor.pool.get(), bytes).map(Some)
-                }
-                Some(&TAG_ALLOCATION_EXECUTOR) => {
-                    decode_allocation_executor(executor.pool.get(), bytes)?;
-                    Ok(None)
-                }
-                _ => {
-                    ConfigRow::decode_at(executor.pool.get(), bytes)?;
-                    Ok(None)
-                }
-            })?
-            .flatten();
+        let pool = self.get(POOLS, executor.pool.get(), |bytes| {
+            decode_allocation_pool(executor.pool.get(), bytes)
+        })?;
         if pool.is_none_or(|pool| pool.archived) {
             return self.reject(Violation::InvalidValue("executor", "Pool does not exist"));
         }
-        let existing =
-            self.step(|tx| Ok(tx.open_table(CONFIGS)?.get(executor.id.get())?.is_some()))?;
+        let existing = self.resource_identity_exists(executor.id.get())?;
         if existing {
             return self.reject(Violation::InvalidValue(
                 "executor",
@@ -2039,13 +2058,22 @@ impl Batch {
         }
         self.observe_configuration_id(executor.id.get())?;
         self.insert(
-            CONFIGS,
+            EXECUTORS,
             executor.id.get(),
             encode_allocation_executor(&executor).as_slice(),
         )?;
+        self.insert(POOL_EXECUTORS, (executor.pool.get(), executor.id.get()), ())?;
         self.resource_deltas
             .push(NativeResourceDelta::Executor(executor));
         Ok(())
+    }
+
+    fn resource_identity_exists(&mut self, id: u128) -> Result<bool, BatchError> {
+        self.step(|tx| {
+            Ok(tx.open_table(POOLS)?.get(id)?.is_some()
+                || tx.open_table(EXECUTORS)?.get(id)?.is_some()
+                || tx.open_table(CONFIGS)?.get(id)?.is_some())
+        })
     }
 
     fn observe_configuration_id(&mut self, id: u128) -> Result<(), BatchError> {
@@ -2072,15 +2100,8 @@ impl Batch {
         ) -> Result<(), BatchError>,
     ) -> Result<crate::db::entities::AllocationPool, BatchError> {
         self.require_allocation_durability()?;
-        let Some(mut pool) = self.step(|tx| {
-            let configs = tx.open_table(CONFIGS)?;
-            let Some(bytes) = configs.get(id.get())? else {
-                return Ok(None);
-            };
-            Ok(match decode_native_config_row(id.get(), bytes.value())? {
-                NativeConfigRow::Pool(pool) => Some(pool),
-                NativeConfigRow::Executor(_) | NativeConfigRow::Other => None,
-            })
+        let Some(mut pool) = self.get(POOLS, id.get(), |bytes| {
+            decode_allocation_pool(id.get(), bytes)
         })?
         else {
             return self.reject(Violation::NotFound(RecordRef::ExecutionPool(id)));
@@ -2098,7 +2119,7 @@ impl Batch {
             .ok_or(BatchError(Failure::Rejected(Violation::ValueOutOfRange(
                 "revision",
             ))))?;
-        self.insert(CONFIGS, id.get(), encode_allocation_pool(&pool).as_slice())?;
+        self.insert(POOLS, id.get(), encode_allocation_pool(&pool).as_slice())?;
         self.resource_deltas
             .push(NativeResourceDelta::Pool(pool.clone()));
         Ok(pool)
@@ -2156,7 +2177,7 @@ impl Batch {
                     "revision",
                 ))))?;
         self.insert(
-            CONFIGS,
+            EXECUTORS,
             id.get(),
             encode_allocation_executor(&executor).as_slice(),
         )?;
@@ -2220,18 +2241,9 @@ impl Batch {
         &mut self,
         id: ExecutorId,
     ) -> Result<Option<crate::db::entities::AllocationExecutor>, BatchError> {
-        let existing = self.get(CONFIGS, id.get(), |bytes| match bytes.first() {
-            Some(&TAG_ALLOCATION_EXECUTOR) => decode_allocation_executor(id.get(), bytes).map(Some),
-            Some(&TAG_ALLOCATION_POOL) => {
-                decode_allocation_pool(id.get(), bytes)?;
-                Ok(None)
-            }
-            _ => {
-                ConfigRow::decode_at(id.get(), bytes)?;
-                Ok(None)
-            }
-        })?;
-        Ok(existing.flatten())
+        self.get(EXECUTORS, id.get(), |bytes| {
+            decode_allocation_executor(id.get(), bytes)
+        })
     }
 
     pub(crate) fn archive_native_executor(
@@ -2310,23 +2322,30 @@ impl Batch {
                     ));
                 }
                 let has_unarchived_executor = batch.step(|tx| {
-                    let configs = tx.open_table(CONFIGS)?;
-                    for (examined, entry) in configs.iter()?.enumerate() {
-                        if examined == POOL_ARCHIVE_SCAN_LIMIT {
-                            return Ok(Some("child Executor verification exceeds the scan bound"));
+                    let executors = tx.open_table(EXECUTORS)?;
+                    let members = tx.open_table(POOL_EXECUTORS)?;
+                    for entry in members.range((pool_key, 0)..=(pool_key, u128::MAX))? {
+                        let (_, executor_id) = entry?.0.value();
+                        let value = executors.get(executor_id)?.ok_or_else(|| {
+                            StorageError::corrupted("Pool membership references a missing Executor")
+                        })?;
+                        let executor = decode_allocation_executor(executor_id, value.value())?;
+                        if executor.pool.get() != pool_key {
+                            return Err(StorageError::corrupted(
+                                "Pool membership names another Pool",
+                            ));
                         }
-                        let (key, value) = entry?;
-                        if matches!(
-                            decode_native_config_row(key.value(), value.value())?,
-                            NativeConfigRow::Executor(e) if e.pool.get() == pool_key && !e.archived
-                        ) {
-                            return Ok(Some("has an unarchived Executor"));
+                        if !executor.archived {
+                            return Ok(true);
                         }
                     }
-                    Ok(None)
+                    Ok(false)
                 })?;
-                if let Some(reason) = has_unarchived_executor {
-                    return batch.reject(Violation::InvalidValue("pool", reason));
+                if has_unarchived_executor {
+                    return batch.reject(Violation::InvalidValue(
+                        "pool",
+                        "has an unarchived Executor",
+                    ));
                 }
                 pool.archived = true;
                 pool.enabled = false;
@@ -2355,33 +2374,23 @@ impl Batch {
         protocol: Option<LlmTransport>,
     ) -> Result<bool, BatchError> {
         self.step(|tx| {
-            let configs = tx.open_table(CONFIGS)?;
-            let mut available = false;
-            for entry in configs.iter()? {
+            let pools = tx.open_table(POOLS)?;
+            let executors = tx.open_table(EXECUTORS)?;
+            for entry in executors.iter()? {
                 let (key, value) = entry?;
-                match value.value().first() {
-                    Some(&TAG_ALLOCATION_EXECUTOR) => {
-                        let executor = decode_allocation_executor(key.value(), value.value())?;
-                        let pool_bytes = configs.get(executor.pool.get())?.ok_or_else(|| {
-                            StorageError::corrupted("Executor references a missing Pool")
-                        })?;
-                        let pool = decode_allocation_pool(executor.pool.get(), pool_bytes.value())?;
-                        if !pool.archived
-                            && !executor.archived
-                            && executor.capabilities.contains(&(operation, protocol))
-                        {
-                            available = true;
-                        }
-                    }
-                    Some(&TAG_ALLOCATION_POOL) => {
-                        decode_allocation_pool(key.value(), value.value())?;
-                    }
-                    _ => {
-                        ConfigRow::decode_at(key.value(), value.value())?;
-                    }
+                let executor = decode_allocation_executor(key.value(), value.value())?;
+                let pool_bytes = pools
+                    .get(executor.pool.get())?
+                    .ok_or_else(|| StorageError::corrupted("Executor references a missing Pool"))?;
+                let pool = decode_allocation_pool(executor.pool.get(), pool_bytes.value())?;
+                if !pool.archived
+                    && !executor.archived
+                    && executor.capabilities.contains(&(operation, protocol))
+                {
+                    return Ok(true);
                 }
             }
-            Ok(available)
+            Ok(false)
         })
     }
 
@@ -2427,13 +2436,13 @@ impl Batch {
         let pool_id = request.pool;
         let executor_id = request.executor;
         let after = request.after;
-        let Some(pool) = self.get(CONFIGS, pool_id.get(), |bytes| {
+        let Some(pool) = self.get(POOLS, pool_id.get(), |bytes| {
             decode_allocation_pool(pool_id.get(), bytes)
         })?
         else {
             return self.reject(Violation::InvalidValue("pool", "Pool does not exist"));
         };
-        let Some(executor) = self.get(CONFIGS, executor_id.get(), |bytes| {
+        let Some(executor) = self.get(EXECUTORS, executor_id.get(), |bytes| {
             decode_allocation_executor(executor_id.get(), bytes)
         })?
         else {
@@ -2505,7 +2514,7 @@ impl Batch {
                     .get(POOL_ALLOCATIONS, id.get(), |bytes| {
                         decode_pool_allocation(id.get(), bytes)
                     })?
-                    .is_some()
+                    .is_some_and(|allocation| allocation.holds_capacity())
             {
                 return self.corrupted("invalid mutable ready entry".to_owned());
             }
@@ -2514,7 +2523,9 @@ impl Batch {
             {
                 continue;
             }
-            if job.context_selection == crate::db::entities::MutableContextSelection::FullHistory
+            if self.pool_allocation(id)?.is_none()
+                && job.context_selection
+                    == crate::db::entities::MutableContextSelection::FullHistory
                 && job.previous.is_some()
                 && let Some((producer, source)) = self.latest_verified_summary(job.parent_id, id)?
             {
@@ -2537,9 +2548,6 @@ impl Batch {
                         "execution_context",
                         "Generative Jobs cannot follow Decision history",
                     )))) => {
-                        if !matches!(selection, ReadySelection::Scheduled { .. }) {
-                            self.remove(MUTABLE_READY, *key)?;
-                        }
                         continue;
                     }
                     Err(BatchError(Failure::Rejected(_))) => continue,
@@ -2557,12 +2565,7 @@ impl Batch {
             {
                 continue;
             }
-            if self.step(|tx| {
-                Ok(tx
-                    .open_table(UNSETTLED)?
-                    .get(id.get())?
-                    .is_some_and(|counts| counts.value().0 > 0))
-            })? {
+            if self.step(|tx| Ok(state::pending(tx, id)?.is_some_and(|counts| counts.0 > 0)))? {
                 continue;
             }
             let mut attachments_available = true;
@@ -2718,6 +2721,25 @@ impl Batch {
                 "Executor or Pool capacity is unavailable",
             ));
         }
+        let previous = self.pool_allocation(row.id)?;
+        let snapshot = self
+            .step(|tx| execution::replay_job(tx, row.id, None))?
+            .ok_or_else(|| {
+                BatchError(Failure::Storage(StorageError::corrupted(
+                    "ready Job has no execution history",
+                )))
+            })?;
+        if snapshot.outcome.is_some()
+            || snapshot.phase != Some(MutableJobPhase::Queued)
+            || snapshot.input_revision != Some(row.revision)
+            || !snapshot.dependencies.is_empty()
+            || snapshot.allocation != previous
+            || previous.is_some()
+        {
+            return self
+                .corrupted("ready Job disagrees with authoritative execution history".to_owned());
+        }
+        let generation = std::num::NonZeroU32::MIN;
         let allocation = PoolAllocation {
             request_id: request.id,
             request_after: request.after,
@@ -2725,7 +2747,7 @@ impl Batch {
                 job: row.id,
                 pool: pool.id,
                 executor: executor.id,
-                generation: std::num::NonZeroU32::MIN,
+                generation,
                 epoch: self.epoch,
             },
             job_revision: row.revision,
@@ -2741,7 +2763,7 @@ impl Batch {
             stop_confirmed_at: None,
             stop_proof: None,
         };
-        self.put_pool_allocation(&allocation, None)?;
+        self.put_pool_allocation(&allocation, previous.as_ref())?;
         self.step(|tx| {
             tx.open_table(MUTABLE_READY)?.remove(ready_key)?;
             tx.open_table(PENDING)?.remove(row.id.get())?;
@@ -2806,14 +2828,14 @@ impl Batch {
         candidate: &reader::DevelopmentCandidate,
     ) -> Result<(), BatchError> {
         use crate::db::entities::{AllocationPhase, MutableJobPhase};
-        let (allocation, job, pool, executor, conversation, control, project) = match candidate {
+        let (allocation, job, pool, executor, conversation, lifecycle, project) = match candidate {
             reader::DevelopmentCandidate::Generative(context) => (
                 &context.allocation,
                 &context.job,
                 &context.pool,
                 &context.executor,
                 &context.conversation,
-                &context.conversation_control,
+                &context.conversation_lifecycle,
                 &context.project,
             ),
             reader::DevelopmentCandidate::Decision(context) => (
@@ -2822,7 +2844,7 @@ impl Batch {
                 &context.pool,
                 &context.executor,
                 &context.conversation,
-                &context.conversation_control,
+                &context.conversation_lifecycle,
                 &context.project,
             ),
         };
@@ -2862,15 +2884,13 @@ impl Batch {
             || job.phase != MutableJobPhase::Queued
             || job.revision != allocation.job_revision
             || state.outcome.is_some()
-            || state.stop_confirmed_at.is_some()
-            || state.stop_confirmed_by.is_some()
         {
             return Err(stale());
         }
-        let current_pool = self.get(CONFIGS, token.pool.get(), |bytes| {
+        let current_pool = self.get(POOLS, token.pool.get(), |bytes| {
             decode_allocation_pool(token.pool.get(), bytes)
         })?;
-        let current_executor = self.get(CONFIGS, token.executor.get(), |bytes| {
+        let current_executor = self.get(EXECUTORS, token.executor.get(), |bytes| {
             decode_allocation_executor(token.executor.get(), bytes)
         })?;
         if current_pool.as_ref().is_none_or(|current| {
@@ -2920,7 +2940,7 @@ impl Batch {
             return Err(stale());
         }
         if self.require_mutable_conversation(job.parent_id)? != *conversation
-            || self.job_control(job.parent_id)? != *control
+            || self.job_lifecycle(job.parent_id)? != *lifecycle
         {
             return Err(stale());
         }
@@ -2993,7 +3013,7 @@ impl Batch {
                     let current = self.step(|tx| {
                         match reader::verify_native_summary_tables(
                             &tx.open_table(JOBS)?,
-                            &tx.open_table(JOB_STATES)?,
+                            &tx.open_table(JOB_RUNTIME)?,
                             &tx.open_table(JOB_OUTPUTS)?,
                             &tx.open_table(MESSAGES)?,
                             job.parent_id,
@@ -3220,7 +3240,7 @@ impl Batch {
         job.phase = MutableJobPhase::Executing;
         allocation.phase = AllocationPhase::Running;
         allocation.started_at = Some(self.now);
-        self.insert(JOBS, job.id.get(), encode_mutable_job(&job).as_slice())?;
+        self.store_mutable_job(&job)?;
         let previous = self.allocation_for_token(allocation.token)?;
         self.put_pool_allocation(&allocation, Some(&previous))?;
         self.probe = Some(Probe::MutableJobStarted(allocation.token, job.revision));
@@ -3277,9 +3297,7 @@ impl Batch {
                 )
             )
             || state.outcome.is_some()
-            || state.stop_confirmed_at.is_some()
-            || state.stop_confirmed_by.is_some()
-            || (self.job_control(job.parent_id)?.closing.is_some()
+            || (self.job_lifecycle(job.parent_id)?.closing.is_some()
                 && allocation.phase != AllocationPhase::StopRequested)
         {
             return self.reject(rejected());
@@ -3382,7 +3400,7 @@ impl Batch {
         expected_seq: u32,
         finalization: crate::db::entities::JobFinalization,
         rejection: Option<crate::db::entities::AvailabilityStat>,
-    ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
+    ) -> Result<AppendedOutput, BatchError> {
         use crate::db::entities::JobFinalization;
         self.require_development_write_any(proof)?;
         match (&finalization, rejection) {
@@ -3438,13 +3456,14 @@ impl Batch {
             }
         };
         self.require_development_write_for(proof, operation)?;
+        let first_request = RequestNumber::FIRST;
         if result
             .validate(
                 &request,
                 &decision_frozen,
                 RequestRef {
                     job: job_id,
-                    request: RequestNumber::FIRST,
+                    request: first_request,
                 },
             )
             .is_err()
@@ -3530,6 +3549,7 @@ impl Batch {
         expected_seq: u32,
         finalization: crate::db::entities::JobFinalization,
     ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
+        self.require_development_write_any(proof)?;
         let (kind, result) = match finalization {
             crate::db::entities::JobFinalization::Completed(result) => {
                 (OutcomeKind::Completed, result)
@@ -3550,13 +3570,62 @@ impl Batch {
             return self.reject(Violation::NotFound(RecordRef::Job(token.job)));
         };
         let valid = self.step(|tx| {
-            if tx
-                .open_table(UNSETTLED)?
-                .get(token.job.get())?
-                .map(|v| v.value())
-                != Some((0, 0))
-            {
+            if state::pending(tx, token.job)? != Some((0, 0)) {
                 return Ok(false);
+            }
+            let mut requests = std::collections::BTreeMap::<u32, (bool, bool)>::new();
+            for entry in tx.open_table(REQUEST_EVENTS)?.range(
+                (token.job.get(), RequestNumber::FIRST.get(), 0)
+                    ..=(token.job.get(), u32::MAX, u32::MAX),
+            )? {
+                let (key, row) = entry?;
+                let (_, request, seq) = key.value();
+                let number = RequestNumber::new(request)
+                    .ok_or_else(|| StorageError::corrupted("zero request identity"))?;
+                let state = requests.entry(request).or_default();
+                match rows::decode_request_event(token.job, number, seq, row.value())?.payload {
+                    crate::db::entities::RequestPayload::Sent { .. } => state.0 = true,
+                    crate::db::entities::RequestPayload::Received { .. } => state.1 = true,
+                    crate::db::entities::RequestPayload::Availability {
+                        status_code,
+                        finish_reason,
+                        raw_finish_reason,
+                        failure,
+                    } => {
+                        let observation = crate::db::entities::AvailabilityObservation {
+                            status_code,
+                            finish_reason,
+                            raw_finish_reason,
+                            failure,
+                        };
+                        state.1 |= matches!(
+                            observation.classification(),
+                            crate::db::entities::AvailabilityClassification::Rejected(_)
+                        );
+                    }
+                    crate::db::entities::RequestPayload::ApprovedCalls => *state = (true, true),
+                    _ => {}
+                }
+            }
+            if requests.values().any(|&(sent, settled)| !sent || !settled) {
+                return Ok(false);
+            }
+            for entry in tx.open_table(TOOL_CALLS)?.range(
+                (token.job.get(), RequestNumber::FIRST.get(), 0)
+                    ..=(token.job.get(), u32::MAX, u32::MAX),
+            )? {
+                let (key, row) = entry?;
+                let call =
+                    rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, row.value())?;
+                if call.admission().is_some()
+                    && call.reconciliation.is_none()
+                    && call
+                        .outcome
+                        .as_ref()
+                        .is_none_or(|outcome| !outcome.fact.is_definite())
+                {
+                    return Ok(false);
+                }
             }
             let mut last = 0u32;
             for entry in tx
@@ -3621,9 +3690,6 @@ impl Batch {
                 let Some(bytes) = jobs.get(child_id.get())? else {
                     continue;
                 };
-                if bytes.value().first() != Some(&TAG_JOB) {
-                    continue;
-                }
                 let child = decode_mutable_job(child_id.get(), bytes.value())?;
                 if let Some(source) = child.summary_source {
                     found.push((child_id, source));
@@ -3638,7 +3704,7 @@ impl Batch {
             let ok = self.step(|tx| {
                 Ok(reader::verify_native_summary_tables(
                     &tx.open_table(JOBS)?,
-                    &tx.open_table(JOB_STATES)?,
+                    &tx.open_table(JOB_RUNTIME)?,
                     &tx.open_table(JOB_OUTPUTS)?,
                     &tx.open_table(MESSAGES)?,
                     conversation,
@@ -3722,7 +3788,7 @@ impl Batch {
         let (summary_blocked, pred_blocked, pred_count) = self.step(|tx| {
             let children = tx.open_table(CHILDREN)?;
             let jobs = tx.open_table(JOBS)?;
-            let states = tx.open_table(JOB_STATES)?;
+            let states = tx.open_table(JOB_RUNTIME)?;
             let mut summary_blocked = false;
             let mut pred_blocked = false;
             let mut pred_count = 0u32;
@@ -3734,12 +3800,10 @@ impl Batch {
                 let Some(row) = jobs.get(child_id)? else {
                     continue;
                 };
-                let Ok(child_job) = decode_mutable_job(child_id, row.value()) else {
-                    continue;
-                };
+                let child_job = decode_mutable_job(child_id, row.value())?;
                 let outcome = states
                     .get(child_id)?
-                    .map(|s| JobState::decode(s.value()))
+                    .map(|s| state::decode_state(child_id, s.value()))
                     .transpose()?
                     .and_then(|s| s.outcome);
                 if child_job.summary_source.is_some() {
@@ -3824,6 +3888,7 @@ impl Batch {
                         id: pred_id,
                         parent_id: conversation,
                         previous: None,
+                        retry: None,
                         composer_context: crate::db::entities::ComposerContextId::new(
                             self.next_id()?,
                         ),
@@ -3868,34 +3933,21 @@ impl Batch {
             result.value,
         )?;
         self.step(|tx| {
-            let mut unsettled = tx.open_table(UNSETTLED)?;
-            if unsettled.remove(token.job.get())?.is_none() {
-                return Err(StorageError::corrupted("native Job unsettled row missing"));
+            let mut child = state::require(tx, token.job)?;
+            if child.pending.take().is_none() {
+                return Err(StorageError::corrupted("native Job pending counts missing"));
             }
-            let (dependencies, children) = unsettled
-                .get(job.parent_id.get())?
-                .map(|v| v.value())
-                .ok_or_else(|| {
-                StorageError::corrupted("native conversation unsettled row missing")
+            state::write(tx, &child)?;
+            let mut parent = state::require(tx, job.parent_id)?;
+            let (dependencies, children) = parent.pending.ok_or_else(|| {
+                StorageError::corrupted("native conversation pending counts missing")
             })?;
             let children = children.checked_sub(1).ok_or_else(|| {
                 StorageError::corrupted("native conversation child count underflow")
             })?;
-            unsettled.insert(job.parent_id.get(), (dependencies, children))?;
-            let mut results = tx.open_table(GROUP_RESULTS)?;
-            let previous = results
-                .get(job.parent_id.get())?
-                .map_or((0, 0), |v| v.value());
-            let answered = if kind == OutcomeKind::Cancelled {
-                previous.0
-            } else {
-                previous.0.max(token.job.get())
-            };
-            results.insert(
-                job.parent_id.get(),
-                (answered, previous.1.max(token.job.get())),
-            )?;
-            Ok(())
+            parent.pending = Some((dependencies, children));
+            parent.record_result(token.job);
+            state::write(tx, &parent)
         })?;
         self.advance_recurrence_on_settlement(job, kind)?;
         self.settle_native_dependents(token.job, kind)?;
@@ -3932,21 +3984,10 @@ impl Batch {
         &mut self,
         job: &crate::db::entities::MutableJob,
     ) -> Result<(), BatchError> {
-        if self.pool_allocation(job.id)?.is_some() {
+        if self.pool_allocation(job.id)?.is_some()
+            || self.require_job_state(job.id)?.outcome.is_some()
+        {
             return Ok(());
-        }
-        if matches!(
-            &job.input.content,
-            crate::db::entities::MutableJobContent::Generative { .. }
-        ) {
-            match self.require_generative_predecessors(job) {
-                Ok(()) => {}
-                Err(BatchError(Failure::Rejected(Violation::InvalidValue(
-                    "execution_context",
-                    "Generative Jobs cannot follow Decision history",
-                )))) => return Ok(()),
-                Err(error) => return Err(error),
-            }
         }
         let submitted = job.submitted_at.ok_or_else(|| {
             BatchError(Failure::Storage(StorageError::corrupted(
@@ -4002,27 +4043,34 @@ impl Batch {
             let Some(waiter_job) = self.mutable_job(waiter_id)? else {
                 continue;
             };
+            let dependency_state = Self::dependency_outcome_kind_state(kind, condition);
+            if dependency_state != DependencyState::Waiting {
+                self.record_execution_event(
+                    waiter_id,
+                    ExecutionEventKind::DependencyResolved {
+                        prerequisite,
+                        state: dependency_state,
+                    },
+                )?;
+            }
             let waiter_state = self.require_job_state(waiter_id)?;
             if waiter_job.phase != MutableJobPhase::Queued || waiter_state.outcome.is_some() {
                 continue;
             }
-            match Self::dependency_outcome_kind_state(kind, condition) {
+            match dependency_state {
                 DependencyState::Waiting => {}
                 DependencyState::Impossible => {
                     self.end_queued_native_job(&waiter_job, OutcomeCause::DependencyImpossible)?;
                 }
                 DependencyState::Satisfied => {
                     let ready_now = self.step(|tx| {
-                        let mut unsettled = tx.open_table(UNSETTLED)?;
-                        let Some((dependencies, children)) =
-                            unsettled.get(waiter_id.get())?.map(|v| v.value())
-                        else {
+                        let Some((dependencies, children)) = state::pending(tx, waiter_id)? else {
                             return Ok(false);
                         };
                         let dependencies = dependencies.checked_sub(1).ok_or_else(|| {
                             StorageError::corrupted("native Job dependency count underflow")
                         })?;
-                        unsettled.insert(waiter_id.get(), (dependencies, children))?;
+                        state::set_pending(tx, waiter_id, Some((dependencies, children)))?;
                         Ok(dependencies == 0 && children == 0)
                     })?;
                     if ready_now {
@@ -4054,17 +4102,12 @@ impl Batch {
         {
             return Ok(None);
         }
-        let JobKind::Group {
-            project: Some(project_id),
-            ref origin,
-            ..
-        } = parent.kind
-        else {
+        let Some(project_id) = parent.project else {
             return Ok(None);
         };
-        if let Origin::Agent { call: opened } = origin
+        if let Origin::Agent { call: opened } = parent.origin
             && self
-                .tool_evidence(*opened)?
+                .tool_evidence(opened)?
                 .is_some_and(|opening| opening.name == "job_plan")
         {
             return Ok(None);
@@ -4147,6 +4190,7 @@ impl Batch {
             id: dec_id,
             parent_id: job.parent_id,
             previous: None,
+            retry: None,
             composer_context: ComposerContextId::new(self.next_id()?),
             created_at: self.now,
             submitted_at: Some(self.now),
@@ -4173,6 +4217,13 @@ impl Batch {
             )?;
             Ok(())
         })?;
+        self.record_execution_event(
+            job.id,
+            ExecutionEventKind::DependencyAdded {
+                prerequisite: dec_id,
+                condition: DependencyCondition::Success,
+            },
+        )?;
         Ok(true)
     }
 
@@ -4203,9 +4254,7 @@ impl Batch {
                 let Some(row) = jobs.get(child_id)? else {
                     continue;
                 };
-                let Ok(child) = decode_mutable_job(child_id, row.value()) else {
-                    continue;
-                };
+                let child = decode_mutable_job(child_id, row.value())?;
                 if let MutableJobContent::Decision { request, .. } = &child.input.content
                     && request.state.get("kind").and_then(|v| v.as_str())
                         == Some("project_planning_decision")
@@ -4304,9 +4353,9 @@ impl Batch {
             return Ok(());
         }
         if kind == OutcomeKind::Completed {
-            let control = self.job_control(job.parent_id)?;
+            let lifecycle = self.job_lifecycle(job.parent_id)?;
             let parent_settled = self.require_job_state(job.parent_id)?.outcome.is_some();
-            if control.closing.is_some() || control.hidden_at.is_some() || parent_settled {
+            if lifecycle.closing.is_some() || lifecycle.hidden_at.is_some() || parent_settled {
                 rec.phase = RecurrencePhase::Halted {
                     reason: RecurrenceHalt::Closed,
                 };
@@ -4371,9 +4420,9 @@ impl Batch {
                 continue;
             }
             let conv = JobId::new(conv_u128);
-            let control = self.job_control(conv)?;
+            let lifecycle = self.job_lifecycle(conv)?;
             let parent_settled = self.require_job_state(conv)?.outcome.is_some();
-            if control.closing.is_some() || control.hidden_at.is_some() || parent_settled {
+            if lifecycle.closing.is_some() || lifecycle.hidden_at.is_some() || parent_settled {
                 rec.phase = RecurrencePhase::Halted {
                     reason: RecurrenceHalt::Closed,
                 };
@@ -4460,9 +4509,9 @@ impl Batch {
         if !matches!(rec.phase, RecurrencePhase::Halted { .. }) {
             return Ok(());
         }
-        let control = self.job_control(conversation)?;
+        let lifecycle = self.job_lifecycle(conversation)?;
         let parent_settled = self.require_job_state(conversation)?.outcome.is_some();
-        if control.closing.is_some() || control.hidden_at.is_some() || parent_settled {
+        if lifecycle.closing.is_some() || lifecycle.hidden_at.is_some() || parent_settled {
             return self.reject(Violation::InvalidValue(
                 "recurrence",
                 "cannot resume a closed recurrence",
@@ -4491,10 +4540,14 @@ impl Batch {
         &mut self,
         token: crate::db::entities::AllocationToken,
         cause: crate::db::entities::UnstartedCause,
-    ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
+    ) -> Result<AppendedOutput, BatchError> {
         let (job, output) = self.end_untouched_reservation(
             token,
-            OutcomeKind::Failed,
+            if cause == crate::db::entities::UnstartedCause::Cancelled {
+                OutcomeKind::Cancelled
+            } else {
+                OutcomeKind::Failed
+            },
             crate::db::entities::FinalResult {
                 summary: Some(cause.summary().to_owned()),
                 code: Some(cause.code().to_owned()),
@@ -4589,9 +4642,9 @@ impl Batch {
                 .get(action.token.job.get())?
                 .is_some_and(|row| row.value() == action.expected_allocation);
             let state = tx
-                .open_table(JOB_STATES)?
+                .open_table(JOB_RUNTIME)?
                 .get(action.token.job.get())?
-                .is_some_and(|row| row.value() == action.expected_state);
+                .is_some_and(|row| row.value() == action.expected_runtime);
             Ok(allocation && state)
         })?;
         if !unchanged {
@@ -4652,9 +4705,9 @@ impl Batch {
     ) -> Result<crate::db::entities::NativeStopRequest, BatchError> {
         use crate::db::entities::{AllocationPhase, NativeStopRequest};
         self.require_allocation_durability()?;
-        if self.mutable_job(job)?.is_none() {
+        let Some(row) = self.mutable_job(job)? else {
             return self.reject(Violation::NotFound(RecordRef::Job(job)));
-        }
+        };
         let ended = Violation::InvalidValue("stop", crate::db::entities::STOP_JOB_ENDED);
         if self.require_job_state(job)?.outcome.is_some() {
             return self.reject(ended);
@@ -4683,10 +4736,19 @@ impl Batch {
             }
             AllocationPhase::Running => {
                 self.transition_pool_allocation(token, AllocationPhase::StopRequested, None)?;
-                self.probe = Some(Probe::PoolAllocation(token));
+                let seq =
+                    self.step(|tx| execution::latest_event_seq(&tx.open_table(JOB_EVENTS)?, job))?;
+                self.probe = Some(Probe::ExecutionEvent(job, seq));
                 Ok(NativeStopRequest::Requested(token))
             }
             AllocationPhase::StopRequested => Ok(NativeStopRequest::AlreadyRequested(token)),
+            AllocationPhase::Released if row.phase == MutableJobPhase::Queued => {
+                self.end_queued_native_job(
+                    &row,
+                    OutcomeCause::Text(STOPPED_BEFORE_START_SUMMARY.to_owned()),
+                )?;
+                Ok(NativeStopRequest::EndedBeforeStart(token))
+            }
             AllocationPhase::Uncertain | AllocationPhase::Released => self.reject(ended),
         }
     }
@@ -4743,12 +4805,7 @@ impl Batch {
         }
         let mut state = self.require_job_state(token.job)?;
         if next == AllocationPhase::Released {
-            if !state.locally_stopped()
-                || state
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-            {
+            if !state.confirmed_terminal() {
                 return self.reject(Violation::InvalidValue(
                     "allocation",
                     "Job has no confirmed outcome",
@@ -4779,23 +4836,28 @@ impl Batch {
     ) -> Result<(), BatchError> {
         let token = allocation.token;
         let active_key = (token.pool.get(), token.executor.get(), token.job.get());
+        let new_reservation = previous.is_none();
         if let Some(previous) = previous
             && (previous.token != token
                 || previous.request_id != allocation.request_id
                 || !previous.holds_capacity())
         {
-            return self
-                .corrupted("Allocation identity changed or Released row rewritten".to_owned());
+            return self.corrupted(
+                "Job Allocation identity changed or a released allocation was rewritten".to_owned(),
+            );
         }
         let outcome = self.step(|tx| {
             let mut allocations = tx.open_table(POOL_ALLOCATIONS)?;
             let mut requests = tx.open_table(ALLOCATION_REQUESTS)?;
             let mut active = tx.open_table(ACTIVE_ALLOCATIONS)?;
-            let stored = allocations.get(token.job.get())?.is_some();
-            if stored != previous.is_some() {
+            let stored = allocations
+                .get(token.job.get())?
+                .map(|row| decode_pool_allocation(token.job.get(), row.value()))
+                .transpose()?;
+            if stored.as_ref() != previous {
                 return Ok(Some("Allocation presence disagrees with the writer's view"));
             }
-            if previous.is_none() {
+            if new_reservation {
                 if requests
                     .insert(allocation.request_id.get(), token.job.get())?
                     .is_some()
@@ -4809,20 +4871,20 @@ impl Batch {
                 return Ok(Some("reservation request index is missing or wrong"));
             }
             let indexed = active.get(active_key)?.is_some();
-            match (previous.is_some(), allocation.holds_capacity()) {
-                (false, true) => {
+            match (new_reservation, allocation.holds_capacity()) {
+                (true, true) => {
                     if indexed {
                         return Ok(Some("active Allocation index already has this Job"));
                     }
                     active.insert(active_key, ())?;
                 }
-                (false, false) => return Ok(Some("a new Allocation cannot be Released")),
-                (true, true) => {
+                (true, false) => return Ok(Some("a new Allocation cannot be Released")),
+                (false, true) => {
                     if !indexed {
                         return Ok(Some("active Allocation index is missing a holding row"));
                     }
                 }
-                (true, false) => {
+                (false, false) => {
                     if !indexed {
                         return Ok(Some("active Allocation index is missing a holding row"));
                     }
@@ -4837,7 +4899,10 @@ impl Batch {
         })?;
         match outcome {
             Some(detail) => self.corrupted(detail.to_owned()),
-            None => Ok(()),
+            None => {
+                self.record_allocation_transition(previous, allocation)?;
+                Ok(())
+            }
         }
     }
 }
@@ -4950,8 +5015,7 @@ impl Batch {
         delta: i64,
     ) -> Result<(), BatchError> {
         self.step(|tx| {
-            let mut unsettled = tx.open_table(UNSETTLED)?;
-            let counts = unsettled.get(job.get())?.map(|counts| counts.value());
+            let counts = state::pending(tx, job)?;
             let Some((dependencies, children)) = counts else {
                 return Ok(());
             };
@@ -4963,7 +5027,7 @@ impl Batch {
                         "{job} has {children} open children, which cannot change by {delta}"
                     ))
                 })?;
-            unsettled.insert(job.get(), (dependencies, children))?;
+            state::set_pending(tx, job, Some((dependencies, children)))?;
             Ok(())
         })
     }
@@ -4998,7 +5062,7 @@ impl Batch {
                     "no matching approval in this conversation",
                 ));
             };
-            if self.job_control(conversation)?.closing.is_some() {
+            if self.job_lifecycle(conversation)?.closing.is_some() {
                 return self.reject(Violation::InvalidValue(
                     "conversation_closing",
                     "approved calls cannot run while closing",
@@ -5152,6 +5216,13 @@ impl Batch {
             }
             Ok(())
         })?;
+        self.record_execution_event(
+            call.job,
+            ExecutionEventKind::ToolRecorded {
+                call,
+                completed: false,
+            },
+        )?;
         if let Some(original) = approval
             && let Some(conversation) = conversation
         {
@@ -5168,7 +5239,7 @@ impl Batch {
             ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_)
         ) && let Some(conversation) = conversation
         {
-            if let Some(closing) = self.job_control(conversation)?.closing {
+            if let Some(closing) = self.job_lifecycle(conversation)?.closing {
                 self.put_approval(call, ApprovalDecision::Voided, closing.by)?;
             } else {
                 self.insert(OPEN_APPROVALS, approvals::open_key(conversation, call), 0)?;
@@ -5236,6 +5307,13 @@ impl Batch {
             at: self.now,
         });
         self.put_tool_evidence(&record)?;
+        self.record_execution_event(
+            call.job,
+            ExecutionEventKind::ToolRecorded {
+                call,
+                completed: true,
+            },
+        )?;
         self.insert(TOOL_STATS, record.name.as_str(), updated_stats)?;
         self.probe = Some(Probe::ToolOutcome(call));
         Ok(())
@@ -5431,7 +5509,7 @@ impl Batch {
         &mut self,
         frozen: &FrozenExecutionConfig,
     ) -> Result<ScheduledPolicyMatch, BatchError> {
-        if !ExecutionControl::ScheduledExternalTransport.is_enabled() {
+        if !ExecutionFeature::ScheduledExternalTransport.is_enabled() {
             return Ok(ScheduledPolicyMatch::None);
         }
         let candidates = self.step(|tx| {
@@ -5465,10 +5543,10 @@ impl Batch {
         let Some(binding) = self.scheduled_external_binding_by_job(job)? else {
             return Ok(None);
         };
-        if !ExecutionControl::ScheduledExternalTransport.is_enabled() {
+        if !ExecutionFeature::ScheduledExternalTransport.is_enabled() {
             return self.reject(Violation::InvalidValue(
                 "scheduled_external_policy",
-                "the scheduled external transport control is disabled",
+                "the scheduled external transport feature is disabled",
             ));
         }
         let Some(record) = self.scheduled_external_policy_by_id(binding.policy)? else {

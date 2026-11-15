@@ -16,18 +16,18 @@ use crate::db::{
     ScheduledReservation, SchedulerWakeSubscription,
 };
 use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
-use crate::system::execution_controls::ExecutionControl;
-use crate::system::executor::blocking::Permit;
+use crate::system::execution_features::ExecutionFeature;
 use crate::system::executor::execution_runtime::{
     EndpointPolicy, WorkspaceTools, supervise_development_decision,
     supervise_development_generative,
 };
 use crate::system::executor::native_tools::NativeTooling;
 use crate::system::external_approval::MAX_TIMEOUT_CEILING;
-use crate::system::scheduler::{ClaimScope, DispatchBatch, Scheduler};
+use crate::system::scheduler::{ClaimScope, Scheduler};
 
 const EXECUTOR_PAGE: usize = 100;
 const MAX_EXECUTOR_PAGES: usize = 16;
+const MAX_DISPATCHES: usize = 16;
 const MAX_READY_PAGES: usize = 8;
 const HEAD_PAGES: usize = 2;
 const DISPATCH_TIMEOUT: Duration = MAX_TIMEOUT_CEILING;
@@ -44,7 +44,7 @@ pub(crate) struct SchedulingAuthority(());
 impl SchedulingAuthority {
     pub(crate) fn host_autonomous(database: &DatabaseHandle, scope: ClaimScope) -> Option<Self> {
         (scope == ClaimScope::Stored
-            && ExecutionControl::AutonomousScheduling.is_enabled()
+            && ExecutionFeature::AutonomousScheduling.is_enabled()
             && database.status() == crate::db::DatabaseStatus::Open)
             .then_some(Self(()))
     }
@@ -62,7 +62,7 @@ pub(crate) const NOT_ASSESSED: [&str; 7] = [
     "predecessor_settlement",
     "attachment_availability",
     "executor_capacity",
-    "autonomous_scheduling_control_compiled",
+    "autonomous_scheduling_enabled",
     "host_armed_activation",
     "reservation_and_writer_admission",
 ];
@@ -117,7 +117,7 @@ pub(crate) fn loopback_eligibility(
     let Some(endpoint) = endpoint else {
         return none("endpoint_missing", "the frozen Provider has no endpoint");
     };
-    if ExecutionControl::ExternalProviderTransport.is_enabled() {
+    if ExecutionFeature::ExternalProviderTransport.is_enabled() {
         return none(
             "external_transport_enabled",
             "this build enables external Provider transport, under which the loopback dispatch admits no endpoint",
@@ -171,7 +171,7 @@ fn scheduled_policy(frozen: &FrozenExecutionConfig) -> bool {
         .endpoint
         .as_deref()
         .is_some_and(crate::system::http::direct_diagnostic_loopback)
-        || ExecutionControl::ScheduledExternalTransport.is_enabled()
+        || ExecutionFeature::ScheduledExternalTransport.is_enabled()
 }
 
 fn scheduled_decision_policy(native: &NativeDecisionConfig) -> bool {
@@ -270,16 +270,10 @@ pub(crate) async fn run_with(
         workspace_tools,
     ));
     Scheduler::new(&database, wake, shutdown)
-        .run(
-            |database_changed| {
-                let scheduler = scheduler.clone();
-                async move { scheduler.claim(database_changed).await }
-            },
-            |allocation| {
-                let scheduler = scheduler.clone();
-                async move { scheduler.spawn(allocation) }
-            },
-        )
+        .run(|database_changed| {
+            let scheduler = scheduler.clone();
+            async move { scheduler.dispatch(database_changed).await }
+        })
         .await;
     scheduler.drain().await;
     log::info!("native scheduler stopped");
@@ -332,13 +326,12 @@ pub(crate) struct NativeScheduler {
     _authority: SchedulingAuthority,
     shutdown: CancellationToken,
     stops: NativeStops,
-    // A scan may skip Jobs that another capability set or a file permit admits.
-    // Two capability bits and one permit bit bound the independent cursors.
+    // A scan may skip Jobs that another capability set or workspace access admits.
+    // Two capability bits and one workspace bit bound the independent cursors.
     resume: Cell<[Option<DevelopmentReadyCursor>; 8]>,
     // A changed queue may make a Job eligible in a previously scanned segment.
     rescan: Cell<u8>,
     discovery: Cell<Discovery>,
-    turns: Cell<u64>,
     workspace_tools: Option<crate::system::executor::execution_runtime::WorkspaceTools>,
     running: RefCell<Vec<ntex::rt::JoinHandle<Dispatched>>>,
     halted: Rc<Cell<bool>>,
@@ -361,7 +354,6 @@ impl NativeScheduler {
             resume: Cell::new([None; 8]),
             rescan: Cell::new(0),
             discovery: Cell::new(Discovery::default()),
-            turns: Cell::new(0),
             running: RefCell::new(Vec::new()),
             halted: Rc::new(Cell::new(false)),
         }
@@ -375,10 +367,10 @@ impl NativeScheduler {
         }
     }
 
-    pub(crate) async fn claim(
+    pub(crate) async fn dispatch(
         &self,
         database_changed: bool,
-    ) -> Result<DispatchBatch<(PoolAllocation, Option<Permit>)>, DatabaseError> {
+    ) -> Result<Option<Duration>, DatabaseError> {
         if database_changed {
             let mut rescan = self.rescan.get();
             for (index, cursor) in self.resume.get().iter().enumerate() {
@@ -388,7 +380,6 @@ impl NativeScheduler {
             }
             self.rescan.set(rescan);
         }
-        let mut grants = Vec::new();
         let (finished, running): (Vec<_>, Vec<_>) = std::mem::take(&mut *self.running.borrow_mut())
             .into_iter()
             .partition(|task| task.is_finished());
@@ -405,12 +396,9 @@ impl NativeScheduler {
         {
             log::warn!("failed to retry unproven groups on a blocking worker: {error}");
         }
-        if self.halted.get() || self.shutdown.is_cancelled() {
-            return Ok(DispatchBatch {
-                grants,
-                next_due: None,
-                wait_for_blocking: false,
-            });
+        let available = MAX_DISPATCHES.saturating_sub(self.running.borrow().len());
+        if self.halted.get() || self.shutdown.is_cancelled() || available == 0 {
+            return Ok(None);
         }
         let recurrence_due = self.database.claim_due_recurrences(16).await?;
         let discovery = self.discovery.get();
@@ -419,11 +407,7 @@ impl NativeScheduler {
         let mut reached = None;
         for _ in 0..MAX_EXECUTOR_PAGES {
             if self.shutdown.is_cancelled() {
-                return Ok(DispatchBatch {
-                    grants,
-                    next_due: None,
-                    wait_for_blocking: false,
-                });
+                return Ok(None);
             }
             let page = self
                 .database
@@ -449,22 +433,24 @@ impl NativeScheduler {
                 None => break,
             }
         }
-        let turn = self.turns.get();
-        if !executors.is_empty() {
-            let start = usize::try_from(turn % executors.len() as u64).unwrap_or(0);
-            executors.rotate_left(start);
-        }
         let mut rotating = false;
         let mut revisit = false;
-        let mut wait_for_blocking = false;
+        let mut capacity_reached = false;
+        let mut dispatched = 0;
+        let mut last_examined = None;
+        // Workspace preparation acquires its bounded file permit when it actually
+        // reads files. Claims never retain permits for other Jobs or provider IO.
+        let workspace_permit = self.workspace_tools.is_some();
         let mut exhausted = 0u8;
         for (pool, executor, capabilities) in executors {
             if self.halted.get() || self.shutdown.is_cancelled() {
                 break;
             }
-            let permit = Permit::try_file();
-            let workspace_permit = permit.is_some();
-            wait_for_blocking |= !workspace_permit;
+            if dispatched == available {
+                capacity_reached = true;
+                break;
+            }
+            last_examined = Some(ConfigId::new(executor.get()));
             let scan = capabilities | (usize::from(workspace_permit) << 2);
             if exhausted & (1 << scan) != 0 {
                 continue;
@@ -473,7 +459,12 @@ impl NativeScheduler {
                 .reserve_for(pool, executor, workspace_permit, scan)
                 .await
             {
-                ExecutorPass::Reserved(allocation) => grants.push((*allocation, permit)),
+                ExecutorPass::Reserved(allocation) => {
+                    // Transfer each committed claim to its dispatch owner before
+                    // awaiting the next reservation in this bounded sweep.
+                    self.spawn(*allocation);
+                    dispatched += 1;
+                }
                 ExecutorPass::Nothing => {}
                 ExecutorPass::BudgetSpent => rotating = true,
                 ExecutorPass::Rescan => {
@@ -484,25 +475,26 @@ impl NativeScheduler {
                 ExecutorPass::Halted => break,
             }
         }
+        let reached = if capacity_reached {
+            // Continue after the last candidate actually examined, not after
+            // the prefetched page. This also advances beyond a busy first page.
+            last_examined
+        } else {
+            reached
+        };
         let discovery = discovery.advanced(reached);
         self.discovery.set(discovery);
-        if reached.is_none() {
-            self.turns.set(turn.wrapping_add(1));
-        }
         let dispatch_due = ((revisit
             || rotating && self.resume.get().iter().any(Option::is_some)
             || discovery.sweep.is_some())
+            && !capacity_reached
             && !self.halted.get())
         .then_some(Duration::ZERO);
         let next_due = match (dispatch_due, recurrence_due) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
-        Ok(DispatchBatch {
-            grants,
-            next_due,
-            wait_for_blocking,
-        })
+        Ok(next_due)
     }
 
     pub(crate) async fn reserve_for(
@@ -577,8 +569,7 @@ impl NativeScheduler {
         ExecutorPass::BudgetSpent
     }
 
-    pub(crate) fn spawn(&self, grant: (PoolAllocation, Option<Permit>)) {
-        let (allocation, permit) = grant;
+    pub(crate) fn spawn(&self, allocation: PoolAllocation) {
         let database = self.database.clone();
         let cancellation = self.shutdown.child();
         let registration = self.stops.register(allocation.token, cancellation.clone());
@@ -586,6 +577,7 @@ impl NativeScheduler {
         let workspace_tools = self.workspace_tools.clone();
         let stops = self.stops.clone();
         let task = ntex::rt::spawn(async move {
+            let _completion = DispatchWake(database.clone());
             let _registration = registration;
             let dispatched = dispatch(
                 &database,
@@ -593,7 +585,6 @@ impl NativeScheduler {
                 &cancellation,
                 workspace_tools.as_ref(),
                 &stops,
-                permit,
             )
             .await;
             dispatched.log();
@@ -618,6 +609,14 @@ impl NativeScheduler {
             }
         }
         finished
+    }
+}
+
+struct DispatchWake(DatabaseHandle);
+
+impl Drop for DispatchWake {
+    fn drop(&mut self) {
+        self.0.wake_scheduler();
     }
 }
 
@@ -779,12 +778,11 @@ pub(crate) async fn dispatch(
     cancellation: &CancellationToken,
     workspace_tools: Option<&crate::system::executor::execution_runtime::WorkspaceTools>,
     stops: &NativeStops,
-    permit: Option<Permit>,
 ) -> Dispatched {
     let token = allocation.token;
     let detail = if cancellation.is_cancelled() {
         match database
-            .fail_unstarted_development_reservation(token, UnstartedCause::StartRefused)
+            .fail_unstarted_development_reservation(token, UnstartedCause::Cancelled)
             .await
         {
             Ok(_) => "cancelled before the start; the reservation was ended and nothing was sent"
@@ -815,7 +813,6 @@ pub(crate) async fn dispatch(
                         .map(WorkspaceTools::data_directory),
                     stops,
                     check_prepared_native,
-                    permit,
                 )
                 .await
             }
@@ -856,7 +853,6 @@ pub(crate) async fn dispatch(
                         .map(WorkspaceTools::data_directory),
                     stops,
                     guard,
-                    permit,
                 )
                 .await
             }
@@ -877,7 +873,9 @@ pub(crate) async fn dispatch(
         }
     };
     let dispatched = reported(database, token, detail).await;
-    if dispatched.outcome.is_some()
+    if dispatched
+        .outcome
+        .is_some_and(|outcome| outcome != OutcomeKind::Unknown)
         && let Err(error) = database.settle_child_turns(vec![token.job]).await
     {
         log::warn!(
@@ -899,9 +897,8 @@ async fn start_and_exchange(
     data_directory: Option<&crate::system::data_directory::DataDirectory>,
     stops: &NativeStops,
     guard: impl Fn(&crate::db::PreparedDevelopmentHandoff) -> Result<(), &'static str>,
-    permit: Option<Permit>,
 ) -> String {
-    let tooling = NativeTooling::new(data_directory, stops.clone(), permit);
+    let tooling = NativeTooling::new(data_directory, stops.clone(), cancellation.clone());
     let handoff = loop {
         match database
             .checked_development_handoff_guarded(token, &tooling, &guard)
@@ -942,6 +939,11 @@ async fn start_and_exchange(
             }
         }
         Err(DevelopmentHandoffError::NotStarted { cause, error }) => {
+            let cause = if cancellation.is_cancelled() {
+                UnstartedCause::Cancelled
+            } else {
+                cause
+            };
             let settled = loop {
                 match database
                     .fail_unstarted_development_reservation(token, cause)
@@ -971,7 +973,12 @@ async fn start_and_exchange(
 async fn reported(database: &DatabaseHandle, token: AllocationToken, detail: String) -> Dispatched {
     match database.development_trial_job(token.job).await {
         Ok(Some((record, Some(allocation)))) if allocation.token == token => {
-            if allocation.phase == AllocationPhase::Released {
+            if allocation.phase == AllocationPhase::Released
+                && record
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.kind != OutcomeKind::Unknown)
+            {
                 crate::system::executor::blocking::stop_settled(token.job);
             }
             Dispatched {

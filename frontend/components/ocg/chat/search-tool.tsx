@@ -4,7 +4,7 @@ import { type ReactNode } from "react";
 import { Check, Copy, FileCode2, Search } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import type { ControlToolCall } from "../contracts";
+import type { ToolCall } from "../contracts";
 import { useI18n } from "../i18n";
 import { highlightCode } from "../markdown/markdown-pipeline";
 import { sourceLanguage } from "../markdown/source-snapshot";
@@ -139,7 +139,7 @@ function SearchFileResult({ file }: { file: SearchFile }) {
   );
 }
 
-export function SearchTool({ call, children }: { call: ControlToolCall; children: ReactNode }) {
+export function SearchTool({ call, children }: { call: ToolCall; children: ReactNode }) {
   const { t, locale } = useI18n();
   const { isCopied, copyToClipboard } = useCopyToClipboard();
   const args = toolObject(call.arguments);

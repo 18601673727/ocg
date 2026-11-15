@@ -7,13 +7,13 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Pill } from "@/components/ocg/primitives";
-import type { ControlProject } from "@/components/ocg/contracts";
+import type { Project } from "@/components/ocg/contracts";
 import type {
-  ControlProjectCommand,
-  ControlProjectCreate,
-  ControlProjectUpdate,
-  HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/control-client";
+  ProjectCommand,
+  ProjectCreate,
+  ProjectUpdate,
+  ApiClient,
+} from "@/components/ocg/runtime/api-client";
 import { Section, describeError, refusalText } from "./settings-parts";
 import { useI18n, type I18nKey } from "../i18n";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
@@ -29,7 +29,7 @@ const PROJECT_REFUSALS: Partial<Record<string, I18nKey>> = {
   invalid_request: "settings.projects.refusal.invalidRequest",
 };
 
-function CopyRootButton({ project }: { project: ControlProject }) {
+function CopyRootButton({ project }: { project: Project }) {
   const { t } = useI18n();
   const { isCopied, isCopyFailed, copyToClipboard } = useCopyToClipboard();
 
@@ -54,12 +54,12 @@ function CopyRootButton({ project }: { project: ControlProject }) {
   );
 }
 
-export function ProjectsSection({ client }: { client: HttpCanonicalControlClient }) {
+export function ProjectsSection({ client }: { client: ApiClient }) {
   const { t, locale } = useI18n();
-  const [projects, setProjects] = useState<ControlProject[]>([]);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [loadError, setLoadError] = useState<string | null>(null);
 
-  const [editingProject, setEditingProject] = useState<ControlProject | null>(null);
+  const [editingProject, setEditingProject] = useState<Project | null>(null);
   const [name, setName] = useState("");
   const [root, setRoot] = useState("");
   const [description, setDescription] = useState("");
@@ -90,7 +90,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
     return () => controller.abort();
   }, [loadProjects]);
 
-  const managementChanged = useCallback((updated: ControlProject) => {
+  const managementChanged = useCallback((updated: Project) => {
     setProjects((previous) =>
       previous.map((project) => (project.id === updated.id ? updated : project)),
     );
@@ -111,7 +111,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
     setError(null);
   }
 
-  function startEdit(project: ControlProject) {
+  function startEdit(project: Project) {
     if (editingProject?.id === project.id) {
       resetForm();
       return;
@@ -133,11 +133,11 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
 
     const trimmedDesc = description.trim();
     const finalDescription = trimmedDesc.length > 0 ? trimmedDesc : null;
-    const finalCommands: ControlProjectCommand[] = toProjectCommands(commands);
+    const finalCommands: ProjectCommand[] = toProjectCommands(commands);
 
     try {
       if (editingProject) {
-        const payload: ControlProjectUpdate = {
+        const payload: ProjectUpdate = {
           name: name.trim(),
           description: finalDescription,
           commands: finalCommands,
@@ -147,7 +147,7 @@ export function ProjectsSection({ client }: { client: HttpCanonicalControlClient
         resetForm();
         setNotice(t("settings.projects.updatedNotice"));
       } else {
-        const payload: ControlProjectCreate = {
+        const payload: ProjectCreate = {
           name: name.trim(),
           root: root.trim(),
           description: finalDescription,

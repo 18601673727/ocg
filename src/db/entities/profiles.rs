@@ -269,10 +269,9 @@ impl AgentConfig {
                     *capability == AgentCapability::Decision
                         && !model.declared_capabilities.is_empty()
                 }
-                ConfigBody::Agent(_)
-                | ConfigBody::DecisionAgent(_)
-                | ConfigBody::Connection(_)
-                | ConfigBody::Pool(_) => false,
+                ConfigBody::Agent(_) | ConfigBody::DecisionAgent(_) | ConfigBody::Connection(_) => {
+                    false
+                }
             })
     }
 }
@@ -320,7 +319,6 @@ pub enum ConfigKind {
     Connection = 1,
     Model = 2,
     Agent = 3,
-    Pool = 4,
     DecisionModel = 5,
     DecisionAgent = 6,
 }
@@ -355,20 +353,12 @@ pub struct ModelConfig {
     pub declared_capabilities: BTreeSet<ModelCapability>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PoolConfig {
-    pub capabilities: BTreeSet<(ExecutionOperation, Option<LlmTransport>)>,
-    pub concurrency_limit: u32,
-    pub enabled: bool,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum ConfigBody {
     Connection(ConnectionConfig),
     Model(ModelConfig),
     Agent(AgentConfig),
-    Pool(PoolConfig),
     DecisionModel(DecisionModelConfig),
     DecisionAgent(DecisionAgentConfig),
 }
@@ -379,7 +369,6 @@ impl ConfigBody {
             Self::Connection(_) => ConfigKind::Connection,
             Self::Model(_) => ConfigKind::Model,
             Self::Agent(_) => ConfigKind::Agent,
-            Self::Pool(_) => ConfigKind::Pool,
             Self::DecisionModel(_) => ConfigKind::DecisionModel,
             Self::DecisionAgent(_) => ConfigKind::DecisionAgent,
         }
@@ -475,81 +464,10 @@ impl FrozenExecutionConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct SubmittedConfiguration {
-    pub agent_profile: Option<ProfileId>,
-    pub llm_profile: ProfileId,
-    pub frozen: FrozenExecutionConfig,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ExecutionOperation {
     LlmRequest,
     Decision,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CapabilitySet {
-    pub operations: BTreeSet<ExecutionOperation>,
-    pub llm_protocols: BTreeSet<LlmTransport>,
-}
-
-impl CapabilitySet {
-    pub fn supports(&self, operation: ExecutionOperation, protocol: Option<LlmTransport>) -> bool {
-        self.operations.contains(&operation)
-            && protocol.is_none_or(|protocol| self.llm_protocols.contains(&protocol))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutionPoolConfig {
-    pub concurrency_limit: NonZeroU32,
-    pub capabilities: CapabilitySet,
-}
-
-impl ExecutionPoolConfig {
-    pub fn body(&self, enabled: bool) -> PoolConfig {
-        let mut capabilities = BTreeSet::new();
-        for operation in &self.capabilities.operations {
-            if *operation == ExecutionOperation::Decision
-                || self.capabilities.llm_protocols.is_empty()
-            {
-                capabilities.insert((*operation, None));
-            }
-            for protocol in &self.capabilities.llm_protocols {
-                capabilities.insert((*operation, Some(*protocol)));
-            }
-        }
-        PoolConfig {
-            capabilities,
-            concurrency_limit: self.concurrency_limit.get(),
-            enabled,
-        }
-    }
-}
-
-impl PoolConfig {
-    pub fn capability_set(&self) -> CapabilitySet {
-        let mut set = CapabilitySet::default();
-        for (operation, protocol) in &self.capabilities {
-            set.operations.insert(*operation);
-            if let Some(protocol) = protocol {
-                set.llm_protocols.insert(*protocol);
-            }
-        }
-        set
-    }
-
-    pub fn offers(&self, operation: ExecutionOperation, protocol: Option<LlmTransport>) -> bool {
-        self.capabilities.contains(&(operation, protocol))
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ExecutionPool {
-    pub name: String,
-    pub config: ExecutionPoolConfig,
-    pub enabled: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

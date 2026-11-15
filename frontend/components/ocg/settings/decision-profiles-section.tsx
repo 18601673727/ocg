@@ -2,13 +2,10 @@
 
 import { useState, type FormEvent } from "react";
 import Link from "next/link";
-import type { ControlProfilesSnapshot } from "../contracts";
-import type { DecisionLimits as ControlDecisionLimits } from "../contracts/api";
-import type {
-  HttpCanonicalControlClient,
-  ControlProfileWriteRequest,
-} from "../runtime/control-client";
-import { isProfileConflict } from "../runtime/control-client";
+import type { ProfilesSnapshot } from "../contracts";
+import type { DecisionLimits as DecisionLimits } from "../contracts/api";
+import type { ApiClient, ProfileWriteRequest } from "../runtime/api-client";
+import { isProfileConflict } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { Section, describeError, selectableLlmProfiles } from "./settings-parts";
 import { Button } from "@/components/ui/button";
@@ -38,16 +35,16 @@ import {
   headersToDrafts,
 } from "./header-drafts";
 
-const emptyLimits: ControlDecisionLimits = {
+const emptyLimits: DecisionLimits = {
   max_input_tokens_per_request: null,
   max_output_tokens_per_request: null,
   max_input_tokens_per_question: null,
   max_output_tokens_per_question: null,
 };
 type ProfileEditorProps = {
-  client: HttpCanonicalControlClient;
-  profiles: ControlProfilesSnapshot;
-  onSaved(profiles: ControlProfilesSnapshot): void;
+  client: ApiClient;
+  profiles: ProfilesSnapshot;
+  onSaved(profiles: ProfilesSnapshot): void;
   onManageModels?(): void;
 };
 
@@ -73,7 +70,7 @@ function ProfileEditor({
   const [headers, setHeaders] = useState<HeaderDraft[]>([]);
   const [headerError, setHeaderError] = useState<HeaderDraftError>();
   const [capabilities, setCapabilities] = useState<string[]>(["choice"]);
-  const [limits, setLimits] = useState<ControlDecisionLimits>(emptyLimits);
+  const [limits, setLimits] = useState<DecisionLimits>(emptyLimits);
   const [instructions, setInstructions] = useState("");
   const [models, setModels] = useState<string[]>([]);
   const [defaultModel, setDefaultModel] = useState<string | null>(null);
@@ -107,7 +104,7 @@ function ProfileEditor({
     setHeaderError(undefined);
     setBusy(true);
     setError(undefined);
-    const payload: ControlProfileWriteRequest =
+    const payload: ProfileWriteRequest =
       kind === "decision_model"
         ? {
             kind,

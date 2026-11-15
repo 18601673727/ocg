@@ -97,14 +97,6 @@ impl Batch {
         approval: ToolCallRef,
         decision: ApprovalDecision,
     ) -> Result<Appended, BatchError> {
-        self.decide_with_assessment(approval, decision, None)
-    }
-    fn decide_with_assessment(
-        &mut self,
-        approval: ToolCallRef,
-        decision: ApprovalDecision,
-        assessment: Option<JobId>,
-    ) -> Result<Appended, BatchError> {
         let Some(call) = self.tool_evidence(approval)? else {
             return self.reject(Violation::InvalidValue(
                 "approval_not_found",
@@ -159,28 +151,20 @@ impl Batch {
                 "decision does not match the awaiting call",
             ));
         }
-        if self.job_control(conversation)?.closing.is_some() {
+        if self.job_lifecycle(conversation)?.closing.is_some() {
             return self.reject(Violation::InvalidValue(
                 "conversation_closing",
                 "decisions cannot continue a closing conversation",
             ));
         }
         if decision == ApprovalDecision::Approved {
-            self.grant_project_command(&call, conversation, assessment)?;
+            self.grant_project_command(&call, conversation)?;
         }
         let text = match self.perform_decided_job_call(approval, conversation, &call, &decision)? {
             Some(text) => text,
             None => continuation_text(&call.name, &decision),
         };
-        self.put_approval(
-            approval,
-            decision,
-            if assessment.is_some() {
-                Actor::Auto
-            } else {
-                Actor::User
-            },
-        )?;
+        self.put_approval(approval, decision, Actor::User)?;
         self.step(|tx| {
             tx.open_table(OPEN_APPROVALS)?.remove(key)?;
             Ok(())
@@ -249,12 +233,9 @@ impl Batch {
         conversation: JobId,
     ) -> Result<Option<crate::db::entities::ProjectRecord>, BatchError> {
         let row = self.require_mutable_conversation(conversation)?;
-        match row.kind {
-            JobKind::Group {
-                project: Some(project),
-                ..
-            } => self.require_project_record(project).map(Some),
-            JobKind::Group { project: None, .. } | JobKind::Execution { .. } => Ok(None),
+        match row.project {
+            Some(project) => self.require_project_record(project).map(Some),
+            None => Ok(None),
         }
     }
 
@@ -336,7 +317,6 @@ impl Batch {
         &mut self,
         call: &crate::db::entities::ToolEvidenceRecord,
         conversation: JobId,
-        assessment: Option<JobId>,
     ) -> Result<(), BatchError> {
         use crate::db::entities::*;
         let Some(mut project) = self.command_project(conversation)? else {
@@ -347,30 +327,21 @@ impl Batch {
         };
         if call.name == "workspace_request_command" {
             let mut command = input.command;
-            command.owner = if assessment.is_some() {
-                CommandOwner::Decision
-            } else {
-                CommandOwner::User
-            };
-            command.proposal = assessment;
+            command.owner = CommandOwner::User;
+            command.proposal = None;
             if let Some(index) = project
                 .commands
                 .iter()
                 .position(|prior| prior.name == command.name)
             {
-                if assessment.is_some() && project.commands[index].owner == CommandOwner::User {
-                    return Ok(());
-                }
-                command.proposal = command.proposal.or(project.commands[index].proposal);
                 project.commands[index] = command;
             } else {
                 project.commands.push(command);
             }
-        } else if assessment.is_none()
-            && let Some(command) = project
-                .commands
-                .iter_mut()
-                .find(|command| command.name == input.command.name)
+        } else if let Some(command) = project
+            .commands
+            .iter_mut()
+            .find(|command| command.name == input.command.name)
         {
             command.owner = CommandOwner::User;
         } else {
@@ -388,54 +359,6 @@ impl Batch {
         }
         project.updated_at = self.now;
         self.insert_project(&project)
-    }
-
-    pub(crate) fn resume_user_command_grants(
-        &mut self,
-        project: &crate::db::entities::ProjectRecord,
-    ) -> Result<(), BatchError> {
-        use crate::db::entities::*;
-        for command in &project.commands {
-            if command.owner != CommandOwner::User || command.status != CommandStatus::Allowed {
-                continue;
-            }
-            let Some(proposal) = command.proposal else {
-                continue;
-            };
-            let row = self.require_job(proposal)?;
-            let JobKind::Execution {
-                execution: JobExecution::Decision(work),
-                ..
-            } = row.kind
-            else {
-                continue;
-            };
-            let Some(binding) = work.commands else {
-                continue;
-            };
-            let Some(evidence) = self.tool_evidence(binding.approval)? else {
-                continue;
-            };
-            let Some(input) = self.command_input(&evidence, project)? else {
-                continue;
-            };
-            if input.command.name != command.name || input.command.argv != command.argv {
-                continue;
-            }
-            let Some(conversation) = self.turn_conversation(binding.approval.job)? else {
-                continue;
-            };
-            let pending = self.step(|tx| {
-                Ok(tx
-                    .open_table(OPEN_APPROVALS)?
-                    .get(open_key(conversation, binding.approval))?
-                    .is_some_and(|value| value.value() == 0))
-            })?;
-            if pending && self.job_control(conversation)?.closing.is_none() {
-                self.decide(binding.approval, ApprovalDecision::Approved)?;
-            }
-        }
-        Ok(())
     }
 
     pub(crate) fn void_approvals(

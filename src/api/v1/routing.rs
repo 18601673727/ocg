@@ -28,6 +28,15 @@ pub(super) enum Route {
     Logs(dashboard::LogQuery),
     Subscription(subscriptions::Topic),
     Job(JobId),
+    JobHistory {
+        job: JobId,
+        after: Option<u64>,
+        limit: usize,
+    },
+    JobState {
+        job: JobId,
+        at_seq: Option<u64>,
+    },
     JobInput(JobId),
     ConversationChildren {
         conversation: JobId,
@@ -43,11 +52,6 @@ pub(super) enum Route {
     ConversationContext {
         conversation: JobId,
         before: Option<JobId>,
-        limit: usize,
-    },
-    ConversationNotices {
-        conversation: JobId,
-        after: u32,
         limit: usize,
     },
     ProviderRequest(JobId, RequestNumber),
@@ -179,12 +183,13 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::Logs(_)
             | Route::Subscription(_)
             | Route::Job(_)
+            | Route::JobHistory { .. }
+            | Route::JobState { .. }
             | Route::JobInput(_)
             | Route::ConversationChildren { .. }
             | Route::ConversationTurns { .. }
             | Route::JobLimits(_)
             | Route::ConversationContext { .. }
-            | Route::ConversationNotices { .. }
             | Route::ProviderRequest(..)
             | Route::ProviderResponses { .. }
             | Route::Tools { .. }
@@ -405,6 +410,15 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::Job(job))
         }
+        ["jobs", job, "history"] => {
+            let job = job_id(job)?;
+            let (after, limit) = jobs::history_query(query)?;
+            Ok(Route::JobHistory { job, after, limit })
+        }
+        ["jobs", job, "state"] => {
+            let job = job_id(job)?;
+            jobs::state_query(query).map(|at_seq| Route::JobState { job, at_seq })
+        }
         ["jobs", job, "requests", number] => {
             let job = job_id(job)?;
             let request = decimal::<u32>(number)
@@ -456,20 +470,6 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             Ok(Route::ConversationTurns {
                 conversation,
                 before,
-                limit,
-            })
-        }
-        ["conversations", conversation, "notices"] => {
-            let conversation = job_id(conversation)?;
-            let (after, limit) = output_query(query)?;
-            let after = after
-                .map(u32::try_from)
-                .transpose()
-                .map_err(|_| INVALID_REQUEST)?
-                .unwrap_or(0);
-            Ok(Route::ConversationNotices {
-                conversation,
-                after,
                 limit,
             })
         }
@@ -527,10 +527,10 @@ fn no_query(query: &str) -> Result<(), Refusal> {
 }
 
 pub(super) fn decimal<T: std::str::FromStr>(text: &str) -> Option<T> {
-    let canonical = !text.is_empty()
+    let valid = !text.is_empty()
         && text.bytes().all(|byte| byte.is_ascii_digit())
         && (text == "0" || !text.starts_with('0'));
-    canonical.then(|| text.parse().ok()).flatten()
+    valid.then(|| text.parse().ok()).flatten()
 }
 
 pub(super) fn job_id(text: &str) -> Result<JobId, Refusal> {
@@ -638,6 +638,10 @@ pub(super) async fn respond(
             }
         }
         Route::JobInput(job) => catalog::job_input(database, job, request).await,
+        Route::JobHistory { job, after, limit } => {
+            jobs::history(shared, job, after, limit, request).await
+        }
+        Route::JobState { job, at_seq } => jobs::state(shared, job, at_seq, request).await,
         Route::ConversationChildren {
             conversation,
             before,
@@ -657,11 +661,6 @@ pub(super) async fn respond(
             let reply = catalog::conversation_turns(database, conversation, before, limit).await?;
             catalog::bound_conversation_turns(shared, reply.body)
         }
-        Route::ConversationNotices {
-            conversation,
-            after,
-            limit,
-        } => catalog::conversation_notices(database, conversation, after, limit).await,
         Route::ProviderRequest(job, request) => {
             let record = database
                 .provider_request(job, request)

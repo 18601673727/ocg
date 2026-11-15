@@ -4,7 +4,7 @@ import type * as Api from "@/components/ocg/contracts/api";
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { ContentContainer, ContentHeader } from "../layout/content-container";
 import { HealthChart, ReliabilityChart, UsageChart } from "./chart";
@@ -28,7 +28,7 @@ export function ObservationsSurface({
   health,
   onJob,
 }: {
-  client: HttpCanonicalControlClient;
+  client: ApiClient;
   kind: "usage" | "health";
   health: Api.Health | null;
   onJob: (job: string) => void;
@@ -213,23 +213,23 @@ export function ObservationsSurface({
             className="grid grid-cols-2 gap-px overflow-hidden rounded-xl border border-border bg-border lg:grid-cols-4"
           >
             {[
-              [t("settings.control.host"), health?.host ?? t("settings.control.unreachable")],
-              [t("settings.control.database"), health?.database.status ?? t("common.unknown")],
+              [t("settings.api.host"), health?.host ?? t("settings.api.unreachable")],
+              [t("settings.api.database"), health?.database.status ?? t("common.unknown")],
               [
-                t("settings.control.reads"),
+                t("settings.api.reads"),
                 !health
                   ? t("common.unknown")
                   : health.database.readable
-                    ? t("settings.control.available")
-                    : t("settings.control.unavailable"),
+                    ? t("settings.api.available")
+                    : t("settings.api.unavailable"),
               ],
               [
-                t("settings.control.commands"),
+                t("settings.api.commands"),
                 !health
                   ? t("common.unknown")
                   : health.database.accepting_commands
-                    ? t("settings.control.accepting")
-                    : t("settings.control.notAccepting"),
+                    ? t("settings.api.accepting")
+                    : t("settings.api.notAccepting"),
               ],
             ].map(([label, value]) => (
               <div className="min-w-0 bg-card p-4 sm:p-5" key={label}>

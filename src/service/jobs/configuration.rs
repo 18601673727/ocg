@@ -264,8 +264,7 @@ where
                 ConfigBody::Agent(_)
                 | ConfigBody::Model(_)
                 | ConfigBody::DecisionModel(_)
-                | ConfigBody::Connection(_)
-                | ConfigBody::Pool(_) => {
+                | ConfigBody::Connection(_) => {
                     return self.reject(Violation::InvalidValue(
                         "capabilities",
                         "the Agent must support decision work with this model",
@@ -341,7 +340,7 @@ where
             }
             ConfigBody::Agent(_) => (None, None),
             ConfigBody::Model(_) | ConfigBody::DecisionModel(_) => (None, Some(profile)),
-            ConfigBody::Connection(_) | ConfigBody::Pool(_) => (None, None),
+            ConfigBody::Connection(_) => (None, None),
         };
         let Some(model) = model else {
             return self.reject(Violation::InvalidValue(

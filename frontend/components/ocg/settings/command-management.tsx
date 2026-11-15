@@ -22,8 +22,8 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import type { ControlProfilesSnapshot, ControlProject } from "../contracts";
-import type { HttpCanonicalControlClient } from "../runtime/control-client";
+import type { ProfilesSnapshot, Project } from "../contracts";
+import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { describeError, selectableLlmProfiles } from "./settings-parts";
 
@@ -33,14 +33,14 @@ export function ProjectDecisionConfigButton({
   disabled,
   onChanged,
 }: {
-  client: HttpCanonicalControlClient;
-  project: ControlProject | null;
+  client: ApiClient;
+  project: Project | null;
   disabled: boolean;
-  onChanged(project: ControlProject): void;
+  onChanged(project: Project): void;
 }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
-  const [profiles, setProfiles] = useState<ControlProfilesSnapshot | null>(null);
+  const [profiles, setProfiles] = useState<ProfilesSnapshot | null>(null);
   const [selected, setSelected] = useState("");
   const [cutoff, setCutoff] = useState("0.6");
   const [busy, setBusy] = useState(false);

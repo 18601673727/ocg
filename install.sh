@@ -429,7 +429,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
 
     if [ -f "$settings" ]; then
         data=$(sed -n "s/^OCG_DATA_DIR='\(.*\)'$/\1/p" "$settings" </dev/null)
-        port=$(sed -n "s/^OCG_CONTROL_PORT='\(.*\)'$/\1/p" "$settings" </dev/null)
+        port=$(sed -n "s/^OCG_API_PORT='\(.*\)'$/\1/p" "$settings" </dev/null)
         [ -n "$data" ] && [ -n "$port" ] || { printf 'Cannot read settings from %s\n' "$settings" >&2; exit 1; }
         if [ "$port_set" = true ]; then printf 'Ignoring --port; existing settings are in %s\n' "$settings"; fi
     fi
@@ -491,8 +491,8 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         cp -p "$service_file" "$tmp/service" </dev/null
     fi
     if [ -f "$settings" ]; then
-        token=$(sed -n "s/^OCG_CONTROL_TOKEN='\(.*\)'$/\1/p" "$settings" </dev/null)
-        [ -n "$token" ] || { printf 'Cannot read control token from %s\n' "$settings" >&2; exit 1; }
+        token=$(sed -n "s/^OCG_API_TOKEN='\(.*\)'$/\1/p" "$settings" </dev/null)
+        [ -n "$token" ] || { printf 'Cannot read API token from %s\n' "$settings" >&2; exit 1; }
         escaped_token=$(printf '%s\n' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
     fi
     if [ "$managed" = true ] && [ "$os" = Linux ]; then
@@ -549,16 +549,11 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         stop_launchd || { printf '%s\n' 'Timed out stopping OCG.' >&2; exit 1; }
     fi
     if [ -f "$data/ocg.redb" ]; then
-        check_ok=false
-        if result=$(OCG_DATA_DIR="$data" "$release_dir/ocg" migrate --check </dev/null 2>&1); then check_ok=true; fi
-        case $result in
-            *'no migration required'*) if [ "$check_ok" = true ]; then result=; fi ;;
-        esac
-        if [ "$check_ok" != true ] || [ -n "$result" ]; then
+        if ! result=$("$release_dir/ocg" verify "$data" </dev/null 2>&1); then
             printf '%s\n' "$result" >&2
             case $result in
                 *'Database already open'*) printf '%s\n' 'OCG is running outside the service; stop it and rerun the installer.' >&2 ;;
-                *) printf '%s\n' 'Unable to verify database compatibility; installation stopped.' >&2 ;;
+                *) printf '%s\n' 'Database verification failed; installation stopped. This version does not migrate historical databases.' >&2 ;;
             esac
             exit 1
         fi
@@ -578,9 +573,9 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     if [ ! -f "$settings" ]; then
         umask 077
         token=$(od -An -v -N32 -tx1 /dev/urandom </dev/null | tr -dc '0-9a-f')
-        [ "${#token}" -eq 64 ] || { printf '%s\n' 'Failed to generate a control token.' >&2; exit 1; }
+        [ "${#token}" -eq 64 ] || { printf '%s\n' 'Failed to generate an API token.' >&2; exit 1; }
         settings_created=true
-        printf "OCG_DATA_DIR='%s'\nOCG_UI_DIR='%s'\nOCG_CONTROL_PORT='%s'\nOCG_CONTROL_TOKEN='%s'\n" "$data" "$prefix/current/ui" "$port" "$token" > "$settings"
+        printf "OCG_DATA_DIR='%s'\nOCG_UI_DIR='%s'\nOCG_API_PORT='%s'\nOCG_API_TOKEN='%s'\n" "$data" "$prefix/current/ui" "$port" "$token" > "$settings"
     fi
     manual="sh -c 'set -a; . \"\$1\"; exec \"\$2\"' sh '$settings' '$prefix/current/ocg'"
     if [ "$service" = false ]; then rollback=false; keep_staged=true; printf 'Start OCG manually:\n%s\n' "$manual"; exit 0; fi
@@ -621,8 +616,8 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         fi
         stop="launchctl bootout $domain/$uid '$plist'"
     fi
-    token=$(sed -n "s/^OCG_CONTROL_TOKEN='\(.*\)'$/\1/p" "$settings" </dev/null)
-    [ -n "$token" ] || { printf 'Cannot read control token from %s\n' "$settings" >&2; exit 1; }
+    token=$(sed -n "s/^OCG_API_TOKEN='\(.*\)'$/\1/p" "$settings" </dev/null)
+    [ -n "$token" ] || { printf 'Cannot read API token from %s\n' "$settings" >&2; exit 1; }
     escaped_token=$(printf '%s\n' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
     if wait_health "$version"; then
         active_dir=$(cd -P "$prefix/current" && pwd -P)

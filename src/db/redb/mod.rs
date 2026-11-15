@@ -7,10 +7,8 @@ use ::redb::{
 };
 
 use crate::db::entities::{
-    Actor, Appended, ApprovalDecision, ApprovalRecord, Entry, JobExecution, JobGroup,
-    JobInputEntry, JobKind, JobLimits, Notice, NoticeBody, NoticeClass, NoticeEvent, Origin,
-    OutcomeKind, PlanSource, RecordEvent, Recurrence, RecurrenceHalt, RecurrencePhase,
-    ResponseFormat, StopProof,
+    Actor, Appended, ApprovalDecision, ApprovalRecord, Entry, JobGroup, JobKind, JobLimits, Origin,
+    OutcomeKind, Recurrence, RecurrenceHalt, RecurrencePhase, StopProof,
 };
 use crate::db::entities::{
     AgentCapability, AgentConfig, AttachmentId, AttachmentOrigin, AttachmentRecord,
@@ -28,14 +26,12 @@ use crate::service::ai::providers::openai_compatible::{
 
 mod approvals;
 mod codec;
+pub(crate) mod execution;
 mod indexes;
 mod job_records;
 mod job_tools;
 pub(crate) use job_tools::JobToolApplied;
 mod job_tree;
-mod migrate;
-pub(crate) use migrate::{HeldSource, MigrationInspection, apply, inspect};
-mod notices;
 mod observations;
 mod reader;
 mod recovery;
@@ -43,14 +39,16 @@ pub(crate) use recovery::reclaim_pending;
 mod recurrences;
 mod rows;
 mod schema;
+mod state;
+use state::JobRuntime;
 mod transactions;
 mod writer;
 
 use crate::db::entities::AvailabilityStatId;
 use codec::{
     Code, Dec, DecodeResult, Enc, TAG_ATTACHMENT, TAG_CONFIG, TAG_GLOBAL_COMPACTION,
-    TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_CONTROL, TAG_JOB_STATE, TAG_OUTPUT, TAG_PROJECT,
-    TAG_REQUEST_EVENT, TAG_SUBMISSION, TAG_TOOL_CALL, decode_scheduled_external_binding,
+    TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME, TAG_OUTPUT, TAG_PROJECT, TAG_REQUEST_EVENT,
+    TAG_SUBMISSION, TAG_TOOL_CALL, decode_scheduled_external_binding,
     decode_scheduled_external_policy, encode_scheduled_external_binding,
     encode_scheduled_external_policy,
 };
@@ -63,6 +61,9 @@ pub(crate) use writer::{
 pub(crate) use reader::{
     DevelopmentCandidate, DevelopmentResolvedCandidate, DevelopmentResolvedContext,
     read_development_execution_context,
+};
+pub(crate) use reader::{
+    ExecutionHistoryItem, ExecutionHistoryPage, read_execution_history, read_execution_snapshot,
 };
 pub(crate) use reader::{
     NativeResource, NativeResourceCatalog, NativeResourceKind, PoolAllocationPage,
@@ -101,17 +102,17 @@ pub(crate) use reader::{
 };
 pub(crate) use reader::{
     ContextState, ContextWorkDetails, JobTree, TreeFacts, TreeNode, UncertainAllocation,
-    UsageRetriesPage, probe_committed, queue_counts, read_agent_model_configs, read_attachment,
-    read_attachments, read_children, read_config, read_configs, read_context_state,
-    read_conversation_search, read_conversations, read_credential_ref_in_use, read_decision_work,
-    read_job, read_job_configuration, read_job_input, read_job_search, read_job_tree,
-    read_latest_output, read_native_job, read_outputs, read_profile_page, read_project,
-    read_projects, read_retries, read_submission, read_tool_evidence, read_tool_stats,
-    read_uncertain_allocations, read_usage_buckets, read_usage_retries, read_usage_summary,
+    UsageRetriesPage, check_readable, probe_committed, queue_counts, read_agent_model_configs,
+    read_attachment, read_attachments, read_children, read_config, read_configs,
+    read_context_state, read_conversation_search, read_conversations, read_credential_ref_in_use,
+    read_job, read_job_search, read_job_tree, read_latest_output, read_native_job, read_outputs,
+    read_profile_page, read_project, read_projects, read_retries, read_submission,
+    read_tool_evidence, read_tool_stats, read_uncertain_allocations, read_usage_buckets,
+    read_usage_retries, read_usage_summary,
 };
 pub(crate) use reader::{
     MutableConversationPage, MutableJobDetails, MutableJobDetailsLookup, read_conversation_limits,
-    read_mutable_conversation_turn_page, read_mutable_job_details, read_notices,
+    read_mutable_conversation_turn_page, read_mutable_job_details,
 };
 pub(crate) use reader::{ProfilePageRecords, StoredCredential, credential_count, read_credential};
 pub(crate) use reader::{
@@ -119,10 +120,10 @@ pub(crate) use reader::{
     read_scheduled_external_policy,
 };
 
-pub(crate) use crate::db::entities::{JobControl, JobSpec, JobState};
+pub(crate) use crate::db::entities::{JobLifecycle, JobSpec, JobState};
 pub(crate) use rows::{
     ConfigRow, CredentialKey, CredentialSecret, create_credential_key, load_credential_key,
-    usage_agent, valid_credential_ref,
+    valid_credential_ref,
 };
 use rows::{
     decode_attachment, decode_credential, decode_output, decode_project, decode_project_root,
@@ -186,7 +187,7 @@ impl From<::redb::Error> for StorageError {
     }
 }
 
-pub(super) trait TxRead {
+pub(crate) trait TxRead {
     type Table<'t, K: Key + 'static, V: Value + 'static>: ReadableTable<K, V>
     where
         Self: 't;
@@ -218,9 +219,9 @@ pub(crate) fn record_clean_shutdown(database: &Database) -> Result<(), StorageEr
     let tx = database.begin_write()?;
     {
         let mut unknown = false;
-        for entry in tx.open_table(schema::JOB_STATES)?.iter()? {
+        for entry in tx.open_table(schema::JOB_RUNTIME)?.iter()? {
             let (key, value) = entry?;
-            if JobState::decode_at(key.value(), value.value())?
+            if state::decode_state(key.value(), value.value())?
                 .outcome
                 .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
             {

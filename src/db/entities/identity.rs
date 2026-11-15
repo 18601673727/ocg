@@ -51,7 +51,7 @@ macro_rules! record_id_type {
             fn from_str(text: &str) -> Result<Self, Self::Err> {
                 parse_entity_id(text)
                     .map(Self)
-                    .ok_or("expected a canonical UUID")
+                    .ok_or("expected a lowercase hyphenated UUID")
             }
         }
 

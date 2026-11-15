@@ -23,11 +23,11 @@ use crate::db::entities::{
     AppendedOutput, Attachment, AttachmentId, AttachmentOrigin, AttachmentRecord,
     AvailabilityStatId, AvailabilityStatRecord, Config, ConfigBody, ConfigId, ConfigKind,
     ConfigRecord, ContentDigest, ExecutionPoolId, ExecutorId, JobEdit, JobFinalization, JobId,
-    JobInputId, JobOutput, JobOutputRecord, JobRecord, Metrics, MetricsId, MetricsRecord,
-    ObservationCursor, ObservationFilter, ObservationPage, OperationId, OperationKind, Project,
-    ProjectCommand, ProjectId, ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber,
-    Submission, SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord,
-    ToolOutcome, Violation,
+    JobOutput, JobOutputRecord, JobRecord, Metrics, MetricsId, MetricsRecord, ObservationCursor,
+    ObservationFilter, ObservationPage, OperationId, OperationKind, Project, ProjectCommand,
+    ProjectId, ProjectRecord, ProviderAnswer, ProviderRequestRecord, RequestNumber, Submission,
+    SubmissionKey, SubmissionRecord, ToolCallRef, ToolEvidence, ToolEvidenceRecord, ToolOutcome,
+    Violation,
 };
 use crate::db::mutations::PublishedAttachment;
 pub(crate) use crate::db::redb::{Batch, BatchError, Failure};
@@ -132,7 +132,7 @@ pub(crate) fn next_check_interval(configured: Duration, locked: bool) -> Duratio
 pub const READ_WORKERS: usize = 2;
 pub const READ_QUEUE_CAPACITY: usize = 64;
 pub const MAX_OBSERVATION_SCAN: usize = redb::MAX_OBSERVATION_SCAN;
-const CONTROL_QUEUE_CAPACITY: usize = 2;
+const MAINTENANCE_QUEUE_CAPACITY: usize = 2;
 const TRANSACTION_ALLOWANCE_BYTES: u64 = 1024 * 1024;
 
 mod commands;
@@ -148,7 +148,7 @@ mod shared;
 
 mod worker;
 
-use commands::{Command, Control, Envelope, InFlightCommand, Message, Reply};
+use commands::{Command, Envelope, InFlightCommand, Maintenance, Message, Reply};
 use errors::operation_status;
 pub use errors::{
     CommandOutcome, CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError,

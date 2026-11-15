@@ -15,19 +15,19 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { PageSurface, Pill, SELECTED_OPTION } from "@/components/ocg/primitives";
 import type {
-  ControlAgentCapability,
-  ControlCapability,
-  ControlLlmProfile,
-  ControlManagedAgentProfile,
-  ControlProfilesSnapshot,
+  AgentCapability,
+  Capability,
+  LlmProfile,
+  ManagedAgentProfile,
+  ProfilesSnapshot,
 } from "@/components/ocg/contracts";
-import type { DecisionLimits as ControlDecisionLimits } from "@/components/ocg/contracts/api";
+import type { DecisionLimits as DecisionLimits } from "@/components/ocg/contracts/api";
 import {
-  ControlTransportError,
+  ApiError,
   isProfileConflict,
-  type ControlProfileWriteRequest,
-  type HttpCanonicalControlClient,
-} from "@/components/ocg/runtime/control-client";
+  type ProfileWriteRequest,
+  type ApiClient,
+} from "@/components/ocg/runtime/api-client";
 import { cn } from "@/lib/utils";
 import { Section, describeError } from "./settings-parts";
 import { ProjectsSection } from "./projects-section";
@@ -59,21 +59,21 @@ import { ContentHeader } from "../layout/content-container";
 import { SettingsNavigation } from "./settings-navigation";
 import type { SettingsSection } from "./settings-sections";
 
-const ALL_CAPABILITIES: readonly { value: ControlCapability; labelKey: I18nKey }[] = [
+const ALL_CAPABILITIES: readonly { value: Capability; labelKey: I18nKey }[] = [
   { value: "chat", labelKey: "settings.llm.capabilityChat" },
   { value: "vision", labelKey: "settings.llm.capabilityVision" },
   { value: "tools", labelKey: "settings.llm.capabilityTools" },
   { value: "reasoning", labelKey: "settings.llm.capabilityReasoning" },
 ];
 const DECISION_CAPABILITIES = ["choice", "binary_probability", "ordinal_score"] as const;
-const EMPTY_DECISION_LIMITS: ControlDecisionLimits = {
+const EMPTY_DECISION_LIMITS: DecisionLimits = {
   max_input_tokens_per_request: null,
   max_output_tokens_per_request: null,
   max_input_tokens_per_question: null,
   max_output_tokens_per_question: null,
 };
 type ModelKind = "llm" | "decision_model";
-type DecisionModelProfile = ControlProfilesSnapshot["decision_profiles"][number];
+type DecisionModelProfile = ProfilesSnapshot["decision_profiles"][number];
 
 function ChoiceGroup<T extends string>({
   label,
@@ -147,7 +147,7 @@ export function SettingsSurface({
   section,
   onNavigate,
 }: {
-  client?: HttpCanonicalControlClient;
+  client?: ApiClient;
   sessionExpiresAtUs: number | null;
   signingOut: boolean;
   onSignOut: () => void;
@@ -156,7 +156,7 @@ export function SettingsSurface({
 }) {
   const { t } = useI18n();
   const theme = useTheme();
-  const [snapshot, setSnapshot] = useState<ControlProfilesSnapshot | null>(null);
+  const [snapshot, setSnapshot] = useState<ProfilesSnapshot | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
 
   const [editingLlmId, setEditingLlmId] = useState<string | null>(null);
@@ -171,18 +171,17 @@ export function SettingsSurface({
   const [llmSecret, setLlmSecret] = useState("");
   const [llmHeaders, setLlmHeaders] = useState<HeaderDraft[]>([]);
   const [llmHeaderError, setLlmHeaderError] = useState<HeaderDraftError>();
-  const [llmCapabilities, setLlmCapabilities] = useState<ControlCapability[]>(["chat"]);
+  const [llmCapabilities, setLlmCapabilities] = useState<Capability[]>(["chat"]);
   const [decisionCapabilities, setDecisionCapabilities] = useState<string[]>(["choice"]);
-  const [decisionLimits, setDecisionLimits] =
-    useState<ControlDecisionLimits>(EMPTY_DECISION_LIMITS);
+  const [decisionLimits, setDecisionLimits] = useState<DecisionLimits>(EMPTY_DECISION_LIMITS);
   const [llmTemperature, setLlmTemperature] = useState("");
   const [llmTopP, setLlmTopP] = useState("");
   const [llmMaxTokens, setLlmMaxTokens] = useState("");
   const [llmReasoningEffort, setLlmReasoningEffort] = useState("");
   const [llmContextWindow, setLlmContextWindow] = useState("");
-  const [deletingModel, setDeletingModel] = useState<
-    ControlLlmProfile | DecisionModelProfile | null
-  >(null);
+  const [deletingModel, setDeletingModel] = useState<LlmProfile | DecisionModelProfile | null>(
+    null,
+  );
   const [deleting, setDeleting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const [llmSaving, setLlmSaving] = useState(false);
@@ -196,7 +195,7 @@ export function SettingsSurface({
   const [editingAgentSeq, setEditingAgentSeq] = useState<number | null>(null);
   const [agentName, setAgentName] = useState("");
   const [agentInstructions, setAgentInstructions] = useState("");
-  const [agentCapabilities, setAgentCapabilities] = useState<ControlAgentCapability[]>(["chat"]);
+  const [agentCapabilities, setAgentCapabilities] = useState<AgentCapability[]>(["chat"]);
   const [agentTargets, setAgentTargets] = useState<string[]>([]);
   const [agentSaving, setAgentSaving] = useState(false);
   const [agentError, setAgentError] = useState<string | null>(null);
@@ -279,7 +278,7 @@ export function SettingsSurface({
     setLlmError(null);
   }
 
-  function startEditLlm(profile: ControlLlmProfile) {
+  function startEditLlm(profile: LlmProfile) {
     setModelKind("llm");
     setEditingLlmId(profile.id);
     setEditingEditSeq(profile.edit_seq);
@@ -323,7 +322,7 @@ export function SettingsSurface({
     setLlmFormOpen(true);
   }
 
-  function toggleCapability(cap: ControlCapability) {
+  function toggleCapability(cap: Capability) {
     setLlmCapabilities((current) =>
       current.includes(cap) ? current.filter((entry) => entry !== cap) : [...current, cap],
     );
@@ -359,7 +358,7 @@ export function SettingsSurface({
       return;
     }
     setLlmHeaderError(undefined);
-    let payload: ControlProfileWriteRequest;
+    let payload: ProfileWriteRequest;
     if (modelKind === "decision_model") {
       if (decisionCapabilities.length === 0) {
         setLlmError(t("settings.llm.validation.capabilities"));
@@ -473,7 +472,7 @@ export function SettingsSurface({
         return;
       }
       setLlmError(describeError(error, t));
-      if (error instanceof ControlTransportError && error.code === "credential_not_saved") {
+      if (error instanceof ApiError && error.code === "credential_not_saved") {
         await refreshProfiles();
       }
     } finally {
@@ -491,7 +490,7 @@ export function SettingsSurface({
     setAgentError(null);
   }
 
-  function startEditAgent(agent: ControlManagedAgentProfile) {
+  function startEditAgent(agent: ManagedAgentProfile) {
     setEditingAgentId(agent.id);
     setEditingAgentSeq(agent.edit_seq);
     setAgentName(agent.name);
@@ -514,7 +513,7 @@ export function SettingsSurface({
   ];
   function supportsCapabilities(
     model: (typeof assignableModels)[number],
-    capabilities: ControlAgentCapability[],
+    capabilities: AgentCapability[],
   ) {
     return (
       capabilities.length > 0 &&
@@ -535,7 +534,7 @@ export function SettingsSurface({
   const unassignedModels = eligibleModels.filter(
     (model) => !assignedModels.includes(model.id) && (model.kind === "decision" || model.enabled),
   );
-  function toggleAgentCapability(capability: ControlAgentCapability) {
+  function toggleAgentCapability(capability: AgentCapability) {
     const next = agentCapabilities.includes(capability)
       ? agentCapabilities.filter((value) => value !== capability)
       : [...agentCapabilities, capability];

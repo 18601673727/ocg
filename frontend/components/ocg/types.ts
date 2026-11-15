@@ -27,16 +27,16 @@ export type MessageStatus =
   | "failed";
 
 export type ChatMessage = {
-  decision?: import("./contracts/control-conversation").NativeDecisionTurn;
+  decision?: import("./contracts/conversations").NativeDecisionTurn;
   agentInstruction?: boolean;
-  compaction?: import("./contracts").ControlConversationTurn["compaction"];
+  compaction?: import("./contracts").ConversationTurn["compaction"];
   withdrawn?: boolean;
   queued?: boolean;
   queueHistory?: { content: string; at: string }[];
   execution?: import("./runtime/job-status").NativeExecutionStatus;
-  activity?: import("./contracts").ControlJobActivity;
-  taskPlan?: import("./contracts").ControlTaskPlan | null;
-  toolCalls?: import("./contracts").ControlToolCall[];
+  activity?: import("./contracts").JobActivity;
+  taskPlan?: import("./contracts").TaskPlan | null;
+  toolCalls?: import("./contracts").ToolCall[];
   images?: import("./contracts").ChatImage[];
   id: string;
   commandId?: string;
