@@ -3328,55 +3328,66 @@ impl Batch {
         self.require_development_write(proof)?;
         let job_id = proof.token().job;
         if let Some(job) = self.mutable_job(job_id)?
-            && let Some(source) = job.summary_source
             && let crate::db::entities::JobFinalization::Completed(ref mut output) = finalization
         {
-            let raw = output
-                .summary
-                .as_deref()
-                .ok_or(BatchError(Failure::Rejected(Violation::InvalidValue(
-                    "summary",
-                    "summary result text is missing",
-                ))))?;
-            let summary: crate::db::entities::SummarizationResult = serde_json::from_str(raw)
-                .map_err(|_| {
-                    BatchError(Failure::Rejected(Violation::InvalidValue(
-                        "summary",
-                        "summary result must be valid JSON",
-                    )))
-                })?;
-            if summary.validate().is_err() || summary.source != source {
-                return self.reject(Violation::InvalidValue(
-                    "summary",
-                    "summary result failed schema or source validation",
-                ));
-            }
-            let summary_value = serde_json::to_value(&summary).map_err(|_| {
-                BatchError(Failure::Storage(StorageError::corrupted(
-                    "summary serialization failed",
-                )))
-            })?;
-            let body = crate::db::entities::MessageBody::new(&summary_value).map_err(|_| {
-                BatchError(Failure::Rejected(Violation::InvalidValue(
-                    "summary",
-                    "summary payload exceeds maximum message size",
-                )))
-            })?;
-            self.put_message(&body)?;
-            let producer_job = ContentDigest::of(&encode_mutable_job(&job));
-            let link = crate::db::entities::NativeSummaryResultLink {
-                source,
-                producer_job,
-                payload: body.digest(),
-            };
-            output.value = Some(serde_json::to_value(link).map_err(|_| {
-                BatchError(Failure::Storage(StorageError::corrupted(
-                    "summary link serialization failed",
-                )))
-            })?);
-            output.summary = Some(summary.summary);
+            self.normalize_summary_output(&job, output)?;
         }
         self.finish_development_job(proof, expected_seq, finalization)
+    }
+
+    pub(super) fn normalize_summary_output(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+        output: &mut crate::db::entities::FinalResult,
+    ) -> Result<(), BatchError> {
+        let Some(source) = job.summary_source else {
+            return Ok(());
+        };
+        let raw = output
+            .summary
+            .as_deref()
+            .ok_or(BatchError(Failure::Rejected(Violation::InvalidValue(
+                "summary",
+                "summary result text is missing",
+            ))))?;
+        let summary: crate::db::entities::SummarizationResult =
+            serde_json::from_str(raw).map_err(|_| {
+                BatchError(Failure::Rejected(Violation::InvalidValue(
+                    "summary",
+                    "summary result must be valid JSON",
+                )))
+            })?;
+        if summary.validate().is_err() || summary.source != source {
+            return self.reject(Violation::InvalidValue(
+                "summary",
+                "summary result failed schema or source validation",
+            ));
+        }
+        let summary_value = serde_json::to_value(&summary).map_err(|_| {
+            BatchError(Failure::Storage(StorageError::corrupted(
+                "summary serialization failed",
+            )))
+        })?;
+        let body = crate::db::entities::MessageBody::new(&summary_value).map_err(|_| {
+            BatchError(Failure::Rejected(Violation::InvalidValue(
+                "summary",
+                "summary payload exceeds maximum message size",
+            )))
+        })?;
+        self.put_message(&body)?;
+        let producer_job = ContentDigest::of(&encode_mutable_job(job));
+        let link = crate::db::entities::NativeSummaryResultLink {
+            source,
+            producer_job,
+            payload: body.digest(),
+        };
+        output.value = Some(serde_json::to_value(link).map_err(|_| {
+            BatchError(Failure::Storage(StorageError::corrupted(
+                "summary link serialization failed",
+            )))
+        })?);
+        output.summary = Some(summary.summary);
+        Ok(())
     }
 
     pub(crate) fn record_development_uncertain(
@@ -3910,7 +3921,7 @@ impl Batch {
         Ok(())
     }
 
-    fn settle_mutable_outcome(
+    pub(super) fn settle_mutable_outcome(
         &mut self,
         token: crate::db::entities::AllocationToken,
         job: &crate::db::entities::MutableJob,
@@ -4829,7 +4840,7 @@ impl Batch {
         self.put_pool_allocation(&allocation, Some(&previous))
     }
 
-    fn put_pool_allocation(
+    pub(super) fn put_pool_allocation(
         &mut self,
         allocation: &crate::db::entities::PoolAllocation,
         previous: Option<&crate::db::entities::PoolAllocation>,
