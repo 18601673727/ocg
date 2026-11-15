@@ -45,7 +45,9 @@ impl AvailabilityObservation {
             && self.failure.is_none()
             && matches!(
                 self.finish_reason,
-                Some(ChatFinishReason::Stop | ChatFinishReason::Length)
+                Some(
+                    ChatFinishReason::Stop | ChatFinishReason::Length | ChatFinishReason::ToolCalls
+                )
             )
         {
             AvailabilityClassification::Available

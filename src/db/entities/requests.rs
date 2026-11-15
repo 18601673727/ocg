@@ -251,6 +251,19 @@ pub enum ChatFinishReason {
     Other,
 }
 
+impl ChatFinishReason {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Length => "length",
+            Self::ToolCalls => "tool_calls",
+            Self::ContentFilter => "content_filter",
+            Self::Error => "error",
+            Self::Other => "other",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct NormalizedUsage {
     pub input_tokens: Option<u32>,

@@ -15,7 +15,6 @@ use crate::db::entities::{
 };
 use crate::db::entities::{AvailabilityStatId, AvailabilityStatRecord, MetricsId, MetricsRecord};
 use crate::db::entities::{RequestEligibility, UsageFinality};
-use crate::service::ai::providers::openai_compatible::stream::finish_reason_str;
 
 fn pairs(query: &str) -> Result<std::collections::BTreeMap<&str, &str>, Refusal> {
     let mut values = std::collections::BTreeMap::new();
@@ -729,7 +728,7 @@ fn availability_record(record: &AvailabilityStatRecord) -> AvailabilityObservati
         status_code: observation.status_code,
         finish_reason: observation
             .finish_reason
-            .map(|reason| finish_reason_str(reason).to_owned()),
+            .map(|reason| reason.as_str().to_owned()),
         classification: classification.to_owned(),
         id: record.id.to_string(),
         job: record.job.to_string(),
