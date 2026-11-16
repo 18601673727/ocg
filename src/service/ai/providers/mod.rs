@@ -8,33 +8,27 @@ use std::{future::Future, pin::Pin};
 
 use ntex::client::{ClientResponse, error::ClientError};
 
-use ntex::http::header::{ACCEPT, HeaderValue};
+use ntex::http::header::ACCEPT;
 use serde_json::{Value, json};
 
-use crate::db::entities::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::db::entities::{
     FrozenExecutionConfig, IntermediateOutputKind, Timestamp, UsageFinality,
 };
-use openai_compatible::{ChatConversation, ChatMessage, CompletedToolCall, InvalidToolCall};
+use crate::db::entities::{NormalizedUsage, ProviderFailure};
+use openai_compatible::{ChatConversation, CompletedToolCall, InvalidToolCall};
 
 pub(crate) const MAX_SSE_LINE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_PROVIDER_ERROR_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub(crate) struct StreamFinish {
-    pub(crate) reason: ChatFinishReason,
-    pub(crate) raw: String,
-}
-
-pub mod anthropic;
+mod anthropic;
 mod cancellation;
 mod models;
 pub(crate) mod observe;
 pub mod openai_compatible;
 mod record;
 pub use record::{RequestRecorder, SentRequestState};
-pub(crate) mod responses;
 mod types;
 pub(crate) mod usage;
 
@@ -48,10 +42,9 @@ pub(crate) fn model_endpoint(endpoint: &str) -> Result<String, ProviderExecution
 pub(crate) use models::{ModelListError, list_models};
 pub use observe::{error_observations, metrics, result_value, success_observation};
 pub use types::{
-    ApprovedRoute, CredentialResolver, DestinationPolicy, EnvironmentCredentialResolver,
-    ExternalAuthority, LoopbackProxy, OutputSinkError, ProviderExecutionConfig,
-    ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
-    ProviderOutputSink, ResponseFacts,
+    CredentialResolver, DestinationPolicy, EnvironmentCredentialResolver, LoopbackProxy,
+    OutputSinkError, ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult,
+    ProviderFact, ProviderObservation, ProviderOutputSink, ResponseFacts,
 };
 
 pub(crate) use types::incomplete_tool_calls;

@@ -32,7 +32,7 @@ pub(crate) struct UpdatePause(Arc<Shared>);
 impl Drop for UpdatePause {
     fn drop(&mut self) {
         self.0.update_paused.store(false, Ordering::SeqCst);
-        self.0.scheduler_wake.publish(true, true);
+        self.0.scheduler_wake.publish();
     }
 }
 
@@ -44,7 +44,7 @@ impl Drop for AttachmentPermit {
 
 impl DatabaseHandle {
     pub(crate) fn wake_scheduler(&self) {
-        self.shared.scheduler_wake.publish(false, true);
+        self.shared.scheduler_wake.publish();
     }
 
     async fn attachment_permit(&self) -> Result<AttachmentPermit, DatabaseError> {

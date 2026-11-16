@@ -1,5 +1,4 @@
 use std::future::Future;
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use crate::api::v1::{ApiServer, ServerConfig};
@@ -7,8 +6,9 @@ use crate::db::{DatabaseHandle, DatabaseWorker};
 use crate::system::data_directory::DataDirectory;
 use crate::system::logger::{LogStore, RuntimeLogger};
 use crate::system::monitor::report_protection;
+use crate::system::native_scheduler::NativeStops;
 use crate::system::policy::SystemPolicy;
-use crate::system::scheduler::{ExecutionRuntime, SchedulerHandle};
+use crate::system::scheduler::ExecutionRuntime;
 
 const REMOVED_WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
 
@@ -49,23 +49,13 @@ pub struct HostError {
 
 #[derive(Debug, Default)]
 pub(crate) struct HostReport {
-    pub(crate) attempted: Vec<Phase>,
     pub(crate) failures: Vec<HostFailure>,
 }
 
 impl HostReport {
-    fn attempt<T, E: std::fmt::Display>(
-        &mut self,
-        phase: Phase,
-        result: Result<T, E>,
-    ) -> Option<T> {
-        self.attempted.push(phase);
-        match result {
-            Ok(value) => Some(value),
-            Err(error) => {
-                self.fail(phase, error);
-                None
-            }
+    fn record(&mut self, phase: Phase, result: Result<(), impl std::fmt::Display>) {
+        if let Err(error) = result {
+            self.fail(phase, error);
         }
     }
 
@@ -87,44 +77,10 @@ impl HostReport {
     }
 }
 
-#[derive(Clone)]
-pub struct HostContext {
-    database: DatabaseHandle,
-    scheduler: SchedulerHandle,
-    api_address: Option<SocketAddr>,
-}
-
-impl HostContext {
-    pub fn database(&self) -> &DatabaseHandle {
-        &self.database
-    }
-
-    pub fn scheduler(&self) -> &SchedulerHandle {
-        &self.scheduler
-    }
-
-    pub fn api_address(&self) -> Option<SocketAddr> {
-        self.api_address
-    }
-}
-
-pub fn run<F>(
+pub(crate) fn run_hosted<F>(
     data_directory: &DataDirectory,
     signals: bool,
     until_stopped: impl FnOnce(DatabaseHandle) -> F + 'static,
-) -> Result<(), HostError>
-where
-    F: Future<Output = ()> + 'static,
-{
-    run_server(data_directory, signals, None, move |context| {
-        until_stopped(context.database)
-    })
-}
-
-pub fn run_hosted<F>(
-    data_directory: &DataDirectory,
-    signals: bool,
-    until_stopped: impl FnOnce(HostContext) -> F + 'static,
 ) -> Result<(), HostError>
 where
     F: Future<Output = ()> + 'static,
@@ -135,7 +91,7 @@ where
 pub(crate) fn run_hosted_reporting<F>(
     data_directory: &DataDirectory,
     signals: bool,
-    until_stopped: impl FnOnce(HostContext) -> F + 'static,
+    until_stopped: impl FnOnce(DatabaseHandle) -> F + 'static,
 ) -> HostReport
 where
     F: Future<Output = ()> + 'static,
@@ -149,11 +105,11 @@ where
     )
 }
 
-pub fn run_server<F>(
+pub(crate) fn run_server<F>(
     data_directory: &DataDirectory,
     signals: bool,
     server_config: Option<ServerConfig>,
-    until_stopped: impl FnOnce(HostContext) -> F + 'static,
+    until_stopped: impl FnOnce(DatabaseHandle) -> F + 'static,
 ) -> Result<(), HostError>
 where
     F: Future<Output = ()> + 'static,
@@ -173,7 +129,7 @@ fn run_scoped_reporting<F>(
     signals: bool,
     server_config: Option<ServerConfig>,
     scope: crate::system::scheduler::ClaimScope,
-    until_stopped: impl FnOnce(HostContext) -> F + 'static,
+    until_stopped: impl FnOnce(DatabaseHandle) -> F + 'static,
 ) -> HostReport
 where
     F: Future<Output = ()> + 'static,
@@ -210,9 +166,8 @@ where
             workspace_tools,
             until_stopped,
         ));
-    report.attempted.extend(served.attempted);
     report.failures.extend(served.failures);
-    report.attempt(Phase::Database, database.shutdown());
+    report.record(Phase::Database, database.shutdown());
     report
 }
 
@@ -221,7 +176,7 @@ async fn serve<F>(
     scope: crate::system::scheduler::ClaimScope,
     server_config: Option<ServerConfig>,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
-    until_stopped: impl FnOnce(HostContext) -> F,
+    until_stopped: impl FnOnce(DatabaseHandle) -> F,
 ) -> HostReport
 where
     F: Future<Output = ()>,
@@ -235,17 +190,12 @@ where
         }
     };
     ntex::rt::spawn(report_protection(handle.watch_disk_protection()));
-    let context = HostContext {
-        database: handle.clone(),
-        scheduler: execution.scheduler(),
-        api_address: None,
-    };
     let logs = LogStore::new(handle.data_directory().logs_path());
     let logger = match RuntimeLogger::start(handle.clone(), logs.clone()) {
         Ok(logger) => logger,
         Err(error) => {
-            report.attempt::<(), _>(Phase::Logger, Err(error));
-            report.attempt(Phase::ExecutionRuntime, execution.shutdown().await);
+            report.fail(Phase::Logger, error);
+            report.record(Phase::ExecutionRuntime, execution.shutdown().await);
             return report;
         }
     };
@@ -280,7 +230,6 @@ where
     }
 
     crate::system::http::log_configuration();
-    report.attempted.push(Phase::LogCleanup);
     let cleanup = match crate::system::logger::start_retention(&handle, logs.clone()) {
         Ok(cleanup) => Some(cleanup),
         Err(error) => {
@@ -291,7 +240,8 @@ where
     };
     serve_api(
         &mut report,
-        context,
+        handle,
+        execution.native_stops(),
         logs,
         server_config,
         workspace_tools,
@@ -299,14 +249,13 @@ where
     )
     .await;
 
-    report.attempt(Phase::ExecutionRuntime, execution.shutdown().await);
+    report.record(Phase::ExecutionRuntime, execution.shutdown().await);
     if let Some(cleanup) = cleanup
         && let Err(error) = cleanup.shutdown()
     {
         report.fail(Phase::LogCleanup, error);
     }
     log::info!("OCG foundation shutting down");
-    report.attempted.push(Phase::Logger);
     match logger.shutdown() {
         Ok(status) => {
             if let Some(failure) = status.last_failure {
@@ -320,25 +269,19 @@ where
 
 async fn serve_api<F>(
     report: &mut HostReport,
-    mut context: HostContext,
+    handle: DatabaseHandle,
+    native_stops: NativeStops,
     logs: Arc<LogStore>,
     server_config: Option<ServerConfig>,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
-    until_stopped: impl FnOnce(HostContext) -> F,
+    until_stopped: impl FnOnce(DatabaseHandle) -> F,
 ) where
     F: Future<Output = ()>,
 {
     let listener = match server_config {
         None => None,
         Some(config) => {
-            report.attempted.push(Phase::ApiServer);
-            match ApiServer::start(
-                config,
-                context.database.clone(),
-                logs,
-                context.scheduler.clone(),
-                workspace_tools,
-            ) {
+            match ApiServer::start(config, handle.clone(), logs, native_stops, workspace_tools) {
                 Ok(listener) => Some(listener),
                 Err(error) => {
                     log::error!("{error}");
@@ -348,8 +291,7 @@ async fn serve_api<F>(
             }
         }
     };
-    context.api_address = listener.as_ref().map(ApiServer::address);
-    if let Some(address) = context.api_address {
+    if let Some(address) = listener.as_ref().map(ApiServer::address) {
         log::info!("API server listening on http://{address}");
         eprintln!("OCG API server listening on http://{address}");
     }
@@ -357,7 +299,7 @@ async fn serve_api<F>(
         eprintln!("OCG local browser pairing code: {pairing}");
     }
     eprintln!("OCG host running");
-    until_stopped(context).await;
+    until_stopped(handle).await;
     if let Some(listener) = listener
         && let Err(error) = listener.stop().await
     {

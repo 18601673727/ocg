@@ -5,7 +5,7 @@ use super::jobs::tool_evidence;
 use crate::db::entities::JobId;
 use crate::db::entities::{
     Actor, ChildConversationEntry, ContextState, ContextWorkDetails, ContextWorkState,
-    ConversationEntry, ConversationsPage, Entry, JobLifecycle, JobLimits, JobSpec,
+    ConversationEntry, ConversationsPage, JobLifecycle, JobLimits, JobSpec,
     MutableConversationPage, MutableConversationTurn, Origin, OutputKind, Recurrence,
 };
 use crate::db::entities::{ConfigId, ConfigRecord, ExecutionOperation, OutcomeKind};
@@ -14,7 +14,7 @@ use crate::db::redb::batch::{BatchError, Failure};
 use crate::db::redb::reads::execution_context::verify_native_summary_in;
 use crate::db::redb::reads::jobs::{
     active_job, first_entry_text, mutable_job_details_in, mutable_job_record_in,
-    read_conversation_row, read_job_lifecycle, read_state, turn_first, turn_head, turn_state,
+    read_conversation_row, read_job_lifecycle, read_state, turn_first, turn_head,
     unstarted_settlement_in,
 };
 use crate::db::redb::reads::read;
@@ -128,29 +128,46 @@ pub(crate) fn read_mutable_conversation_turn_page(
 
 fn conversation_job_state(
     rx: &ReadTransaction,
-    conversation: JobId,
-    tip: JobId,
-) -> Result<String, StorageError> {
-    let mut awaiting_user = false;
+    runtime: &state::JobRuntime,
+    tip: Option<JobId>,
+) -> Result<&'static str, StorageError> {
+    if let Some(outcome) = &runtime.state.outcome {
+        return Ok(outcome_label(outcome.kind));
+    }
+    let conversation = runtime.state.job_id;
     for entry in rx.open_table(OPEN_APPROVALS)?.range(
         (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
     )? {
         let (_, state) = entry?;
         if state.value() == 0 {
-            awaiting_user = true;
-            break;
+            return Ok("waiting_for_user");
         }
     }
-    Ok(if read_state(rx, conversation)?.outcome.is_some() {
-        turn_state(rx, conversation)?
-    } else if awaiting_user {
-        "waiting_for_user"
-    } else if let Some((active, _, _)) = active_job(rx, conversation)? {
-        turn_state(rx, active)?
-    } else {
-        turn_state(rx, tip)?
+    let turn = active_job(rx, conversation)?
+        .map(|(id, _, _)| id)
+        .or(tip)
+        .map(|id| state::require(rx, id))
+        .transpose()?;
+    let runtime = turn.as_ref().unwrap_or(runtime);
+    Ok(match &runtime.state.outcome {
+        Some(outcome) => outcome_label(outcome.kind),
+        None if runtime
+            .pending
+            .is_some_and(|(dependencies, _)| dependencies > 0) =>
+        {
+            "waiting"
+        }
+        None => "queued",
+    })
+}
+
+fn outcome_label(kind: OutcomeKind) -> &'static str {
+    match kind {
+        OutcomeKind::Completed => "completed",
+        OutcomeKind::Failed => "failed",
+        OutcomeKind::Cancelled => "cancelled",
+        OutcomeKind::Unknown => "unknown",
     }
-    .to_owned())
 }
 
 fn has_visible_child(rx: &ReadTransaction, conversation: JobId) -> Result<bool, StorageError> {
@@ -188,9 +205,9 @@ pub(crate) fn conversation_summary(
     tip: Option<JobId>,
 ) -> Result<ConversationEntry, StorageError> {
     let conversation = row.id;
-    let metadata = state::require(rx, conversation)?.lifecycle;
-    let title = conversation_title(rx, conversation, &metadata)?;
-    let state = read_state(rx, conversation)?;
+    let runtime = state::require(rx, conversation)?;
+    let metadata = &runtime.lifecycle;
+    let title = conversation_title(rx, conversation, metadata)?;
     let on_hold = metadata.on_hold.map(|code| {
         if code == super::job_tree::HELD_BY_AGENT {
             Actor::Agent {
@@ -200,15 +217,17 @@ pub(crate) fn conversation_summary(
             Actor::User
         }
     });
-    let (tip_state, tip_created_at) = match tip {
-        Some(tip) => (
-            read_state(rx, tip)?,
-            mutable_job_record_in(rx, tip)?
-                .ok_or_else(|| StorageError::corrupted("missing tip"))?
-                .job
-                .created_at,
-        ),
-        None => (state.clone(), row.created_at),
+    let outcome = runtime.state.outcome.as_ref().map(|outcome| outcome.kind);
+    let (tip_outcome, tip_created_at) = match tip {
+        Some(tip) => {
+            let record = mutable_job_record_in(rx, tip)?
+                .ok_or_else(|| StorageError::corrupted("missing tip"))?;
+            (
+                record.outcome.map(|outcome| outcome.kind),
+                record.job.created_at,
+            )
+        }
+        None => (outcome, row.created_at),
     };
     Ok(ConversationEntry {
         root_job: conversation,
@@ -216,7 +235,7 @@ pub(crate) fn conversation_summary(
         agent: row.agent,
         project: row.project,
         title,
-        state: if state.outcome.is_some() {
+        state: if outcome.is_some() {
             "settled"
         } else if metadata.closing.is_some() {
             "closing"
@@ -225,17 +244,9 @@ pub(crate) fn conversation_summary(
         }
         .to_owned(),
         on_hold,
-        tip_settlement_state: tip_state
-            .outcome
-            .map_or("unsettled", |outcome| match outcome.kind {
-                OutcomeKind::Completed => "completed",
-                OutcomeKind::Failed => "failed",
-                OutcomeKind::Cancelled => "cancelled",
-                OutcomeKind::Unknown => "unknown",
-            })
-            .to_owned(),
+        tip_settlement_state: tip_outcome.map_or("unsettled", outcome_label).to_owned(),
         tip_created_at,
-        job_state: conversation_job_state(rx, conversation, tip.unwrap_or(conversation))?,
+        job_state: conversation_job_state(rx, &runtime, tip)?.to_owned(),
         has_children: has_visible_child(rx, conversation)?,
     })
 }
@@ -257,8 +268,12 @@ pub(crate) fn read_conversation_children(
     parent: JobId,
     before: Option<JobId>,
     limit: usize,
-) -> Result<Vec<ChildConversationEntry>, StorageError> {
+) -> Result<Option<Vec<ChildConversationEntry>>, StorageError> {
     let rx = read(database)?;
+    if read_conversation_row(&rx, parent)?.is_none() {
+        return Ok(None);
+    }
+    state::require(&rx, parent)?;
     let mut children = Vec::new();
     for entry in rx
         .open_table(CHILD_GROUPS)?
@@ -271,7 +286,6 @@ pub(crate) fn read_conversation_children(
             .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
         let conversation = conversation_summary(&rx, &row, conversation_tip(&rx, &row)?)?;
         children.push(ChildConversationEntry {
-            job_state: conversation.job_state.clone(),
             conversation,
             origin: row.origin,
             keep_open: row.keep_open,
@@ -282,7 +296,7 @@ pub(crate) fn read_conversation_children(
                 .transpose()?,
         });
     }
-    Ok(children)
+    Ok(Some(children))
 }
 
 pub(crate) fn read_conversations(
@@ -396,12 +410,9 @@ fn conversation_matches(
                         "search turn has invalid conversation",
                     ));
                 }
-                let entry = Entry::UserMessage {
-                    text: job.job.input.text().to_owned(),
-                    attachments: job.job.input.attachments().to_vec(),
-                };
-                if indexes::search_input_text(&rx.open_table(ATTACHMENTS)?, &entry)?
-                    .is_some_and(|text| text.to_lowercase().contains(term))
+                if indexes::search_input_text(&rx.open_table(ATTACHMENTS)?, &job.job.input)?
+                    .to_lowercase()
+                    .contains(term)
                 {
                     matched = true;
                     break;

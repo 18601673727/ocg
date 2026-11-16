@@ -580,14 +580,7 @@ pub(super) async fn respond(
     match route {
         Route::Health => Ok(Reply::ok(health(database).await)),
         Route::MutableJob(action) => {
-            mutable_jobs::respond(
-                action,
-                request,
-                payload,
-                database,
-                shared.scheduler.native_stops(),
-            )
-            .await
+            mutable_jobs::respond(action, request, payload, database, &shared.native_stops).await
         }
         Route::Update(latest) => update::get(latest).await,
         Route::StartUpdate => {

@@ -1,10 +1,9 @@
 use crate::db::derived::ActivityProjection;
 use crate::db::entities::{ConfigBody, ConfigId, DependencyState, OutcomeKind, ToolCallRef};
 use crate::db::entities::{
-    CursorPage, DependencyCondition, JobId, JobInputId, JobKind, JobLifecycle, JobOutputId,
-    JobOutputRecord, JobRecord, JobSearchPage, JobSpec, JobState, JobTree, JobUsage,
-    MutableConfiguration, MutableJobDetails, NativeJobItem, Origin, OutputKind, Recurrence,
-    RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
+    DependencyCondition, JobId, JobLifecycle, JobOutputId, JobOutputRecord, JobSearchPage, JobSpec,
+    JobState, JobTree, JobUsage, MutableConfiguration, MutableJobDetails, NativeJobItem, Origin,
+    OutputKind, Recurrence, RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
 };
 use crate::db::redb::approvals::approved_calls;
 use crate::db::redb::batch::Batch;
@@ -14,7 +13,7 @@ use crate::db::redb::rows::{ConfigRow, decode_output, decode_tool_evidence, tool
 use crate::db::redb::schema::{
     ACTIVE_ALLOCATIONS, APPROVALS, CHILDREN, CONFIGS, CONVERSATIONS, JOB_OBSERVATIONS, JOB_OUTPUTS,
     JOB_RUNTIME, JOBS, MAX_OBSERVATION_SCAN, MAX_PAGE, OPEN_APPROVALS, POOL_ALLOCATIONS,
-    RECURRENCES, REQUEST_EVENTS, RETRY_JOBS, TOOL_CALLS, TURNS,
+    RECURRENCES, REQUEST_EVENTS, TOOL_CALLS, TURNS,
 };
 use crate::db::redb::{StorageError, TxRead, allocations, rows, state};
 use crate::db::redb::{execution, observations};
@@ -39,11 +38,7 @@ pub(crate) fn read_job_lifecycle(
 }
 
 pub(crate) fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobState, StorageError> {
-    rx.open_table(JOB_RUNTIME)?
-        .get(id.get())?
-        .map(|bytes| state::decode_state(id.get(), bytes.value()))
-        .transpose()?
-        .ok_or_else(|| StorageError::corrupted(format!("{id} has no job_state")))
+    Ok(state::require(rx, id)?.state)
 }
 
 pub(crate) fn turn_head(
@@ -66,70 +61,6 @@ pub(crate) fn turn_first(
         .next()
         .transpose()?
         .map(|(key, _)| JobId::new(key.value().1)))
-}
-
-pub(super) fn conversation_record(
-    rx: &ReadTransaction,
-    row: JobSpec,
-) -> Result<JobRecord, StorageError> {
-    let id = row.id;
-    let state = read_state(rx, id)?;
-    let at = |kind: OutcomeKind| {
-        state
-            .outcome
-            .as_ref()
-            .filter(|outcome| outcome.kind == kind)
-            .map(|outcome| outcome.at)
-    };
-    let subtree_settled = state::pending(rx, id)?.is_none();
-    let updated_at = [
-        Some(row.created_at),
-        state.outcome.as_ref().map(|outcome| outcome.at),
-    ]
-    .into_iter()
-    .flatten()
-    .max()
-    .unwrap_or(row.created_at);
-    let children_closed_at = read_job_lifecycle(rx, id)?
-        .closing
-        .map(|closing| closing.at);
-    Ok(JobRecord {
-        id,
-        name: None,
-        started_at: None,
-        completed_at: at(OutcomeKind::Completed),
-        failed_at: at(OutcomeKind::Failed),
-        cancelled_at: at(OutcomeKind::Cancelled),
-        unknown_at: at(OutcomeKind::Unknown),
-        stop_confirmed_at: None,
-        stop_confirmed_by: None,
-        created_at: row.created_at,
-        updated_at,
-        input: JobInputId::new(id.get()),
-        parent: row.parent_id.unwrap_or(JobId::new(0)),
-        parent_id: row.parent_id,
-        group: None,
-        objective: None,
-        configuration: None,
-        assigned_executor: None,
-        previous: None,
-        outcome: state.outcome,
-        children_closed_at,
-        kind: JobKind::Group {
-            agent: row.agent,
-            project: row.project,
-            origin: row.origin,
-            keep_open: row.keep_open,
-        },
-        subtree_settled,
-    })
-}
-
-pub(crate) fn read_job(database: &Database, id: JobId) -> Result<Option<JobRecord>, StorageError> {
-    let rx = read(database)?;
-    read_conversation_row(&rx, id)?
-        .map(|row| conversation_record(&rx, row))
-        .transpose()
 }
 
 pub(crate) fn mutable_job_record_in(
@@ -258,25 +189,6 @@ pub(crate) fn read_job_search(
         next_before,
         has_more,
     })
-}
-
-pub(crate) fn read_children(
-    database: &Database,
-    parent: JobId,
-    after: Option<JobId>,
-    limit: usize,
-) -> Result<Vec<JobId>, StorageError> {
-    let rx = read(database)?;
-    let table = rx.open_table(CHILDREN)?;
-    let start = after.map_or(0, |after| after.get().saturating_add(1));
-    let mut children = Vec::new();
-    for entry in table
-        .range((parent.get(), start)..=(parent.get(), u128::MAX))?
-        .take(limit.min(MAX_PAGE))
-    {
-        children.push(JobId::new(entry?.0.value().1));
-    }
-    Ok(children)
 }
 
 pub(crate) const TREE_PAGE_MAX: usize = 100;
@@ -416,20 +328,6 @@ pub(crate) fn active_job(
         }
     };
     Ok(Some((job.id, model, name)))
-}
-
-pub(crate) fn turn_state(rx: &ReadTransaction, id: JobId) -> Result<&'static str, StorageError> {
-    let state = read_state(rx, id)?;
-    if let Some(outcome) = &state.outcome {
-        return Ok(match outcome.kind {
-            OutcomeKind::Completed => "completed",
-            OutcomeKind::Failed => "failed",
-            OutcomeKind::Cancelled => "cancelled",
-            OutcomeKind::Unknown => "unknown",
-        });
-    }
-    let open = state::pending(rx, id)?.map_or(0, |counts| counts.0);
-    Ok(if open > 0 { "waiting" } else { "queued" })
 }
 
 fn dependency_state(
@@ -661,50 +559,6 @@ pub(crate) fn read_job_tree(
     Ok(Some(JobTree { ancestors, nodes }))
 }
 
-pub(crate) fn read_retries(
-    database: &Database,
-    original: JobId,
-    after: Option<JobId>,
-    limit: usize,
-) -> Result<CursorPage<JobId, JobId>, StorageError> {
-    let rx = read(database)?;
-    let jobs = rx.open_table(JOBS)?;
-    let Some(row) = jobs.get(original.get())? else {
-        return Ok(CursorPage {
-            records: Vec::new(),
-            next: None,
-        });
-    };
-    let source = crate::db::redb::jobs::decode_mutable_job(original.get(), row.value())?;
-    let original = if let Some(retry) = &source.retry {
-        let root = jobs
-            .get(retry.original.get())?
-            .map(|row| crate::db::redb::jobs::decode_mutable_job(retry.original.get(), row.value()))
-            .transpose()?
-            .ok_or_else(|| StorageError::corrupted("retry source missing"))?;
-        crate::db::redb::jobs::validate_retry_source(&source, &root)?;
-        root.id
-    } else {
-        original
-    };
-    let table = rx.open_table(RETRY_JOBS)?;
-    let limit = limit.clamp(1, MAX_PAGE);
-    let mut records = Vec::new();
-    let mut more = false;
-    for entry in table.range((
-        std::ops::Bound::Excluded((original.get(), after.map_or(0, JobId::get))),
-        std::ops::Bound::Included((original.get(), u128::MAX)),
-    ))? {
-        if records.len() == limit {
-            more = true;
-            break;
-        }
-        records.push(JobId::new(entry?.0.value().1));
-    }
-    let next = records.last().copied().filter(|_| more);
-    Ok(CursorPage { records, next })
-}
-
 pub(crate) fn read_output_job_is_decision(
     database: &Database,
     id: JobId,
@@ -733,21 +587,19 @@ pub(crate) fn read_outputs(
     outputs(&read(database)?, job, after_seq, limit)
 }
 
-fn output_is_group(rx: &ReadTransaction, job: JobId) -> Result<bool, StorageError> {
-    Ok(read_conversation_row(rx, job)?.is_some())
-}
-
 fn outputs(
     rx: &ReadTransaction,
     job: JobId,
     after_seq: Option<i64>,
     limit: usize,
 ) -> Result<Vec<JobOutputRecord>, StorageError> {
-    if output_is_group(rx, job)? {
+    if let Some(conversation) = read_conversation_row(rx, job)? {
         if after_seq.is_some_and(|seq| seq >= 1) || limit == 0 {
             return Ok(Vec::new());
         }
-        return Ok(conversation_result(rx, job)?.into_iter().collect());
+        return Ok(conversation_result(rx, &conversation)?
+            .into_iter()
+            .collect());
     }
     let outputs = rx.open_table(JOB_OUTPUTS)?;
     let start = match after_seq.map(u32::try_from) {
@@ -778,8 +630,8 @@ fn latest_output(
     rx: &ReadTransaction,
     job: JobId,
 ) -> Result<Option<JobOutputRecord>, StorageError> {
-    if output_is_group(rx, job)? {
-        return conversation_result(rx, job);
+    if let Some(conversation) = read_conversation_row(rx, job)? {
+        return conversation_result(rx, &conversation);
     }
     let outputs = rx.open_table(JOB_OUTPUTS)?;
     outputs
@@ -792,16 +644,14 @@ fn latest_output(
 
 fn conversation_result(
     rx: &ReadTransaction,
-    conversation: JobId,
+    row: &JobSpec,
 ) -> Result<Option<JobOutputRecord>, StorageError> {
-    let state = read_state(rx, conversation)?;
-    let Some(outcome) = state.outcome else {
+    let runtime = state::require(rx, row.id)?;
+    let Some(outcome) = runtime.state.outcome else {
         return Ok(None);
     };
     let mut summary = String::new();
     let mut value = None;
-    let row = read_conversation_row(rx, conversation)?
-        .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
     if row.is_chunk_group() {
         summary = match outcome.kind {
             OutcomeKind::Completed => "All summary chunks completed.",
@@ -810,9 +660,7 @@ fn conversation_result(
             OutcomeKind::Unknown => "The summary chunks have an unknown outcome.",
         }
         .to_owned();
-    } else if let Some(turn) = state::require(rx, conversation)?
-        .last_result
-        .map(JobId::get)
+    } else if let Some(turn) = runtime.last_result.map(JobId::get)
         && let Some((key, bytes)) = rx
             .open_table(JOB_OUTPUTS)?
             .range((turn, 0)..=(turn, u32::MAX))?
@@ -823,7 +671,7 @@ fn conversation_result(
         summary = output.summary.unwrap_or_default();
         value = output.value;
     }
-    for call in approved_calls(rx, conversation)? {
+    for call in approved_calls(rx, row.id)? {
         summary.push_str(&format!(
             "\nApproved, never ran: {} {}",
             call.name,
@@ -835,7 +683,7 @@ fn conversation_result(
     }
     Ok(Some(JobOutputRecord {
         id: JobOutputId::new(1),
-        job: conversation,
+        job: row.id,
         seq: 1,
         kind: OutputKind::Result,
         summary: Some(summary),

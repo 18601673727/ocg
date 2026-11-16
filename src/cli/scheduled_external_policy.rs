@@ -42,9 +42,10 @@ pub(super) fn run(
     let action = parse(arguments)?;
     let result = Rc::new(RefCell::new(None));
     let returned = result.clone();
-    let report =
-        crate::system::runtime::run_hosted_reporting(directory, false, move |context| async move {
-            let database = context.database();
+    let report = crate::system::runtime::run_hosted_reporting(
+        directory,
+        false,
+        move |database| async move {
             let outcome: Result<(), Box<dyn std::error::Error>> = async {
                 match action {
                     Action::Create { draft } => {
@@ -101,7 +102,8 @@ pub(super) fn run(
             }
             .await;
             *returned.borrow_mut() = Some(outcome);
-        });
+        },
+    );
     for failure in report.failures {
         if failure.phase != crate::system::runtime::Phase::Logger {
             return Err(failure.error.into());

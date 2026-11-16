@@ -1,8 +1,9 @@
 use super::{
-    CancellationToken, ChatFinishReason, CompletedToolCall, DEFAULT_TIMEOUT, Duration,
-    FrozenExecutionConfig, Future, IntermediateOutputKind, InvalidToolCall, MAX_OUTPUT_BYTES,
-    NormalizedUsage, Pin, ProviderFailure, Timestamp, UsageFinality, Value,
+    CancellationToken, CompletedToolCall, DEFAULT_TIMEOUT, Duration, FrozenExecutionConfig, Future,
+    IntermediateOutputKind, InvalidToolCall, MAX_OUTPUT_BYTES, NormalizedUsage, Pin,
+    ProviderFailure, Timestamp, UsageFinality, Value,
 };
+use crate::db::entities::ChatFinishReason;
 
 pub trait CredentialResolver: Send + Sync {
     fn resolve<'a>(
@@ -86,55 +87,8 @@ pub enum DestinationPolicy {
     ApprovedHttps {
         host: String,
         port: u16,
-        route: ApprovedRoute,
-        authority: ExternalAuthority,
+        proxy: LoopbackProxy,
     },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExternalAuthority {
-    ManualExternalTrial,
-    ManualExternalExecution,
-    ScheduledExternalTransport,
-}
-
-impl ExternalAuthority {
-    pub(crate) const fn feature(self) -> crate::system::execution_features::ExecutionFeature {
-        use crate::system::execution_features::ExecutionFeature;
-        match self {
-            ExternalAuthority::ManualExternalTrial => ExecutionFeature::ManualExternalTrial,
-            ExternalAuthority::ManualExternalExecution => ExecutionFeature::ManualExternalExecution,
-            ExternalAuthority::ScheduledExternalTransport => {
-                ExecutionFeature::ScheduledExternalTransport
-            }
-        }
-    }
-
-    pub(crate) const fn admits_route(self, route: &ApprovedRoute) -> bool {
-        match (self, route) {
-            (
-                ExternalAuthority::ManualExternalTrial,
-                ApprovedRoute::Direct | ApprovedRoute::TrustedProxy(_),
-            )
-            | (ExternalAuthority::ManualExternalExecution, ApprovedRoute::TrustedProxy(_)) => true,
-            (ExternalAuthority::ScheduledExternalTransport, ApprovedRoute::TrustedProxy(_)) => true,
-            (
-                ExternalAuthority::ManualExternalExecution
-                | ExternalAuthority::ScheduledExternalTransport,
-                ApprovedRoute::Direct,
-            ) => false,
-        }
-    }
-
-    pub(crate) const fn name(self) -> &'static str {
-        self.feature().name()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ApprovedRoute {
-    Direct,
-    TrustedProxy(LoopbackProxy),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,7 +106,6 @@ impl LoopbackProxy {
 
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionConfig {
-    pub transport: crate::db::entities::LlmTransport,
     pub session_id: Option<crate::db::entities::JobId>,
     pub timeout: Duration,
     pub first_delta_timeout: Option<Duration>,
@@ -164,7 +117,6 @@ pub struct ProviderExecutionConfig {
 impl ProviderExecutionConfig {
     pub(crate) fn for_profile(&self, frozen: &FrozenExecutionConfig) -> Self {
         let mut config = self.clone();
-        config.transport = frozen.llm.provider.transport;
         if frozen
             .llm
             .config
@@ -180,7 +132,6 @@ impl ProviderExecutionConfig {
 impl Default for ProviderExecutionConfig {
     fn default() -> Self {
         Self {
-            transport: crate::db::entities::LlmTransport::OpenAiChatCompletions,
             session_id: None,
             timeout: DEFAULT_TIMEOUT,
             first_delta_timeout: None,
@@ -193,9 +144,7 @@ impl Default for ProviderExecutionConfig {
 
 #[derive(Debug, Clone)]
 pub struct ProviderExecutionResult {
-    pub response_items: Vec<Value>,
     pub text: String,
-    pub reasoning: String,
     pub tool_calls: Vec<CompletedToolCall>,
     pub refused: Vec<InvalidToolCall>,
     pub usage: NormalizedUsage,

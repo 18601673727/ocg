@@ -220,7 +220,7 @@ impl Batch {
             at: self.now,
             cause: None,
         });
-        self.put_mutable_job_state(token.job, &state)?;
+        self.put_job_state(token.job, &state)?;
         let (seq, id) = self.write_output(
             token.job,
             OutputKind::Result,

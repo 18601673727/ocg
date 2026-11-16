@@ -1,13 +1,13 @@
-use std::future::Future;
 use std::time::{Duration, Instant};
 
 use ntex::util::{Either, select};
 
-use crate::db::{DatabaseError, DatabaseHandle, SchedulerWakeSubscription};
+use crate::db::{DatabaseHandle, SchedulerWakeSubscription};
 use crate::service::ai::providers::CancellationToken;
 use crate::system::execution_features::ExecutionFeature;
 use crate::system::executor::execution_runtime::ExecutionRuntimeError;
 use crate::system::monitor::ProtectionWatch;
+use crate::system::native_scheduler::{NativeScheduler, NativeStops};
 
 const BATCH_FLOOR: Duration = Duration::from_millis(5);
 const RECONCILE: Duration = Duration::from_secs(30);
@@ -31,11 +31,7 @@ impl Scheduler {
         }
     }
 
-    pub(crate) async fn run<Dispatch, DispatchFuture>(self, mut dispatch: Dispatch)
-    where
-        Dispatch: FnMut(bool) -> DispatchFuture,
-        DispatchFuture: Future<Output = Result<Option<Duration>, DatabaseError>>,
-    {
+    pub(super) async fn run(self, scheduler: &NativeScheduler) {
         let mut previous_batch = None;
         let mut next_due = None;
         loop {
@@ -81,7 +77,7 @@ impl Scheduler {
             while self.wake.try_recv().is_ok() {
                 database_changed = true;
             }
-            let result = dispatch(database_changed).await;
+            let result = scheduler.dispatch(database_changed).await;
             previous_batch = Some(Instant::now());
             match result {
                 Ok(due) => next_due = due,
@@ -102,19 +98,8 @@ fn batch_delay(previous: Instant, next_due: Option<Duration>) -> Duration {
     due.max(BATCH_FLOOR.saturating_sub(previous.elapsed()))
 }
 
-#[derive(Clone)]
-pub struct SchedulerHandle {
-    native_stops: crate::system::native_scheduler::NativeStops,
-}
-
-impl SchedulerHandle {
-    pub(crate) fn native_stops(&self) -> &crate::system::native_scheduler::NativeStops {
-        &self.native_stops
-    }
-}
-
 pub struct ExecutionRuntime {
-    scheduler: SchedulerHandle,
+    native_stops: NativeStops,
     shutdown: CancellationToken,
     finished: Option<ntex::rt::JoinHandle<()>>,
 }
@@ -126,18 +111,9 @@ pub enum ClaimScope {
 }
 
 impl ExecutionRuntime {
-    pub fn start(
-        _database: DatabaseHandle,
-        _scope: ClaimScope,
-    ) -> Result<Self, ExecutionRuntimeError> {
-        Ok(Self::idle())
-    }
-
     fn idle() -> Self {
         Self {
-            scheduler: SchedulerHandle {
-                native_stops: crate::system::native_scheduler::NativeStops::default(),
-            },
+            native_stops: NativeStops::default(),
             shutdown: CancellationToken::default(),
             finished: None,
         }
@@ -157,7 +133,7 @@ impl ExecutionRuntime {
                 database,
                 wake,
                 runtime.shutdown.clone(),
-                runtime.scheduler.native_stops.clone(),
+                runtime.native_stops.clone(),
                 workspace_tools.clone(),
             )));
         }
@@ -168,8 +144,8 @@ impl ExecutionRuntime {
         self.finished.is_some()
     }
 
-    pub fn scheduler(&self) -> SchedulerHandle {
-        self.scheduler.clone()
+    pub(super) fn native_stops(&self) -> NativeStops {
+        self.native_stops.clone()
     }
 
     pub async fn shutdown(mut self) -> Result<(), ExecutionRuntimeError> {

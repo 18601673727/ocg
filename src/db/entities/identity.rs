@@ -78,7 +78,6 @@ macro_rules! record_id_type {
 
 record_id_type!(JobId, "job");
 record_id_type!(ComposerContextId, "composer_context");
-record_id_type!(JobInputId, "job_input");
 record_id_type!(JobOutputId, "job_output");
 record_id_type!(ConfigId, "config");
 record_id_type!(ExecutorId, "executor");
@@ -205,7 +204,6 @@ impl fmt::Display for RequestRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum RecordRef {
     Job(JobId),
-    JobInput(JobInputId),
     JobOutput(JobOutputId),
     Executor(ExecutorId),
     ExecutionPool(ExecutionPoolId),
@@ -222,7 +220,6 @@ impl fmt::Display for RecordRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Job(id) => id.fmt(f),
-            Self::JobInput(id) => id.fmt(f),
             Self::JobOutput(id) => id.fmt(f),
             Self::Executor(id) => id.fmt(f),
             Self::ExecutionPool(id) => id.fmt(f),

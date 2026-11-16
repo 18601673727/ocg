@@ -634,46 +634,9 @@ struct DecisionSubmissionInput {
     reasoning_effort: Option<String>,
     decision_agent: String,
     decision_model: String,
-    request: DecisionRequestInput,
+    request: crate::db::entities::DecisionRequest,
     #[serde(default)]
     name: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DecisionRequestInput {
-    state: serde_json::Value,
-    question: DecisionQuestionInput,
-}
-
-#[derive(Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum DecisionQuestionInput {
-    Choice {
-        prompt: String,
-        options: Vec<ChoiceOptionInput>,
-    },
-    BinaryProbability {
-        prompt: String,
-    },
-    OrdinalScore {
-        prompt: String,
-        levels: Vec<ScoreLevelInput>,
-    },
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ChoiceOptionInput {
-    id: String,
-    description: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ScoreLevelInput {
-    value: i32,
-    description: String,
 }
 
 impl DecisionJobRequest {
@@ -693,38 +656,7 @@ impl DecisionJobRequest {
         {
             return Err(INVALID_DECISION_REQUEST);
         }
-        let request = crate::db::entities::DecisionRequest {
-            state: wire.request.state,
-            question: match wire.request.question {
-                DecisionQuestionInput::Choice { prompt, options } => {
-                    crate::db::entities::DecisionQuestion::Choice {
-                        prompt,
-                        options: options
-                            .into_iter()
-                            .map(|option| crate::db::entities::ChoiceOption {
-                                id: option.id,
-                                description: option.description,
-                            })
-                            .collect(),
-                    }
-                }
-                DecisionQuestionInput::BinaryProbability { prompt } => {
-                    crate::db::entities::DecisionQuestion::BinaryProbability { prompt }
-                }
-                DecisionQuestionInput::OrdinalScore { prompt, levels } => {
-                    crate::db::entities::DecisionQuestion::OrdinalScore {
-                        prompt,
-                        levels: levels
-                            .into_iter()
-                            .map(|level| crate::db::entities::ScoreLevel {
-                                value: level.value,
-                                description: level.description,
-                            })
-                            .collect(),
-                    }
-                }
-            },
-        };
+        let request = wire.request;
         if serde_json::to_vec(&request)
             .map(|bytes| bytes.len() > crate::db::entities::MAX_DECISION_REQUEST_BYTES)
             .unwrap_or(true)
@@ -785,25 +717,10 @@ async fn admit_decision(
         agent_profile: Some(request.decision_agent),
         llm_profile: request.decision_model,
     };
-    let first = crate::db::entities::Entry::UserMessage {
-        text: match &request.request.question {
-            crate::db::entities::DecisionQuestion::Choice { prompt, .. }
-            | crate::db::entities::DecisionQuestion::BinaryProbability { prompt }
-            | crate::db::entities::DecisionQuestion::OrdinalScore { prompt, .. } => prompt.clone(),
-        },
-        attachments: Vec::new(),
-    };
     let admitted = shared
         .database
         .submit_decision(
-            crate::db::entities::JobGroup {
-                name: request.name.clone(),
-                agent: Some(request.decision_agent.into()),
-                project: None,
-                origin: crate::db::entities::Origin::System,
-                keep_open: false,
-            },
-            first,
+            request.name.clone(),
             configuration,
             request.request.clone(),
             submission,
@@ -1012,7 +929,7 @@ pub(super) async fn action(
     }
     .map_err(action_error)?;
     for token in &result.running {
-        shared.scheduler.native_stops().cancel(*token);
+        shared.native_stops.cancel(*token);
     }
     if let Err(error) = shared
         .database
@@ -1153,18 +1070,11 @@ pub(super) async fn decide(
 }
 
 pub(super) async fn cards(shared: &Shared, conversation: JobId) -> Result<Reply, Refusal> {
-    if !shared
-        .database
-        .job(conversation)
-        .await?
-        .is_some_and(|job| job.kind.is_group())
-    {
-        return Err(conversation_refusal("conversation_not_found"));
-    }
     let cards = shared
         .database
         .conversation_cards(conversation)
         .await?
+        .ok_or_else(|| conversation_refusal("conversation_not_found"))?
         .into_iter()
         .map(serde_json::from_value)
         .collect::<Result<Vec<CardView>, _>>()

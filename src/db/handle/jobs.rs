@@ -1,8 +1,7 @@
 use crate::db::commands::{byte_count, compaction_bytes, debug_bytes};
 use crate::db::entities::{
-    Actor, Appended, ConfigId, Entry, ExecutionConfiguration, JobAction, JobEdit, JobGroup, JobId,
-    JobOutputRecord, JobRecord, OperationKind, Submission, SubmissionKey, SubmissionRecord,
-    ToolCallRef,
+    Actor, Appended, ConfigId, ExecutionConfiguration, JobAction, JobEdit, JobId, JobOutputRecord,
+    OperationKind, Submission, SubmissionKey, SubmissionRecord, ToolCallRef,
 };
 use crate::db::errors::DatabaseError;
 use crate::db::worker::DatabaseHandle;
@@ -15,7 +14,7 @@ impl DatabaseHandle {
         conversation: JobId,
         before: Option<JobId>,
         limit: usize,
-    ) -> Result<Vec<crate::db::entities::ChildConversationEntry>, DatabaseError> {
+    ) -> Result<Option<Vec<crate::db::entities::ChildConversationEntry>>, DatabaseError> {
         self.read(move |database| {
             redb::read_conversation_children(database, conversation, before, limit)
         })
@@ -48,11 +47,6 @@ impl DatabaseHandle {
         context: Option<entities::ComposerContextId>,
     ) -> Result<Option<crate::db::entities::MutableJobDetails>, DatabaseError> {
         self.read(move |database| redb::read_mutable_job_details(database, job, context))
-            .await
-    }
-
-    pub async fn job(&self, job: JobId) -> Result<Option<JobRecord>, DatabaseError> {
-        self.read(move |database| redb::read_job(database, job))
             .await
     }
 
@@ -93,16 +87,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn children(
-        &self,
-        parent: JobId,
-        after: Option<JobId>,
-        limit: usize,
-    ) -> Result<Vec<JobId>, DatabaseError> {
-        self.read(move |database| redb::read_children(database, parent, after, limit))
-            .await
-    }
-
     pub async fn job_tree(
         &self,
         job: JobId,
@@ -111,16 +95,6 @@ impl DatabaseHandle {
         depth: u8,
     ) -> Result<Option<crate::db::entities::JobTree>, DatabaseError> {
         self.read(move |database| redb::read_job_tree(database, job, after, limit, depth))
-            .await
-    }
-
-    pub async fn retries(
-        &self,
-        original: JobId,
-        after: Option<JobId>,
-        limit: usize,
-    ) -> Result<crate::db::entities::CursorPage<JobId, JobId>, DatabaseError> {
-        self.read(move |database| redb::read_retries(database, original, after, limit))
             .await
     }
 
@@ -153,7 +127,7 @@ impl DatabaseHandle {
     pub async fn conversation_cards(
         &self,
         conversation: JobId,
-    ) -> Result<Vec<serde_json::Value>, DatabaseError> {
+    ) -> Result<Option<Vec<serde_json::Value>>, DatabaseError> {
         self.read(move |database| redb::read_cards(database, conversation))
             .await
     }
@@ -354,23 +328,21 @@ impl DatabaseHandle {
         .await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn submit_decision(
         &self,
-        spec: JobGroup,
-        first: Entry,
+        name: Option<String>,
         configuration: ExecutionConfiguration,
         request: entities::DecisionRequest,
         submission: Option<Submission>,
     ) -> Result<(JobId, Appended), DatabaseError> {
         let capabilities = self.shared.native_resources.clone();
         self.write_sized(
-            (spec, first, configuration, request, submission),
-            |(_, first, _, request, _)| debug_bytes(first).saturating_add(debug_bytes(request)),
+            (name, configuration, request, submission),
+            |(_, _, request, _)| debug_bytes(request),
             OperationKind::Open,
-            move |batch, (spec, _first, configuration, request, submission)| {
+            move |batch, (name, configuration, request, submission)| {
                 batch.submit_native_decision(
-                    spec,
+                    name,
                     configuration,
                     request,
                     submission,
@@ -499,7 +471,7 @@ impl DatabaseHandle {
         self.write_sized(
             (root, edit),
             |(_, edit)| match edit {
-                JobEdit::Title(title) | JobEdit::SuggestedTitle(title) => byte_count(title.len()),
+                JobEdit::Title(title) => byte_count(title.len()),
                 JobEdit::Hide | JobEdit::Limits(_) => 16,
                 JobEdit::CompactionPolicy(policy) => compaction_bytes(policy.as_ref()),
             },

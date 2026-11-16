@@ -11,20 +11,12 @@ use crate::db::entities::ToolCallRefusal;
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct ChatConversation {
     #[serde(skip)]
-    pub response_items: BTreeMap<usize, Vec<Value>>,
-    #[serde(skip)]
     pub dropped_turns: u32,
     #[serde(skip)]
     pub image_attachments: BTreeMap<usize, Vec<crate::db::entities::AttachmentId>>,
     pub messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<ToolWire>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub tool_choice: Option<ToolChoiceWire>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub parallel_tool_calls: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub response_format: Option<ResponseFormatWire>,
 }
 
 impl ChatConversation {
@@ -56,32 +48,6 @@ impl ChatConversation {
                     format!("tools[{index}].function.name"),
                     format!("tool `{}` is offered twice", tool.function.name),
                 ));
-            }
-        }
-        if self.tools.is_empty()
-            && (self.tool_choice.is_some() || self.parallel_tool_calls.is_some())
-        {
-            return Err(TransportError::unsupported(
-                "tool_choice",
-                "tool_choice and parallel_tool_calls require tools",
-            ));
-        }
-        if let Some(choice) = &self.tool_choice {
-            match choice {
-                ToolChoiceWire::Mode(mode)
-                    if matches!(mode.as_str(), "auto" | "required" | "none") => {}
-                ToolChoiceWire::Named(named)
-                    if named.kind == "function"
-                        && self
-                            .tools
-                            .iter()
-                            .any(|tool| tool.function.name == named.function.name) => {}
-                _ => {
-                    return Err(TransportError::unsupported(
-                        "tool_choice",
-                        "invalid tool_choice",
-                    ));
-                }
             }
         }
         let mut image_count = 0usize;
@@ -127,15 +93,6 @@ impl ChatConversation {
         calls: &[CompletedToolCall],
         assembled: Vec<InvalidToolCall>,
     ) -> Result<Vec<InvalidToolCall>, InvalidToolCall> {
-        if self.parallel_tool_calls == Some(false) && calls.len() > 1 {
-            return Err(InvalidToolCall::new(
-                ToolCallRefusal::Unauthorized,
-                format!(
-                    "{} tool calls were returned with parallel_tool_calls off",
-                    calls.len()
-                ),
-            ));
-        }
         let mut assembled: std::collections::BTreeMap<u32, InvalidToolCall> = assembled
             .into_iter()
             .filter_map(|refusal| refusal.index.map(|index| (index, refusal)))
@@ -155,15 +112,6 @@ impl ChatConversation {
                     ),
                 )
             };
-            let chosen = match &self.tool_choice {
-                Some(ToolChoiceWire::Mode(mode)) => match mode.as_str() {
-                    "auto" | "required" => true,
-                    "none" => false,
-                    _ => return Err(unauthorized()),
-                },
-                Some(ToolChoiceWire::Named(named)) => named.function.name == call.name,
-                None => true,
-            };
             let mut offered = self
                 .tools
                 .iter()
@@ -177,10 +125,6 @@ impl ChatConversation {
                 }
                 _ => return Err(unauthorized()),
             };
-            if !chosen {
-                refused.push(unauthorized());
-                continue;
-            }
             if let Some(refusal) = assembled {
                 refused.push(refusal);
                 continue;
@@ -394,67 +338,5 @@ pub(crate) fn parse_reasoning_effort(effort: &str) -> Result<(), TransportError>
             "reasoning_effort",
             format!("unsupported reasoning effort `{other}`"),
         )),
-    }
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-pub enum ToolChoiceWire {
-    Mode(String),
-    Named(NamedToolChoiceWire),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct NamedToolChoiceWire {
-    #[serde(rename = "type")]
-    pub kind: String,
-    pub function: NamedFunctionWire,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct NamedFunctionWire {
-    pub name: String,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ResponseFormatWire {
-    Text {},
-    JsonObject {},
-    JsonSchema { json_schema: JsonSchemaWire },
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct JsonSchemaWire {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub schema: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub description: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub strict: Option<bool>,
-}
-
-impl From<crate::db::entities::ResponseFormat> for ResponseFormatWire {
-    fn from(format: crate::db::entities::ResponseFormat) -> Self {
-        match format {
-            crate::db::entities::ResponseFormat::JsonObject => Self::JsonObject {},
-            crate::db::entities::ResponseFormat::JsonSchema {
-                name,
-                schema,
-                strict,
-            } => Self::JsonSchema {
-                json_schema: JsonSchemaWire {
-                    name: Some(name),
-                    schema: Some(schema),
-                    strict,
-                    description: None,
-                },
-            },
-        }
     }
 }

@@ -3,12 +3,8 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::db::DatabaseError;
 use crate::db::entities::{AttachmentCleanup, AttachmentId, AttachmentRecord, ContentDigest};
-use crate::db::{DatabaseError, DatabaseHandle};
-use crate::service::ai::providers::openai_compatible::image::{
-    MAX_IMAGE_BYTES, MAX_REQUEST_IMAGE_BYTES, MAX_REQUEST_IMAGES,
-};
-use crate::service::ai::providers::openai_compatible::{ImageError, ImageInput, ImageMime};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum StoreError {
@@ -55,22 +51,6 @@ pub enum AttachmentError {
 pub enum Reclamation {
     Removed,
     Absent,
-    Retained,
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum ReclamationError {
-    #[error("whether other Attachments still need the content could not be read: {0}")]
-    Database(DatabaseError),
-    #[error("the content file was not removed: {0}")]
-    Store(StoreError),
-}
-
-#[derive(Debug)]
-pub struct AttachmentCleanupReport {
-    pub record: AttachmentRecord,
-    pub recorded: bool,
-    pub content: Result<Reclamation, ReclamationError>,
 }
 
 #[derive(Debug, Default)]
@@ -576,64 +556,4 @@ mod unsupported {
             Ok(0)
         }
     }
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum AttachmentImageError {
-    #[error(transparent)]
-    Attachment(#[from] AttachmentError),
-    #[error("a request may carry at most {MAX_REQUEST_IMAGES} images")]
-    TooMany,
-    #[error("{attachment} cannot be sent as an image: {error}")]
-    NotAnImage {
-        attachment: AttachmentId,
-        error: ImageError,
-    },
-    #[error("the images may not exceed {MAX_REQUEST_IMAGE_BYTES} bytes together")]
-    TooLarge,
-}
-
-pub async fn attachment_images(
-    database: &DatabaseHandle,
-    attachments: &[AttachmentId],
-) -> Result<Vec<ImageInput>, AttachmentImageError> {
-    if attachments.len() > MAX_REQUEST_IMAGES {
-        return Err(AttachmentImageError::TooMany);
-    }
-    let mut declared = Vec::with_capacity(attachments.len());
-    let mut total = 0u64;
-    for &attachment in attachments {
-        let record = database
-            .attachment(attachment)
-            .await
-            .map_err(AttachmentError::Database)?
-            .ok_or(AttachmentError::NotFound(attachment))?;
-        if let Some(cleanup) = record.cleanup {
-            return Err(AttachmentError::CleanedUp {
-                id: attachment,
-                cleanup,
-            }
-            .into());
-        }
-        let not_an_image = |error| AttachmentImageError::NotAnImage { attachment, error };
-        let mime =
-            ImageMime::from_mime(&record.mime).ok_or(not_an_image(ImageError::UnsupportedType))?;
-        if record.byte_length > MAX_IMAGE_BYTES as u64 {
-            return Err(not_an_image(ImageError::TooLarge));
-        }
-        total += record.byte_length;
-        declared.push((attachment, mime));
-    }
-    if total > MAX_REQUEST_IMAGE_BYTES as u64 {
-        return Err(AttachmentImageError::TooLarge);
-    }
-    let mut images = Vec::with_capacity(declared.len());
-    for (attachment, mime) in declared {
-        let content = database.attachment_content(attachment).await?;
-        images.push(
-            ImageInput::new(mime, content.bytes)
-                .map_err(|error| AttachmentImageError::NotAnImage { attachment, error })?,
-        );
-    }
-    Ok(images)
 }

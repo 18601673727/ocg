@@ -701,7 +701,7 @@ pub(crate) async fn execute_decision_with_sink(
                 })?;
             Ok(DecisionExecution {
                 availability: observe::success_observation(&execution),
-                raw: json!({"text": execution.text, "response_items": execution.response_items}),
+                raw: json!({"text": execution.text, "response_items": []}),
                 result,
                 usage: execution.usage,
                 finished_in: execution.finished_in,

@@ -141,12 +141,7 @@ impl Batch {
                 ));
             }
         };
-        let Some(conversation) = self.turn_conversation(approval.job)? else {
-            return self.reject(Violation::InvalidValue(
-                "approval_not_found",
-                "no conversation",
-            ));
-        };
+        let conversation = self.turn_conversation(approval.job)?;
         if self.require_job_state(approval.job)?.outcome.is_none() {
             return self.reject(Violation::InvalidValue(
                 "approval_not_ready",
@@ -435,12 +430,6 @@ impl Batch {
         }
         let conversation = self.turn_conversation(call.job)?;
         if let Some(original) = approval {
-            let Some(conversation) = conversation else {
-                return self.reject(Violation::InvalidValue(
-                    "approval_executed",
-                    "no matching approval in this conversation",
-                ));
-            };
             if self.job_lifecycle(conversation)?.closing.is_some() {
                 return self.reject(Violation::InvalidValue(
                     "conversation_closing",
@@ -508,16 +497,6 @@ impl Batch {
                     crate::db::entities::RequestPayload::ApprovedCalls,
                 )?;
             }
-        }
-        if matches!(
-            decision,
-            ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_)
-        ) && conversation.is_none()
-        {
-            return self.reject(Violation::InvalidValue(
-                "approve",
-                "awaiting calls require a conversation",
-            ));
         }
         if !self.request_observed(call.job, call.request)? {
             return self.reject(Violation::RequestNotObserved {
@@ -602,9 +581,7 @@ impl Batch {
                 completed: false,
             },
         )?;
-        if let Some(original) = approval
-            && let Some(conversation) = conversation
-        {
+        if let Some(original) = approval {
             self.step(|tx| {
                 tx.open_table(OPEN_APPROVALS)?
                     .remove(approvals::open_key(conversation, original))?;
@@ -616,8 +593,7 @@ impl Batch {
         if matches!(
             record.decision.fact,
             ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_)
-        ) && let Some(conversation) = conversation
-        {
+        ) {
             if let Some(closing) = self.job_lifecycle(conversation)?.closing {
                 self.put_approval(call, ApprovalDecision::Voided, closing.by)?;
             } else {
@@ -804,7 +780,7 @@ fn approval_assessment(
 pub(crate) fn read_cards(
     database: &Database,
     root: JobId,
-) -> Result<Vec<serde_json::Value>, StorageError> {
+) -> Result<Option<Vec<serde_json::Value>>, StorageError> {
     use serde_json::json;
     let rx = read(database)?;
     let mut cards = Vec::new();
@@ -816,8 +792,15 @@ pub(crate) fn read_cards(
                 "live conversation tree exceeds its bound",
             ));
         }
-        let row = read_conversation_row(&rx, conversation)?
-            .ok_or_else(|| StorageError::corrupted("conversation missing"))?;
+        let Some(row) = read_conversation_row(&rx, conversation)? else {
+            if conversation == root {
+                return Ok(None);
+            }
+            return Err(StorageError::corrupted("conversation missing"));
+        };
+        if conversation == root {
+            super::state::require(&rx, root)?;
+        }
         let (origin, project) = (row.origin, row.project);
         let parent = row.parent_id.map(|id| id.to_string());
         if origin != Origin::System {
@@ -871,5 +854,5 @@ pub(crate) fn read_cards(
             pending.push(JobId::new(entry?.0.value().1));
         }
     }
-    Ok(cards)
+    Ok(Some(cards))
 }

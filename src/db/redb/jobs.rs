@@ -1,9 +1,9 @@
 use super::{StorageError, StorageErrorKind, execution};
 use crate::db::entities::{
     Appended, AttachmentId, ConfigId, ExecutionConfiguration, ExecutionEventKind,
-    ExecutionOperation, FrozenConfiguration, FrozenDecisionConfig, JobGroup, JobId, JobLifecycle,
-    JobSpec, JobState, LlmTransport, Origin, OutcomeCause, OutcomeKind, OutcomeRecord, ProfileId,
-    ProjectId, RecordRef, Recurrence, RecurrenceHalt, RecurrencePhase, SubmissionRecord, Violation,
+    ExecutionOperation, FrozenConfiguration, FrozenDecisionConfig, JobId, JobLifecycle, JobSpec,
+    JobState, LlmTransport, Origin, OutcomeCause, OutcomeKind, OutcomeRecord, ProfileId, ProjectId,
+    RecordRef, Recurrence, RecurrenceHalt, RecurrencePhase, SubmissionRecord, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Commit, Failure, Probe};
 use crate::db::redb::codec::{Dec, DecodeResult, Enc, TAG_JOB};
@@ -615,14 +615,6 @@ impl Batch {
         })
     }
 
-    pub(super) fn put_mutable_job_state(
-        &mut self,
-        id: JobId,
-        state: &JobState,
-    ) -> Result<(), BatchError> {
-        self.put_job_state(id, state)
-    }
-
     pub(super) fn store_mutable_job(
         &mut self,
         job: &crate::db::entities::MutableJob,
@@ -1017,7 +1009,7 @@ impl Batch {
             frozen: None,
         };
         self.store_mutable_job(&job)?;
-        self.put_mutable_job_state(id, &JobState::new(id))?;
+        self.put_job_state(id, &JobState::new(id))?;
         if by_user {
             let mut lifecycle = self.job_lifecycle(parent_id)?;
             if !lifecycle.user_input || lifecycle.loop_count != 0 {
@@ -1240,7 +1232,7 @@ impl Batch {
             at: self.now,
             cause: Some(OutcomeCause::Text("discarded before submission".to_owned())),
         });
-        self.put_mutable_job_state(id, &state)?;
+        self.put_job_state(id, &state)?;
         self.release_draft_context(&job)?;
         self.settle_native_dependents(id, OutcomeKind::Cancelled)?;
         self.probe = Some(Probe::Outcome(id));
@@ -1352,7 +1344,7 @@ impl Batch {
             at: self.now,
             cause: Some(cause),
         });
-        self.put_mutable_job_state(id, &state)?;
+        self.put_job_state(id, &state)?;
         self.probe = Some(Probe::Outcome(id));
         self.settle_native_dependents(id, OutcomeKind::Cancelled)?;
         self.settle_summary_membership(job)?;
@@ -1516,7 +1508,7 @@ impl Batch {
 
     pub(crate) fn submit_native_decision(
         &mut self,
-        spec: JobGroup,
+        name: Option<String>,
         configuration: ExecutionConfiguration,
         request: crate::db::entities::DecisionRequest,
         submission: Option<crate::db::entities::Submission>,
@@ -1587,10 +1579,10 @@ impl Batch {
             id: conversation_id,
             created_at: self.now,
             parent_id: None,
-            agent: spec.agent,
-            project: spec.project,
-            origin: spec.origin,
-            keep_open: spec.keep_open,
+            agent: configuration.agent_profile.map(Into::into),
+            project: None,
+            origin: Origin::System,
+            keep_open: false,
         };
         self.insert(
             CONVERSATIONS,
@@ -1601,7 +1593,7 @@ impl Batch {
         self.put_job_lifecycle(
             conversation_id,
             &JobLifecycle {
-                title: spec.name,
+                title: name,
                 ..JobLifecycle::default()
             },
         )?;
@@ -1681,9 +1673,9 @@ impl Batch {
         })
     }
 
-    pub(crate) fn turn_conversation(&mut self, id: JobId) -> Result<Option<JobId>, BatchError> {
+    pub(crate) fn turn_conversation(&mut self, id: JobId) -> Result<JobId, BatchError> {
         match self.mutable_job(id)? {
-            Some(job) => Ok(Some(job.parent_id)),
+            Some(job) => Ok(job.parent_id),
             None => self.reject(Violation::InvalidValue("job", "the Job does not exist")),
         }
     }

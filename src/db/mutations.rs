@@ -396,8 +396,6 @@ pub(crate) fn set_conversation(batch: &mut Batch, root: JobId, edit: JobEdit) ->
             };
         }
         JobEdit::Title(title) => row.title = Some(title),
-        JobEdit::SuggestedTitle(_) if row.title.is_some() => return Ok(()),
-        JobEdit::SuggestedTitle(title) => row.title = Some(title),
         JobEdit::Hide if row.hidden_at.is_some() => return Ok(()),
         JobEdit::Hide => row.hidden_at = Some(batch.now()),
     }

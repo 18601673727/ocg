@@ -198,10 +198,9 @@ pub async fn agent_profile(
 pub fn register(data_directory: &DataDirectory, target: Target) -> Result<(), Error> {
     let registered = std::rc::Rc::new(std::cell::RefCell::new(None));
     let slot = registered.clone();
-    runtime::run_hosted(data_directory, false, move |context| async move {
-        let database = context.database();
-        let outcome = match targets(database, &target).await {
-            Ok((executor, llm_profile, pool)) => agent_profile(database, llm_profile)
+    runtime::run_hosted(data_directory, false, move |database| async move {
+        let outcome = match targets(&database, &target).await {
+            Ok((executor, llm_profile, pool)) => agent_profile(&database, llm_profile)
                 .await
                 .map(|agent_profile| (executor, llm_profile, agent_profile, pool)),
             Err(error) => Err(error),

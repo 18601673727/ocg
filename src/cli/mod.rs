@@ -57,17 +57,9 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server_config = ServerConfig::from_environment()?;
     let data_directory = DataDirectory::from_environment()?;
     eprintln!("OCG data directory: {}", data_directory.root().display());
-    match server_config {
-        None => crate::system::runtime::run(&data_directory, true, |_database| until_signalled())?,
-        Some(server_config) => {
-            crate::system::runtime::run_server(
-                &data_directory,
-                true,
-                Some(server_config),
-                |_context| until_signalled(),
-            )?;
-        }
-    }
+    crate::system::runtime::run_server(&data_directory, true, server_config, |_| {
+        until_signalled()
+    })?;
     Ok(())
 }
 

@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::db::entities::{
     AllocationPhase, AllocationToken, DevelopmentFreshReservation, DevelopmentReadyCursor,
@@ -255,23 +255,16 @@ pub(crate) async fn run(
     if let Err(error) = database.settle_unreported_children().await {
         log::warn!("native scheduler: unreported child conversations were not settled ({error})");
     }
-    let scheduler = Rc::new(NativeScheduler::new(
-        database.clone(),
-        shutdown.clone(),
-        stops,
-        workspace_tools,
-    ));
+    let scheduler =
+        NativeScheduler::new(database.clone(), shutdown.clone(), stops, workspace_tools);
     Scheduler::new(&database, wake, shutdown)
-        .run(|database_changed| {
-            let scheduler = scheduler.clone();
-            async move { scheduler.dispatch(database_changed).await }
-        })
+        .run(&scheduler)
         .await;
     scheduler.drain().await;
     log::info!("native scheduler stopped");
 }
 
-pub(crate) enum ExecutorPass {
+enum ExecutorPass {
     Reserved(Box<PoolAllocation>),
     Nothing,
     BudgetSpent,
@@ -313,7 +306,7 @@ impl Discovery {
     }
 }
 
-pub(crate) struct NativeScheduler {
+pub(super) struct NativeScheduler {
     database: DatabaseHandle,
     shutdown: CancellationToken,
     stops: NativeStops,
@@ -323,7 +316,7 @@ pub(crate) struct NativeScheduler {
     rescan: Cell<u8>,
     discovery: Cell<Discovery>,
     workspace_tools: WorkspaceTools,
-    running: RefCell<Vec<ntex::rt::JoinHandle<Dispatched>>>,
+    running: RefCell<Vec<ntex::rt::JoinHandle<()>>>,
     halted: Rc<Cell<bool>>,
 }
 
@@ -355,7 +348,7 @@ impl NativeScheduler {
         }
     }
 
-    pub(crate) async fn dispatch(
+    pub(super) async fn dispatch(
         &self,
         database_changed: bool,
     ) -> Result<Option<Duration>, DatabaseError> {
@@ -476,7 +469,7 @@ impl NativeScheduler {
         Ok(next_due)
     }
 
-    pub(crate) async fn reserve_for(
+    async fn reserve_for(
         &self,
         pool: ExecutionPoolId,
         executor: ExecutorId,
@@ -541,7 +534,7 @@ impl NativeScheduler {
         ExecutorPass::BudgetSpent
     }
 
-    pub(crate) fn spawn(&self, allocation: PoolAllocation) {
+    fn spawn(&self, allocation: PoolAllocation) {
         let database = self.database.clone();
         let cancellation = self.shutdown.child();
         let registration = self.stops.register(allocation.token, cancellation.clone());
@@ -566,21 +559,17 @@ impl NativeScheduler {
                     dispatched.job
                 );
             }
-            dispatched
         });
         self.running.borrow_mut().push(task);
     }
 
-    pub(crate) async fn drain(&self) -> Vec<Dispatched> {
+    async fn drain(&self) {
         let tasks = std::mem::take(&mut *self.running.borrow_mut());
-        let mut finished = Vec::with_capacity(tasks.len());
         for task in tasks {
-            match task.await {
-                Ok(dispatched) => finished.push(dispatched),
-                Err(_) => self.halt("a dispatch ended without a report"),
+            if task.await.is_err() {
+                self.halt("a dispatch ended without a report");
             }
         }
-        finished
     }
 }
 
@@ -699,13 +688,24 @@ async fn within_deadline<F: std::future::Future>(
     timeout: Duration,
     exchange: F,
 ) -> F::Output {
+    let deadline = Instant::now() + timeout;
     let done = CancellationToken::default();
     let timer = ntex::rt::spawn({
         let cancellation = cancellation.clone();
         let done = done.clone();
         async move {
             use ntex::util::{Either, select};
-            if let Either::Right(()) = select(done.cancelled(), ntex::time::sleep(timeout)).await {
+            let wait_for_deadline = async {
+                loop {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    // The timer wheel rounds long sleeps up by tens of seconds.
+                    ntex::time::sleep(remaining.min(Duration::from_secs(5))).await;
+                }
+            };
+            if let Either::Right(()) = select(done.cancelled(), wait_for_deadline).await {
                 cancellation.cancel();
             }
         }
@@ -744,7 +744,7 @@ async fn wait_for_protection_recovery(
     }
 }
 
-pub(crate) async fn dispatch(
+async fn dispatch(
     database: &DatabaseHandle,
     allocation: PoolAllocation,
     cancellation: &CancellationToken,

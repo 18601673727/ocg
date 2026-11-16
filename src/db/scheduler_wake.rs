@@ -14,10 +14,7 @@ impl SchedulerWake {
         (Self { permit_tx }, SchedulerWakeSubscription { permit_rx })
     }
 
-    pub(super) fn publish(&self, dirty: bool, capacity: bool) {
-        if !dirty && !capacity {
-            return;
-        }
+    pub(super) fn publish(&self) {
         match self.permit_tx.try_send(()) {
             Ok(()) | Err(flume::TrySendError::Full(())) => {}
             Err(flume::TrySendError::Disconnected(())) => {}
@@ -38,12 +35,10 @@ impl SchedulerWakeSubscription {
 pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
     match kind {
         OperationKind::CreateExecutionPool
-        | OperationKind::SetExecutionPoolEnabled
         | OperationKind::SetExecutionPoolProfile
         | OperationKind::SetScheduledExternalPolicy
         | OperationKind::CreateJobWithInput
         | OperationKind::Open
-        | OperationKind::Append
         | OperationKind::StopTurn
         | OperationKind::Close
         | OperationKind::Hold
@@ -54,81 +49,23 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::SettleChildTurns
         | OperationKind::AssignJobExecutor
         | OperationKind::FinalizeJob
-        | OperationKind::ConfirmJobStopped
-        | OperationKind::QuarantineAbandonedJob
         | OperationKind::CreateExecutor
         | OperationKind::UpdateExecutor
         | OperationKind::ArchiveExecutor
         | OperationKind::ArchivePool
-        | OperationKind::CreateLlmProvider
         | OperationKind::CreateProfile
         | OperationKind::UpdateProfile
-        | OperationKind::CreateAgent
-        | OperationKind::RecordToolOutcome
-        | OperationKind::ReconcileToolEffect => true,
+        | OperationKind::RecordToolOutcome => true,
         OperationKind::ClaimExecution
         | OperationKind::SaveJobInput
         | OperationKind::CreateProject
         | OperationKind::UpdateProject
         | OperationKind::SetConversation
         | OperationKind::AppendJobOutput
-        | OperationKind::RecordMetrics
-        | OperationKind::RecordAvailabilityStat
         | OperationKind::RecordSentRequest
         | OperationKind::RecordProviderAnswer
-        | OperationKind::ConsumeAvailability
         | OperationKind::ConsumeTokenUsage
         | OperationKind::RecordToolDecision
-        | OperationKind::CreateAttachment
-        | OperationKind::CleanupAttachment => false,
-    }
-}
-
-pub(super) fn releases_capacity(kind: OperationKind) -> bool {
-    match kind {
-        OperationKind::FinalizeJob
-        | OperationKind::ConfirmJobStopped
-        | OperationKind::CreateExecutionPool
-        | OperationKind::SetExecutionPoolEnabled
-        | OperationKind::SetExecutionPoolProfile
-        | OperationKind::UpdateProfile => true,
-        OperationKind::QuarantineAbandonedJob
-        | OperationKind::SetScheduledExternalPolicy
-        | OperationKind::ClaimExecution
-        | OperationKind::SaveJobInput
-        | OperationKind::CreateJobWithInput
-        | OperationKind::Open
-        | OperationKind::Append
-        | OperationKind::StopTurn
-        | OperationKind::Close
-        | OperationKind::Hold
-        | OperationKind::Unhold
-        | OperationKind::Retry
-        | OperationKind::DecideApproval
-        | OperationKind::ApplyJobTool
-        | OperationKind::SettleChildTurns
-        | OperationKind::AssignJobExecutor
-        | OperationKind::CreateExecutor
-        | OperationKind::UpdateExecutor
-        | OperationKind::ArchiveExecutor
-        | OperationKind::ArchivePool
-        | OperationKind::CreateLlmProvider
-        | OperationKind::CreateProfile
-        | OperationKind::CreateAgent
-        | OperationKind::RecordToolOutcome
-        | OperationKind::ReconcileToolEffect
-        | OperationKind::CreateProject
-        | OperationKind::UpdateProject
-        | OperationKind::SetConversation
-        | OperationKind::AppendJobOutput
-        | OperationKind::RecordMetrics
-        | OperationKind::RecordAvailabilityStat
-        | OperationKind::RecordSentRequest
-        | OperationKind::RecordProviderAnswer
-        | OperationKind::ConsumeAvailability
-        | OperationKind::ConsumeTokenUsage
-        | OperationKind::RecordToolDecision
-        | OperationKind::CreateAttachment
-        | OperationKind::CleanupAttachment => false,
+        | OperationKind::CreateAttachment => false,
     }
 }

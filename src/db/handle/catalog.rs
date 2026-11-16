@@ -493,15 +493,6 @@ impl DatabaseHandle {
             .await
     }
 
-    pub async fn attachments(
-        &self,
-        before: Option<AttachmentId>,
-        limit: usize,
-    ) -> Result<Vec<AttachmentRecord>, DatabaseError> {
-        self.read(move |database| redb::read_attachments(database, before, limit))
-            .await
-    }
-
     pub async fn attachment_content(
         &self,
         id: AttachmentId,

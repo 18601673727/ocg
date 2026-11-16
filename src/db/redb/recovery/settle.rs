@@ -194,9 +194,7 @@ pub(crate) fn settle_confirmed_answers(batch: &mut Batch) -> Result<(), BatchErr
         for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
             let (key, value) = entry?;
             let allocation = allocations::decode_pool_allocation(key.value(), value.value())?;
-            if allocation.holds_capacity()
-                && let Some(result) = confirmed_answer(tx, &allocation)?
-            {
+            if let Some(result) = confirmed_answer(tx, &allocation)? {
                 found.push((allocation, result));
             }
         }

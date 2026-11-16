@@ -397,7 +397,10 @@ pub(crate) fn latest_seq(tx: &impl TxRead, job: JobId) -> DecodeResult<u64> {
     }
 }
 
-fn allocation_phase_transition_allowed(from: AllocationPhase, to: AllocationPhase) -> bool {
+pub(super) fn allocation_phase_transition_allowed(
+    from: AllocationPhase,
+    to: AllocationPhase,
+) -> bool {
     match (from, to) {
         (AllocationPhase::Reserved, AllocationPhase::Released | AllocationPhase::Uncertain)
         | (

@@ -37,10 +37,10 @@ pub(crate) use batch::{
     run_batch_declinable, run_batch_with,
 };
 pub(crate) use reads::catalog::{
-    StoredCredential, credential_count, read_agent_model_configs, read_attachment,
-    read_attachments, read_config, read_configs, read_credential, read_credential_ref_in_use,
-    read_global_compaction_settings, read_global_outbound_headers, read_handoff_credential,
-    read_profile_page, read_project, read_projects, read_submission,
+    StoredCredential, credential_count, read_agent_model_configs, read_attachment, read_config,
+    read_configs, read_credential, read_credential_ref_in_use, read_global_compaction_settings,
+    read_global_outbound_headers, read_handoff_credential, read_profile_page, read_project,
+    read_projects, read_submission,
 };
 pub(crate) use reads::check_readable;
 pub(crate) use reads::conversations::{
@@ -49,9 +49,8 @@ pub(crate) use reads::conversations::{
 };
 pub(crate) use reads::execution_context::{read_development_execution_context, read_trial_job};
 pub(crate) use reads::jobs::{
-    read_children, read_job, read_job_search, read_job_tree, read_latest_output,
-    read_mutable_job_details, read_native_job, read_output_job_is_decision, read_outputs,
-    read_retries, read_tool_evidence,
+    read_job_search, read_job_tree, read_latest_output, read_mutable_job_details, read_native_job,
+    read_output_job_is_decision, read_outputs, read_tool_evidence,
 };
 pub(crate) use reads::usage::{
     read_tool_stats, read_usage_buckets, read_usage_retries, read_usage_summary,

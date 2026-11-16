@@ -43,22 +43,6 @@ pub(crate) fn read_attachment(
         .transpose()
 }
 
-pub(crate) fn read_attachments(
-    database: &Database,
-    before: Option<AttachmentId>,
-    limit: usize,
-) -> Result<Vec<AttachmentRecord>, StorageError> {
-    let rx = read(database)?;
-    let table = rx.open_table(ATTACHMENTS)?;
-    let end = before.map_or(u128::MAX, AttachmentId::get);
-    let mut records = Vec::new();
-    for entry in table.range(..end)?.rev().take(limit.min(MAX_PAGE)) {
-        let (key, bytes) = entry?;
-        records.push(decode_attachment(key.value(), bytes.value())?);
-    }
-    Ok(records)
-}
-
 pub(crate) fn read_project(
     database: &Database,
     id: ProjectId,

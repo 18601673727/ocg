@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{StorageError, jobs};
 use crate::db::entities::{
-    AttachmentRecord, ContentDigest, Entry, JobId, JobOutputRecord, JobSpec, Origin, OutcomeKind,
-    OutputKind,
+    AttachmentRecord, ContentDigest, JobId, JobOutputRecord, JobSpec, MutableJobInput, Origin,
+    OutcomeKind, OutputKind,
 };
 use crate::db::entities::{RequestEventRecord, RequestPayload};
 use crate::db::redb::schema::{
@@ -43,15 +43,9 @@ pub(super) fn update_mutable_turn_search(
     new: &crate::db::entities::MutableJobInput,
 ) -> Result<(), StorageError> {
     let attachments = tx.open_table(ATTACHMENTS)?;
-    let grams =
-        |input: &crate::db::entities::MutableJobInput| -> Result<BTreeSet<u64>, StorageError> {
-            let entry = Entry::UserMessage {
-                text: input.text().to_owned(),
-                attachments: input.attachments().to_vec(),
-            };
-            Ok(search_input_text(&attachments, &entry)?
-                .map_or_else(BTreeSet::new, |text| search_grams(&text)))
-        };
+    let grams = |input: &MutableJobInput| {
+        search_input_text(&attachments, input).map(|text| search_grams(&text))
+    };
     let previous = old.map(grams).transpose()?.unwrap_or_default();
     let next = grams(new)?;
     let mut index = tx.open_table(CONVERSATION_SEARCH)?;
@@ -123,39 +117,19 @@ pub(super) fn searchable_conversation(row: &JobSpec) -> bool {
 
 pub(super) fn search_input_text(
     attachments: &impl ReadableTable<u128, &'static [u8]>,
-    entry: &Entry,
-) -> Result<Option<String>, StorageError> {
-    match entry {
-        Entry::UserMessage {
-            text,
-            attachments: ids,
+    input: &MutableJobInput,
+) -> Result<String, StorageError> {
+    let mut text = input.text().to_owned();
+    for id in input.attachments() {
+        let bytes = attachments
+            .get(id.get())?
+            .ok_or_else(|| StorageError::corrupted("search attachment missing"))?;
+        if let Some(name) = rows::decode_attachment(id.get(), bytes.value())?.display_name {
+            text.push('\n');
+            text.push_str(&name);
         }
-        | Entry::UserMessageEdit {
-            text,
-            attachments: ids,
-            ..
-        } => {
-            let mut text = text.clone();
-            for id in ids {
-                let bytes = attachments
-                    .get(id.get())?
-                    .ok_or_else(|| StorageError::corrupted("search attachment missing"))?;
-                if let Some(name) = rows::decode_attachment(id.get(), bytes.value())?.display_name {
-                    text.push('\n');
-                    text.push_str(&name);
-                }
-            }
-            Ok(Some(text))
-        }
-        Entry::AgentMessage { text, .. } => Ok(Some(text.clone())),
-        Entry::Decision { .. }
-        | Entry::RetryOf { .. }
-        | Entry::Iteration { .. }
-        | Entry::UserMessageWithdraw { .. }
-        | Entry::ContextPreparation { .. }
-        | Entry::ContextUse { .. }
-        | Entry::ResponseFormat { .. } => Ok(None),
     }
+    Ok(text)
 }
 
 pub(super) fn search_output_text(output: &JobOutputRecord, completed: bool) -> Option<&str> {

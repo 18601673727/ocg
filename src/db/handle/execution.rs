@@ -21,6 +21,15 @@ use crate::db::{entities, mutations, redb};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 
+fn finalization_bytes(finalization: &JobFinalization) -> u64 {
+    let result = finalization.result();
+    output_bytes(
+        result.summary.as_deref(),
+        result.code.as_deref(),
+        result.value.as_ref(),
+    )
+}
+
 impl DatabaseHandle {
     pub(crate) async fn provider_responses(
         &self,
@@ -531,23 +540,17 @@ impl DatabaseHandle {
         let handoff = returned.handoff();
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         if let Some(secret) = &handoff.prepared.credentials.spellings {
-            let result = match &finalization {
-                JobFinalization::Completed(result)
-                | JobFinalization::Failed(result)
-                | JobFinalization::Cancelled(result) => Some(result),
-                JobFinalization::Unknown => None,
-            };
-            if result.is_some_and(|result| {
-                result
-                    .summary
-                    .as_deref()
-                    .is_some_and(|s| secret.found_in(s))
-                    || result.code.as_deref().is_some_and(|s| secret.found_in(s))
-                    || result
-                        .value
-                        .as_ref()
-                        .is_some_and(|v| development_contains_secret(v, secret))
-            }) {
+            let result = finalization.result();
+            if result
+                .summary
+                .as_deref()
+                .is_some_and(|s| secret.found_in(s))
+                || result.code.as_deref().is_some_and(|s| secret.found_in(s))
+                || result
+                    .value
+                    .as_ref()
+                    .is_some_and(|v| development_contains_secret(v, secret))
+            {
                 return Err(DatabaseError::Rejected(Violation::InvalidValue(
                     "outcome",
                     "result contains credential material",
@@ -558,16 +561,7 @@ impl DatabaseHandle {
             .write_output(
                 proof.token.job,
                 (proof, expected_seq, finalization),
-                |(_, _, value)| match value {
-                    JobFinalization::Completed(result)
-                    | JobFinalization::Failed(result)
-                    | JobFinalization::Cancelled(result) => output_bytes(
-                        result.summary.as_deref(),
-                        result.code.as_deref(),
-                        result.value.as_ref(),
-                    ),
-                    JobFinalization::Unknown => 0,
-                },
+                |(_, _, finalization)| finalization_bytes(finalization),
                 OperationKind::FinalizeJob,
                 |batch, (proof, expected_seq, finalization)| {
                     batch.finalize_development_job(&proof, expected_seq, finalization)
@@ -643,15 +637,7 @@ impl DatabaseHandle {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let token = proof.token;
         if let Some(secret) = &handoff.prepared.credentials.spellings {
-            let (JobFinalization::Completed(result)
-            | JobFinalization::Failed(result)
-            | JobFinalization::Cancelled(result)) = &finalization
-            else {
-                return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                    "outcome",
-                    "an unanswered failure needs a result",
-                )));
-            };
+            let result = finalization.result();
             let failure = rejection
                 .as_ref()
                 .and_then(|(_, _, observation)| observation.failure.as_ref());
@@ -691,17 +677,7 @@ impl DatabaseHandle {
                 proof.token.job,
                 (proof, expected_seq, finalization, rejection),
                 |(_, _, finalization, rejection)| {
-                    let result = match finalization {
-                        JobFinalization::Completed(result)
-                        | JobFinalization::Failed(result)
-                        | JobFinalization::Cancelled(result) => output_bytes(
-                            result.summary.as_deref(),
-                            result.code.as_deref(),
-                            result.value.as_ref(),
-                        ),
-                        JobFinalization::Unknown => 0,
-                    };
-                    result.saturating_add(
+                    finalization_bytes(finalization).saturating_add(
                         rejection
                             .as_ref()
                             .map_or(0, |stat| debug_bytes(&stat.observation)),

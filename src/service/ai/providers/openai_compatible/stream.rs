@@ -2,8 +2,8 @@ use serde::de::IgnoredAny;
 use serde_json::{Map, Value};
 
 use crate::db::entities::{
-    ChatFinishReason, MAX_FUNCTION_NAME_BYTES, MAX_TOOL_CALL_ID_BYTES, NormalizedUsage,
-    ToolCallRefusal, is_function_name,
+    ChatFinishReason, MAX_FUNCTION_NAME_BYTES, MAX_TOOL_CALL_ID_BYTES, ToolCallRefusal,
+    is_function_name,
 };
 
 use super::request::{MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALLS};
@@ -17,48 +17,6 @@ pub(crate) fn parse_finish_reason(raw: &str) -> ChatFinishReason {
         "error" => ChatFinishReason::Error,
         _ => ChatFinishReason::Other,
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum ChatStreamEvent {
-    Image {
-        url: String,
-    },
-    TextDelta {
-        delta: String,
-    },
-    ReasoningDelta {
-        delta: String,
-    },
-    ToolCallStart {
-        index: u32,
-        id: String,
-        name: String,
-    },
-    ToolCallArgumentsDelta {
-        index: u32,
-        id: String,
-        delta: String,
-    },
-    ToolCallComplete {
-        index: u32,
-        id: String,
-        name: String,
-        arguments: String,
-    },
-    Metadata {
-        id: Option<String>,
-        model: Option<String>,
-        timestamp: Option<String>,
-    },
-    RoundBegan,
-    RoundReset,
-    Finish {
-        reason: ChatFinishReason,
-        raw_reason: Option<String>,
-        usage: NormalizedUsage,
-    },
-    Error(super::error::TransportError),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -386,87 +344,4 @@ fn fragment<'a>(
 
 fn is_json_object(text: &str) -> bool {
     text.trim_start().starts_with('{') && serde_json::from_str::<IgnoredAny>(text).is_ok()
-}
-
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ChatStreamSummary {
-    pub images: Vec<String>,
-    pub text: String,
-    pub reasoning: String,
-    pub tool_calls: Vec<CompletedToolCall>,
-    pub usage: NormalizedUsage,
-    pub finish_reason: Option<ChatFinishReason>,
-    pub raw_finish_reason: Option<String>,
-}
-
-impl ChatStreamSummary {
-    pub fn apply(&mut self, event: &ChatStreamEvent) {
-        match event {
-            ChatStreamEvent::Image { url } => {
-                if !self.images.contains(url) {
-                    self.images.push(url.clone());
-                }
-            }
-            ChatStreamEvent::TextDelta { delta } => self.text.push_str(delta),
-            ChatStreamEvent::ReasoningDelta { delta } => self.reasoning.push_str(delta),
-            ChatStreamEvent::ToolCallStart { index, id, name } => {
-                let slot = self.slot(*index);
-                if !slot.id.is_empty() && slot.id != *id {
-                    slot.arguments.clear();
-                }
-                slot.id.clone_from(id);
-                slot.name.clone_from(name);
-            }
-            ChatStreamEvent::ToolCallArgumentsDelta { index, id, delta } => {
-                let slot = self.slot(*index);
-                if slot.id.is_empty() {
-                    slot.id.clone_from(id);
-                }
-                slot.arguments.push_str(delta);
-            }
-            ChatStreamEvent::ToolCallComplete {
-                index,
-                id,
-                name,
-                arguments,
-            } => {
-                let slot = self.slot(*index);
-                slot.id.clone_from(id);
-                slot.name.clone_from(name);
-                slot.arguments.clone_from(arguments);
-            }
-            ChatStreamEvent::Finish {
-                reason,
-                raw_reason,
-                usage,
-            } => {
-                self.usage.clone_from(usage);
-                self.finish_reason = Some(*reason);
-                self.raw_finish_reason.clone_from(raw_reason);
-            }
-            ChatStreamEvent::Metadata { .. }
-            | ChatStreamEvent::Error(_)
-            | ChatStreamEvent::RoundBegan
-            | ChatStreamEvent::RoundReset => {}
-        }
-    }
-
-    fn slot(&mut self, index: u32) -> &mut CompletedToolCall {
-        match self
-            .tool_calls
-            .binary_search_by_key(&index, |call| call.index)
-        {
-            Ok(position) => &mut self.tool_calls[position],
-            Err(position) => {
-                self.tool_calls.insert(
-                    position,
-                    CompletedToolCall {
-                        index,
-                        ..CompletedToolCall::default()
-                    },
-                );
-                &mut self.tool_calls[position]
-            }
-        }
-    }
 }

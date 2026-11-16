@@ -218,25 +218,17 @@ pub(crate) async fn provider_client_for(
             }
             standard_client(timeout).await
         }
-        DestinationPolicy::ApprovedHttps {
-            host,
-            port,
-            route,
-            authority,
-        } => {
-            if !authority.feature().is_enabled() {
+        DestinationPolicy::ApprovedHttps { host, port, proxy } => {
+            let feature =
+                crate::system::execution_features::ExecutionFeature::ScheduledExternalTransport;
+            if !feature.is_enabled() {
                 return Err(ProviderExecutionError::Build {
-                    message: authority.feature().refusal(),
-                });
-            }
-            if !authority.admits_route(route) {
-                return Err(ProviderExecutionError::Build {
-                    message: format!("{} requires a trusted proxy route", authority.name()),
+                    message: feature.refusal(),
                 });
             }
             Client::builder()
                 .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-                .connector::<()>(approved_connector(host, *port, route)?)
+                .connector::<()>(approved_connector(host, *port, *proxy)?)
                 .disable_redirects()
                 .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
                 .response_payload_timeout(Millis::ZERO)
@@ -605,24 +597,17 @@ fn connector() -> Result<Connector, ProviderExecutionError> {
 fn approved_connector(
     host: &str,
     port: u16,
-    route: &crate::service::ai::providers::ApprovedRoute,
+    proxy: crate::service::ai::providers::LoopbackProxy,
 ) -> Result<Connector, ProviderExecutionError> {
-    use crate::service::ai::providers::ApprovedRoute;
     let tls = tunnel_tls();
     let approved = Arc::new((bare_host(host), port));
-    let proxy = match route {
-        ApprovedRoute::Direct => None,
-        ApprovedRoute::TrustedProxy(proxy) => {
-            let addr = proxy.address();
-            let uri: Uri =
-                format!("http://{addr}")
-                    .parse()
-                    .map_err(|_| ProviderExecutionError::Build {
-                        message: "the trusted proxy address is not usable".to_owned(),
-                    })?;
-            Some((addr, uri))
-        }
-    };
+    let addr = proxy.address();
+    let proxy: Uri =
+        format!("http://{addr}")
+            .parse()
+            .map_err(|_| ProviderExecutionError::Build {
+                message: "the trusted proxy address is not usable".to_owned(),
+            })?;
     Ok(Connector::default()
         .connector(apply_fn_factory(
             TcpConnector::<Uri>::new(),
@@ -639,17 +624,10 @@ fn approved_connector(
                 if bare_host(host) != approved.0 || port != approved.1 {
                     return Err(ConnectError::InvalidInput);
                 }
-                let io = if let Some((addr, uri)) = &proxy {
-                    let io = service
-                        .call(Connect::new(uri.clone()).set_addrs(vec![*addr]))
-                        .await?;
-                    connect_tunnel_with_timeout(&io, host, port, None, TUNNEL_TIMEOUT).await?;
-                    io
-                } else {
-                    let refused = Arc::new(AtomicBool::new(false));
-                    let addrs = resolve_approved_target(host, port, &refused).await?;
-                    service.call(request.set_addrs(addrs)).await?
-                };
+                let io = service
+                    .call(Connect::new(proxy.clone()).set_addrs(vec![addr]))
+                    .await?;
+                connect_tunnel_with_timeout(&io, host, port, None, TUNNEL_TIMEOUT).await?;
                 wrap_tls(io, host, tls.clone()).await
             },
         )))
@@ -716,23 +694,6 @@ fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, ProviderExecu
                 wrap_tls(io, &host, tls.clone()).await
             },
         )))
-}
-
-async fn resolve_approved_target(
-    host: &str,
-    port: u16,
-    non_public: &Arc<AtomicBool>,
-) -> Result<Vec<SocketAddr>, ConnectError> {
-    let addrs = resolve_direct_web_target(host, port, non_public).await?;
-    let substituted = addrs.iter().any(|addr| match addr.ip() {
-        IpAddr::V4(v4) => is_fake_ip_ipv4(v4),
-        IpAddr::V6(v6) => embedded_ipv4(v6.segments()).is_some_and(is_fake_ip_ipv4),
-    });
-    if substituted {
-        non_public.store(true, Ordering::SeqCst);
-        return Err(ConnectError::Unresolved);
-    }
-    Ok(addrs)
 }
 
 async fn resolve_direct_web_target(

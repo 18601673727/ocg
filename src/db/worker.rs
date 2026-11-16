@@ -15,9 +15,7 @@ use crate::db::redb::{
     BatchError, BatchFailure, Commit, CompactFailure, OpenedFile, Probe, StorageError,
     StorageErrorKind,
 };
-use crate::db::scheduler_wake::{
-    SchedulerWake, SchedulerWakeSubscription, affects_scheduling, releases_capacity,
-};
+use crate::db::scheduler_wake::{SchedulerWake, affects_scheduling};
 use crate::db::shared::{
     Admission, Opened, ReadMessage, ReadWorkerExit, ReleaseOnPanic, Shared, StagingBarrier,
     flush_staged, serve_reads,
@@ -57,7 +55,6 @@ pub(super) struct Executed {
     pub(super) output_changed: Option<JobId>,
     pub(super) observations: Vec<ObservationChange>,
     pub(super) committed: bool,
-    capacity_released: bool,
     probe: Option<Probe>,
     resource_deltas: Vec<redb::NativeResourceDelta>,
     answer: Answer,
@@ -93,15 +90,12 @@ pub(super) fn settle<T: Send + 'static>(
         },
     });
     let outcome_unknown = matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
-    let staged = commit == Commit::Staged && result.is_ok() && !declined;
-    let scheduling_dirty =
-        result.is_ok() && !declined && (affects_scheduling(kind) || outcome.scheduling_wake);
-    let capacity_released =
-        result.is_ok() && !declined && (releases_capacity(kind) || outcome.capacity_freed);
-    let catalog_changed =
-        result.is_ok() && !declined && (outcome.catalog_changed || outcome.scheduling_wake);
-    let output_changed = None;
     let committed = result.is_ok() && !declined;
+    let staged = commit == Commit::Staged && committed;
+    let scheduling_dirty = committed
+        && (affects_scheduling(kind) || outcome.scheduling_wake || outcome.capacity_freed);
+    let catalog_changed = committed && (outcome.catalog_changed || outcome.scheduling_wake);
+    let output_changed = None;
     let answer: Answer = Box::new(move |lost| {
         let result = match (result, lost) {
             (Ok(_), Some(error)) if declined => Err(DatabaseError::RolledBack(error.clone())),
@@ -125,7 +119,6 @@ pub(super) fn settle<T: Send + 'static>(
         output_changed,
         observations: Vec::new(),
         committed,
-        capacity_released,
         probe: outcome.probe,
         resource_deltas: if committed {
             outcome.resource_deltas
@@ -372,10 +365,6 @@ impl DatabaseWorker {
 
     pub fn handle(&self) -> DatabaseHandle {
         self.handle.clone()
-    }
-
-    pub fn take_scheduler_wake(&mut self) -> Option<SchedulerWakeSubscription> {
-        self.handle.take_scheduler_wake()
     }
 
     pub fn shutdown(self) -> Result<(), DatabaseError> {
@@ -707,9 +696,6 @@ impl WriteWorker {
         let scheduling_dirty = failure.is_none()
             && lost.is_none()
             && executed.iter().any(|(ran, _)| ran.scheduling_dirty);
-        let capacity_released = failure.is_none()
-            && lost.is_none()
-            && executed.iter().any(|(ran, _)| ran.capacity_released);
         let catalog_changed = failure.is_none()
             && lost.is_none()
             && executed.iter().any(|(ran, _)| ran.catalog_changed);
@@ -718,8 +704,8 @@ impl WriteWorker {
             self.activate(vec![ProtectionReason::StorageUnavailable(failure.error)])
         });
         drop(staging);
-        if scheduling_dirty || capacity_released {
-            self.publish_scheduling_change(scheduling_dirty, capacity_released);
+        if scheduling_dirty {
+            self.publish_scheduling_change();
         }
         if catalog_changed {
             self.shared.catalog_changes.publish();
@@ -758,12 +744,12 @@ impl WriteWorker {
         }
     }
 
-    fn publish_scheduling_change(&self, dirty: bool, capacity: bool) {
+    fn publish_scheduling_change(&self) {
         if self.storage_failure.is_none()
             && !self.shared.released.load(Ordering::SeqCst)
             && self.shared.protection.status().lock.is_none()
         {
-            self.shared.scheduler_wake.publish(dirty, capacity);
+            self.shared.scheduler_wake.publish();
         }
     }
 
@@ -939,7 +925,7 @@ impl WriteWorker {
     pub(super) fn recover(&mut self) -> Result<RecoveryReport, RecoveryError> {
         match self.shared.admission() {
             Admission::Open => {
-                self.publish_scheduling_change(true, true);
+                self.publish_scheduling_change();
                 self.shared.catalog_changes.publish();
                 return Ok(RecoveryReport::default());
             }
@@ -972,7 +958,7 @@ impl WriteWorker {
                 .protection
                 .update(|status| status.recovering = false);
         } else {
-            self.publish_scheduling_change(true, true);
+            self.publish_scheduling_change();
             self.shared.catalog_changes.publish();
         }
         result

@@ -8,12 +8,9 @@ pub use error::TransportError;
 pub use image::{ImageError, ImageInput, ImageMime};
 pub use request::{
     ChatConversation, ChatFunctionCallWire, ChatMessage, ChatRole, ChatToolCallWire,
-    ContentPartWire, FunctionDefinitionWire, ImageUrlWire, JsonSchemaWire,
-    MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALLS, MAX_TOOLS, MessageContentWire, NamedFunctionWire,
-    NamedToolChoiceWire, ResponseFormatWire, ToolChoiceWire, ToolWire,
+    ContentPartWire, FunctionDefinitionWire, ImageUrlWire, MAX_TOOL_ARGUMENTS_BYTES,
+    MAX_TOOL_CALLS, MAX_TOOLS, MessageContentWire, ToolWire,
 };
-pub use stream::{
-    ChatStreamEvent, ChatStreamSummary, CompletedToolCall, InvalidToolCall, ToolCallAssembler,
-};
+pub use stream::{CompletedToolCall, InvalidToolCall, ToolCallAssembler};
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.openai.com/v1/chat/completions";

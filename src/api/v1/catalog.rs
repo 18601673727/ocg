@@ -202,21 +202,7 @@ pub(super) async fn job_input(
         match database.mutable_job_details(job, context).await? {
             Some(details) => {
                 let record = details.record;
-                let configuration = details
-                    .configuration
-                    .map(|configuration| ConfigurationView {
-                        agent_profile: configuration
-                            .selection
-                            .agent_profile
-                            .map(|id| id.to_string()),
-                        llm_profile: configuration.selection.llm_profile.to_string(),
-                        model: configuration.model,
-                        context_window: configuration.context_window,
-                        reasoning_effort: configuration
-                            .selection
-                            .reasoning_effort
-                            .map(|effort| effort.as_str().to_owned()),
-                    });
+                let configuration = details.configuration.map(ConfigurationView::from);
                 let mut body = envelope(serde_json::json!(JobInputView {
                     job: job.to_string(),
                     input: InputView {
@@ -342,13 +328,10 @@ pub(super) async fn conversation_children(
     before: Option<JobId>,
     limit: usize,
 ) -> Result<Reply, Refusal> {
-    let row = database.job(conversation).await?.ok_or(JOB_NOT_FOUND)?;
-    if !row.kind.is_group() {
-        return Err(JOB_NOT_FOUND);
-    }
     let records = database
         .conversation_children(conversation, before, limit + 1)
-        .await?;
+        .await?
+        .ok_or(JOB_NOT_FOUND)?;
     let has_more = records.len() > limit;
     let mut children = Vec::new();
     for record in records.iter().take(limit) {
@@ -358,7 +341,7 @@ pub(super) async fn conversation_children(
             title: c.title.clone(),
             agent: c.agent.map(|id| ProfileId::from(id).to_string()),
             state: c.state.clone(),
-            job_state: record.job_state.clone(),
+            job_state: c.job_state.clone(),
             on_hold: c.on_hold.as_ref().map(|by| HoldView { by: actor_view(by) }),
             keep_open: record.keep_open,
             recurrence: record.recurrence.as_ref().map(recurrence_json),
@@ -688,21 +671,7 @@ pub(super) async fn conversation_turns(
                         item.details.activity.last_activity_at_us(),
                     ),
                     entries: if decision.is_some() { Vec::new() } else { vec![entry] },
-                    configuration: item.details.configuration.map(|configuration| {
-                        ConfigurationView {
-                            agent_profile: configuration
-                                .selection
-                                .agent_profile
-                                .map(|id| id.to_string()),
-                            llm_profile: configuration.selection.llm_profile.to_string(),
-                            model: configuration.model,
-                            context_window: configuration.context_window,
-                            reasoning_effort: configuration
-                                .selection
-                                .reasoning_effort
-                                .map(|effort| effort.as_str().to_owned()),
-                        }
-                    }),
+                    configuration: item.details.configuration.map(ConfigurationView::from),
                     outputs: item
                         .outputs
                         .iter()
@@ -1235,7 +1204,7 @@ pub(super) async fn edit_conversation(
             .await
             .map_err(map_error)?;
         for token in &action.running {
-            shared.scheduler.native_stops().cancel(*token);
+            shared.native_stops.cancel(*token);
         }
         if let Err(error) = shared.database.settle_child_turns(action.ended).await {
             log::warn!("the parents of the turns hiding ended were not told: {error}");
@@ -1319,6 +1288,21 @@ pub(crate) struct ConfigurationView {
     model: String,
     context_window: Option<u32>,
     reasoning_effort: Option<String>,
+}
+
+impl From<crate::db::entities::MutableConfiguration> for ConfigurationView {
+    fn from(configuration: crate::db::entities::MutableConfiguration) -> Self {
+        let selection = configuration.selection;
+        Self {
+            agent_profile: selection.agent_profile.map(|id| id.to_string()),
+            llm_profile: selection.llm_profile.to_string(),
+            model: configuration.model,
+            context_window: configuration.context_window,
+            reasoning_effort: selection
+                .reasoning_effort
+                .map(|effort| effort.as_str().to_owned()),
+        }
+    }
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]

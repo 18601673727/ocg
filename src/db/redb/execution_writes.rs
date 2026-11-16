@@ -2,9 +2,9 @@ use super::rows::{decode_request_event, encode_request_event};
 use super::{StorageError, jobs, observations};
 use crate::db::entities::{
     AppendedOutput, AvailabilityStatId, ConfigId, ContentDigest, ExecutionEventKind,
-    ExecutionOperation, JobId, JobOutputId, JobOutputRecord, MetricsId, OutcomeKind, OutputKind,
-    RecordRef, RequestEventRecord, RequestNumber, RequestPayload, Timestamp, ToolCallRef,
-    Violation,
+    ExecutionOperation, JobId, JobOutputId, JobOutputRecord, MetricsId, MutableJob, OutcomeKind,
+    OutputKind, RecordRef, RequestEventRecord, RequestNumber, RequestPayload, Timestamp,
+    ToolCallRef, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
 use crate::db::redb::jobs::{decode_mutable_job, encode_mutable_job};
@@ -24,7 +24,7 @@ impl Batch {
         output: crate::db::entities::JobOutput,
     ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
         use crate::db::entities::IntermediateOutputKind;
-        self.require_development_write(proof)?;
+        self.require_development_write_for(proof, Some(ExecutionOperation::LlmRequest))?;
         if !matches!(
             output.kind,
             IntermediateOutputKind::Progress
@@ -352,28 +352,6 @@ impl Batch {
         ))
     }
 
-    fn insert_development_request_event(
-        &mut self,
-        identity: &crate::db::redb::reads::jobs::UsageIdentity,
-        job: JobId,
-        request: RequestNumber,
-        seq: u32,
-        observed_at: Timestamp,
-        payload: RequestPayload,
-    ) -> Result<u128, BatchError> {
-        let id = self.next_id()?;
-        self.insert_development_request_event_with_id(
-            identity,
-            job,
-            request,
-            id,
-            seq,
-            observed_at,
-            payload,
-        )?;
-        Ok(id)
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn insert_development_request_event_with_id(
         &mut self,
@@ -641,13 +619,11 @@ impl Batch {
         })
     }
 
-    pub(crate) fn record_development_provider_failure(
+    fn record_development_provider_failure(
         &mut self,
-        proof: &crate::db::handoff::DevelopmentWriteProof,
+        job: JobId,
         stat: crate::db::entities::AvailabilityStat,
-    ) -> Result<AvailabilityStatId, BatchError> {
-        self.require_development_write_for(proof, None)?;
-        let job = proof.token().job;
+    ) -> Result<(), BatchError> {
         if stat.job != job {
             return self.reject(Violation::InvalidValue(
                 "request",
@@ -671,10 +647,12 @@ impl Batch {
             return self.reject(Violation::ValueOutOfRange("seq"));
         };
         let identity = self.development_usage_identity(job)?;
-        let id = self.insert_development_request_event(
+        let id = self.next_id()?;
+        self.insert_development_request_event_with_id(
             &identity,
             job,
             stat.request,
+            id,
             seq,
             stat.observed_at,
             RequestPayload::Availability {
@@ -683,8 +661,7 @@ impl Batch {
                 raw_finish_reason: observation.raw_finish_reason,
                 failure: observation.failure,
             },
-        )?;
-        Ok(AvailabilityStatId::new(id))
+        )
     }
 
     fn replace_development_usage_total(
@@ -932,20 +909,21 @@ impl Batch {
         rejection: Option<crate::db::entities::AvailabilityStat>,
     ) -> Result<AppendedOutput, BatchError> {
         use crate::db::entities::JobFinalization;
-        self.require_development_write_for(proof, None)?;
+        let job = self.require_development_write_for(proof, None)?;
         match (&finalization, rejection) {
             (JobFinalization::Failed(_), Some(stat)) => {
-                self.record_development_provider_failure(proof, stat)?;
+                self.record_development_provider_failure(job.id, stat)?;
             }
             (JobFinalization::Failed(_) | JobFinalization::Cancelled(_), None) => {}
-            (JobFinalization::Completed(_) | JobFinalization::Unknown, None) | (_, Some(_)) => {
+            (JobFinalization::Completed(_), None)
+            | (JobFinalization::Completed(_) | JobFinalization::Cancelled(_), Some(_)) => {
                 return self.reject(Violation::InvalidValue(
                     "outcome",
                     "only an unanswered failure can be settled here",
                 ));
             }
         }
-        self.finish_development_job(proof, expected_seq, finalization)
+        self.finish_development_job(proof.token(), &job, expected_seq, finalization)
     }
 
     pub(crate) fn finalize_development_decision(
@@ -985,7 +963,7 @@ impl Batch {
                 ));
             }
         };
-        self.require_development_write_for(proof, Some(operation))?;
+        let job = self.require_development_write_for(proof, Some(operation))?;
         let first_request = RequestNumber::FIRST;
         if result
             .validate(
@@ -1030,7 +1008,8 @@ impl Batch {
             ));
         }
         let outcome = self.finish_development_job(
-            proof,
+            proof.token(),
+            &job,
             expected_seq,
             crate::db::entities::JobFinalization::Completed(crate::db::entities::FinalResult {
                 summary: None,
@@ -1079,23 +1058,21 @@ impl Batch {
         expected_seq: u32,
         mut finalization: crate::db::entities::JobFinalization,
     ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
-        self.require_development_write(proof)?;
-        let job_id = proof.token().job;
-        if let Some(job) = self.mutable_job(job_id)?
-            && let crate::db::entities::JobFinalization::Completed(ref mut output) = finalization
-        {
+        let job =
+            self.require_development_write_for(proof, Some(ExecutionOperation::LlmRequest))?;
+        if let crate::db::entities::JobFinalization::Completed(ref mut output) = finalization {
             self.normalize_summary_output(&job, output)?;
         }
-        self.finish_development_job(proof, expected_seq, finalization)
+        self.finish_development_job(proof.token(), &job, expected_seq, finalization)
     }
 
-    pub(super) fn finish_development_job(
+    fn finish_development_job(
         &mut self,
-        proof: &crate::db::handoff::DevelopmentWriteProof,
+        token: crate::db::entities::AllocationToken,
+        job: &MutableJob,
         expected_seq: u32,
         finalization: crate::db::entities::JobFinalization,
     ) -> Result<crate::db::entities::AppendedOutput, BatchError> {
-        self.require_development_write_for(proof, None)?;
         let (kind, result) = match finalization {
             crate::db::entities::JobFinalization::Completed(result) => {
                 (OutcomeKind::Completed, result)
@@ -1104,16 +1081,6 @@ impl Batch {
             crate::db::entities::JobFinalization::Cancelled(result) => {
                 (OutcomeKind::Cancelled, result)
             }
-            crate::db::entities::JobFinalization::Unknown => {
-                return self.reject(Violation::InvalidValue(
-                    "outcome",
-                    "cancellation or uncertain execution cannot be finalized here",
-                ));
-            }
-        };
-        let token = proof.token();
-        let Some(job) = self.mutable_job(token.job)? else {
-            return self.reject(Violation::NotFound(RecordRef::Job(token.job)));
         };
         let valid = self.step(|tx| {
             if state::pending(tx, token.job)? != Some((0, 0)) {
@@ -1150,7 +1117,8 @@ impl Batch {
                         );
                     }
                     crate::db::entities::RequestPayload::ApprovedCalls => *state = (true, true),
-                    _ => {}
+                    crate::db::entities::RequestPayload::Measurement { .. }
+                    | crate::db::entities::RequestPayload::Token { .. } => {}
                 }
             }
             if requests.values().any(|&(sent, settled)| !sent || !settled) {
@@ -1192,14 +1160,14 @@ impl Batch {
                 "required evidence or output sequence is invalid",
             ));
         }
-        let (seq, id) = self.settle_mutable_outcome(token, &job, kind, result)?;
+        let (seq, id) = self.settle_mutable_outcome(token, job, kind, result)?;
         self.transition_pool_allocation(
             token,
             crate::db::entities::AllocationPhase::Released,
             None,
         )?;
-        self.settle_summary_membership(&job)?;
-        self.settle_standalone_decision(&job)?;
+        self.settle_summary_membership(job)?;
+        self.settle_standalone_decision(job)?;
         self.freed_capacity = true;
         self.probe = Some(Probe::Outcome(token.job));
         if kind == OutcomeKind::Completed
@@ -1280,7 +1248,7 @@ impl Batch {
                 "the call belongs to another Job",
             ));
         }
-        self.require_development_write(proof)?;
+        self.require_development_write_for(proof, Some(ExecutionOperation::LlmRequest))?;
         Ok(())
     }
 }

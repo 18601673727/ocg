@@ -890,18 +890,11 @@ impl Batch {
         Ok(job)
     }
 
-    pub(super) fn require_development_write(
-        &mut self,
-        proof: &crate::db::handoff::DevelopmentWriteProof,
-    ) -> Result<(), BatchError> {
-        self.require_development_write_for(proof, Some(ExecutionOperation::LlmRequest))
-    }
-
     pub(super) fn require_development_write_for(
         &mut self,
         proof: &crate::db::handoff::DevelopmentWriteProof,
         operation: Option<ExecutionOperation>,
-    ) -> Result<(), BatchError> {
+    ) -> Result<crate::db::entities::MutableJob, BatchError> {
         use crate::db::entities::{AllocationPhase, MutableFrozenConfiguration, MutableJobPhase};
         self.require_allocation_durability()?;
         let token = proof.token();
@@ -945,7 +938,7 @@ impl Batch {
         {
             return self.reject(rejected());
         }
-        Ok(())
+        Ok(job)
     }
 }
 
@@ -1068,7 +1061,7 @@ impl Batch {
                     at: self.now,
                     cause: Some(crate::db::entities::OutcomeCause::Uncertain(action.reason)),
                 });
-                self.put_mutable_job_state(action.token.job, &state)?;
+                self.put_job_state(action.token.job, &state)?;
             }
             _ => {
                 return self.reject(Violation::InvalidValue(
@@ -1140,7 +1133,7 @@ impl Batch {
         }
     }
 
-    pub(crate) fn transition_pool_allocation(
+    pub(super) fn transition_pool_allocation(
         &mut self,
         token: crate::db::entities::AllocationToken,
         next: crate::db::entities::AllocationPhase,
@@ -1161,30 +1154,11 @@ impl Batch {
                 "stale database epoch",
             ));
         }
-        if allocation.phase == AllocationPhase::Reserved && next == AllocationPhase::Running {
-            return self.reject(Violation::InvalidValue(
-                "allocation",
-                "execution start requires a verified Job revision",
-            ));
-        }
-        let allowed = matches!(
-            (allocation.phase, next),
-            (
-                AllocationPhase::Reserved,
-                AllocationPhase::Running
-                    | AllocationPhase::StopRequested
-                    | AllocationPhase::Uncertain
-            ) | (
-                AllocationPhase::Running,
-                AllocationPhase::StopRequested
-                    | AllocationPhase::Uncertain
-                    | AllocationPhase::Released
-            ) | (
-                AllocationPhase::StopRequested,
-                AllocationPhase::Uncertain | AllocationPhase::Released
-            )
-        );
-        if !allowed {
+        if !matches!(
+            allocation.phase,
+            AllocationPhase::Running | AllocationPhase::StopRequested
+        ) || !execution::allocation_phase_transition_allowed(allocation.phase, next)
+        {
             return self.reject(Violation::InvalidValue(
                 "allocation",
                 "invalid allocation transition",
@@ -1203,13 +1177,13 @@ impl Batch {
                 "allocation",
                 "Job already has an outcome",
             ));
-        } else if next == AllocationPhase::Uncertain {
+        } else if let Some(reason) = uncertainty {
             state.outcome = Some(OutcomeRecord {
                 kind: OutcomeKind::Unknown,
                 at: self.now,
-                cause: uncertainty.map(OutcomeCause::Uncertain),
+                cause: Some(OutcomeCause::Uncertain(reason)),
             });
-            self.put_mutable_job_state(token.job, &state)?;
+            self.put_job_state(token.job, &state)?;
         }
         let previous = allocation.clone();
         allocation.phase = next;

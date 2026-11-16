@@ -10,13 +10,12 @@ use super::providers::observe::{self, Redactor, bounded_body, classify_client_er
 use super::providers::openai_compatible::{
     ChatConversation, ChatMessage, ContentPartWire, ImageInput, InvalidToolCall, ToolCallAssembler,
 };
-use super::providers::usage::{self, reported_usage};
+use super::providers::usage::reported_usage;
 use super::providers::{
     CredentialResolver, MAX_PROVIDER_ERROR_BYTES, MAX_SSE_LINE_BYTES, OutputSinkError,
     ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult, ProviderFact,
-    ProviderObservation, ProviderOutputSink, ResponseFacts, UsageCapture, announce, anthropic,
-    endpoint, incomplete_tool_calls, openai_compatible, rejected_failure, responses,
-    unannounced_fact,
+    ProviderObservation, ProviderOutputSink, ResponseFacts, UsageCapture, announce, endpoint,
+    incomplete_tool_calls, openai_compatible, rejected_failure, unannounced_fact,
 };
 use crate::db::entities::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::db::entities::{FrozenExecutionConfig, IntermediateOutputKind, LlmParameters};
@@ -150,7 +149,7 @@ pub(crate) fn request_body(
     Ok(body)
 }
 
-pub async fn execute_conversation(
+pub(crate) async fn execute_conversation(
     frozen: &FrozenExecutionConfig,
     conversation: &ChatConversation,
     resolver: &dyn CredentialResolver,
@@ -194,50 +193,28 @@ async fn exchange(
     announced: &mut bool,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let provider = &frozen.llm.provider;
-    let anthropic = config.transport == crate::db::entities::LlmTransport::AnthropicMessages;
     let endpoint = endpoint(
-        provider.endpoint.as_deref().unwrap_or(if anthropic {
-            anthropic::DEFAULT_ENDPOINT
-        } else {
-            openai_compatible::DEFAULT_ENDPOINT
-        }),
-        match config.transport {
-            crate::db::entities::LlmTransport::OpenAiChatCompletions => "chat/completions",
-            crate::db::entities::LlmTransport::OpenAiResponses => "responses",
-            crate::db::entities::LlmTransport::AnthropicMessages => "messages",
-        },
+        provider
+            .endpoint
+            .as_deref()
+            .unwrap_or(openai_compatible::DEFAULT_ENDPOINT),
+        "chat/completions",
     )?;
 
     let credential = resolver.resolve(provider.credential_ref.as_deref()).await?;
     let headers = crate::system::http::resolve_request_headers(&provider.headers, resolver).await?;
     let redactor = Redactor::new(credential.as_deref()).with_secrets(headers.secrets());
-    let authorization = credential
-        .as_deref()
-        .map(if anthropic {
-            anthropic::api_key
-        } else {
-            authorization
-        })
-        .transpose()?;
+    let authorization = credential.as_deref().map(authorization).transpose()?;
     if config.cancellation.is_cancelled() {
         return Err(ProviderExecutionError::NotDelivered {
             message: "provider execution was cancelled before sending".to_owned(),
         });
     }
-    let chat_body = request_body(
+    let body = request_body(
         &frozen.llm.config.model,
         &frozen.llm.config.parameters,
         conversation,
     )?;
-    let body = match config.transport {
-        crate::db::entities::LlmTransport::OpenAiChatCompletions => chat_body,
-        crate::db::entities::LlmTransport::AnthropicMessages => {
-            anthropic::request_body(chat_body, conversation)?
-        }
-        crate::db::entities::LlmTransport::OpenAiResponses => {
-            responses::request_body(chat_body, conversation)?
-        }
-    };
     let head_timeout = config.first_delta_timeout.unwrap_or(config.timeout);
     let client = provider_client_for(head_timeout, &config.destination, &endpoint).await?;
     let session = endpoint
@@ -259,20 +236,8 @@ async fn exchange(
             request.set_header("x-opencode-session", session)
         })
         .if_some(authorization, |authorization, request| {
-            request.set_header(
-                if anthropic {
-                    "x-api-key"
-                } else {
-                    "authorization"
-                },
-                authorization,
-            )
+            request.set_header("authorization", authorization)
         });
-    let request = if anthropic {
-        request.set_header("anthropic-version", anthropic::API_VERSION)
-    } else {
-        request
-    };
 
     if config.cancellation.is_cancelled() {
         return Err(ProviderExecutionError::NotDelivered {
@@ -310,11 +275,7 @@ async fn exchange(
     announce(borrow_output_sink(sink), ProviderFact::Delivered).await;
     let status = response.status().as_u16();
     let request_id = response
-        .header(if anthropic {
-            "request-id"
-        } else {
-            "x-request-id"
-        })
+        .header("x-request-id")
         .and_then(|value| value.to_str().ok())
         .map(|value| redactor.text(value));
     let retry_after_ms = response
@@ -365,8 +326,6 @@ async fn exchange(
     .await
     .map_err(|error| redactor.error(error))
 }
-
-const MAX_NATIVE_SSE_LINE_BYTES: usize = 16 * 1024 * 1024;
 
 pub(crate) async fn read_response(
     payload: Payload,
@@ -636,19 +595,6 @@ async fn parse_stream_body(
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut buffer = Vec::with_capacity(MAX_SSE_LINE_BYTES);
     let mut response = StreamedResponse::default();
-    let native = config.transport == crate::db::entities::LlmTransport::OpenAiResponses;
-    let mut responses = responses::ResponseStream::default();
-    let anthropic = config.transport == crate::db::entities::LlmTransport::AnthropicMessages;
-    let mut messages = anthropic::MessageStream::default();
-    let line_limit = if native || anthropic {
-        config
-            .max_output_bytes
-            .saturating_mul(6)
-            .saturating_add(MAX_SSE_LINE_BYTES)
-            .min(MAX_NATIVE_SSE_LINE_BYTES)
-    } else {
-        MAX_SSE_LINE_BYTES
-    };
     let mut saw_event = false;
     let mut first_byte = None;
     let mut idle_waited = Duration::ZERO;
@@ -714,7 +660,7 @@ async fn parse_stream_body(
         let chunk = chunk.map_err(|error| response.unknown(error.to_string(), status_code))?;
         first_byte.get_or_insert_with(Instant::now);
         for byte in chunk {
-            if buffer.len() == line_limit {
+            if buffer.len() == MAX_SSE_LINE_BYTES {
                 return Err(
                     response.incomplete("provider SSE line exceeded its limit", status_code)
                 );
@@ -725,7 +671,7 @@ async fn parse_stream_body(
             }
             let line = buffer.strip_suffix(b"\n").unwrap_or(&buffer);
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.len() > line_limit {
+            if line.len() > MAX_SSE_LINE_BYTES {
                 return Err(
                     response.incomplete("provider SSE line exceeded its limit", status_code)
                 );
@@ -747,79 +693,10 @@ async fn parse_stream_body(
             })?;
             buffer.clear();
             saw_event = true;
-            let (event, finish) = if anthropic {
-                messages
-                    .event(&event, config.max_output_bytes)
-                    .map_err(|message| {
-                        if message == "Anthropic output exceeded its limit" {
-                            local_stop(
-                                message,
-                                status_code,
-                                response.finish_reason,
-                                response.raw_finish_reason.as_deref(),
-                            )
-                        } else {
-                            response.incomplete(message, status_code)
-                        }
-                    })?
-            } else {
-                (event, None)
-            };
-            let reported = if anthropic {
-                messages.reported_usage()
-            } else if native {
-                usage::reported_responses_usage(&event)
-            } else {
-                reported_usage(&event)
-            };
-            if let Some(reported) = reported {
+            if let Some(reported) = reported_usage(&event) {
                 response.usage = reported.usage.clone();
                 capture.record(Some(output), reported).await;
             }
-            if native && event["type"] == "response.failed" {
-                let (message, provider_code) =
-                    observe::parse_provider_error(&event["response"]["error"].to_string())
-                        .unwrap_or_else(|| {
-                            ("Responses provider failed after delivery".to_owned(), None)
-                        });
-                return Err(ProviderExecutionError::StreamFailure {
-                    failure: Box::new(ProviderFailure {
-                        message,
-                        provider_code,
-                        request_id: request_id.clone(),
-                        ..ProviderFailure::default()
-                    }),
-                    facts: response.facts(status_code),
-                    finished: response.finish_reason.is_some() && response.tool_calls.is_empty(),
-                });
-            }
-            if native && event["type"] == "response.incomplete" {
-                let reason = event["response"]["incomplete_details"]["reason"]
-                    .as_str()
-                    .unwrap_or("unspecified");
-                return Err(response.incomplete(
-                    format!("Responses request ended incomplete: {reason}"),
-                    status_code,
-                ));
-            }
-            let (event, finish) = if native {
-                responses
-                    .event(&event, config.max_output_bytes)
-                    .map_err(|message| {
-                        if message == "Responses output exceeded its limit" {
-                            local_stop(
-                                message,
-                                status_code,
-                                response.finish_reason,
-                                response.raw_finish_reason.as_deref(),
-                            )
-                        } else {
-                            response.incomplete(message, status_code)
-                        }
-                    })?
-            } else {
-                (event, finish)
-            };
             if let Some(error) = event.get("error").filter(|error| error.is_object()) {
                 let (message, provider_code) = observe::parse_provider_error(&event.to_string())
                     .unwrap_or_else(|| ("provider request failed".to_owned(), None));
@@ -850,12 +727,6 @@ async fn parse_stream_body(
                             && response.tool_calls.is_empty(),
                     },
                 });
-            }
-            if native && finish.is_some() {
-                response = StreamedResponse {
-                    usage: std::mem::take(&mut response.usage),
-                    ..Default::default()
-                };
             }
             let delta = consume_event(&event, &mut response, config.max_output_bytes).map_err(
                 |refused| match refused {
@@ -892,13 +763,6 @@ async fn parse_stream_body(
             {
                 saw_delta = true;
             }
-            if let Some(finish) = finish {
-                response.finish_reason = Some(finish.reason);
-                response.raw_finish_reason = Some(finish.raw);
-                if native {
-                    break 'stream;
-                }
-            }
             for (kind, delta) in delta {
                 output.buffer(kind, &delta).await.map_err(|error| {
                     local_stop(
@@ -908,9 +772,6 @@ async fn parse_stream_body(
                         response.raw_finish_reason.as_deref(),
                     )
                 })?;
-            }
-            if anthropic && messages.terminal {
-                break 'stream;
             }
         }
     }
@@ -922,9 +783,6 @@ async fn parse_stream_body(
             response.finish_reason,
             response.raw_finish_reason.as_deref(),
         ));
-    }
-    if anthropic && !messages.terminal {
-        return Err(response.incomplete("Anthropic stream ended without message_stop", status_code));
     }
     if !buffer.is_empty() {
         return Err(response.incomplete(
@@ -951,13 +809,7 @@ async fn parse_stream_body(
             })?;
     let finished_in = started.elapsed();
     Ok(ProviderExecutionResult {
-        response_items: if anthropic {
-            messages.output()
-        } else {
-            responses.output
-        },
         text: response.text,
-        reasoning: response.reasoning,
         tool_calls,
         refused,
         usage: response.usage,
@@ -989,7 +841,7 @@ fn local_stop(
 #[derive(Default)]
 struct StreamedResponse {
     text: String,
-    reasoning: String,
+    reasoning_bytes: usize,
     tool_calls: ToolCallAssembler,
     usage: NormalizedUsage,
     finish_reason: Option<ChatFinishReason>,
@@ -1000,7 +852,7 @@ impl StreamedResponse {
     fn output_bytes(&self) -> usize {
         self.text
             .len()
-            .saturating_add(self.reasoning.len())
+            .saturating_add(self.reasoning_bytes)
             .saturating_add(self.tool_calls.bytes())
     }
 
@@ -1064,7 +916,7 @@ fn consume_event(
             if response.output_bytes().saturating_add(value.len()) > max_output_bytes {
                 return Err(Refused::OutputLimit);
             }
-            response.reasoning.push_str(value);
+            response.reasoning_bytes += value.len();
             deltas.push((IntermediateOutputKind::Reasoning, value.to_owned()));
         }
         if let Some(value) = delta.get("content").and_then(Value::as_str) {

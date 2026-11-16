@@ -22,7 +22,7 @@ use crate::db::entities::{
     UncertainCause, WithheldReason,
 };
 use crate::db::{DatabaseError, DatabaseHandle, DatabaseStatus};
-use crate::system::scheduler::SchedulerHandle;
+use crate::system::native_scheduler::NativeStops;
 
 mod assets;
 mod attachments;
@@ -95,7 +95,7 @@ use wire::{
 struct Shared {
     database: DatabaseHandle,
     logs: Arc<crate::system::logger::LogStore>,
-    scheduler: SchedulerHandle,
+    native_stops: NativeStops,
     submissions: submissions::Registry,
     workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
     token: Token,

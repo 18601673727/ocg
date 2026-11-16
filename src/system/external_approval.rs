@@ -2,8 +2,7 @@ use std::time::Duration;
 
 use crate::db::entities::{FrozenExecutionConfig, LlmTransport};
 use crate::service::ai::providers::{
-    ApprovedRoute, CancellationToken, DestinationPolicy, ExternalAuthority, LoopbackProxy,
-    ProviderExecutionConfig,
+    CancellationToken, DestinationPolicy, LoopbackProxy, ProviderExecutionConfig,
 };
 
 pub(crate) const MAX_REQUEST_BYTES_CEILING: usize = 1 << 20;
@@ -228,12 +227,11 @@ fn check_thinking(model: &str, effort: Option<&str>) -> Result<(), ApprovalRefus
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ExternalApproval {
-    authority: ExternalAuthority,
     endpoint: ApprovedEndpoint,
     credential_ref: String,
     limits: ApprovalLimits,
-    route: ApprovedRoute,
-    model: Option<String>,
+    proxy: LoopbackProxy,
+    model: String,
 }
 
 fn approved_credential_ref(credential_ref: &str) -> Result<String, ApprovalRefusal> {
@@ -257,12 +255,11 @@ impl ExternalApproval {
         let credential_ref = approved_credential_ref(credential_ref)?;
         valid_model_id(model)?;
         Ok(Self {
-            authority: ExternalAuthority::ScheduledExternalTransport,
             endpoint: ApprovedEndpoint::parse(endpoint)?,
             credential_ref,
             limits,
-            route: ApprovedRoute::TrustedProxy(proxy),
-            model: Some(model.to_owned()),
+            proxy,
+            model: model.to_owned(),
         })
     }
 
@@ -275,31 +272,22 @@ impl ExternalApproval {
     }
 
     pub(crate) fn names_model(&self, model: &str) -> bool {
-        self.model.as_deref() == Some(model)
+        self.model == model
     }
 
     pub(crate) fn destination(&self) -> DestinationPolicy {
         DestinationPolicy::ApprovedHttps {
             host: self.endpoint.host().to_owned(),
             port: self.endpoint.port(),
-            route: self.route.clone(),
-            authority: self.authority,
+            proxy: self.proxy,
         }
     }
 
     fn authorized(&self) -> Result<(), ApprovalRefusal> {
-        let feature = self.authority.feature();
+        let feature =
+            crate::system::execution_features::ExecutionFeature::ScheduledExternalTransport;
         if !feature.is_enabled() {
             return Err(refuse("feature_disabled", feature.refusal()));
-        }
-        if !self.authority.admits_route(&self.route) {
-            return Err(refuse(
-                "proxy_required",
-                format!(
-                    "{} connects only through a named trusted HTTP proxy",
-                    self.authority.name()
-                ),
-            ));
         }
         Ok(())
     }
@@ -352,22 +340,13 @@ impl ExternalApproval {
             ));
         }
         let model = frozen.llm.config.model.as_str();
-        if self
-            .model
-            .as_deref()
-            .is_some_and(|approved| approved != model)
-        {
+        if !self.names_model(model) {
             return Err(refuse(
                 "model_not_approved",
                 "the Job's frozen model is not the model approved for this invocation",
             ));
         }
-        let refusal = if self.authority == ExternalAuthority::ScheduledExternalTransport {
-            frozen.native_execution_refusal()
-        } else {
-            frozen.single_request_refusal()
-        };
-        if let Some(reason) = refusal {
+        if let Some(reason) = frozen.native_execution_refusal() {
             return Err(refuse("not_single_request_generative", reason));
         }
         let parameters = &frozen.llm.config.parameters;
@@ -402,9 +381,7 @@ impl ExternalApproval {
                 "a Generative Job is required",
             ));
         };
-        if prepared.is_summary_producer()
-            && self.authority == ExternalAuthority::ScheduledExternalTransport
-        {
+        if prepared.is_summary_producer() {
             if let Some(reason) = frozen.provider_refusal() {
                 return Err(refuse("not_single_request_generative", reason));
             }
@@ -434,10 +411,7 @@ impl ExternalApproval {
             .and_then(serde_json::Value::as_str);
         if request.get("thinking").is_some()
             || model.is_none_or(|model| check_thinking(model, effort).is_err())
-            || self
-                .model
-                .as_deref()
-                .is_some_and(|approved| model != Some(approved))
+            || model != Some(self.model.as_str())
         {
             return Err(refuse(
                 "request_not_bounded",
