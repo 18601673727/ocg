@@ -1,25 +1,23 @@
 use std::time::{Duration, Instant};
 use std::{future::Future, pin::Pin};
 
-use ntex::http::header::{ACCEPT, CONTENT_TYPE};
 use ntex::http::{Payload, StatusCode};
 use ntex::util::{Either, select};
 use serde_json::{Value, json};
 
-use super::providers::observe::{self, Redactor, bounded_body, classify_client_error, trim_ascii};
+use super::providers::observe::{self, trim_ascii};
 use super::providers::openai_compatible::{
     ChatConversation, ChatMessage, ContentPartWire, ImageInput, InvalidToolCall, ToolCallAssembler,
 };
 use super::providers::usage::reported_usage;
 use super::providers::{
-    CredentialResolver, MAX_PROVIDER_ERROR_BYTES, MAX_SSE_LINE_BYTES, OutputSinkError,
-    ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult, ProviderFact,
-    ProviderObservation, ProviderOutputSink, ResponseFacts, UsageCapture, announce, endpoint,
-    incomplete_tool_calls, openai_compatible, rejected_failure, unannounced_fact,
+    CredentialResolver, MAX_SSE_LINE_BYTES, OutputSinkError, ProviderExecutionConfig,
+    ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
+    ProviderOutputSink, ResponseFacts, UsageCapture, announce, endpoint, incomplete_tool_calls,
+    openai_compatible, unannounced_fact,
 };
 use crate::db::entities::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::db::entities::{FrozenExecutionConfig, IntermediateOutputKind, LlmParameters};
-use crate::system::http::{authorization, provider_client_for};
 
 const STREAM_OUTPUT_BUFFER_BYTES: usize = 4 * 1024;
 const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
@@ -152,6 +150,7 @@ pub(crate) fn request_body(
 pub(crate) async fn execute_conversation(
     frozen: &FrozenExecutionConfig,
     conversation: &ChatConversation,
+    body: &Value,
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
     mut sink: Option<&mut dyn ProviderOutputSink>,
@@ -166,6 +165,7 @@ pub(crate) async fn execute_conversation(
         exchange(
             frozen,
             conversation,
+            body,
             resolver,
             &config,
             &mut sink,
@@ -193,6 +193,7 @@ fn borrow_output_sink<'a>(
 async fn exchange(
     frozen: &FrozenExecutionConfig,
     conversation: &ChatConversation,
+    body: &Value,
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
     sink: &mut Option<&mut dyn ProviderOutputSink>,
@@ -207,116 +208,29 @@ async fn exchange(
         "chat/completions",
     )?;
 
-    let credential = resolver.resolve(provider.credential_ref.as_deref()).await?;
-    let headers = crate::system::http::resolve_request_headers(&provider.headers, resolver).await?;
-    let redactor = Redactor::new(credential.as_deref()).with_secrets(headers.secrets());
-    let authorization = credential.as_deref().map(authorization).transpose()?;
-    if config.cancellation.is_cancelled() {
-        return Err(ProviderExecutionError::NotDelivered {
-            message: "provider execution was cancelled before sending".to_owned(),
-        });
-    }
-    let body = request_body(
-        &frozen.llm.config.model,
-        &frozen.llm.config.parameters,
-        conversation,
-    )?;
-    let head_timeout = config.first_delta_timeout.unwrap_or(config.timeout);
-    let client = provider_client_for(head_timeout, &config.destination, &endpoint).await?;
-    let session = endpoint
-        .parse::<ntex::http::Uri>()
-        .ok()
-        .filter(|uri| {
-            uri.host()
-                .is_some_and(|host| host.eq_ignore_ascii_case("opencode.ai"))
-        })
-        .and(config.session_id)
-        .map(|id| format!("ocg-{}", id.get()));
-
-    let request = headers
-        .apply(client.post(endpoint))
-        .set_header(CONTENT_TYPE, "application/json")
-        .set_header(ACCEPT, "text/event-stream")
-        .set_header("Cache-Control", "no-cache")
-        .if_some(session, |session, request| {
-            request.set_header("x-opencode-session", session)
-        })
-        .if_some(authorization, |authorization, request| {
-            request.set_header("authorization", authorization)
-        });
-
-    if config.cancellation.is_cancelled() {
-        return Err(ProviderExecutionError::NotDelivered {
-            message: "provider execution was cancelled before sending".to_owned(),
-        });
-    }
-    if let Some(sink) = sink.as_deref_mut() {
-        sink.sending(&body)
-            .await
-            .map_err(|error| ProviderExecutionError::NotDelivered {
-                message: error.message,
-            })?;
-    }
-    let started = Instant::now();
-    let sent = select(
-        config.cancellation.cancelled(),
-        ntex::time::timeout(head_timeout, request.send_json(&body)),
+    let (response, started, redactor) = super::providers::send(
+        endpoint,
+        (provider.credential_ref.as_deref(), &provider.headers),
+        resolver,
+        config,
+        body,
+        borrow_output_sink(sink),
+        true,
     )
-    .await;
-    let response = match sent {
-        Either::Left(()) => {
-            return Err(ProviderExecutionError::Interrupted {
-                message: "provider execution was cancelled before a response arrived".to_owned(),
-            });
-        }
-        Either::Right(sent) => sent,
-    }
-    .map_err(|_| ProviderExecutionError::Unknown {
-        message: "provider request timed out after it may have been delivered".to_owned(),
-        facts: None,
-        finished: false,
-    })?
-    .map_err(classify_client_error)?;
+    .await?;
     *announced = true;
     announce(borrow_output_sink(sink), ProviderFact::Delivered).await;
     let status = response.status().as_u16();
-    let request_id = response
-        .header("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| redactor.text(value));
-    let retry_after_ms = response
-        .header("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(observe::retry_after_ms);
+    let request_id = redactor.request_id(&response);
     if response.status() != StatusCode::OK {
-        if conversation.carries_images() {
-            return Err(ProviderExecutionError::Rejected {
-                failure: observe::with_retry_after(
-                    redactor.failure(rejected_failure(conversation, status, request_id, None)),
-                    retry_after_ms,
-                ),
-            });
-        }
-        let body = match select(
-            config.cancellation.cancelled(),
-            ntex::time::timeout(
-                config.timeout,
-                bounded_body(response, MAX_PROVIDER_ERROR_BYTES),
-            ),
+        return Err(observe::reject_response(
+            response,
+            request_id,
+            config,
+            &redactor,
+            conversation.carries_images(),
         )
-        .await
-        {
-            Either::Left(()) => None,
-            Either::Right(Ok(body)) => body,
-            Either::Right(Err(())) => None,
-        };
-        let body = body.map(|body| redactor.body(&body));
-        return Err(ProviderExecutionError::Rejected {
-            failure: observe::with_retry_after(
-                redactor.failure(rejected_failure(conversation, status, request_id, body)),
-                retry_after_ms,
-            ),
-        });
+        .await);
     }
 
     let payload = response.take_payload();

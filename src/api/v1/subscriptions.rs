@@ -1,16 +1,10 @@
-use std::cell::Cell;
-use std::future::Future;
 use std::hash::{DefaultHasher, Hasher};
-use std::pin::Pin;
-use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use ntex::http::header;
 use ntex::io::IoRef;
-use ntex::util::{Bytes, Stream};
+use ntex::util::Bytes;
 use ntex::web::HttpResponse;
 use serde_json::{Value, json};
 
@@ -194,19 +188,13 @@ pub(super) fn open(
         observation_ready: false,
         _slot: slot,
     };
-    let polled = Rc::new(Cell::new(now));
-    let watched = io.map(|io| events::watch(io, polled.clone(), shared.stream_limits.stall));
-    Ok(HttpResponse::Ok()
-        .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
-        .header(header::CACHE_CONTROL, "no-store")
-        .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
-        .streaming(Body {
-            feed: Some(feed),
-            next: None,
-            rest: None,
-            polled,
-            _watched: watched,
-        }))
+    Ok(events::response(
+        io,
+        now,
+        shared.stream_limits.stall,
+        feed,
+        Feed::next,
+    ))
 }
 
 struct Feed {
@@ -576,51 +564,4 @@ fn cursor(value: &Value) -> Result<Option<JobId>, Refusal> {
         .and_then(Value::as_str)
         .ok_or(super::INTERNAL)?;
     super::routing::job_id(next).map(Some)
-}
-
-type Next = Pin<Box<dyn Future<Output = Option<(Bytes, Feed)>>>>;
-struct Body {
-    feed: Option<Feed>,
-    next: Option<Next>,
-    rest: Option<(Bytes, Feed)>,
-    polled: Rc<Cell<Instant>>,
-    _watched: Option<flume::Sender<()>>,
-}
-
-impl Body {
-    fn piece(&mut self, mut bytes: Bytes, feed: Feed) -> Bytes {
-        if bytes.len() <= events::PIECE {
-            self.feed = Some(feed);
-            return bytes;
-        }
-        let piece = bytes.split_to(events::PIECE);
-        self.rest = Some((bytes, feed));
-        piece
-    }
-}
-
-impl Stream for Body {
-    type Item = Result<Bytes, std::io::Error>;
-    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.polled.set(Instant::now());
-        if let Some((bytes, feed)) = self.rest.take() {
-            return Poll::Ready(Some(Ok(self.piece(bytes, feed))));
-        }
-        if self.next.is_none() {
-            let Some(feed) = self.feed.take() else {
-                return Poll::Ready(None);
-            };
-            self.next = Some(Box::pin(feed.next()));
-        }
-        let Some(next) = self.next.as_mut() else {
-            return Poll::Ready(None);
-        };
-        match next.as_mut().poll(context) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(value) => {
-                self.next = None;
-                Poll::Ready(value.map(|(bytes, feed)| Ok(self.piece(bytes, feed))))
-            }
-        }
-    }
 }

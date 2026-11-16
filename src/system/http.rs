@@ -18,14 +18,6 @@ use crate::service::ai::providers::ProviderExecutionError;
 
 static PROXY: OnceLock<Result<Option<Proxy>, String>> = OnceLock::new();
 
-pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
-    use crate::system::execution_features::{ExecutionFeature, FeatureState};
-    match ExecutionFeature::ExternalProviderTransport.state() {
-        FeatureState::Disabled => literal_direct_loopback(endpoint),
-        FeatureState::Enabled => false,
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LoopbackEndpointClass {
     LiteralDirect,
@@ -57,7 +49,7 @@ pub(crate) fn classify_loopback_endpoint(endpoint: &str) -> LoopbackEndpointClas
     };
     match uri.host() {
         Some("127.0.0.1") => {
-            if literal_direct_loopback(endpoint) {
+            if direct_diagnostic_loopback(endpoint) {
                 LoopbackEndpointClass::LiteralDirect
             } else if uri.scheme_str() == Some("http")
                 && uri
@@ -77,7 +69,7 @@ pub(crate) fn classify_loopback_endpoint(endpoint: &str) -> LoopbackEndpointClas
     }
 }
 
-fn literal_direct_loopback(endpoint: &str) -> bool {
+pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
     let Ok(uri) = endpoint.parse::<Uri>() else {
         return false;
     };
@@ -218,29 +210,20 @@ pub(crate) async fn provider_client_for(
             }
             standard_client(timeout).await
         }
-        DestinationPolicy::ApprovedHttps { host, port, proxy } => {
-            let feature =
-                crate::system::execution_features::ExecutionFeature::ScheduledExternalTransport;
-            if !feature.is_enabled() {
-                return Err(ProviderExecutionError::Build {
-                    message: feature.refusal(),
-                });
-            }
-            Client::builder()
-                .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-                .connector::<()>(approved_connector(host, *port, *proxy)?)
-                .disable_redirects()
-                .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
-                .response_payload_timeout(Millis::ZERO)
-                .build(
-                    ntex::SharedCfg::new("provider-approved")
-                        .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
-                )
-                .await
-                .map_err(|_| ProviderExecutionError::Build {
-                    message: "provider HTTP client could not be initialized".to_owned(),
-                })
-        }
+        DestinationPolicy::ApprovedHttps { host, port, proxy } => Client::builder()
+            .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
+            .connector::<()>(approved_connector(host, *port, *proxy)?)
+            .disable_redirects()
+            .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
+            .response_payload_timeout(Millis::ZERO)
+            .build(
+                ntex::SharedCfg::new("provider-approved")
+                    .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
+            )
+            .await
+            .map_err(|_| ProviderExecutionError::Build {
+                message: "provider HTTP client could not be initialized".to_owned(),
+            }),
     }
 }
 
@@ -249,19 +232,11 @@ pub(crate) enum DiscoveryClientError {
     Unavailable,
 }
 
-pub(crate) fn discovery_permitted(endpoint: &str) -> bool {
-    use crate::system::execution_features::{ExecutionFeature, FeatureState};
-    match ExecutionFeature::ProviderDiscovery.state() {
-        FeatureState::Enabled => true,
-        FeatureState::Disabled => literal_direct_loopback(endpoint),
-    }
-}
-
 pub(crate) async fn discovery_client(
     timeout: Duration,
     endpoint: &str,
 ) -> Result<Client, DiscoveryClientError> {
-    if !discovery_permitted(endpoint) {
+    if !direct_diagnostic_loopback(endpoint) {
         return Err(DiscoveryClientError::NotAuthorized);
     }
     standard_client(timeout)

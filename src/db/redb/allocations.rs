@@ -1,15 +1,13 @@
 use super::{StorageError, StorageErrorKind, TxRead};
 use crate::db::entities::{
-    AllocationExecutor, AllocationPhase, AllocationPool, ConfigBody, CursorPage,
-    ExecutionOperation, ExecutionPoolId, ExecutorId, JobId, LlmTransport, OutcomeKind,
-    PoolAllocationPage, PoolOccupancy, ProfileId, RecordRef, StopProof, UncertainAllocation,
-    Violation,
+    AllocationExecutor, AllocationPhase, AllocationPool, CursorPage, ExecutionOperation,
+    ExecutionPoolId, ExecutorId, JobId, LlmTransport, OutcomeKind, PoolAllocationPage,
+    PoolOccupancy, RecordRef, StopProof, UncertainAllocation, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure, NativeResourceDelta};
 use crate::db::redb::codec::{Code, Dec, DecodeResult, Enc};
 use crate::db::redb::reads::jobs::mutable_job_record_in;
 use crate::db::redb::reads::read;
-use crate::db::redb::rows::ConfigRow;
 use crate::db::redb::schema::{
     ACTIVE_ALLOCATIONS, CONFIGS, EXECUTORS, MAX_PAGE, POOL_ALLOCATIONS, POOL_EXECUTORS, POOLS,
     SEQUENCES,
@@ -902,13 +900,6 @@ pub(crate) fn read_pool_allocations(
     }))
 }
 
-fn pools_offering(
-    rx: &impl TxRead,
-    protocol: LlmTransport,
-) -> Result<Vec<ExecutorId>, StorageError> {
-    pools_offering_capability(rx, ExecutionOperation::LlmRequest, Some(protocol))
-}
-
 pub(crate) fn pools_offering_capability(
     rx: &impl TxRead,
     operation: ExecutionOperation,
@@ -1013,43 +1004,6 @@ pub(crate) fn read_native_resource_catalog(
         }
     }
     Ok(catalog)
-}
-
-pub(super) fn compatible_executors(
-    rx: &impl TxRead,
-    llm_profile: ProfileId,
-) -> Result<Vec<ExecutorId>, StorageError> {
-    let configs = rx.table(CONFIGS)?;
-    let Some(model) = configs
-        .get(llm_profile.get())?
-        .map(|bytes| ConfigRow::decode_at(llm_profile.get(), bytes.value()))
-        .transpose()?
-    else {
-        return Ok(Vec::new());
-    };
-    let model_eligible = model.model_enabled && model.archived_at.is_none();
-    let ConfigBody::Model(model) = model.body else {
-        return Err(StorageError::corrupted("expected a Model configuration"));
-    };
-    let Some(connection) = configs
-        .get(model.connection_id.get())?
-        .map(|bytes| ConfigRow::decode_at(model.connection_id.get(), bytes.value()))
-        .transpose()?
-    else {
-        return Err(StorageError::corrupted(
-            "Model references a missing Connection",
-        ));
-    };
-    let ConfigBody::Connection(connection) = connection.body else {
-        return Err(StorageError::corrupted(
-            "Model references a non-Connection configuration",
-        ));
-    };
-    if !model_eligible {
-        return Ok(Vec::new());
-    }
-    drop(configs);
-    pools_offering(rx, connection.protocol)
 }
 
 pub(crate) fn read_uncertain_allocations(

@@ -18,7 +18,7 @@ pub(crate) async fn list_models(
     protocol: Option<crate::db::entities::LlmTransport>,
     headers: &crate::system::http::RequestHeaders,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
-    if !crate::system::http::discovery_permitted(endpoint) {
+    if !crate::system::http::direct_diagnostic_loopback(endpoint) {
         return Err(ModelListError::NotAuthorized);
     }
     let base = super::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;

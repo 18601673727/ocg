@@ -1,21 +1,19 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use ntex::http::StatusCode;
-use ntex::http::header::{ACCEPT, CONTENT_TYPE};
 use ntex::util::{Either, select};
 use serde_json::{Value, json};
 
 use super::providers::observe::{self, Redactor};
+use super::providers::openai_compatible::ChatConversation;
 use super::providers::{
-    CredentialResolver, MAX_PROVIDER_ERROR_BYTES, ProviderExecutionConfig, ProviderExecutionError,
-    ResponseFacts,
+    CredentialResolver, ProviderExecutionConfig, ProviderExecutionError, ResponseFacts,
 };
 use crate::db::entities::{
     AvailabilityObservation, ChatFinishReason, DecisionAnswer, DecisionConfidence, DecisionOutcome,
     DecisionQuestion, DecisionRequest, DecisionResult, FrozenDecisionConfig, NativeDecisionConfig,
     NormalizedUsage, RequestRef,
 };
-use crate::system::http::{authorization, provider_client_for};
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
@@ -28,7 +26,7 @@ pub(crate) struct DecisionExecution {
     pub finished_in: Duration,
 }
 
-pub(crate) async fn execute_native_with_sink(
+async fn execute_native_with_sink(
     frozen: &NativeDecisionConfig,
     input: &DecisionRequest,
     body: &Value,
@@ -46,97 +44,27 @@ pub(crate) async fn execute_native_with_sink(
             message: "direct loopback endpoint required".into(),
         });
     }
-    input
-        .validate(&frozen.model.declared_capabilities)
-        .map_err(|message| ProviderExecutionError::Build {
-            message: message.to_owned(),
-        })?;
-    if !matches!(
-        input.state,
-        Value::String(_) | Value::Object(_) | Value::Array(_)
-    ) {
-        return Err(ProviderExecutionError::Build {
-            message: "decision state must be a string, object or array".to_owned(),
-        });
-    }
     let endpoint = super::providers::endpoint(
         frozen.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT),
         "systemone",
     )?;
-    let credential = resolver.resolve(frozen.credential_ref.as_deref()).await?;
-    let headers = crate::system::http::resolve_request_headers(&frozen.headers, resolver).await?;
-    let redactor = Redactor::new(credential.as_deref()).with_secrets(headers.secrets());
-    let authorization = credential.as_deref().map(authorization).transpose()?;
-    if config.cancellation.is_cancelled() {
-        return Err(ProviderExecutionError::NotDelivered {
-            message: "decision execution was cancelled before sending".to_owned(),
-        });
-    }
-    let client = provider_client_for(config.timeout, &config.destination, &endpoint).await?;
-    let request = headers
-        .apply(client.post(endpoint))
-        .set_header(CONTENT_TYPE, "application/json")
-        .set_header(ACCEPT, "application/json")
-        .if_some(authorization, |authorization, request| {
-            request.set_header("authorization", authorization)
-        });
-    sink.sending(body)
-        .await
-        .map_err(|error| ProviderExecutionError::NotDelivered {
-            message: error.message,
-        })?;
-    let started = Instant::now();
-    let sent = select(
-        config.cancellation.cancelled(),
-        ntex::time::timeout(config.timeout, request.send_json(body)),
+    let (response, started, redactor) = super::providers::send(
+        endpoint,
+        (frozen.credential_ref.as_deref(), &frozen.headers),
+        resolver,
+        config,
+        body,
+        Some(sink),
+        false,
     )
-    .await;
-    let response = match sent {
-        Either::Left(()) => {
-            return Err(ProviderExecutionError::Interrupted {
-                message: "decision execution was cancelled before a response arrived".to_owned(),
-            });
-        }
-        Either::Right(sent) => sent,
-    }
-    .map_err(|_| ProviderExecutionError::Unknown {
-        message: "decision request timed out after it may have been delivered".to_owned(),
-        facts: None,
-        finished: false,
-    })?
-    .map_err(observe::classify_client_error)?;
-    let status = response.status().as_u16();
-    let request_id = response
-        .header("x-request-id")
-        .and_then(|value| value.to_str().ok())
-        .map(|value| redactor.text(value));
-    let retry_after_ms = response
-        .header("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .and_then(observe::retry_after_ms);
+    .await?;
+    let status = response.status();
+    let request_id = redactor.request_id(&response);
     let finished_in = started.elapsed();
-    if status != StatusCode::OK.as_u16() {
-        let body = match select(
-            config.cancellation.cancelled(),
-            ntex::time::timeout(
-                config.timeout,
-                observe::bounded_body(response, MAX_PROVIDER_ERROR_BYTES),
-            ),
-        )
-        .await
-        {
-            Either::Left(()) => None,
-            Either::Right(Ok(body)) => body,
-            Either::Right(Err(())) => None,
-        };
-        let body = body.map(|body| redactor.body(&body));
-        return Err(ProviderExecutionError::Rejected {
-            failure: observe::with_retry_after(
-                redactor.failure(observe::provider_failure(status, request_id, body)),
-                retry_after_ms,
-            ),
-        });
+    if status != StatusCode::OK {
+        return Err(observe::reject_response(response, request_id, config, &redactor, false).await);
     }
+    let status = status.as_u16();
     let body = match select(
         config.cancellation.cancelled(),
         ntex::time::timeout(
@@ -250,11 +178,6 @@ fn native_request_body(
     frozen: &NativeDecisionConfig,
     input: &DecisionRequest,
 ) -> Result<Value, ProviderExecutionError> {
-    input
-        .validate(&frozen.model.declared_capabilities)
-        .map_err(|message| ProviderExecutionError::Build {
-            message: message.into(),
-        })?;
     if !matches!(
         input.state,
         Value::String(_) | Value::Object(_) | Value::Array(_)
@@ -563,10 +486,10 @@ fn decode_usage(usage: Option<&Value>) -> NormalizedUsage {
     }
 }
 
-pub(crate) fn request_body(
+pub(crate) fn prepare_request(
     frozen: &FrozenDecisionConfig,
     input: &DecisionRequest,
-) -> Result<Value, ProviderExecutionError> {
+) -> Result<(Value, Option<ChatConversation>), ProviderExecutionError> {
     frozen
         .validate()
         .and_then(|()| input.validate(&frozen.capabilities()))
@@ -574,19 +497,21 @@ pub(crate) fn request_body(
             message: message.into(),
         })?;
     match frozen {
-        FrozenDecisionConfig::Native(native) => native_request_body(native, input),
+        FrozenDecisionConfig::Native(native) => Ok((native_request_body(native, input)?, None)),
         FrozenDecisionConfig::Generative(generative, profile) => {
-            super::generative_model::request_body(
+            let conversation = decision_conversation(
+                generative,
+                input,
+                profile
+                    .as_ref()
+                    .and_then(|(agent, _)| agent.instructions.as_deref()),
+            );
+            let body = super::generative_model::request_body(
                 &generative.llm.config.model,
                 &generative.llm.config.parameters,
-                &decision_conversation(
-                    generative,
-                    input,
-                    profile
-                        .as_ref()
-                        .and_then(|(agent, _)| agent.instructions.as_deref()),
-                ),
-            )
+                &conversation,
+            )?;
+            Ok((body, Some(conversation)))
         }
     }
 }
@@ -595,8 +520,8 @@ fn decision_conversation(
     frozen: &crate::db::entities::FrozenExecutionConfig,
     input: &DecisionRequest,
     instructions: Option<&str>,
-) -> super::providers::openai_compatible::ChatConversation {
-    use super::providers::openai_compatible::{ChatConversation, ChatMessage};
+) -> ChatConversation {
+    use super::providers::openai_compatible::ChatMessage;
     let shape = match input.question {
         DecisionQuestion::Choice { .. } => {
             json!({"status":"answer", "answer":{"kind":"choice", "selected":"requested option id", "distribution":{"each requested option id":0.5}, "confidence":{"value":0.8,"semantics":"self_reported"}}})
@@ -628,7 +553,7 @@ fn decision_conversation(
 pub(crate) async fn execute_decision_with_sink(
     frozen: &FrozenDecisionConfig,
     input: &DecisionRequest,
-    body: &Value,
+    (body, conversation): (&Value, Option<&ChatConversation>),
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
     reference: RequestRef,
@@ -638,17 +563,14 @@ pub(crate) async fn execute_decision_with_sink(
         FrozenDecisionConfig::Native(native) => {
             execute_native_with_sink(native, input, body, resolver, config, reference, sink).await
         }
-        FrozenDecisionConfig::Generative(generative, profile) => {
-            request_body(frozen, input)?;
+        FrozenDecisionConfig::Generative(generative, _) => {
+            let conversation = conversation.ok_or_else(|| ProviderExecutionError::Build {
+                message: "generative Decision requires a prepared chat conversation".into(),
+            })?;
             let execution = super::generative_model::execute_conversation(
                 generative,
-                &decision_conversation(
-                    generative,
-                    input,
-                    profile
-                        .as_ref()
-                        .and_then(|(agent, _)| agent.instructions.as_deref()),
-                ),
+                conversation,
+                body,
                 resolver,
                 config,
                 Some(sink),

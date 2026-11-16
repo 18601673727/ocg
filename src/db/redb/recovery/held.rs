@@ -9,6 +9,7 @@ use crate::db::redb::recovery::audit::{
 };
 use crate::db::redb::recovery::offline::{
     apply_reconciliation, finalization_copy, with_reconciliation_copy,
+    with_verified_finalization_copy,
 };
 use crate::db::redb::recovery::reserved::ReservedRefusal;
 use crate::db::redb::schema::FORMAT_VERSION;
@@ -770,16 +771,7 @@ pub(crate) fn verify_held_publication_delta(
 
     let source = finalization_copy(source)?;
     let published = finalization_copy(published)?;
-    with_reconciliation_copy(source, |source_database| {
-        if !source_database
-            .check_integrity()
-            .map_err(StorageError::from)?
-        {
-            return Err(ReservedRefusal::new(
-                "page_integrity",
-                "redb found damage in the rollback copy and had to repair it",
-            ));
-        }
+    with_verified_finalization_copy(source, "rollback", |source_database| {
         let plan = held_recovery_plan_in(&*source_database, source_sha256)?;
         if plan.digest != expected_digest || &plan.evidence != expected_plan {
             return Err(ReservedRefusal::new(
@@ -787,13 +779,7 @@ pub(crate) fn verify_held_publication_delta(
                 "the prepared plan is not the exact plan authorized by the rollback source",
             ));
         }
-        with_reconciliation_copy(published, |database| {
-            if !database.check_integrity().map_err(StorageError::from)? {
-                return Err(ReservedRefusal::new(
-                    "page_integrity",
-                    "redb found damage in the published copy and had to repair it",
-                ));
-            }
+        with_verified_finalization_copy(published, "published", |database| {
             verify_recovered(&*database)?;
             let targets = plan
                 .actions

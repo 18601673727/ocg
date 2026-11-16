@@ -406,14 +406,7 @@ async fn previous_model_connection(
     database: &DatabaseHandle,
     existing_id: Option<ProfileId>,
     kind: ConfigKind,
-) -> Result<
-    Option<(
-        ConfigBody,
-        ConnectionConfig,
-        crate::db::mutations::ProfileSaveGuard,
-    )>,
-    Refusal,
-> {
+) -> Result<Option<(ConfigRecord, crate::db::mutations::ProfileSaveGuard)>, Refusal> {
     let Some(id) = existing_id else {
         return Ok(None);
     };
@@ -435,18 +428,12 @@ async fn previous_model_connection(
         .config(connection_id)
         .await?
         .ok_or(INCONSISTENT_RECORD)?;
-    let ConfigBody::Connection(connection) = connection_record.body else {
-        return Err(INCONSISTENT_RECORD);
+    let guard = crate::db::mutations::ProfileSaveGuard {
+        profile_edit_seq: record.edit_seq,
+        connection_id,
+        connection_edit_seq: connection_record.edit_seq,
     };
-    Ok(Some((
-        record.body,
-        connection,
-        crate::db::mutations::ProfileSaveGuard {
-            profile_edit_seq: record.edit_seq,
-            connection_id,
-            connection_edit_seq: connection_record.edit_seq,
-        },
-    )))
+    Ok(Some((connection_record, guard)))
 }
 
 fn config_revision(current: u32, expected_edit_seq: Option<u32>) -> Result<Option<u32>, Refusal> {
@@ -1213,11 +1200,16 @@ async fn prepare_model_save(
         input.clear_credential,
     )?;
     let previous = previous_model_connection(database, existing_id, kind).await?;
-    let previous_headers = previous
-        .as_ref()
-        .map(|(_, connection, _)| connection.headers.clone())
-        .unwrap_or_default();
-    let guard = revision_guard(previous.map(|(_, _, guard)| guard), input.expected_edit_seq)?;
+    let previous_headers = match &previous {
+        Some((record, _)) => {
+            let ConfigBody::Connection(connection) = &record.body else {
+                return Err(INCONSISTENT_RECORD);
+            };
+            connection.headers.clone()
+        }
+        None => Vec::new(),
+    };
+    let guard = revision_guard(previous.map(|(_, guard)| guard), input.expected_edit_seq)?;
     let plan = plan_headers(database, input.headers, &previous_headers).await?;
     Ok(ModelProfileSave {
         headers: plan.change,
@@ -1653,17 +1645,9 @@ pub(crate) async fn import_models(
         (Some(id), None) => {
             headers = HeaderChange::Preserve;
             let id = profile_id(&id)?;
-            let source = database.config(id.into()).await?.ok_or(PROFILE_NOT_FOUND)?;
-            if source.archived_at.is_some() {
-                return Err(PROFILE_NOT_FOUND);
-            }
-            let ConfigBody::Model(model) = source.body else {
-                return Err(WRONG_PROFILE_KIND);
-            };
-            let connection = database
-                .config(model.connection_id)
+            let (connection, _) = previous_model_connection(database, Some(id), ConfigKind::Model)
                 .await?
-                .ok_or(INCONSISTENT_RECORD)?;
+                .ok_or(PROFILE_NOT_FOUND)?;
             if connection.archived_at.is_some() {
                 return Err(PROFILE_NOT_FOUND);
             }
@@ -1861,7 +1845,7 @@ pub(crate) async fn provider_models(
     if request.credential.is_some() && request.credential_ref.is_some() {
         return Err(INVALID_PROFILE_BODY);
     }
-    if !crate::system::http::discovery_permitted(&request.endpoint) {
+    if !crate::system::http::direct_diagnostic_loopback(&request.endpoint) {
         return Err(PROVIDER_DISCOVERY_DISABLED);
     }
     let saved_connection = request.credential.is_none();
@@ -1898,7 +1882,12 @@ pub(crate) async fn provider_models(
                 DiscoveryProtocol::Decision(_) => ConfigKind::DecisionModel,
             };
             match previous_model_connection(database, Some(profile_id(id)?), kind).await? {
-                Some((_, connection, _)) => connection.headers,
+                Some((record, _)) => {
+                    let ConfigBody::Connection(connection) = record.body else {
+                        return Err(INCONSISTENT_RECORD);
+                    };
+                    connection.headers
+                }
                 None => Vec::new(),
             }
         }

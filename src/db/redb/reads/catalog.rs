@@ -1,13 +1,12 @@
 use crate::db::entities::{
-    AgentModelConfig, AttachmentRecord, CredentialSecret, CursorPage, ProfilePageRecord,
-    ProfilePageRecords, ProjectRecord, SubmissionKey, SubmissionRecord,
+    AgentModelConfig, AttachmentRecord, CredentialSecret, CursorPage, ExecutionOperation,
+    ProfilePageRecord, ProfilePageRecords, ProjectRecord, SubmissionKey, SubmissionRecord,
 };
-use crate::db::entities::{AttachmentId, ProjectId};
+use crate::db::entities::{AttachmentId, ExecutorId, ProjectId};
 use crate::db::entities::{ConfigBody, ConfigId, ConfigKind, ConfigRecord};
 use crate::db::redb::StorageError;
 use crate::db::redb::TxRead;
 use crate::db::redb::allocations;
-use crate::db::redb::allocations::compatible_executors;
 use crate::db::redb::codec::{Dec, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS};
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::{
@@ -366,15 +365,36 @@ pub(crate) fn read_agent_model_configs(
     ids: &[ConfigId],
 ) -> Result<Vec<AgentModelConfig>, StorageError> {
     let rx = read(database)?;
+    let mut executors_by_protocol = BTreeMap::<_, Vec<ExecutorId>>::new();
     ids.iter()
         .map(|id| {
             let record = config(&rx, *id)?;
-            let executors = if record.as_ref().is_some_and(|record| {
-                record.model_enabled
-                    && record.archived_at.is_none()
-                    && matches!(record.body, ConfigBody::Model(_))
-            }) {
-                compatible_executors(&rx, (*id).into())?
+            let executors = if let Some(ConfigRecord {
+                body: ConfigBody::Model(model),
+                model_enabled: true,
+                archived_at: None,
+                ..
+            }) = &record
+            {
+                let connection = config(&rx, model.connection_id)?.ok_or_else(|| {
+                    StorageError::corrupted("Model references a missing Connection")
+                })?;
+                let ConfigBody::Connection(connection) = connection.body else {
+                    return Err(StorageError::corrupted(
+                        "Model references a non-Connection configuration",
+                    ));
+                };
+                use std::collections::btree_map::Entry;
+                match executors_by_protocol.entry(connection.protocol) {
+                    Entry::Occupied(entry) => entry.get().clone(),
+                    Entry::Vacant(entry) => entry
+                        .insert(allocations::pools_offering_capability(
+                            &rx,
+                            ExecutionOperation::LlmRequest,
+                            Some(connection.protocol),
+                        )?)
+                        .clone(),
+                }
             } else {
                 Vec::new()
             };

@@ -114,6 +114,7 @@ pub(crate) async fn supervise_development_generative(
         let result = crate::service::ai::generative_model::execute_conversation(
             frozen,
             &conversation,
+            &body,
             &handoff,
             config,
             Some(&mut sink),
@@ -281,7 +282,6 @@ pub(crate) async fn supervise_development_generative(
     }
 }
 
-#[cfg(unix)]
 #[cfg(unix)]
 async fn capture_file_snapshots(
     workspace: super::workspace_read::Workspace,
@@ -588,45 +588,36 @@ pub(crate) async fn supervise_development_decision(
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
 ) -> Result<AppendedOutput, DatabaseError> {
-    let (frozen, request, body, token) =
+    let (frozen, request, body, conversation) =
         handoff
             .decision_inputs()
             .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
                 "handoff",
                 "Decision handoff required",
             )))?;
-    let frozen = frozen.clone();
-    let effective_config = match &frozen {
-        crate::db::entities::FrozenDecisionConfig::Native(_) => config.clone(),
-        crate::db::entities::FrozenDecisionConfig::Generative(generative, _) => {
-            config.for_profile(generative)
-        }
-    };
-    let endpoint = match &frozen {
+    let job = handoff.job();
+    let endpoint = match frozen {
         crate::db::entities::FrozenDecisionConfig::Native(native) => native.endpoint.as_deref(),
         crate::db::entities::FrozenDecisionConfig::Generative(generative, _) => {
             generative.llm.provider.endpoint.as_deref()
         }
     };
     let local_rejection = match endpoint {
-        None => Some((NOT_SENT, "explicit loopback endpoint required")),
-        Some(endpoint) if !policy.permits(endpoint, &effective_config) => {
-            Some((NOT_SENT, policy.refusal()))
+        None => Some("explicit loopback endpoint required"),
+        Some(endpoint) if !policy.permits(endpoint, config) => Some(policy.refusal()),
+        Some(_) if config.cancellation.is_cancelled() => {
+            Some("Execution was cancelled before the provider request.")
         }
-        Some(_) if effective_config.cancellation.is_cancelled() => Some((
-            NOT_SENT,
-            "Execution was cancelled before the provider request.",
-        )),
         Some(_) => None,
     };
-    if let Some((code, message)) = local_rejection {
+    if let Some(message) = local_rejection {
         return settle_development_unsent(
             database,
             &handoff,
             RequestNumber::FIRST,
             1,
-            &effective_config,
-            code,
+            config,
+            NOT_SENT,
             message,
         )
         .await;
@@ -636,7 +627,7 @@ pub(crate) async fn supervise_development_decision(
         handoff: &handoff,
         request: RequestNumber::FIRST,
         prepared: body,
-        cancellation: &effective_config.cancellation,
+        cancellation: &config.cancellation,
         output_seq: 1,
         sent: false,
         evidence_incomplete: false,
@@ -644,13 +635,13 @@ pub(crate) async fn supervise_development_decision(
         streamed: String::new(),
     };
     let result = crate::service::ai::decisive_model::execute_decision_with_sink(
-        &frozen,
+        frozen,
         request,
-        body,
+        (body, conversation),
         &handoff,
-        &effective_config,
+        config,
         crate::db::entities::RequestRef {
-            job: token.job,
+            job,
             request: RequestNumber::FIRST,
         },
         &mut sink,
@@ -670,7 +661,7 @@ pub(crate) async fn supervise_development_decision(
                 &handoff,
                 RequestNumber::FIRST,
                 sink.output_seq,
-                &effective_config,
+                config,
                 sink.sent,
                 error,
             )
@@ -693,7 +684,7 @@ pub(crate) async fn supervise_development_decision(
         vec![(
             5,
             Metrics {
-                job: token.job,
+                job,
                 request: RequestNumber::FIRST,
                 observed_at: Timestamp::now(),
                 measurements: Measurements {
@@ -713,7 +704,7 @@ pub(crate) async fn supervise_development_decision(
             &handoff,
             crate::db::entities::ProviderAnswer {
                 stat: AvailabilityStat {
-                    job: token.job,
+                    job,
                     request: RequestNumber::FIRST,
                     observed_at: Timestamp::now(),
                     observation: result.availability,

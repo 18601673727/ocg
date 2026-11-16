@@ -10,7 +10,6 @@ use crate::db::redb::codec::{
 };
 use crate::db::redb::reads::read;
 use crate::db::redb::schema::{MAX_PAGE, SCHEDULED_EXTERNAL_BINDING, SCHEDULED_EXTERNAL_POLICY};
-use crate::system::execution_features::ExecutionFeature;
 use ::redb::{Database, ReadableTable};
 
 pub(super) enum ScheduledPolicyMatch {
@@ -194,9 +193,6 @@ impl Batch {
         &mut self,
         frozen: &FrozenExecutionConfig,
     ) -> Result<ScheduledPolicyMatch, BatchError> {
-        if !ExecutionFeature::ScheduledExternalTransport.is_enabled() {
-            return Ok(ScheduledPolicyMatch::None);
-        }
         self.step(|tx| {
             let table = tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
             let mut matching = ScheduledPolicyMatch::None;
@@ -228,12 +224,6 @@ impl Batch {
         let Some(binding) = self.scheduled_external_binding_by_job(job)? else {
             return Ok(None);
         };
-        if !ExecutionFeature::ScheduledExternalTransport.is_enabled() {
-            return self.reject(Violation::InvalidValue(
-                "scheduled_external_policy",
-                "the scheduled external transport feature is disabled",
-            ));
-        }
         let Some(record) = self.scheduled_external_policy_by_id(binding.policy)? else {
             return self.reject(Violation::InvalidValue(
                 "scheduled_external_policy",

@@ -126,14 +126,16 @@ pub(crate) fn prepare_development_handoff(
             else {
                 return Err(unavailable());
             };
-            let request =
-                crate::service::ai::decisive_model::request_body(&context.configuration, request)
-                    .map_err(|_| unavailable())?;
+            let (request, conversation) = crate::service::ai::decisive_model::prepare_request(
+                &context.configuration,
+                request,
+            )
+            .map_err(|_| unavailable())?;
             Ok(PreparedDevelopmentHandoff::new(
                 DevelopmentCandidate::Decision(context),
                 Vec::new(),
                 request,
-                None,
+                conversation,
                 false,
             ))
         }

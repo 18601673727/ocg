@@ -10,6 +10,7 @@ use crate::db::redb::recovery::audit::{
 };
 use crate::db::redb::recovery::offline::{
     apply_reconciliation, finalization_copy, with_reconciliation_copy,
+    with_verified_finalization_copy,
 };
 use crate::db::redb::schema::{
     APPROVALS, CONVERSATIONS, EXECUTORS, JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, LIVE_CHILDREN,
@@ -405,24 +406,9 @@ pub(crate) fn verify_reserved_publication_delta(
 
     let source = finalization_copy(source)?;
     let published = finalization_copy(published)?;
-    with_reconciliation_copy(source, |source_database| {
-        if !source_database
-            .check_integrity()
-            .map_err(StorageError::from)?
-        {
-            return Err(ReservedRefusal::new(
-                "page_integrity",
-                "redb found damage in the rollback copy and had to repair it",
-            ));
-        }
+    with_verified_finalization_copy(source, "rollback", |source_database| {
         let (_, mut facts, residual) = reserved_preflight_in(&*source_database, job)?;
-        with_reconciliation_copy(published, |database| {
-            if !database.check_integrity().map_err(StorageError::from)? {
-                return Err(ReservedRefusal::new(
-                    "page_integrity",
-                    "redb found damage in the published copy and had to repair it",
-                ));
-            }
+        with_verified_finalization_copy(published, "published", |database| {
             let residual = verify_reserved_residual_against(&*database, &residual)?;
             let source_tx = source_database.begin_read().map_err(StorageError::from)?;
             let source_record = reads::jobs::mutable_job_record_in(&source_tx, job)?

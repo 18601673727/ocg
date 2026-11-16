@@ -204,12 +204,9 @@ where
         Ok(()) => {
             log::set_max_level(log_handle.active_config().level.filter());
             log::info!("OCG foundation initialized; storage is ready");
-            for feature in crate::system::execution_features::ExecutionFeature::ALL {
-                log::info!(
-                    "execution feature {}: {:?}",
-                    feature.name(),
-                    feature.state()
-                );
+            for (name, enabled) in crate::system::execution_features::EXECUTION_FEATURES {
+                let state = if enabled { "Enabled" } else { "Disabled" };
+                log::info!("execution feature {name}: {state}");
             }
             log::info!(
                 "autonomous scheduling: {}",

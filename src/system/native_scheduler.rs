@@ -6,15 +6,14 @@ use std::time::{Duration, Instant};
 
 use crate::db::entities::{
     AllocationPhase, AllocationToken, DevelopmentFreshReservation, DevelopmentReadyCursor,
-    DevelopmentReservation, ExecutionOperation, ExecutionPoolId, ExecutorId, FrozenExecutionConfig,
-    JobId, LlmTransport, OutcomeKind, PoolAllocation, UnstartedCause,
+    DevelopmentReservation, ExecutionOperation, ExecutionPoolId, ExecutorId, JobId, LlmTransport,
+    OutcomeKind, PoolAllocation, UnstartedCause,
 };
 use crate::db::{
     DatabaseError, DatabaseHandle, DevelopmentHandoffError, DevelopmentReservationError,
     SchedulerWakeSubscription,
 };
 use crate::service::ai::providers::{CancellationToken, ProviderExecutionConfig};
-use crate::system::execution_features::ExecutionFeature;
 use crate::system::executor::execution_runtime::{
     EndpointPolicy, WorkspaceTools, supervise_development_decision,
     supervise_development_generative,
@@ -104,12 +103,6 @@ pub(crate) fn loopback_eligibility(
     let Some(endpoint) = endpoint else {
         return none("endpoint_missing", "the frozen Provider has no endpoint");
     };
-    if ExecutionFeature::ExternalProviderTransport.is_enabled() {
-        return none(
-            "external_transport_enabled",
-            "this build enables external Provider transport, under which the loopback dispatch admits no endpoint",
-        );
-    }
     let class = classify_loopback_endpoint(endpoint);
     let detail = match class {
         LoopbackEndpointClass::LiteralDirect => {
@@ -151,16 +144,6 @@ pub(crate) fn loopback_eligibility(
     }
 }
 
-fn scheduled_policy(frozen: &FrozenExecutionConfig) -> bool {
-    frozen
-        .llm
-        .provider
-        .endpoint
-        .as_deref()
-        .is_some_and(crate::system::http::direct_diagnostic_loopback)
-        || ExecutionFeature::ScheduledExternalTransport.is_enabled()
-}
-
 fn can_schedule(
     configuration: &crate::db::entities::FrozenConfiguration,
     summary_work: bool,
@@ -173,14 +156,14 @@ fn can_schedule(
             } else {
                 frozen.native_execution_refusal()
             };
-            refusal.is_none() && scheduled_policy(frozen)
+            refusal.is_none()
         }
         FrozenConfiguration::Decision(FrozenDecisionConfig::Native(native)) => native
             .endpoint
             .as_deref()
             .is_some_and(crate::system::http::direct_diagnostic_loopback),
         FrozenConfiguration::Decision(FrozenDecisionConfig::Generative(frozen, _)) => {
-            frozen.llm.provider.transport.execution_refusal().is_none() && scheduled_policy(frozen)
+            frozen.llm.provider.transport.execution_refusal().is_none()
         }
     }
 }
@@ -751,93 +734,62 @@ async fn dispatch(
     stops: &NativeStops,
 ) -> Dispatched {
     let token = allocation.token;
-    let detail = if cancellation.is_cancelled() {
-        match database
-            .fail_unstarted_development_reservation(token, UnstartedCause::Cancelled)
-            .await
-        {
-            Ok(_) => "cancelled before the start; the reservation was ended and nothing was sent"
-                .to_owned(),
-            Err(error) => {
-                format!("cancelled before the start; the reservation was not ended here ({error})")
-            }
-        }
+    let admitted = if cancellation.is_cancelled() {
+        Err((
+            UnstartedCause::Cancelled,
+            "cancelled before the start".to_owned(),
+        ))
     } else {
         match database.scheduled_external_grant(token.job).await {
-            Ok(None) => {
-                let config = ProviderExecutionConfig {
-                    timeout: DISPATCH_TIMEOUT,
-                    first_delta_timeout: Some(DISPATCH_TIMEOUT),
-                    max_output_bytes: MAX_RESPONSE_BYTES,
-                    cancellation: cancellation.clone(),
-                    ..ProviderExecutionConfig::default()
-                };
-                start_and_exchange(
-                    database,
-                    token,
-                    allocation.operation,
-                    cancellation,
-                    &config,
-                    EndpointPolicy::Loopback,
-                    workspace_tools.data_directory(),
-                    stops,
-                    check_prepared_native,
-                )
-                .await
-            }
-            Ok(Some(_)) if allocation.operation == ExecutionOperation::Decision => {
-                let prefix = "Decision execution is not permitted under a scheduled external grant";
-                match database
-                    .fail_unstarted_development_reservation(token, UnstartedCause::StartRefused)
-                    .await
-                {
-                    Ok(_) => format!("{prefix}; the reservation was ended and nothing was sent"),
-                    Err(settle) => {
-                        format!("{prefix}; the reservation was not ended here ({settle})")
-                    }
-                }
-            }
-            Ok(Some(grant)) => {
-                let config = grant.provider_config(cancellation.clone());
-                let guard = |prepared: &crate::db::PreparedDevelopmentHandoff| {
-                    grant.check_prepared(prepared).map_err(|refusal| {
-                        log::warn!(
-                            "native scheduler: Job {} scheduled external start refused ({}): {}",
-                            token.job,
-                            refusal.code,
-                            refusal.detail
-                        );
-                        refusal.code
-                    })
-                };
-                start_and_exchange(
-                    database,
-                    token,
-                    allocation.operation,
-                    cancellation,
-                    &config,
-                    EndpointPolicy::ScheduledExternal(&grant),
-                    workspace_tools.data_directory(),
-                    stops,
-                    guard,
-                )
-                .await
-            }
-            Err(error) => {
-                let prefix = format!(
+            Ok(Some(_)) if allocation.operation == ExecutionOperation::Decision => Err((
+                UnstartedCause::StartRefused,
+                "Decision execution is not permitted under a scheduled external grant".to_owned(),
+            )),
+            Ok(grant) => Ok(grant),
+            Err(error) => Err((
+                UnstartedCause::StartRefused,
+                format!(
                     "the scheduled external authorization was refused before the start ({error})"
-                );
-                match database
-                    .fail_unstarted_development_reservation(token, UnstartedCause::StartRefused)
-                    .await
-                {
-                    Ok(_) => format!("{prefix}; the reservation was ended and nothing was sent"),
-                    Err(settle) => {
-                        format!("{prefix}; the reservation was not ended here ({settle})")
-                    }
-                }
-            }
+                ),
+            )),
         }
+    };
+    let detail = match admitted {
+        Ok(grant) => {
+            let (config, policy) = match &grant {
+                Some(grant) => (
+                    grant.provider_config(cancellation.clone()),
+                    EndpointPolicy::ScheduledExternal(grant),
+                ),
+                None => (
+                    ProviderExecutionConfig {
+                        timeout: DISPATCH_TIMEOUT,
+                        first_delta_timeout: Some(DISPATCH_TIMEOUT),
+                        max_output_bytes: MAX_RESPONSE_BYTES,
+                        cancellation: cancellation.clone(),
+                        ..ProviderExecutionConfig::default()
+                    },
+                    EndpointPolicy::Loopback,
+                ),
+            };
+            start_and_exchange(
+                database,
+                token,
+                allocation.operation,
+                &config,
+                policy,
+                workspace_tools.data_directory(),
+                stops,
+            )
+            .await
+        }
+        Err((cause, prefix)) => match database
+            .fail_unstarted_development_reservation(token, cause)
+            .await
+        {
+            Ok(_) => format!("{prefix}; the reservation was ended and nothing was sent"),
+            Err(settle) => format!("{prefix}; the reservation was not ended here ({settle})"),
+        },
     };
     let dispatched = reported(database, token, detail).await;
     if dispatched
@@ -853,18 +805,16 @@ async fn dispatch(
     dispatched
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn start_and_exchange(
     database: &DatabaseHandle,
     token: AllocationToken,
     operation: ExecutionOperation,
-    cancellation: &CancellationToken,
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
     data_directory: &crate::system::data_directory::DataDirectory,
     stops: &NativeStops,
-    guard: impl Fn(&crate::db::PreparedDevelopmentHandoff) -> Result<(), &'static str>,
 ) -> String {
+    let cancellation = &config.cancellation;
     let mut tooling = NativeTooling::new(data_directory, stops.clone(), cancellation.clone());
     let handoff = loop {
         let result = async {
@@ -906,7 +856,21 @@ async fn start_and_exchange(
             let mut prepared = prepare_development_handoff(resolved, offer.as_ref())
                 .map_err(classify_unstarted)?;
             database.load_handoff_credentials(&mut prepared).await?;
-            guard(&prepared).map_err(invalid)?;
+            match policy {
+                EndpointPolicy::Loopback => check_prepared_native(&prepared),
+                EndpointPolicy::ScheduledExternal(grant) => {
+                    grant.check_prepared(&prepared).map_err(|refusal| {
+                        log::warn!(
+                            "native scheduler: Job {} scheduled external start refused ({}): {}",
+                            token.job,
+                            refusal.code,
+                            refusal.detail,
+                        );
+                        refusal.code
+                    })
+                }
+            }
+            .map_err(invalid)?;
             database.start_development_handoff(prepared).await
         }
         .await;
@@ -923,20 +887,11 @@ async fn start_and_exchange(
         Ok(handoff) => {
             let tools = tooling.into_execution();
             let exchange = within_deadline(cancellation, DISPATCH_TIMEOUT, async {
-                if handoff.decision_inputs().is_some() {
+                if operation == ExecutionOperation::Decision || handoff.decision_inputs().is_some()
+                {
                     supervise_development_decision(database, handoff, config, policy).await
                 } else {
-                    match operation {
-                        ExecutionOperation::LlmRequest => {
-                            supervise_development_generative(
-                                database, handoff, config, policy, tools,
-                            )
-                            .await
-                        }
-                        ExecutionOperation::Decision => {
-                            supervise_development_decision(database, handoff, config, policy).await
-                        }
-                    }
+                    supervise_development_generative(database, handoff, config, policy, tools).await
                 }
             })
             .await;

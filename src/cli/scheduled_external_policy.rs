@@ -3,7 +3,7 @@ use std::rc::Rc;
 
 use crate::db::entities::{ScheduledExternalPolicyId, ScheduledExternalPolicyRecord, Timestamp};
 use crate::system::data_directory::DataDirectory;
-use crate::system::execution_features::ExecutionFeature;
+use crate::system::execution_features::SCHEDULED_EXTERNAL;
 use crate::system::scheduled_external::ScheduledExternalPolicyDraft;
 
 pub(super) const COMMAND: &str = "scheduled-external-policy";
@@ -380,8 +380,8 @@ fn policy_json(record: &ScheduledExternalPolicyRecord) -> serde_json::Value {
 
 fn feature_json() -> serde_json::Value {
     serde_json::json!({
-        "name": ExecutionFeature::ScheduledExternalTransport.name(),
-        "enabled": ExecutionFeature::ScheduledExternalTransport.is_enabled(),
+        "name": SCHEDULED_EXTERNAL.0,
+        "enabled": SCHEDULED_EXTERNAL.1,
         "note": "a stored policy never enables the feature; every dispatch needs both",
     })
 }

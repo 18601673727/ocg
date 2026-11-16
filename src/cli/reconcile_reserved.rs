@@ -1161,48 +1161,15 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
     .map_err(unfinalized)?;
     crash_point("after-post-publication-verification");
     let completion_path = directory.join(format!("{audit_stem}.finalized.json"));
-    let completion = CompletionEvidence {
-        schema: COMPLETION_SCHEMA.to_owned(),
-        sequence,
-        prepared: prepared_reference,
-        published: published.clone(),
-        verification,
-        completed_at_unix_ns: unix_time_ns().map_err(unfinalized)?,
-        reconstructed_after_crash: false,
-    };
-    crash_point("before-completion-record");
-    let completion_reference = write_immutable_json(
+    let (completion, completion_reference) = complete_publication(
         &directory,
         &completion_path,
-        &completion,
-        before.uid,
-        before.gid,
-        "after-completion",
-        true,
-    )
-    .map_err(|error| Refused {
-        state: Some(PUBLISHED_UNFINALIZED),
-        ..error
-    })?;
-
-    let (completion_check, completion_digest, _) =
-        read_record::<CompletionEvidence>(&completion_path).map_err(|error| Refused {
-            state: Some(INCONSISTENT),
-            ..error
-        })?;
-    if completion_digest != completion_reference
-        || completion_check.published != published
-        || completion_check.verification["passed"] != json!(true)
-    {
-        return Err(refused_in_state(
-            "audit_evidence",
-            INCONSISTENT,
-            "durable completion evidence changed during final confirmation; do not roll back automatically",
-        ));
-    }
-    let final_identity = confirm_final_published(&database_path, &published)?;
-    drop(final_identity);
-    crash_point("after-finalization-before-lock-release");
+        &prepared,
+        prepared_reference,
+        verification,
+        published,
+        false,
+    )?;
     drop(lock);
 
     let mut report = json!({
@@ -1215,7 +1182,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
         "prepared_evidence": manifest_path.display().to_string(),
         "completion_evidence": completion_path.display().to_string(),
         "completion_evidence_sha256": completion_reference.sha256,
-        "published": published,
+        "published": completion.published,
         "post_publication_check": completion.verification,
         "exclusive_lock_released_after_final_confirmation": true,
     });
@@ -1368,6 +1335,61 @@ fn confirm_final_published(database_path: &Path, expected: &FileFact) -> Result<
     Ok(file)
 }
 
+fn complete_publication(
+    directory: &Path,
+    completion_path: &Path,
+    prepared: &PreparedEvidence,
+    prepared_reference: EvidenceRef,
+    verification: Value,
+    published: FileFact,
+    reconstructed_after_crash: bool,
+) -> Result<(CompletionEvidence, EvidenceRef), Refused> {
+    let completion = CompletionEvidence {
+        schema: COMPLETION_SCHEMA.to_owned(),
+        sequence: prepared.sequence,
+        prepared: prepared_reference,
+        published,
+        verification,
+        completed_at_unix_ns: unix_time_ns().map_err(unfinalized)?,
+        reconstructed_after_crash,
+    };
+    crash_point("before-completion-record");
+    let reference = write_immutable_json(
+        directory,
+        completion_path,
+        &completion,
+        prepared.source.uid,
+        prepared.source.gid,
+        "after-completion",
+        true,
+    )
+    .map_err(unfinalized)?;
+    let (check, actual_reference, _) =
+        read_record::<CompletionEvidence>(completion_path).map_err(|error| Refused {
+            state: Some(INCONSISTENT),
+            ..error
+        })?;
+    if actual_reference != reference
+        || check.published != completion.published
+        || (!reconstructed_after_crash && check.verification["passed"] != json!(true))
+    {
+        return Err(refused_in_state(
+            "audit_evidence",
+            INCONSISTENT,
+            if reconstructed_after_crash {
+                "reconstructed completion evidence is inconsistent"
+            } else {
+                "durable completion evidence changed during final confirmation; do not roll back automatically"
+            },
+        ));
+    }
+    let final_file =
+        confirm_final_published(&directory.join(DATABASE_FILE_NAME), &completion.published)?;
+    drop(final_file);
+    crash_point("after-finalization-before-lock-release");
+    Ok((completion, reference))
+}
+
 fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
     let directory = std::fs::canonicalize(directory)
         .map_err(|error| io("resolve the data directory", error))?;
@@ -1505,41 +1527,15 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
                 .map(|stem| stem.to_owned()))
             .ok_or_else(|| refused("audit_evidence", "prepared evidence has an invalid name"))?
     ));
-    let completion = CompletionEvidence {
-        schema: COMPLETION_SCHEMA.to_owned(),
-        sequence: prepared.sequence,
-        prepared: prepared_record.reference.clone(),
-        published: published.clone(),
-        verification,
-        completed_at_unix_ns: unix_time_ns().map_err(unfinalized)?,
-        reconstructed_after_crash: true,
-    };
-    crash_point("before-completion-record");
-    let completion_reference = write_immutable_json(
+    let (completion, completion_reference) = complete_publication(
         &directory,
         &completion_path,
-        &completion,
-        prepared.source.uid,
-        prepared.source.gid,
-        "after-completion",
+        prepared,
+        prepared_record.reference.clone(),
+        verification,
+        published,
         true,
-    )
-    .map_err(unfinalized)?;
-    let (completion_check, actual_reference, _) =
-        read_record::<CompletionEvidence>(&completion_path).map_err(|error| Refused {
-            state: Some(INCONSISTENT),
-            ..error
-        })?;
-    if actual_reference != completion_reference || completion_check.published != published {
-        return Err(refused_in_state(
-            "audit_evidence",
-            INCONSISTENT,
-            "reconstructed completion evidence is inconsistent",
-        ));
-    }
-    let final_file = confirm_final_published(&database_path, &published)?;
-    drop(final_file);
-    crash_point("after-finalization-before-lock-release");
+    )?;
     drop(lock);
     Ok(json!({
         "outcome": "finalized",
@@ -1549,7 +1545,7 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
         "prepared_evidence": prepared_record.path.display().to_string(),
         "completion_evidence": completion_path.display().to_string(),
         "completion_evidence_sha256": completion_reference.sha256,
-        "published": published,
+        "published": completion.published,
         "verification": completion.verification,
         "exclusive_lock_released_after_final_confirmation": true,
     }))

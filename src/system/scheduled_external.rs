@@ -4,7 +4,6 @@ use crate::db::entities::{
 use crate::service::ai::providers::{
     CancellationToken, DestinationPolicy, ProviderExecutionConfig,
 };
-use crate::system::execution_features::ExecutionFeature;
 use crate::system::external_approval::{
     ApprovalLimits, ApprovalRefusal, ApprovedEndpoint, ExternalApproval, MAX_OUTPUT_TOKENS_CEILING,
     MAX_REQUEST_BYTES_CEILING, MAX_TIMEOUT_CEILING, parse_trusted_proxy,
@@ -113,12 +112,6 @@ impl ScheduledExternalGrant {
     pub(crate) fn from_record(
         record: &ScheduledExternalPolicyRecord,
     ) -> Result<Self, ScheduledExternalRefusal> {
-        if !ExecutionFeature::ScheduledExternalTransport.is_enabled() {
-            return Err(ScheduledExternalRefusal::new(
-                "scheduled_external_feature_disabled",
-                ExecutionFeature::ScheduledExternalTransport.refusal(),
-            ));
-        }
         if record.revoked {
             return Err(ScheduledExternalRefusal::new(
                 "scheduled_external_policy_revoked",

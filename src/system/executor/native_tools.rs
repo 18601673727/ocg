@@ -7,11 +7,6 @@ use super::workspace_read::{self, Workspace};
 use crate::db::entities::{FrozenExecutionConfig, ModelCapability, ProjectRecord, ToolEffect};
 use crate::service::ai::providers::CancellationToken;
 use crate::service::jobs::{DevelopmentToolContext, DevelopmentToolOffer};
-use crate::system::execution_features::ExecutionFeature;
-
-fn offered_grant(mutation: bool) -> &'static str {
-    if mutation { "code" } else { "read" }
-}
 
 const MAX_AGENTS_MD_BYTES: usize = 32 * 1024;
 
@@ -53,14 +48,9 @@ impl<'a> NativeTooling<'a> {
             .config
             .declared_capabilities
             .contains(&ModelCapability::Tools);
-        let jobs = agent.is_some_and(|agent| agent.manages_jobs())
-            && tools
-            && ExecutionFeature::ToolsAndChildJobs.is_enabled();
+        let jobs = agent.is_some_and(|agent| agent.manages_jobs()) && tools;
         if !workspace && !jobs {
             return Ok(None);
-        }
-        if workspace && !ExecutionFeature::ToolsAndChildJobs.is_enabled() {
-            return Err("tools_disabled");
         }
         let project = if workspace {
             let Some(project) = project else {
@@ -74,7 +64,6 @@ impl<'a> NativeTooling<'a> {
         let wiring = Wiring {
             ask,
             decider: context.decider,
-            mutation: ExecutionFeature::WorkspaceMutation.is_enabled(),
             jobs,
             plan: !context.plan_step,
         };
@@ -82,12 +71,7 @@ impl<'a> NativeTooling<'a> {
 
         let (execution, offer) = match select(
             self.cancellation.cancelled(),
-            build(
-                Some(self.data_directory),
-                project,
-                wiring,
-                self.stops.clone(),
-            ),
+            build(self.data_directory, project, wiring, self.stops.clone()),
         )
         .await
         {
@@ -165,14 +149,14 @@ async fn authorize_workspace(
 
 #[cfg(unix)]
 async fn build(
-    data_directory: Option<&crate::system::data_directory::DataDirectory>,
+    data_directory: &crate::system::data_directory::DataDirectory,
     project: Option<&ProjectRecord>,
     wiring: Wiring,
     stops: crate::system::native_scheduler::NativeStops,
 ) -> Result<(ToolExecution, DevelopmentToolOffer), &'static str> {
     let mut agents_md = None;
-    let workspace = match (data_directory, project) {
-        (Some(data_directory), Some(project)) => {
+    let workspace = match project {
+        Some(project) => {
             let root = std::path::PathBuf::from(&project.root);
             let (workspace, content) = authorize_workspace(&root, data_directory).await?;
             if workspace.root() != std::path::Path::new(&project.root) {
@@ -181,11 +165,10 @@ async fn build(
             agents_md = content;
             Some((workspace, project.commands.as_slice()))
         }
-        _ => None,
+        None => None,
     };
     let granted = workspace.is_some();
-    let mutation = wiring.mutation && granted;
-    let execution = tools_of(workspace, Wiring { mutation, ..wiring }, stops).map_err(|error| {
+    let execution = tools_of(workspace, wiring, stops).map_err(|error| {
         log::warn!("the tools cannot be offered: {error}");
         "tools_unavailable"
     })?;
@@ -197,7 +180,7 @@ async fn build(
         execution,
         DevelopmentToolOffer {
             wires,
-            grant: granted.then(|| offered_grant(mutation)),
+            grant: granted.then_some("code"),
             agents_md,
         },
     ))
@@ -205,7 +188,7 @@ async fn build(
 
 #[cfg(not(unix))]
 async fn build(
-    _data_directory: Option<&crate::system::data_directory::DataDirectory>,
+    _data_directory: &crate::system::data_directory::DataDirectory,
     _project: Option<&ProjectRecord>,
     _wiring: Wiring,
     _stops: crate::system::native_scheduler::NativeStops,
@@ -217,7 +200,6 @@ async fn build(
 struct Wiring {
     ask: bool,
     decider: bool,
-    mutation: bool,
     jobs: bool,
     plan: bool,
 }
@@ -229,7 +211,7 @@ fn tools_of(
     stops: crate::system::native_scheduler::NativeStops,
 ) -> Result<ToolExecution, ToolRegistryError> {
     let registry = ToolRegistry::default();
-    let limits = if wiring.mutation {
+    let limits = if workspace.is_some() {
         crate::service::ai::command::coding_limits(crate::service::ai::command::COMMAND_TIMEOUT)
     } else {
         ToolLoopLimits::default()
@@ -253,21 +235,19 @@ fn tools_of(
         names.push(crate::service::lsp::TOOL_NAME);
         super::network::register(&registry)?;
         names.extend(super::network::NAMES);
-        if wiring.mutation {
-            super::workspace_write::register(&registry, workspace.clone())?;
-            names.push(super::workspace_write::TOOL_NAME);
-            crate::service::ai::command::register(
-                &registry,
-                workspace,
-                commands,
-                crate::service::ai::command::CommandEnvironment::of_process(),
-                crate::service::ai::command::COMMAND_TIMEOUT,
-            )?;
-            names.push(crate::service::ai::command::TOOL_NAME);
-            if wiring.decider {
-                register_request_command(&registry)?;
-                names.push(REQUEST_COMMAND_TOOL_NAME);
-            }
+        super::workspace_write::register(&registry, workspace.clone())?;
+        names.push(super::workspace_write::TOOL_NAME);
+        crate::service::ai::command::register(
+            &registry,
+            workspace,
+            commands,
+            crate::service::ai::command::CommandEnvironment::of_process(),
+            crate::service::ai::command::COMMAND_TIMEOUT,
+        )?;
+        names.push(crate::service::ai::command::TOOL_NAME);
+        if wiring.decider {
+            register_request_command(&registry)?;
+            names.push(REQUEST_COMMAND_TOOL_NAME);
         }
         for name in &names {
             registry.authorize(name)?;

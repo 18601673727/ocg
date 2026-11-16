@@ -50,7 +50,7 @@ const LAST_EVENT_ID: &str = "last-event-id";
 
 const PAGE: usize = 16;
 
-pub(super) const PIECE: usize = 4 * 1024;
+const PIECE: usize = 4 * 1024;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct StreamLimits {
@@ -148,19 +148,40 @@ pub(super) async fn open(
         written: now,
         _slot: slot,
     };
+    Ok(response(
+        io,
+        now,
+        shared.stream_limits.stall,
+        feed,
+        Feed::next,
+    ))
+}
+
+pub(super) fn response<F, N>(
+    io: Option<IoRef>,
+    now: Instant,
+    stall: Duration,
+    feed: F,
+    advance: fn(F) -> N,
+) -> HttpResponse
+where
+    F: Unpin + 'static,
+    N: Future<Output = Option<(Bytes, F)>> + 'static,
+{
     let polled = Rc::new(Cell::new(now));
-    let watched = io.map(|io| watch(io, polled.clone(), shared.stream_limits.stall));
-    Ok(HttpResponse::build(StatusCode::OK)
+    let watched = io.map(|io| watch(io, polled.clone(), stall));
+    HttpResponse::build(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .streaming(Body {
             feed: Some(feed),
+            advance,
             next: None,
             rest: None,
             polled,
             _watched: watched,
-        }))
+        })
 }
 
 pub(super) struct Slot(Arc<Shared>);
@@ -183,7 +204,7 @@ impl Drop for Slot {
     }
 }
 
-pub(super) fn watch(io: IoRef, polled: Rc<Cell<Instant>>, stall: Duration) -> flume::Sender<()> {
+fn watch(io: IoRef, polled: Rc<Cell<Instant>>, stall: Duration) -> flume::Sender<()> {
     let (watched, ended) = flume::bounded::<()>(1);
     ntex::rt::spawn(async move {
         loop {
@@ -202,52 +223,51 @@ pub(super) fn watch(io: IoRef, polled: Rc<Cell<Instant>>, stall: Duration) -> fl
     watched
 }
 
-type Next = Pin<Box<dyn Future<Output = Option<(Bytes, Feed)>>>>;
-
-struct Body {
-    feed: Option<Feed>,
-    next: Option<Next>,
-    rest: Option<(Bytes, Feed)>,
+struct Body<F, N> {
+    feed: Option<F>,
+    advance: fn(F) -> N,
+    next: Option<Pin<Box<N>>>,
+    rest: Option<(Bytes, F)>,
     polled: Rc<Cell<Instant>>,
     _watched: Option<flume::Sender<()>>,
 }
 
-impl Stream for Body {
+impl<F, N> Body<F, N> {
+    fn piece(&mut self, mut bytes: Bytes, feed: F) -> Bytes {
+        if bytes.len() <= PIECE {
+            self.feed = Some(feed);
+            return bytes;
+        }
+        let piece = bytes.split_to(PIECE);
+        self.rest = Some((bytes, feed));
+        piece
+    }
+}
+
+impl<F: Unpin, N: Future<Output = Option<(Bytes, F)>>> Stream for Body<F, N> {
     type Item = Result<Bytes, std::io::Error>;
 
     fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.polled.set(Instant::now());
-        if let Some((mut event, feed)) = self.rest.take() {
-            return Poll::Ready(Some(Ok(self.piece(&mut event, feed))));
+        if let Some((bytes, feed)) = self.rest.take() {
+            return Poll::Ready(Some(Ok(self.piece(bytes, feed))));
         }
         if self.next.is_none() {
             let Some(feed) = self.feed.take() else {
                 return Poll::Ready(None);
             };
-            self.next = Some(Box::pin(feed.next()));
+            self.next = Some(Box::pin((self.advance)(feed)));
         }
         let Some(next) = self.next.as_mut() else {
             return Poll::Ready(None);
         };
         match next.as_mut().poll(context) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(item) => {
+            Poll::Ready(value) => {
                 self.next = None;
-                Poll::Ready(item.map(|(mut event, feed)| Ok(self.piece(&mut event, feed))))
+                Poll::Ready(value.map(|(bytes, feed)| Ok(self.piece(bytes, feed))))
             }
         }
-    }
-}
-
-impl Body {
-    fn piece(&mut self, event: &mut Bytes, feed: Feed) -> Bytes {
-        if event.len() <= PIECE {
-            self.feed = Some(feed);
-            return std::mem::take(event);
-        }
-        let piece = event.split_to(PIECE);
-        self.rest = Some((std::mem::take(event), feed));
-        piece
     }
 }
 

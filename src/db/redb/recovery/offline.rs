@@ -114,6 +114,22 @@ pub(super) fn finalization_copy(file: &std::fs::File) -> Result<std::fs::File, R
     )?)
 }
 
+pub(super) fn with_verified_finalization_copy<T>(
+    file: std::fs::File,
+    name: &str,
+    body: impl FnOnce(&mut Database) -> Result<T, ReservedRefusal>,
+) -> Result<T, ReservedRefusal> {
+    with_reconciliation_copy(file, |database| {
+        if !database.check_integrity().map_err(StorageError::from)? {
+            return Err(ReservedRefusal::new(
+                "page_integrity",
+                format!("redb found damage in the {name} copy and had to repair it"),
+            ));
+        }
+        body(database)
+    })
+}
+
 pub(super) fn apply_reconciliation<T>(
     database: &mut Database,
     epoch: u64,
@@ -627,9 +643,11 @@ fn inspect_held_in(
         }
         _ => "an index table is missing".to_owned(),
     };
-    let features: Vec<_> = crate::system::execution_features::ExecutionFeature::ALL
-        .iter()
-        .map(|feature| json!({"feature": feature.name(), "state": text(&feature.state())}))
+    let features: Vec<_> = crate::system::execution_features::EXECUTION_FEATURES
+        .into_iter()
+        .map(|(name, enabled)| {
+            json!({"feature": name, "state": if enabled { "Enabled" } else { "Disabled" }})
+        })
         .collect();
     Ok(json!({
         "database": {

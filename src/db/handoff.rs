@@ -3,6 +3,7 @@ use crate::db::entities::{AttachmentId, Violation};
 use crate::db::errors::{DatabaseError, OperationStatus};
 use crate::db::redb::StorageErrorKind;
 use crate::db::shared::Shared;
+use crate::service::ai::providers::openai_compatible::ChatConversation;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -10,8 +11,7 @@ pub(crate) struct PreparedDevelopmentHandoff {
     pub(super) candidate: crate::db::entities::DevelopmentCandidate,
     image_ids: Vec<AttachmentId>,
     pub(super) request: serde_json::Value,
-    pub(super) conversation:
-        Option<crate::service::ai::providers::openai_compatible::ChatConversation>,
+    pub(super) conversation: Option<ChatConversation>,
     offers_tools: bool,
     pub(super) credentials: DevelopmentHandoffCredentials,
 }
@@ -52,7 +52,7 @@ impl PreparedDevelopmentHandoff {
         candidate: crate::db::entities::DevelopmentCandidate,
         image_ids: Vec<AttachmentId>,
         request: serde_json::Value,
-        conversation: Option<crate::service::ai::providers::openai_compatible::ChatConversation>,
+        conversation: Option<ChatConversation>,
         offers_tools: bool,
     ) -> Self {
         Self {
@@ -195,7 +195,7 @@ impl DevelopmentHandoff {
         &self,
     ) -> Option<(
         &entities::FrozenExecutionConfig,
-        &crate::service::ai::providers::openai_compatible::ChatConversation,
+        &ChatConversation,
         &serde_json::Value,
         entities::AllocationToken,
     )> {
@@ -218,7 +218,7 @@ impl DevelopmentHandoff {
         &entities::FrozenDecisionConfig,
         &entities::DecisionRequest,
         &serde_json::Value,
-        entities::AllocationToken,
+        Option<&ChatConversation>,
     )> {
         let crate::db::entities::DevelopmentCandidate::Decision(context) = &self.prepared.candidate
         else {
@@ -232,7 +232,7 @@ impl DevelopmentHandoff {
             &context.configuration,
             request,
             &self.prepared.request,
-            context.allocation.token,
+            self.prepared.conversation.as_ref(),
         ))
     }
 }

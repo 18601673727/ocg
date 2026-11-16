@@ -1,7 +1,7 @@
 use super::{
-    ChatConversation, ClientError, ClientResponse, ProviderExecutionError, ProviderExecutionResult,
-    ProviderFact, ProviderFailure, ProviderObservation, ProviderOutputSink, ResponseFacts,
-    Timestamp, Value,
+    ClientError, ClientResponse, ProviderExecutionConfig, ProviderExecutionError,
+    ProviderExecutionResult, ProviderFact, ProviderFailure, ProviderObservation,
+    ProviderOutputSink, ResponseFacts, Timestamp, Value,
 };
 
 pub(crate) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
@@ -44,7 +44,7 @@ pub(crate) async fn bounded_bytes(response: ClientResponse, limit: usize) -> Opt
         .map(|body| body.to_vec())
 }
 
-pub(crate) async fn bounded_body(response: ClientResponse, limit: usize) -> Option<String> {
+async fn bounded_body(response: ClientResponse, limit: usize) -> Option<String> {
     response
         .body()
         .limit(limit)
@@ -61,6 +61,13 @@ pub(crate) struct Redactor {
 }
 
 impl Redactor {
+    pub(in crate::service::ai) fn request_id(&self, response: &ClientResponse) -> Option<String> {
+        response
+            .header("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| self.text(value))
+    }
+
     pub(crate) fn new(credential: Option<&str>) -> Self {
         Self {
             secrets: crate::system::secrets::Spellings::new(credential.unwrap_or_default()),
@@ -201,19 +208,40 @@ impl Redactor {
     }
 }
 
-pub(crate) fn rejected_failure(
-    conversation: &ChatConversation,
-    status_code: u16,
+pub(in crate::service::ai) async fn reject_response(
+    response: ClientResponse,
     request_id: Option<String>,
-    response_body: Option<String>,
-) -> ProviderFailure {
-    if !conversation.carries_images() {
-        return provider_failure(status_code, request_id, response_body);
+    config: &ProviderExecutionConfig,
+    redactor: &Redactor,
+    carries_images: bool,
+) -> ProviderExecutionError {
+    let status = response.status().as_u16();
+    let retry_after = response
+        .header("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(retry_after_ms);
+    let body = if carries_images {
+        None
+    } else {
+        match ntex::util::select(
+            config.cancellation.cancelled(),
+            ntex::time::timeout(
+                config.timeout,
+                bounded_body(response, super::MAX_PROVIDER_ERROR_BYTES),
+            ),
+        )
+        .await
+        {
+            ntex::util::Either::Right(Ok(body)) => body.map(|body| redactor.body(&body)),
+            ntex::util::Either::Left(()) | ntex::util::Either::Right(Err(())) => None,
+        }
+    };
+    let mut failure = provider_failure(status, request_id, body);
+    if carries_images {
+        failure.message = format!("provider rejected image request (HTTP {status})");
     }
-    ProviderFailure {
-        message: format!("provider rejected image request (HTTP {status_code})"),
-        response_body: None,
-        ..provider_failure(status_code, request_id, response_body)
+    ProviderExecutionError::Rejected {
+        failure: with_retry_after(redactor.failure(failure), retry_after),
     }
 }
 
@@ -418,7 +446,7 @@ pub(crate) fn with_retry_after(
     failure
 }
 
-pub(crate) fn retry_after_ms(value: &str) -> Option<u64> {
+fn retry_after_ms(value: &str) -> Option<u64> {
     let value = value.trim();
     if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
         return Some(

@@ -678,23 +678,18 @@ fn check_execution_history(tx: &ReadTransaction) -> Result<(), StorageError> {
                         "Job has an invalid or duplicate reservation event",
                     ));
                 }
-                let row = jobs.get(key.0)?.ok_or_else(|| {
+                // check_record_payloads already decoded these rows in this read transaction.
+                jobs.get(key.0)?.ok_or_else(|| {
                     StorageError::corrupted("reservation references a missing Job")
                 })?;
-                jobs::decode_mutable_job(key.0, row.value())?;
                 let pools = tx.open_table(POOLS)?;
                 let executors = tx.open_table(EXECUTORS)?;
-                let pool = pools
+                pools
                     .get(allocation.token.pool.get())?
                     .ok_or_else(|| StorageError::corrupted("reservation Pool is missing"))?;
-                allocations::decode_allocation_pool(allocation.token.pool.get(), pool.value())?;
-                let executor = executors
+                executors
                     .get(allocation.token.executor.get())?
                     .ok_or_else(|| StorageError::corrupted("reservation Executor is missing"))?;
-                allocations::decode_allocation_executor(
-                    allocation.token.executor.get(),
-                    executor.value(),
-                )?;
             }
             ExecutionEventKind::RequestRecorded { request, seq } => {
                 if !reserved.contains(&key.0) || !request_refs.insert((key.0, request.get(), *seq))
@@ -1164,13 +1159,12 @@ fn check_record_payloads(tx: &ReadTransaction) -> Result<(), StorageError> {
     for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
         let (key, value) = entry?;
         let allocation = allocations::decode_pool_allocation(key.value(), value.value())?;
-        let Some(job_row) = jobs.get(allocation.token.job.get())? else {
+        if jobs.get(allocation.token.job.get())?.is_none() {
             return Err(StorageError::corrupted(format!(
                 "pool_allocation references missing job {}",
                 allocation.token.job
             )));
-        };
-        jobs::decode_mutable_job(allocation.token.job.get(), job_row.value())?;
+        }
         if pools.get(allocation.token.pool.get())?.is_none() {
             return Err(StorageError::corrupted(
                 "pool_allocation references missing Pool",

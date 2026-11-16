@@ -4,7 +4,6 @@ use ntex::util::{Either, select};
 
 use crate::db::{DatabaseHandle, SchedulerWakeSubscription};
 use crate::service::ai::providers::CancellationToken;
-use crate::system::execution_features::ExecutionFeature;
 use crate::system::executor::execution_runtime::ExecutionRuntimeError;
 use crate::system::monitor::ProtectionWatch;
 use crate::system::native_scheduler::{NativeScheduler, NativeStops};
@@ -132,7 +131,7 @@ impl ExecutionRuntime {
         workspace_tools: &crate::system::executor::execution_runtime::WorkspaceTools,
     ) -> Result<Self, ExecutionRuntimeError> {
         let mut runtime = Self::idle();
-        if scope == ClaimScope::Stored && ExecutionFeature::AutonomousScheduling.is_enabled() {
+        if scope == ClaimScope::Stored {
             let wake = database
                 .take_scheduler_wake()
                 .ok_or(ExecutionRuntimeError::SchedulerStopped)?;

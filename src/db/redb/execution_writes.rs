@@ -2,10 +2,12 @@ use super::rows::{decode_request_event, encode_request_event};
 use super::{StorageError, jobs, observations};
 use crate::db::entities::{
     AppendedOutput, AvailabilityStatId, ConfigId, ContentDigest, ExecutionEventKind,
-    ExecutionOperation, JobId, JobOutputId, JobOutputRecord, MetricsId, MutableJob, OutcomeKind,
-    OutputKind, RecordRef, RequestEventRecord, RequestNumber, RequestPayload, Timestamp,
+    ExecutionOperation, JobId, JobOutputId, JobOutputRecord, Measurements, Metrics, MetricsId,
+    MetricsRecord, MutableJob, OutcomeKind, OutputKind, RecordRef, RequestEventRecord,
+    RequestNumber, RequestPayload, RequestRef, Timestamp, TokenAnnotation, TokenEvidence,
     ToolCallRef, Violation,
 };
+use crate::db::handoff::DevelopmentUsageCheckpoint;
 use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
 use crate::db::redb::jobs::{decode_mutable_job, encode_mutable_job};
 use crate::db::redb::rows::encode_output;
@@ -15,6 +17,14 @@ use crate::db::redb::schema::{
 };
 use crate::db::redb::{indexes, reads, rows, state};
 use ::redb::ReadableTable;
+
+struct PreparedUsage {
+    measurement_id: u128,
+    token_id: u128,
+    observed_at: Timestamp,
+    measurements: Measurements,
+    token: TokenAnnotation,
+}
 
 impl Batch {
     pub(crate) fn append_development_output(
@@ -209,7 +219,6 @@ impl Batch {
             ));
         }
         let mut evidence = checkpoint.evidence();
-        let old = evidence.sample();
         let ids = [self.next_id()?, self.next_id()?, self.next_id()?];
         let mut prepared_usages = Vec::with_capacity(usages.len());
         let Some(first_answer_seq) = checkpoint.last_sequence().checked_add(1) else {
@@ -238,42 +247,8 @@ impl Batch {
                 return self.reject(Violation::ValueOutOfRange("seq"));
             };
             next_seq = next_expected;
-            let first_id = self.next_id()?;
-            let second_id = self.next_id()?;
-            let measurement = crate::db::entities::MetricsRecord {
-                id: MetricsId::new(first_id),
-                job,
-                request: stat.request,
-                target: None,
-                decision_target: None,
-                observed_at: metrics.observed_at,
-                measurements: metrics.measurements.clone(),
-                token: Some(token),
-                recorded_at: self.now,
-            };
-            let Some(observation) =
-                crate::db::entities::TokenObservation::from_record(&measurement)
-            else {
-                return self.reject(Violation::InvalidValue(
-                    "usage",
-                    "Token annotation required",
-                ));
-            };
-            if evidence.add(observation).is_err() {
-                return self.reject(Violation::InvalidValue(
-                    "usage",
-                    "inconsistent Token evidence",
-                ));
-            }
-            prepared_usages.push((
-                first_id,
-                second_id,
-                expected_seq,
-                token_seq,
-                metrics.observed_at,
-                metrics.measurements,
-                token,
-            ));
+            let usage = self.prepare_development_usage(metrics, token, &mut evidence)?;
+            prepared_usages.push((expected_seq, token_seq, usage));
         }
         let new = evidence.sample();
         self.step(|_| indexes::validate_native_sample(new.as_ref()))?;
@@ -308,42 +283,16 @@ impl Batch {
                 payload,
             )?;
         }
-        let mut usage_ids = Vec::with_capacity(prepared_usages.len());
-        let mut last_token_seq = None;
-        for (first_id, second_id, expected_seq, token_seq, observed_at, measurements, token) in
-            prepared_usages
-        {
-            self.insert_development_request_event_with_id(
-                &identity,
+        let (usage_ids, next_checkpoint) = self.write_development_usages(
+            &identity,
+            RequestRef {
                 job,
-                stat.request,
-                first_id,
-                expected_seq,
-                observed_at,
-                RequestPayload::Measurement { measurements },
-            )?;
-            self.insert_development_request_event_with_id(
-                &identity,
-                job,
-                stat.request,
-                second_id,
-                token_seq,
-                observed_at,
-                RequestPayload::Token {
-                    eligibility: token.eligibility,
-                    finality: token.finality,
-                },
-            )?;
-            usage_ids.push(MetricsId::new(first_id));
-            last_token_seq = Some(token_seq);
-        }
-        let next_checkpoint = match last_token_seq {
-            Some(token_seq) => {
-                self.replace_development_usage_total(job, old, new)?;
-                crate::db::handoff::DevelopmentUsageCheckpoint::advanced(token_seq, evidence)
-            }
-            None => checkpoint,
-        };
+                request: stat.request,
+            },
+            prepared_usages,
+            checkpoint,
+            evidence,
+        )?;
         Ok((
             MetricsId::new(ids[0]),
             AvailabilityStatId::new(ids[2]),
@@ -440,7 +389,6 @@ impl Batch {
         }
         let identity = self.development_usage_identity(job)?;
         let mut evidence = checkpoint.evidence();
-        let old = evidence.sample();
         let mut prepared = Vec::with_capacity(usages.len());
         let Some(mut seq) = checkpoint.last_sequence().checked_add(1) else {
             return self.reject(Violation::ValueOutOfRange("seq"));
@@ -458,44 +406,11 @@ impl Batch {
                     "Token annotation required",
                 ));
             };
-            let first_id = self.next_id()?;
-            let second_id = self.next_id()?;
-            let record = crate::db::entities::MetricsRecord {
-                id: MetricsId::new(first_id),
-                job,
-                request,
-                target: None,
-                decision_target: None,
-                observed_at: metrics.observed_at,
-                measurements: metrics.measurements.clone(),
-                token: Some(token),
-                recorded_at: self.now,
-            };
-            let Some(observation) = crate::db::entities::TokenObservation::from_record(&record)
-            else {
-                return self.reject(Violation::InvalidValue(
-                    "usage",
-                    "Token annotation required",
-                ));
-            };
-            if evidence.add(observation).is_err() {
-                return self.reject(Violation::InvalidValue(
-                    "usage",
-                    "inconsistent Token evidence",
-                ));
-            }
+            let usage = self.prepare_development_usage(metrics, token, &mut evidence)?;
             let Some(token_seq) = seq.checked_add(1) else {
                 return self.reject(Violation::ValueOutOfRange("seq"));
             };
-            prepared.push((
-                first_id,
-                second_id,
-                seq,
-                token_seq,
-                metrics.observed_at,
-                metrics.measurements,
-                token,
-            ));
+            prepared.push((seq, token_seq, usage));
             let Some(next) = token_seq.checked_add(1) else {
                 return self.reject(Violation::ValueOutOfRange("seq"));
             };
@@ -503,39 +418,100 @@ impl Batch {
         }
         let new = evidence.sample();
         self.step(|_| indexes::validate_native_sample(new.as_ref()))?;
+        self.write_development_usages(
+            &identity,
+            RequestRef { job, request },
+            prepared,
+            checkpoint,
+            evidence,
+        )
+    }
+
+    fn prepare_development_usage(
+        &mut self,
+        metrics: Metrics,
+        token: TokenAnnotation,
+        evidence: &mut TokenEvidence,
+    ) -> Result<PreparedUsage, BatchError> {
+        let measurement_id = self.next_id()?;
+        let token_id = self.next_id()?;
+        let record = MetricsRecord {
+            id: MetricsId::new(measurement_id),
+            job: metrics.job,
+            request: metrics.request,
+            target: None,
+            decision_target: None,
+            observed_at: metrics.observed_at,
+            measurements: metrics.measurements,
+            token: Some(token),
+            recorded_at: self.now,
+        };
+        let Some(observation) = crate::db::entities::TokenObservation::from_record(&record) else {
+            return self.reject(Violation::InvalidValue(
+                "usage",
+                "Token annotation required",
+            ));
+        };
+        if evidence.add(observation).is_err() {
+            return self.reject(Violation::InvalidValue(
+                "usage",
+                "inconsistent Token evidence",
+            ));
+        }
+        Ok(PreparedUsage {
+            measurement_id,
+            token_id,
+            observed_at: record.observed_at,
+            measurements: record.measurements,
+            token,
+        })
+    }
+
+    fn write_development_usages(
+        &mut self,
+        identity: &reads::jobs::UsageIdentity,
+        request: RequestRef,
+        prepared: Vec<(u32, u32, PreparedUsage)>,
+        checkpoint: DevelopmentUsageCheckpoint,
+        evidence: TokenEvidence,
+    ) -> Result<(Vec<MetricsId>, DevelopmentUsageCheckpoint), BatchError> {
         let mut usage_ids = Vec::with_capacity(prepared.len());
         let mut last_token_seq = None;
-        for (first_id, second_id, measurement_seq, token_seq, observed_at, measurements, token) in
-            prepared
-        {
+        for (measurement_seq, token_seq, usage) in prepared {
             self.insert_development_request_event_with_id(
-                &identity,
-                job,
-                request,
-                first_id,
+                identity,
+                request.job,
+                request.request,
+                usage.measurement_id,
                 measurement_seq,
-                observed_at,
-                RequestPayload::Measurement { measurements },
-            )?;
-            self.insert_development_request_event_with_id(
-                &identity,
-                job,
-                request,
-                second_id,
-                token_seq,
-                observed_at,
-                RequestPayload::Token {
-                    eligibility: token.eligibility,
-                    finality: token.finality,
+                usage.observed_at,
+                RequestPayload::Measurement {
+                    measurements: usage.measurements,
                 },
             )?;
-            usage_ids.push(MetricsId::new(first_id));
+            self.insert_development_request_event_with_id(
+                identity,
+                request.job,
+                request.request,
+                usage.token_id,
+                token_seq,
+                usage.observed_at,
+                RequestPayload::Token {
+                    eligibility: usage.token.eligibility,
+                    finality: usage.token.finality,
+                },
+            )?;
+            usage_ids.push(MetricsId::new(usage.measurement_id));
             last_token_seq = Some(token_seq);
         }
         let next_checkpoint = match last_token_seq {
             Some(token_seq) => {
-                self.replace_development_usage_total(job, old, new)?;
-                crate::db::handoff::DevelopmentUsageCheckpoint::advanced(token_seq, evidence)
+                self.replace_development_usage_total(
+                    request.job,
+                    checkpoint.evidence().sample(),
+                    evidence.sample(),
+                )?;
+                DevelopmentUsageCheckpoint::advanced(token_seq, evidence)
             }
             None => checkpoint,
         };

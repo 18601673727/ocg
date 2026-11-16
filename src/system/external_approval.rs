@@ -283,17 +283,8 @@ impl ExternalApproval {
         }
     }
 
-    fn authorized(&self) -> Result<(), ApprovalRefusal> {
-        let feature =
-            crate::system::execution_features::ExecutionFeature::ScheduledExternalTransport;
-        if !feature.is_enabled() {
-            return Err(refuse("feature_disabled", feature.refusal()));
-        }
-        Ok(())
-    }
-
     pub(crate) fn permits_endpoint(&self, endpoint: &str) -> bool {
-        self.authorized().is_ok() && self.endpoint.permits(endpoint)
+        self.endpoint.permits(endpoint)
     }
 
     pub(crate) fn provider_config(

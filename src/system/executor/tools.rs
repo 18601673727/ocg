@@ -229,23 +229,12 @@ impl ToolRegistry {
     }
 
     pub(crate) fn authorize(&self, name: &str) -> Result<(), ToolRegistryError> {
-        let feature = crate::system::execution_features::ExecutionFeature::ToolsAndChildJobs;
-        if !feature.is_enabled() {
-            return Err(ToolRegistryError::Disabled(
-                name.to_owned(),
-                feature.refusal(),
-            ));
-        }
-        self.set_authorized(name, true)
-    }
-
-    fn set_authorized(&self, name: &str, authorized: bool) -> Result<(), ToolRegistryError> {
         let mut registry = self.lock();
         let tool = registry
             .tools
             .get_mut(name)
             .ok_or_else(|| ToolRegistryError::Unregistered(name.to_owned()))?;
-        tool.authorized = authorized;
+        tool.authorized = true;
         Ok(())
     }
 
