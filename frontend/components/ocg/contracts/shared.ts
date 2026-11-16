@@ -3,7 +3,6 @@ import type * as Api from "./api";
 export type ToolOutcomeKind = Api.ToolOutcomeKind;
 export type ToolCall = Api.ToolCall;
 export type AgentCapability = Api.AgentCapability;
-export const POOL_OPERATIONS = ["llm_request", "decision"] as const;
 export type Approval = Api.ApprovalDecision["approval"];
 export type TreeState =
   | "open"

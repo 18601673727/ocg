@@ -348,6 +348,13 @@ impl Batch {
                 "invalid Executor configuration",
             ));
         }
+        if let Some(reason) = executor
+            .capabilities
+            .iter()
+            .find_map(|(_, protocol)| protocol.and_then(LlmTransport::execution_refusal))
+        {
+            return self.reject(Violation::InvalidValue("executor.protocol", reason));
+        }
         let pool = self.get(POOLS, executor.pool.get(), |bytes| {
             decode_allocation_pool(executor.pool.get(), bytes)
         })?;
@@ -534,6 +541,17 @@ impl Batch {
                             "executor",
                             "invalid Executor configuration",
                         ));
+                    }
+                    // A settings edit may round-trip stored capabilities. Only admit new ones
+                    // the runtime can execute.
+                    if let Some(reason) =
+                        capabilities
+                            .difference(&executor.capabilities)
+                            .find_map(|(_, protocol)| {
+                                protocol.and_then(LlmTransport::execution_refusal)
+                            })
+                    {
+                        return batch.reject(Violation::InvalidValue("executor.protocol", reason));
                     }
                     executor.capabilities = capabilities;
                     Ok(())
@@ -896,6 +914,9 @@ pub(crate) fn pools_offering_capability(
     operation: ExecutionOperation,
     protocol: Option<LlmTransport>,
 ) -> Result<Vec<ExecutorId>, StorageError> {
+    if protocol.and_then(LlmTransport::execution_refusal).is_some() {
+        return Ok(Vec::new());
+    }
     let pools = rx.table(POOLS)?;
     let table = rx.table(EXECUTORS)?;
     let mut executors = Vec::new();

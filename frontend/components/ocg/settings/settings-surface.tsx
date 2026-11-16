@@ -779,6 +779,9 @@ export function SettingsSurface({
                               {profile.credential_ref
                                 ? ` · ${t("settings.credentialRef", { ref: profile.credential_ref })}`
                                 : ""}
+                              {kind === "llm" && profile.protocol !== "openai_chat_completions"
+                                ? ` · ${t("settings.llm.executionUnavailable")}`
+                                : ""}
                             </p>
                             <div className="flex flex-wrap items-center gap-1.5 pt-0.5">
                               {profile.declared_capabilities.map((cap) => (

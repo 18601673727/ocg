@@ -1462,13 +1462,11 @@ fn initialize(database: &Database, fresh: bool) -> Result<u64, StorageError> {
             enabled: true,
             archived: false,
             revision: 1,
-            capabilities: [
-                LlmTransport::OpenAiChatCompletions,
-                LlmTransport::OpenAiResponses,
-                LlmTransport::AnthropicMessages,
-            ]
+            capabilities: [(
+                ExecutionOperation::LlmRequest,
+                Some(LlmTransport::OpenAiChatCompletions),
+            )]
             .into_iter()
-            .map(|protocol| (ExecutionOperation::LlmRequest, Some(protocol)))
             .collect(),
         };
         tx.open_table(POOLS)?.insert(

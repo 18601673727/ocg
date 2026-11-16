@@ -30,6 +30,15 @@ impl LlmTransport {
             _ => None,
         }
     }
+
+    pub(crate) const fn execution_refusal(self) -> Option<&'static str> {
+        match self {
+            Self::OpenAiChatCompletions => None,
+            Self::OpenAiResponses | Self::AnthropicMessages => {
+                Some("native execution requires the OpenAI Chat Completions protocol")
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -500,8 +509,8 @@ impl FrozenExecutionConfig {
     }
 
     pub fn provider_refusal(&self) -> Option<&'static str> {
-        if self.llm.provider.transport != LlmTransport::OpenAiChatCompletions {
-            return Some("native execution requires the OpenAI Chat Completions protocol");
+        if let Some(reason) = self.llm.provider.transport.execution_refusal() {
+            return Some(reason);
         }
         if self.llm.config.context_window.is_none() {
             return Some("native execution requires the Model to declare a context window");

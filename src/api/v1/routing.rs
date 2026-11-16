@@ -3,9 +3,9 @@ use super::{
     Arc, AttachmentId, Caller, DEFAULT_OUTPUT_PAGE, ExecutionPoolId, HttpRequest, INTERNAL,
     INVALID_REQUEST, JOB_NOT_FOUND, JobId, MAX_ATTACHMENT_UPLOAD_BYTES, MAX_OUTPUT_PAGE,
     MAX_SUBMISSION_BYTES, Method, NOT_FOUND, ProfileId, ProjectId, Refusal, Reply, RequestNumber,
-    Shared, StatusCode, attachments, browser, catalog, dashboard, events, health, jobs,
-    mutable_jobs, outputs, pools, profiles, projects, read_body, responses, submissions,
-    subscriptions, tools, update, web,
+    Shared, attachments, browser, catalog, dashboard, events, health, jobs, mutable_jobs, outputs,
+    pools, profiles, projects, read_body, responses, submissions, subscriptions, tools, update,
+    web,
 };
 
 pub(super) enum Route {
@@ -99,7 +99,6 @@ pub(super) enum Route {
         before: Option<ExecutionPoolId>,
         limit: usize,
     },
-    PoolsRetired,
     PoolAllocations {
         pool: ExecutionPoolId,
         after: Option<(u128, u128)>,
@@ -221,7 +220,6 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::ProjectUpdate(_)
             | Route::ProjectDecision(_)
             | Route::Pools { .. }
-            | Route::PoolsRetired
             | Route::PoolUpdate(_)
             | Route::NativePoolArchive(_)
             | Route::JobEdit(_)
@@ -248,12 +246,6 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
 pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
     let path = request.path();
     let query = request.query_string();
-    if path == "/api/v2/pools" {
-        if request.method() != Method::GET {
-            return Err(NOT_FOUND);
-        }
-        return pools::pools_query(query).map(|(before, limit)| Route::Pools { before, limit });
-    }
     let segments = path
         .strip_prefix("/api/v1/")
         .ok_or(NOT_FOUND)?
@@ -394,7 +386,8 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         ["projects"] => {
             projects::projects_query(query).map(|(before, limit)| Route::Projects { before, limit })
         }
-        ["pools"] => Ok(Route::PoolsRetired),
+        ["pools"] => catalog::page_query(query, pools::pool_id)
+            .map(|(before, limit)| Route::Pools { before, limit }),
         ["pools", pool, "allocations"] => {
             let pool = pools::pool_id(pool)?;
             pools::allocations_query(query).map(|(after, limit)| Route::PoolAllocations {
@@ -748,11 +741,6 @@ pub(super) async fn respond(
             projects::update(database, project, &body).await
         }
         Route::Pools { before, limit } => pools::list(database, before, limit).await,
-        Route::PoolsRetired => Err(Refusal::new(
-            StatusCode::GONE,
-            "pool_api_retired",
-            "use GET /api/v2/pools with cursor pagination",
-        )),
         Route::PoolAllocations { pool, after, limit } => {
             pools::list_allocations(database, pool, after, limit).await
         }

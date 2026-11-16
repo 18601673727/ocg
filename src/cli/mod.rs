@@ -89,7 +89,7 @@ fn usage() -> &'static str {
        reconcile-reserved <data-directory> <job> --confirm-no-start | --finalize\n\
        reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
        scheduled-external-policy <create|list|show|update|enable|disable|revoke> ...\n\
-       register-llm\n\
+       register-llm                            (OpenAI Chat Completions)\n\
        help, --help, -h\n\
        --version, -V"
 }

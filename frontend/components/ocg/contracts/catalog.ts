@@ -1,23 +1,8 @@
 import type * as Api from "./api";
 
+export type { Pool, Pools } from "./api";
+
 export type Capability = "chat" | "tools" | "vision" | "reasoning";
-export type NativePoolV2 = {
-  id: string;
-  name: string;
-  capacity: number;
-  enabled: boolean;
-  archived: boolean;
-  revision: number;
-};
-export type Pool = NativePoolV2 & {
-  operations: ("llm_request" | "decision")[] | undefined;
-};
-export type Pools = {
-  resource_model: "independent";
-  pools: Pool[];
-  has_more: boolean;
-  next_before: string | null;
-};
 export type Project = Omit<Api.Project, "commands"> & {
   commands: (Omit<Api.ProjectCommand, "owner" | "status"> & {
     owner: "user" | "decision";

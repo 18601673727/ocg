@@ -936,7 +936,9 @@ fn build_profiles_page(
                     .capabilities
                     .iter()
                     .filter_map(|(operation, protocol)| match (operation, protocol) {
-                        (ExecutionOperation::LlmRequest, Some(protocol)) => {
+                        (ExecutionOperation::LlmRequest, Some(protocol))
+                            if protocol.execution_refusal().is_none() =>
+                        {
                             Some(ProfileExecutorView {
                                 id: executor.id.to_string(),
                                 protocol: protocol.as_str().to_owned(),

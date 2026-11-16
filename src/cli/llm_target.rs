@@ -25,6 +25,8 @@ pub enum Error {
         "OCG_PROVIDER_PROTOCOL must be openai_chat_completions, openai_responses or anthropic_messages"
     )]
     InvalidProtocol,
+    #[error("register-llm: {0}")]
+    UnsupportedExecutionProtocol(&'static str),
     #[error("the variable named by {CREDENTIAL_REF_VARIABLE} is not set")]
     CredentialMissing,
     #[error("usage: ocg {COMMAND}")]
@@ -62,6 +64,9 @@ impl Target {
             return Err(Error::NotHttps);
         }
         let protocol = protocol_from_environment()?;
+        if let Some(reason) = protocol.execution_refusal() {
+            return Err(Error::UnsupportedExecutionProtocol(reason));
+        }
         let model = variable(MODEL_VARIABLE)?;
         let credential_ref = variable(CREDENTIAL_REF_VARIABLE)?;
         if std::env::var_os(&credential_ref).is_none_or(|credential| credential.is_empty()) {

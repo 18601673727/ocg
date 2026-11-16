@@ -1118,14 +1118,16 @@ async fn verify_fixture_identities(
     }
     let mut before: Option<String> = None;
     loop {
-        let mut route = "/api/v2/pools?limit=100".to_owned();
+        let mut route = "/api/v1/pools?limit=100".to_owned();
         if let Some(cursor) = &before {
             route.push_str("&before=");
             route.push_str(cursor);
         }
         let value = client.get_json(&route).await?;
-        if value["api_version"].as_u64() != Some(2) {
-            return Err(format!("{route}: invalid API version: {value}"));
+        if value["api_version"].as_u64() != Some(u64::from(ocg::api::v1::API_VERSION))
+            || value["resource_model"].as_str() != Some("independent")
+        {
+            return Err(format!("{route}: invalid Pool page envelope: {value}"));
         }
         let pools = value["pools"]
             .as_array()
@@ -1155,7 +1157,7 @@ async fn verify_fixture_identities(
         }
         if !has_more {
             return Err(format!(
-                "prepared identity {} missing from /api/v2/pools",
+                "prepared identity {} missing from /api/v1/pools",
                 identity.pool
             ));
         }

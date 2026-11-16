@@ -180,8 +180,7 @@ fn can_schedule(
             .as_deref()
             .is_some_and(crate::system::http::direct_diagnostic_loopback),
         FrozenConfiguration::Decision(FrozenDecisionConfig::Generative(frozen, _)) => {
-            frozen.llm.provider.transport == LlmTransport::OpenAiChatCompletions
-                && scheduled_policy(frozen)
+            frozen.llm.provider.transport.execution_refusal().is_none() && scheduled_policy(frozen)
         }
     }
 }

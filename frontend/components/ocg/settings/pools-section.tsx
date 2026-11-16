@@ -197,21 +197,11 @@ const EXECUTOR_CAPABILITIES: {
 }[] = [
   {
     key: "openai_chat_completions",
-    label: "OpenAI Chat",
+    label: "OpenAI Chat Completions",
     capability: {
       operation: "llm_request",
       protocol: "openai_chat_completions",
     },
-  },
-  {
-    key: "openai_responses",
-    label: "OpenAI Responses",
-    capability: { operation: "llm_request", protocol: "openai_responses" },
-  },
-  {
-    key: "anthropic_messages",
-    label: "Anthropic Messages",
-    capability: { operation: "llm_request", protocol: "anthropic_messages" },
   },
   {
     key: "decision",
@@ -249,6 +239,12 @@ function ExecutorRow({
   const [draft, setDraft] = useState<ReadonlySet<string> | null>(null);
   const disabled = busy || stale !== undefined;
   const current = new Set(executor.capabilities.map(capabilityKey));
+  const legacyOptions = executor.capabilities.flatMap((capability) => {
+    const key = capabilityKey(capability);
+    if (EXECUTOR_CAPABILITIES.some((option) => option.key === key)) return [];
+    return [{ key, label: `${key} (${t("settings.llm.executionUnavailable")})`, capability }];
+  });
+  const options = [...EXECUTOR_CAPABILITIES, ...legacyOptions];
   const state = t(executor.enabled ? "settings.pools.enabled" : "settings.pools.disabled");
   const nameValid = name !== null && name.trim() !== "" && name.trim() !== executor.name;
   const draftValid =
@@ -280,7 +276,9 @@ function ExecutorRow({
           </div>
           <div className="text-xs break-all text-muted-foreground">
             {executor.id} · {executor.pool} ·{" "}
-            {executor.capabilities.map((item) => item.protocol ?? item.operation).join(", ")}
+            {[...current]
+              .map((key) => legacyOptions.find((option) => option.key === key)?.label ?? key)
+              .join(", ")}
           </div>
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
@@ -432,7 +430,7 @@ function ExecutorRow({
       ) : null}
       {draft !== null ? (
         <div className="flex flex-wrap items-center gap-3">
-          {EXECUTOR_CAPABILITIES.map((option) => (
+          {options.map((option) => (
             <label key={option.key} className="flex items-center gap-1.5 text-xs">
               <input
                 type="checkbox"
@@ -454,9 +452,9 @@ function ExecutorRow({
             disabled={disabled || !draftValid}
             onClick={() =>
               void onUpdate(executor, {
-                capabilities: EXECUTOR_CAPABILITIES.filter((option) => draft.has(option.key)).map(
-                  (option) => option.capability,
-                ),
+                capabilities: options
+                  .filter((option) => draft.has(option.key))
+                  .map((option) => option.capability),
               })
             }
           >
@@ -482,7 +480,7 @@ function PoolRow({
 }: {
   pool: Pool;
   onUpdate: (pool: Pool, update: PoolUpdate) => Promise<void>;
-  onArchive: ((pool: Pool) => Promise<ArchiveOutcome>) | undefined;
+  onArchive: (pool: Pool) => Promise<ArchiveOutcome>;
   disabled: boolean;
   stale: RowStale | undefined;
   reloading: boolean;
@@ -517,25 +515,6 @@ function PoolRow({
           <Pill tone={pool.enabled ? "emerald" : "amber"} className="text-xs normal-case">
             {t(pool.enabled ? "settings.pools.enabled" : "settings.pools.disabled")}
           </Pill>
-          {pool.operations === undefined ? (
-            <span className="text-xs text-muted-foreground">
-              {t("settings.pools.operationsUnknown")}
-            </span>
-          ) : pool.operations.length === 0 ? (
-            <span className="text-xs text-muted-foreground">
-              {t("settings.pools.operationsNone")}
-            </span>
-          ) : (
-            pool.operations.map((operation) => (
-              <Pill key={operation} tone="violet" className="text-[11px] normal-case">
-                {t(
-                  operation === "decision"
-                    ? "settings.pools.operationDecision"
-                    : "settings.pools.operationLlmRequest",
-                )}
-              </Pill>
-            ))
-          )}
         </div>
       </div>
       <div className="flex flex-wrap items-center justify-end gap-2">
@@ -581,20 +560,18 @@ function PoolRow({
         >
           {t(pool.enabled ? "settings.pools.disable" : "settings.pools.enable")}
         </Button>
-        {onArchive ? (
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            disabled={locked || archiving}
-            onClick={() => {
-              setArchiveRefusal(null);
-              setConfirmingArchive(!confirmingArchive);
-            }}
-          >
-            {t("settings.pools.poolArchive")}
-          </Button>
-        ) : null}
+        <Button
+          type="button"
+          variant="outline"
+          size="xs"
+          disabled={locked || archiving}
+          onClick={() => {
+            setArchiveRefusal(null);
+            setConfirmingArchive(!confirmingArchive);
+          }}
+        >
+          {t("settings.pools.poolArchive")}
+        </Button>
       </div>
       {stale ? (
         <div role="alert" className="flex w-full flex-wrap items-center gap-2 text-xs">
@@ -604,7 +581,7 @@ function PoolRow({
           </Button>
         </div>
       ) : null}
-      {onArchive && (confirmingArchive || archiveRefusal) ? (
+      {confirmingArchive || archiveRefusal ? (
         <div
           role="alertdialog"
           aria-label={t("settings.pools.poolArchiveTitle")}
@@ -882,7 +859,7 @@ function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
 
 export function PoolsSection({ client }: { client: ApiClient }) {
   const { t } = useI18n();
-  const [pools, setPools] = useState<Pool[]>([]);
+  const [pools, setPools] = useState<Pool[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [updatingPoolId, setUpdatingPoolId] = useState<string | null>(null);
@@ -890,7 +867,6 @@ export function PoolsSection({ client }: { client: ApiClient }) {
   const [previous, setPrevious] = useState<(string | undefined)[]>([]);
   const [nextBefore, setNextBefore] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
-  const [native, setNative] = useState(false);
   const [poolName, setPoolName] = useState("");
   const [poolCapacity, setPoolCapacity] = useState("1");
   const poolIdentity = useRef<string | null>(null);
@@ -921,6 +897,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
   const [stalePools, poolStale] = useStaleRows();
   const poolMutating = useRef(false);
   const archivedPools = useRef(new Set<string>());
+  const hasPoolPage = pools !== null;
 
   const loadPools = useCallback(
     async (cursor: string | undefined, history: (string | undefined)[], signal: AbortSignal) => {
@@ -928,7 +905,6 @@ export function PoolsSection({ client }: { client: ApiClient }) {
       try {
         const page = await client.readPools({ before: cursor, signal });
         if (!signal.aborted) {
-          setNative(page.resource_model === "independent");
           setPools(page.pools);
           poolStale.readSucceeded(sentAt);
           setBefore(cursor);
@@ -991,7 +967,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
   );
 
   useEffect(() => {
-    if (!native) return;
+    if (!hasPoolPage) return;
     const controller = new AbortController();
     executorRequest.current = controller;
     void Promise.resolve().then(() => {
@@ -1001,7 +977,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
       }
     });
     return () => executorRequest.current?.abort();
-  }, [native, loadExecutors]);
+  }, [hasPoolPage, loadExecutors]);
 
   function navigateExecutors(cursor: string | undefined, history: (string | undefined)[]) {
     executorRequest.current?.abort();
@@ -1030,19 +1006,14 @@ export function PoolsSection({ client }: { client: ApiClient }) {
   }
 
   async function createExecutor() {
+    const option = EXECUTOR_CAPABILITIES.find(({ key }) => key === capability);
+    if (!option) return;
     setActionError(null);
     setCreating(true);
     try {
       const id = executorIdentity.current ?? configurationIdentity();
       executorIdentity.current = id;
-      await client.createNativeExecutor(
-        id,
-        executorPool,
-        executorName.trim(),
-        capability === "decision"
-          ? { operation: "decision", protocol: null }
-          : { operation: "llm_request", protocol: capability },
-      );
+      await client.createNativeExecutor(id, executorPool, executorName.trim(), option.capability);
       executorIdentity.current = null;
       setExecutorName("");
       navigateExecutors(undefined, []);
@@ -1125,7 +1096,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
     try {
       await client.archiveNativePool(pool.id, pool.revision);
       archivedPools.current.add(pool.id);
-      setPools((current) => current.filter((item) => item.id !== pool.id));
+      setPools((current) => current?.filter((item) => item.id !== pool.id) ?? null);
       navigate(before, previous);
       return { kind: "archived" };
     } catch (error) {
@@ -1155,7 +1126,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
     setUpdatingPoolId(pool.id);
     try {
       const updated = await client.updatePool(pool.id, pool.revision, update);
-      setPools((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
+      setPools((prev) => prev?.map((p) => (p.id === updated.id ? updated : p)) ?? null);
     } catch (err) {
       const stale = poolUpdateStale(err);
       if (stale) poolStale.mark(pool.id, stale);
@@ -1170,7 +1141,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
     }
   }
 
-  const emptyPage = pools.length === 0 && !loading && !loadError;
+  const emptyPage = pools?.length === 0 && !loading && !loadError;
 
   return (
     <Section
@@ -1202,7 +1173,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
         </DismissibleNotice>
       ) : null}
 
-      {native ? (
+      {hasPoolPage ? (
         <div className="flex flex-wrap items-end gap-2">
           <label className="text-xs">
             {t("settings.pools.nativeName")}
@@ -1242,13 +1213,13 @@ export function PoolsSection({ client }: { client: ApiClient }) {
               {t("settings.pools.emptyLastPage")}
             </p>
           ) : null}
-          {pools.map((pool) => (
+          {pools?.map((pool) => (
             <div key={pool.id}>
               <PoolRow
                 key={`${pool.id}-${pool.revision}`}
                 pool={pool}
                 onUpdate={handleUpdate}
-                onArchive={native ? handlePoolArchive : undefined}
+                onArchive={handlePoolArchive}
                 disabled={updatingPoolId !== null}
                 stale={stalePools.get(pool.id)}
                 reloading={loading}
@@ -1257,7 +1228,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
                   navigate(before, previous);
                 }}
               />
-              {native ? <PoolAllocations client={client} pool={pool} /> : null}
+              <PoolAllocations client={client} pool={pool} />
             </div>
           ))}
         </div>
@@ -1286,7 +1257,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
         </Button>
       </div>
 
-      {native ? (
+      {hasPoolPage ? (
         <div className="space-y-3 border-t border-border/70 pt-3">
           <h3 className="font-semibold">{t("settings.pools.executors")}</h3>
           {executorError ? (
@@ -1311,7 +1282,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
               <ExecutorRow
                 key={`${executor.id}-${executor.revision}`}
                 executor={executor}
-                pool={pools.find((pool) => pool.id === executor.pool)}
+                pool={pools?.find((pool) => pool.id === executor.pool)}
                 busy={updatingExecutorId !== null}
                 stale={staleExecutors.get(executor.id)}
                 onUpdate={handleExecutorUpdate}
@@ -1370,10 +1341,10 @@ export function PoolsSection({ client }: { client: ApiClient }) {
                 onChange={(event) => setExecutorPool(event.target.value)}
               >
                 <option value="">—</option>
-                {executorPool && !pools.some((pool) => pool.id === executorPool) ? (
+                {executorPool && !pools?.some((pool) => pool.id === executorPool) ? (
                   <option value={executorPool}>{executorPool}</option>
                 ) : null}
-                {pools.map((pool) => (
+                {pools?.map((pool) => (
                   <option key={pool.id} value={pool.id}>
                     {pool.name} · {pool.id}
                   </option>
@@ -1387,10 +1358,11 @@ export function PoolsSection({ client }: { client: ApiClient }) {
                 value={capability}
                 onChange={(event) => setCapability(event.target.value)}
               >
-                <option value="openai_chat_completions">OpenAI Chat</option>
-                <option value="openai_responses">OpenAI Responses</option>
-                <option value="anthropic_messages">Anthropic Messages</option>
-                <option value="decision">{t("settings.pools.operationDecision")}</option>
+                {EXECUTOR_CAPABILITIES.map(({ key, label }) => (
+                  <option key={key} value={key}>
+                    {label ?? t("settings.pools.operationDecision")}
+                  </option>
+                ))}
               </select>
             </label>
             <Button

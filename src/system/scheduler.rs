@@ -111,6 +111,13 @@ pub enum ClaimScope {
 }
 
 impl ExecutionRuntime {
+    pub fn start(
+        _database: DatabaseHandle,
+        _scope: ClaimScope,
+    ) -> Result<Self, ExecutionRuntimeError> {
+        Ok(Self::idle())
+    }
+
     fn idle() -> Self {
         Self {
             native_stops: NativeStops::default(),

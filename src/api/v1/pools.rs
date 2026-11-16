@@ -5,12 +5,14 @@ use ntex::http::StatusCode;
 use serde::Deserialize;
 
 use super::{INVALID_REQUEST, Refusal, Reply, catalog, profiles};
-use crate::db::entities::{ExecutionOperation, ExecutionPoolId, ExecutorId, RecordRef, Violation};
+use crate::db::entities::{
+    AllocationPool, ExecutionOperation, ExecutionPoolId, ExecutorId, RecordRef, Violation,
+};
 use crate::db::{DatabaseError, DatabaseHandle};
 
 const POOL_NOT_FOUND: Refusal =
     Refusal::new(StatusCode::NOT_FOUND, "pool_not_found", "no such Pool");
-pub(super) const POOL_API_VERSION: u32 = 2;
+const RESOURCE_MODEL: &str = "independent";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,8 +22,6 @@ struct PoolUpdateInput {
     concurrency_limit: Option<Option<NonZeroU32>>,
     #[serde(default, deserialize_with = "profiles::optional_value")]
     enabled: Option<Option<bool>>,
-    #[serde(default, deserialize_with = "profiles::optional_value")]
-    decision: Option<Option<bool>>,
 }
 
 pub(super) fn pool_id(text: &str) -> Result<ExecutionPoolId, Refusal> {
@@ -42,14 +42,30 @@ fn operation_str(operation: ExecutionOperation) -> &'static str {
 pub(crate) struct PoolView {
     id: String,
     name: String,
-    concurrency_limit: u32,
+    capacity: u32,
     enabled: bool,
-    operations: Vec<String>,
+    archived: bool,
+    revision: u32,
+}
+
+impl From<AllocationPool> for PoolView {
+    fn from(pool: AllocationPool) -> Self {
+        Self {
+            id: pool.id.to_string(),
+            name: pool.name,
+            capacity: pool.capacity.get(),
+            enabled: pool.enabled,
+            archived: pool.archived,
+            revision: pool.revision,
+        }
+    }
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Pools")]
 pub(crate) struct PoolsView {
+    #[ts(type = "\"independent\"")]
+    resource_model: &'static str,
     pools: Vec<PoolView>,
     has_more: bool,
     next_before: Option<String>,
@@ -58,11 +74,16 @@ pub(crate) struct PoolsView {
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "PoolAnswer")]
 pub(crate) struct PoolAnswerView {
+    #[ts(type = "\"independent\"")]
+    resource_model: &'static str,
     pool: PoolView,
 }
 
-pub(super) fn pools_query(query: &str) -> Result<(Option<ExecutionPoolId>, usize), Refusal> {
-    catalog::page_query(query, pool_id)
+fn pool_reply(pool: AllocationPool) -> Reply {
+    Reply::ok(envelope(serde_json::json!(PoolAnswerView {
+        resource_model: RESOURCE_MODEL,
+        pool: pool.into(),
+    })))
 }
 
 pub(super) async fn list(
@@ -72,16 +93,12 @@ pub(super) async fn list(
 ) -> Result<Reply, Refusal> {
     let page = database.allocation_pools(before, limit).await?;
     let next_before = page.next.map(|id| id.to_string());
-    let pools: Vec<_> = page.records.iter().map(native_pool_json).collect();
-    let mut body = envelope(
-        serde_json::json!({"resource_model":"independent", "pools":pools,"has_more":next_before.is_some(),"next_before":next_before}),
-    );
-    body["api_version"] = serde_json::json!(POOL_API_VERSION);
-    Ok(Reply::ok(body))
-}
-
-fn native_pool_json(pool: &crate::db::entities::AllocationPool) -> serde_json::Value {
-    serde_json::json!({"id":pool.id.to_string(),"name":pool.name,"capacity":pool.capacity.get(),"enabled":pool.enabled,"archived":pool.archived,"revision":pool.revision})
+    Ok(Reply::ok(envelope(serde_json::json!(PoolsView {
+        resource_model: RESOURCE_MODEL,
+        pools: page.records.into_iter().map(PoolView::from).collect(),
+        has_more: next_before.is_some(),
+        next_before,
+    }))))
 }
 
 fn native_executor_json(executor: &crate::db::entities::AllocationExecutor) -> serde_json::Value {
@@ -113,7 +130,7 @@ struct NativePoolInput {
 
 pub(super) async fn create_pool(database: &DatabaseHandle, body: &[u8]) -> Result<Reply, Refusal> {
     let input: NativePoolInput = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
-    let pool = crate::db::entities::AllocationPool {
+    let pool = AllocationPool {
         id: pool_id(&input.id)?,
         name: input.name,
         capacity: input.capacity,
@@ -125,9 +142,7 @@ pub(super) async fn create_pool(database: &DatabaseHandle, body: &[u8]) -> Resul
         .register_native_pool(pool.clone())
         .await
         .map_err(refusal)?;
-    Ok(Reply::ok(envelope(
-        serde_json::json!({"resource_model":"independent", "pool":native_pool_json(&pool)}),
-    )))
+    Ok(pool_reply(pool))
 }
 
 #[derive(Deserialize)]
@@ -280,9 +295,7 @@ pub(super) async fn archive_pool(
         .archive_native_pool(id, input.expected_revision)
         .await
         .map_err(refusal)?;
-    Ok(Reply::ok(envelope(
-        serde_json::json!({"resource_model":"independent","pool":native_pool_json(&pool)}),
-    )))
+    Ok(pool_reply(pool))
 }
 
 const INVALID_CURSOR: Refusal = Refusal::new(
@@ -480,6 +493,9 @@ fn refusal(error: DatabaseError) -> Refusal {
             "executor_not_found",
             "no such Executor",
         ),
+        DatabaseError::Rejected(Violation::InvalidValue("executor.protocol", reason)) => {
+            Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, "invalid_executor", reason)
+        }
         DatabaseError::Rejected(Violation::InvalidValue("executor", _)) => Refusal::new(
             StatusCode::UNPROCESSABLE_ENTITY,
             "invalid_executor",
@@ -498,9 +514,6 @@ pub(super) async fn update(
     body: &[u8],
 ) -> Result<Reply, Refusal> {
     let wire: PoolUpdateInput = serde_json::from_slice(body).map_err(|_| INVALID_REQUEST)?;
-    if wire.decision.is_some() {
-        return Err(INVALID_REQUEST);
-    }
     let (capacity, enabled) = match (wire.concurrency_limit, wire.enabled) {
         (Some(Some(capacity)), None) => (Some(capacity), None),
         (None, Some(Some(enabled))) => (None, Some(enabled)),
@@ -510,7 +523,5 @@ pub(super) async fn update(
         .update_native_pool(id, wire.expected_revision, capacity, enabled)
         .await
         .map_err(refusal)?;
-    Ok(Reply::ok(envelope(
-        serde_json::json!({"resource_model":"independent","pool":native_pool_json(&pool)}),
-    )))
+    Ok(pool_reply(pool))
 }

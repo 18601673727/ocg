@@ -256,7 +256,7 @@ impl Batch {
         let headers = self.apply_header_change(&previous_headers, save.headers)?;
 
         if matches!(&save.definition, ModelProfileDefinition::Llm { .. }) {
-            self.ensure_llm_executor(protocol)?;
+            self.require_llm_executor_if_executable(protocol)?;
         }
 
         let connection_body = ConnectionConfig {
@@ -482,8 +482,14 @@ impl Batch {
         })
     }
 
-    fn ensure_llm_executor(&mut self, protocol: LlmTransport) -> Result<(), BatchError> {
-        self.require_native_capability(ExecutionOperation::LlmRequest, Some(protocol))
+    fn require_llm_executor_if_executable(
+        &mut self,
+        protocol: LlmTransport,
+    ) -> Result<(), BatchError> {
+        if protocol.execution_refusal().is_none() {
+            self.require_native_capability(ExecutionOperation::LlmRequest, Some(protocol))?;
+        }
+        Ok(())
     }
 
     fn check_config_body(&mut self, name: &str, body: &ConfigBody) -> Result<(), BatchError> {
@@ -717,7 +723,7 @@ impl Batch {
         let wanted_protocol = wanted.protocol;
         let connection_id = self.find_or_create_connection(connection.name, wanted, true)?;
         self.set_config_enabled(connection_id, ConfigKind::Connection, true)?;
-        self.ensure_llm_executor(wanted_protocol)?;
+        self.require_llm_executor_if_executable(wanted_protocol)?;
         let mut known = self.step(|tx| {
             let mut known = std::collections::BTreeMap::new();
             for entry in tx.open_table(CONFIGS)?.iter()? {

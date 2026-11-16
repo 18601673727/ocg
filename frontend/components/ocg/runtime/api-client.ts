@@ -1,6 +1,7 @@
 import type { Projects, Pool, Pools, Children } from "../contracts";
 import type * as Api from "@/components/ocg/contracts/api";
 import {
+  API_VERSION,
   projectJob,
   executionSequence,
   projectContextStatus,
@@ -46,8 +47,7 @@ export type ProjectUpdate = {
 
 export type PoolUpdate =
   | { concurrency_limit: number; enabled?: never }
-  | { enabled: boolean; concurrency_limit?: never }
-  | { decision: boolean; concurrency_limit?: never; enabled?: never };
+  | { enabled: boolean; concurrency_limit?: never };
 
 export type NativeExecutor = {
   id: string;
@@ -103,7 +103,7 @@ function validateNativeExecutor(
             ))),
     )
   )
-    throw new ContractError("executor.capabilities", "supported Executor capabilities");
+    throw new ContractError("executor.capabilities", "stored Executor capabilities");
 }
 
 function sameCapabilities(
@@ -476,7 +476,6 @@ function nativePool(value: unknown): Pool {
     enabled: pool.enabled,
     archived: pool.archived,
     revision: pool.revision,
-    operations: undefined,
   };
 }
 
@@ -2297,24 +2296,18 @@ export function createApiClient(options: ApiClientOptions) {
 
     async readPools(settings: { before?: string; signal?: AbortSignal } = {}): Promise<Pools> {
       const query = settings.before ? `?before=${encodeURIComponent(settings.before)}` : "";
-      const answer = await send("GET", `/api/v2/pools${query}`, {
+      const answer = await send("GET", `/api/v1/pools${query}`, {
         signal: settings.signal,
       });
-      const page = answer.input as {
-        api_version?: unknown;
-        resource_model?: unknown;
-        pools?: unknown;
-        has_more?: unknown;
-        next_before?: unknown;
-      };
+      const page = answer.input as Partial<Api.Envelope<Api.Pools>>;
       if (
-        page.api_version !== 2 ||
+        page.api_version !== API_VERSION ||
         page.resource_model !== "independent" ||
         !Array.isArray(page.pools) ||
         page.pools.length > 20 ||
         typeof page.has_more !== "boolean"
       ) {
-        throw new ContractError("pools", "a version 2 Pool page");
+        throw new ContractError("pools", "an independent Pool page");
       }
       let nextBefore: string | null = null;
       if (page.has_more) {
@@ -2330,7 +2323,7 @@ export function createApiClient(options: ApiClientOptions) {
         throw new ContractError("next_before", "a terminal Pool cursor");
       }
       return {
-        resource_model: "independent",
+        resource_model: page.resource_model,
         pools: page.pools.map(nativePool),
         has_more: page.has_more,
         next_before: nextBefore,
@@ -2365,12 +2358,8 @@ export function createApiClient(options: ApiClientOptions) {
         sign: true,
         signal,
       });
-      const response = answer.input as {
-        api_version?: unknown;
-        resource_model?: unknown;
-        pool?: unknown;
-      };
-      if (response.api_version !== 1 || response.resource_model !== "independent") {
+      const response = answer.input as Partial<Api.Envelope<Api.PoolAnswer>>;
+      if (response.api_version !== API_VERSION || response.resource_model !== "independent") {
         throw new ContractError("pool", "a native Pool response");
       }
       const pool = nativePool(response.pool);
@@ -2393,12 +2382,8 @@ export function createApiClient(options: ApiClientOptions) {
         body: { id, name, capacity, enabled: true },
         sign: true,
       });
-      const response = result.input as {
-        api_version?: number;
-        resource_model?: string;
-        pool?: unknown;
-      };
-      if (response.api_version !== 1 || response.resource_model !== "independent")
+      const response = result.input as Partial<Api.Envelope<Api.PoolAnswer>>;
+      if (response.api_version !== API_VERSION || response.resource_model !== "independent")
         throw new ContractError("pool", "a native Pool response");
       return nativePool(response.pool);
     },
@@ -2643,14 +2628,10 @@ export function createApiClient(options: ApiClientOptions) {
         sign: true,
         signal,
       });
-      const answer = result.input as {
-        api_version?: number;
-        resource_model?: string;
-        pool?: Record<string, unknown>;
-      };
+      const answer = result.input as Partial<Api.Envelope<Api.PoolAnswer>>;
       const archived = answer.pool;
       if (
-        answer.api_version !== 1 ||
+        answer.api_version !== API_VERSION ||
         answer.resource_model !== "independent" ||
         !archived ||
         archived.id !== id ||

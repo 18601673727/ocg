@@ -50,6 +50,7 @@ export function ProtocolSelect({
           <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
         </SelectContent>
       </Select>
+      {value !== "openai_chat_completions" && <span>{t("settings.llm.executionUnavailable")}</span>}
     </label>
   );
 }

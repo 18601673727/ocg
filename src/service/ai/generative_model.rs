@@ -156,17 +156,23 @@ pub(crate) async fn execute_conversation(
     config: &ProviderExecutionConfig,
     mut sink: Option<&mut dyn ProviderOutputSink>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
-    let config = config.for_profile(frozen);
     let mut announced = false;
-    let result = exchange(
-        frozen,
-        conversation,
-        resolver,
-        &config,
-        &mut sink,
-        &mut announced,
-    )
-    .await;
+    let result = if let Some(reason) = frozen.llm.provider.transport.execution_refusal() {
+        Err(ProviderExecutionError::NotDelivered {
+            message: reason.to_owned(),
+        })
+    } else {
+        let config = config.for_profile(frozen);
+        exchange(
+            frozen,
+            conversation,
+            resolver,
+            &config,
+            &mut sink,
+            &mut announced,
+        )
+        .await
+    };
     if let Err(error) = &result
         && !announced
     {
