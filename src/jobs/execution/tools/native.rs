@@ -2,9 +2,10 @@ use super::registry::{ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRe
 use super::tool_loop::{
     ASK_USER_TOOL_NAME, REQUEST_COMMAND_TOOL_NAME, ToolExecution, ToolLoopLimits,
 };
+use crate::ai::development::DevelopmentToolOffer;
 use crate::ai::providers::CancellationToken;
 use crate::db::entities::{FrozenExecutionConfig, ModelCapability, ProjectRecord, ToolEffect};
-use crate::jobs::{DevelopmentToolContext, DevelopmentToolOffer};
+use crate::jobs::DevelopmentToolContext;
 use crate::workspace::blocking;
 use crate::workspace::files::read::{self, Workspace};
 

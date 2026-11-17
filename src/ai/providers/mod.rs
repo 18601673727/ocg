@@ -19,6 +19,7 @@ const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
 mod anthropic;
+mod credentials;
 pub(crate) mod headers;
 mod models;
 pub(crate) mod observe;
@@ -39,9 +40,9 @@ pub(crate) fn model_endpoint(endpoint: &str) -> Result<String, ProviderExecution
 pub(crate) use models::{ModelListError, list_models};
 pub use observe::{error_observations, metrics, result_value, success_observation};
 pub use types::{
-    CredentialResolver, DestinationPolicy, EnvironmentCredentialResolver, LoopbackProxy,
-    OutputSinkError, ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult,
-    ProviderFact, ProviderObservation, ProviderOutputSink, ResponseFacts,
+    CredentialResolver, DestinationPolicy, EnvironmentCredentialResolver, OutputSinkError,
+    ProviderExecutionConfig, ProviderExecutionError, ProviderExecutionResult, ProviderFact,
+    ProviderObservation, ProviderOutputSink, ResponseFacts,
 };
 
 pub(crate) use types::incomplete_tool_calls;

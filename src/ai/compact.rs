@@ -2,7 +2,12 @@ use super::providers::openai_compatible::{
     ChatConversation, ChatMessage, ChatRole, ContentPartWire, ImageInput, MessageContentWire,
     ToolWire,
 };
-use crate::db::entities::{FrozenExecutionConfig, ProjectRecord};
+use crate::db::entities::{
+    DevelopmentContextRequirements, FrozenExecutionConfig, LlmConfig, ProjectRecord,
+    VerifiedNativeSummary,
+};
+
+pub(super) const ADOPTED_SUMMARY_NOTICE: &str = "Generated context summary (advisory, not an original user instruction). Originals remain available:\n";
 
 pub(crate) const IMAGES_OMITTED_NOTICE: &str = "Images of earlier turns were omitted; a request carries at most 8 images and 16 MiB of images.";
 
@@ -379,4 +384,74 @@ pub(crate) fn fit_with_notices(
     );
     conversation.dropped_turns = drop_count as u32;
     Some(conversation)
+}
+
+pub(crate) struct DevelopmentContextBudget;
+
+impl DevelopmentContextRequirements for DevelopmentContextBudget {
+    fn max_images(&self) -> usize {
+        super::providers::openai_compatible::image::MAX_REQUEST_IMAGES
+    }
+    fn prompt_bytes(
+        &self,
+        configuration: &FrozenExecutionConfig,
+        project: Option<&ProjectRecord>,
+        summary: Option<&VerifiedNativeSummary>,
+    ) -> Result<usize, serde_json::Error> {
+        let summary_bytes = summary.map_or(0, |summary| {
+            summary
+                .summary
+                .context_text()
+                .len()
+                .saturating_add(ADOPTED_SUMMARY_NOTICE.len())
+        });
+        let mut bytes = summary_bytes
+            .saturating_add(super::generative_model::CHART_INSTRUCTIONS.len())
+            .saturating_add(
+                configuration
+                    .agent
+                    .as_ref()
+                    .and_then(|agent| agent.instructions.as_ref())
+                    .map_or(0, String::len),
+            );
+        if let Some(project) = project {
+            let commands: Vec<_> = crate::db::entities::BUILT_IN_COMMANDS
+                .into_iter()
+                .chain(
+                    project
+                        .commands
+                        .iter()
+                        .filter(|command| {
+                            command.status == crate::db::entities::CommandStatus::Allowed
+                        })
+                        .map(|command| command.name.as_str()),
+                )
+                .collect();
+            let grant = configuration
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.workspace_grant());
+            let grounding = super::generative_model::ground_project(
+                &project.name,
+                &project.root,
+                grant,
+                &commands,
+            );
+            bytes = bytes.saturating_add(crate::db::serialized_len(&grounding)?);
+        }
+        Ok(bytes)
+    }
+
+    fn admits_tokens(&self, model: &LlmConfig, selected_bytes: usize, image_count: usize) -> bool {
+        let output_reserve = model
+            .parameters
+            .max_completion_tokens
+            .or(model.parameters.max_tokens)
+            .unwrap_or(4096);
+        let estimated_tokens = (selected_bytes.div_ceil(3) as u64)
+            .saturating_add((image_count as u64).saturating_mul(1600))
+            .saturating_add(u64::from(output_reserve));
+        let window = model.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+        estimated_tokens <= u64::from(window)
+    }
 }

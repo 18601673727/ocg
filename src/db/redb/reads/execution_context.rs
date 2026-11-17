@@ -443,6 +443,7 @@ fn native_epoch(
 pub(crate) fn read_development_execution_context(
     database: &Database,
     token: crate::db::entities::AllocationToken,
+    requirements: &dyn crate::db::entities::DevelopmentContextRequirements,
 ) -> Result<DevelopmentCandidate, StorageError> {
     use crate::db::entities::AllocationPhase;
     let rx = read(database)?;
@@ -467,13 +468,14 @@ pub(crate) fn read_development_execution_context(
             "Allocation ownership is not a current reservation",
         ));
     }
-    development_candidate_in(&rx, &meta, allocation)
+    development_candidate_in(&rx, &meta, allocation, requirements)
 }
 
 fn development_candidate_in(
     rx: &ReadTransaction,
     meta: &impl ReadableTable<&'static str, &'static [u8]>,
     allocation: crate::db::entities::PoolAllocation,
+    requirements: &dyn crate::db::entities::DevelopmentContextRequirements,
 ) -> Result<DevelopmentCandidate, StorageError> {
     use crate::db::entities::MutableJobPhase;
     let token = allocation.token;
@@ -663,49 +665,10 @@ fn development_candidate_in(
     let mut output_count = 0usize;
     let mut output_bytes = 0usize;
     let mut selected_bytes = record.job.input.text().len().saturating_add(
-        adopted_summary
-            .as_ref()
-            .map_or(0, |summary| {
-                summary.summary.context_text().len().saturating_add(
-                    "Generated context summary (advisory, not an original user instruction). Originals remain available:\n".len(),
-                )
-            }),
+        requirements
+            .prompt_bytes(&configuration, project.as_ref(), adopted_summary.as_ref())
+            .map_err(|_| StorageError::corrupted("invalid project context"))?,
     );
-    selected_bytes = selected_bytes
-        .saturating_add(crate::ai::generative_model::CHART_INSTRUCTIONS.len())
-        .saturating_add(
-            configuration
-                .agent
-                .as_ref()
-                .and_then(|agent| agent.instructions.as_ref())
-                .map_or(0, String::len),
-        );
-    if let Some(project) = &project {
-        let commands: Vec<_> = crate::db::entities::BUILT_IN_COMMANDS
-            .into_iter()
-            .chain(
-                project
-                    .commands
-                    .iter()
-                    .filter(|command| command.status == crate::db::entities::CommandStatus::Allowed)
-                    .map(|command| command.name.as_str()),
-            )
-            .collect();
-        let grant = configuration
-            .agent
-            .as_ref()
-            .and_then(|agent| agent.workspace_grant());
-        let grounding = crate::ai::generative_model::ground_project(
-            &project.name,
-            &project.root,
-            grant,
-            &commands,
-        );
-        selected_bytes = selected_bytes.saturating_add(
-            crate::db::serialized_len(&grounding)
-                .map_err(|_| StorageError::corrupted("invalid project context"))?,
-        );
-    }
     let mut image_count = attachments.len();
     while let Some(id) = previous {
         let is_covered = covered.contains(&id);
@@ -754,7 +717,7 @@ fn development_candidate_in(
             ));
         }
         image_count = image_count.saturating_add(prior.job.input.attachments().len());
-        if image_count > crate::ai::providers::openai_compatible::image::MAX_REQUEST_IMAGES {
+        if image_count > requirements.max_images() {
             return Err(context_unavailable(
                 "selected execution context has too many images",
             ));
@@ -832,18 +795,7 @@ fn development_candidate_in(
             "selected Model does not support images",
         ));
     }
-    let output_reserve = model
-        .parameters
-        .max_completion_tokens
-        .or(model.parameters.max_tokens)
-        .unwrap_or(4096);
-    let estimated_tokens = (selected_bytes.div_ceil(3) as u64)
-        .saturating_add((image_count as u64).saturating_mul(1600))
-        .saturating_add(u64::from(output_reserve));
-    let window = model
-        .context_window
-        .unwrap_or(crate::ai::compact::DEFAULT_CONTEXT_WINDOW);
-    if estimated_tokens > u64::from(window) {
+    if !requirements.admits_tokens(model, selected_bytes, image_count) {
         return Err(context_unavailable(
             "selected execution context exceeds estimated model token budget",
         ));

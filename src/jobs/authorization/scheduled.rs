@@ -39,18 +39,13 @@ impl ScheduledExternalGrant {
             first_delta_timeout: Some(timeout),
             max_output_bytes: MAX_RESPONSE_BYTES,
             cancellation,
-            destination: self.destination(),
+            destination: DestinationPolicy::scheduled_external(&self.policy),
             ..ProviderExecutionConfig::default()
         }
     }
 
-    pub(crate) fn destination(&self) -> DestinationPolicy {
-        let (host, port) = self.policy.endpoint_origin();
-        DestinationPolicy::ApprovedHttps {
-            host: host.to_owned(),
-            port,
-            proxy: self.policy.proxy(),
-        }
+    pub(crate) fn permits_destination(&self, destination: &DestinationPolicy) -> bool {
+        *destination == DestinationPolicy::scheduled_external(&self.policy)
     }
 
     pub(crate) fn permits_endpoint(&self, endpoint: &str) -> bool {

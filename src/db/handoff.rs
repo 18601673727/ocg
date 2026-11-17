@@ -1,4 +1,3 @@
-use crate::ai::providers::openai_compatible::ChatConversation;
 use crate::db::entities;
 use crate::db::entities::{AttachmentId, Violation};
 use crate::db::errors::{DatabaseError, OperationStatus};
@@ -11,7 +10,6 @@ pub(crate) struct PreparedDevelopmentHandoff {
     pub(super) candidate: crate::db::entities::DevelopmentCandidate,
     image_ids: Vec<AttachmentId>,
     pub(super) request: serde_json::Value,
-    pub(super) conversation: Option<ChatConversation>,
     offers_tools: bool,
     pub(super) credentials: DevelopmentHandoffCredentials,
 }
@@ -52,14 +50,12 @@ impl PreparedDevelopmentHandoff {
         candidate: crate::db::entities::DevelopmentCandidate,
         image_ids: Vec<AttachmentId>,
         request: serde_json::Value,
-        conversation: Option<ChatConversation>,
         offers_tools: bool,
     ) -> Self {
         Self {
             candidate,
             image_ids,
             request,
-            conversation,
             offers_tools,
             credentials: DevelopmentHandoffCredentials::default(),
         }
@@ -168,7 +164,6 @@ impl PreparedDevelopmentHandoff {
     }
 }
 
-#[allow(dead_code)]
 pub(crate) struct DevelopmentHandoff {
     pub(super) prepared: PreparedDevelopmentHandoff,
     pub(super) started: entities::MutableJob,
@@ -176,7 +171,6 @@ pub(crate) struct DevelopmentHandoff {
     pub(super) output_busy: AtomicBool,
     pub(super) output_uncertain: AtomicBool,
     pub(super) usage_checkpoint: std::sync::Mutex<DevelopmentUsageCheckpoint>,
-    pub(super) recorder: std::sync::Mutex<crate::ai::providers::RequestRecorder>,
 }
 
 impl DevelopmentHandoff {
@@ -195,7 +189,6 @@ impl DevelopmentHandoff {
         &self,
     ) -> Option<(
         &entities::FrozenExecutionConfig,
-        &ChatConversation,
         &serde_json::Value,
         entities::AllocationToken,
     )> {
@@ -206,7 +199,6 @@ impl DevelopmentHandoff {
         };
         Some((
             &context.configuration,
-            self.prepared.conversation.as_ref()?,
             &self.prepared.request,
             context.allocation.token,
         ))
@@ -218,7 +210,6 @@ impl DevelopmentHandoff {
         &entities::FrozenDecisionConfig,
         &entities::DecisionRequest,
         &serde_json::Value,
-        Option<&ChatConversation>,
     )> {
         let crate::db::entities::DevelopmentCandidate::Decision(context) = &self.prepared.candidate
         else {
@@ -228,43 +219,28 @@ impl DevelopmentHandoff {
         else {
             return None;
         };
-        Some((
-            &context.configuration,
-            request,
-            &self.prepared.request,
-            self.prepared.conversation.as_ref(),
-        ))
+        Some((&context.configuration, request, &self.prepared.request))
     }
-}
 
-impl crate::ai::providers::CredentialResolver for DevelopmentHandoff {
-    fn resolve<'a>(
-        &'a self,
-        reference: Option<&'a str>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Option<String>, crate::ai::providers::ProviderExecutionError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let found = reference.and_then(|reference| {
-                self.prepared
-                    .credentials
-                    .items
-                    .iter()
-                    .find(|item| item.reference == reference)
-            });
-            match (reference, found) {
-                (None, _) if self.prepared.provider_credential_reference().is_none() => Ok(None),
-                (Some(_), Some(credential)) => Ok(Some(credential.secret.as_str().to_owned())),
-                _ => Err(crate::ai::providers::ProviderExecutionError::Build {
-                    message: "handoff credential reference mismatch".to_owned(),
-                }),
-            }
-        })
+    pub(crate) fn credential(
+        &self,
+        reference: Option<&str>,
+    ) -> Result<Option<&entities::CredentialSecret>, Violation> {
+        let found = reference.and_then(|reference| {
+            self.prepared
+                .credentials
+                .items
+                .iter()
+                .find(|item| item.reference == reference)
+        });
+        match (reference, found) {
+            (None, _) if self.prepared.provider_credential_reference().is_none() => Ok(None),
+            (Some(_), Some(credential)) => Ok(Some(&credential.secret)),
+            _ => Err(Violation::InvalidValue(
+                "credential",
+                "handoff credential reference mismatch",
+            )),
+        }
     }
 }
 

@@ -1,4 +1,3 @@
-use crate::ai::providers::LoopbackProxy;
 use crate::db::entities::identity::{
     ExecutionPoolId, ExecutorId, JobId, ReservationRequestId, ScheduledExternalPolicyId,
 };
@@ -6,6 +5,7 @@ use crate::db::entities::{
     ExecutionOperation, FrozenExecutionConfig, LlmTransport, StopProof, Timestamp,
     valid_credential_ref,
 };
+use crate::network::http::LoopbackProxy;
 use std::collections::BTreeSet;
 use std::num::NonZeroU32;
 use std::time::Duration;

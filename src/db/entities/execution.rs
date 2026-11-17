@@ -124,6 +124,22 @@ pub(crate) struct ExecutionHistoryPage {
     pub head_seq: u64,
 }
 
+pub(crate) trait DevelopmentContextRequirements: Send + Sync {
+    fn max_images(&self) -> usize;
+    fn prompt_bytes(
+        &self,
+        configuration: &FrozenExecutionConfig,
+        project: Option<&ProjectRecord>,
+        summary: Option<&VerifiedNativeSummary>,
+    ) -> Result<usize, serde_json::Error>;
+    fn admits_tokens(
+        &self,
+        model: &crate::db::entities::LlmConfig,
+        selected_bytes: usize,
+        image_count: usize,
+    ) -> bool;
+}
+
 pub(crate) struct DevelopmentExecutionContext {
     pub allocation: PoolAllocation,
     pub job: MutableJob,

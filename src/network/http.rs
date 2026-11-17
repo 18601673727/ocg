@@ -14,6 +14,19 @@ use ntex::io::{Io, IoBoxed};
 use ntex::service::apply_fn_factory;
 use ntex::time::{Millis, Seconds};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopbackProxy(std::net::SocketAddr);
+
+impl LoopbackProxy {
+    pub fn new(address: std::net::SocketAddr) -> Option<Self> {
+        (address.ip().is_loopback() && address.port() != 0).then_some(Self(address))
+    }
+
+    pub fn address(self) -> std::net::SocketAddr {
+        self.0
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 #[error("provider request could not be built: {message}")]
 pub(crate) struct HttpError {

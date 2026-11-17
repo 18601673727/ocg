@@ -140,9 +140,6 @@ impl DatabaseHandle {
                         usage_checkpoint: std::sync::Mutex::new(
                             DevelopmentUsageCheckpoint::default(),
                         ),
-                        recorder: std::sync::Mutex::new(
-                            crate::ai::providers::RequestRecorder::default(),
-                        ),
                     })
                 },
             )
@@ -191,12 +188,12 @@ impl DatabaseHandle {
         result
     }
 
-    pub(crate) async fn record_development_request(
+    pub(crate) async fn record_development_request<S>(
         &self,
         handoff: &DevelopmentHandoff,
-        request_number: entities::RequestNumber,
         body: &serde_json::Value,
-        observed_at: entities::Timestamp,
+        prepare: impl FnOnce() -> Result<(entities::SentRequest, S), DatabaseError>,
+        remember: impl FnOnce(S),
     ) -> Result<(), DatabaseError> {
         if !Arc::ptr_eq(&self.shared, &handoff.owner) {
             return Err(DatabaseError::Rejected(Violation::InvalidValue(
@@ -204,11 +201,6 @@ impl DatabaseHandle {
                 "different database worker",
             )));
         }
-        let token = handoff.prepared.candidate.allocation().token;
-        let decision = matches!(
-            handoff.prepared.candidate,
-            crate::db::entities::DevelopmentCandidate::Decision(_)
-        );
         if handoff
             .prepared
             .credentials
@@ -221,57 +213,7 @@ impl DatabaseHandle {
                 "request evidence contains credential material",
             )));
         }
-        let mut pending_state = None;
-        let mut sent = if decision {
-            let body = entities::MessageBody::new(&serde_json::json!({"decision": body})).map_err(
-                |_| {
-                    DatabaseError::Rejected(Violation::InvalidValue(
-                        "request",
-                        "prepared decision cannot be recorded",
-                    ))
-                },
-            )?;
-            let digest = body.digest();
-            entities::SentRequest {
-                job: token.job,
-                request: request_number,
-                observed_at,
-                messages: vec![digest],
-                tools: None,
-                parameters: digest,
-                dropped_turns: None,
-                bodies: vec![body],
-                required_messages: Vec::new(),
-            }
-        } else {
-            let mut recorder = handoff
-                .recorder
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if request_number == entities::RequestNumber::FIRST {
-                recorder.image_attachments = handoff
-                    .prepared
-                    .conversation
-                    .as_ref()
-                    .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
-                        "request",
-                        "prepared conversation missing",
-                    )))?
-                    .image_attachments
-                    .clone();
-            }
-            let (sent, state) = recorder
-                .prepare(token.job, request_number, body, 0)
-                .map_err(|_| {
-                    DatabaseError::Rejected(Violation::InvalidValue(
-                        "request",
-                        "prepared request cannot be recorded",
-                    ))
-                })?;
-            pending_state = Some(state);
-            sent
-        };
-        sent.observed_at = observed_at;
+        let (sent, state) = prepare()?;
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let attachments = match &handoff.prepared.candidate {
             crate::db::entities::DevelopmentCandidate::Generative(context) => context
@@ -304,14 +246,8 @@ impl DatabaseHandle {
             )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
-        if result.is_ok()
-            && let Some(state) = pending_state
-        {
-            handoff
-                .recorder
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remember_sent(state);
+        if result.is_ok() {
+            remember(state);
         }
         result
     }
@@ -402,6 +338,7 @@ impl DatabaseHandle {
         handoff: &DevelopmentHandoff,
         answer: ProviderAnswer,
         usages: Vec<(u32, Metrics)>,
+        remember: impl FnOnce(entities::ContentDigest),
     ) -> Result<(), DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let response: serde_json::Value =
@@ -517,11 +454,7 @@ impl DatabaseHandle {
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
         result.map(|next_checkpoint| {
-            handoff
-                .recorder
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .remember_response(response_digest);
+            remember(response_digest);
             if has_usages {
                 *handoff
                     .usage_checkpoint
@@ -731,9 +664,12 @@ impl DatabaseHandle {
     pub(crate) async fn development_execution_context(
         &self,
         token: entities::AllocationToken,
+        requirements: &'static dyn entities::DevelopmentContextRequirements,
     ) -> Result<crate::db::entities::DevelopmentCandidate, DatabaseError> {
-        self.read(move |database| redb::read_development_execution_context(database, token))
-            .await
+        self.read(move |database| {
+            redb::read_development_execution_context(database, token, requirements)
+        })
+        .await
     }
 
     pub(crate) async fn apply_development_job_tool(

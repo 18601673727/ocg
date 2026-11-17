@@ -6,6 +6,7 @@ use super::tools::tool_loop::{
     CallAnswers, CallSite, REQUEST_COMMAND_TOOL_NAME, ToolExecution, ToolLoopStop, answer_calls,
 };
 use crate::ai::compact::{ContextLimits, estimate_request_tokens};
+use crate::ai::development::DevelopmentExecution;
 use crate::ai::providers::openai_compatible::{ChatMessage, ChatToolCallWire};
 use crate::ai::providers::{
     self, CancellationToken, DestinationPolicy, OutputSinkError, ProviderExecutionConfig,
@@ -38,7 +39,7 @@ impl EndpointPolicy<'_> {
                     && config.destination == DestinationPolicy::Standard
             }
             EndpointPolicy::ScheduledExternal(grant) => {
-                grant.permits_endpoint(endpoint) && config.destination == grant.destination()
+                grant.permits_endpoint(endpoint) && grant.permits_destination(&config.destination)
             }
         }
     }
@@ -55,18 +56,26 @@ impl EndpointPolicy<'_> {
 
 pub(crate) async fn supervise_development_generative(
     database: &DatabaseHandle,
-    handoff: crate::db::DevelopmentHandoff,
+    execution: DevelopmentExecution,
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
     tools: Option<ToolExecution>,
 ) -> Result<AppendedOutput, DatabaseError> {
-    let (frozen, first_conversation, prepared, token) =
+    let handoff = &execution.handoff;
+    let (frozen, prepared, token) =
         handoff
             .generative_inputs()
             .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
                 "handoff",
                 "generative handoff required",
             )))?;
+    let first_conversation = execution
+        .conversation
+        .as_ref()
+        .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
+            "handoff",
+            "generative handoff required",
+        )))?;
     let local_rejection =
         if config.max_output_bytes == 0 || config.max_output_bytes > 16 * 1024 * 1024 {
             Some("loopback output limit is invalid")
@@ -80,7 +89,7 @@ pub(crate) async fn supervise_development_generative(
     if let Some(message) = local_rejection {
         return settle_development_unsent(
             database,
-            &handoff,
+            handoff,
             RequestNumber::FIRST,
             1,
             config,
@@ -100,7 +109,7 @@ pub(crate) async fn supervise_development_generative(
     loop {
         let mut sink = DevelopmentLoopbackSink {
             database,
-            handoff: &handoff,
+            execution: &execution,
             request,
             prepared: &body,
             cancellation: &config.cancellation,
@@ -114,7 +123,7 @@ pub(crate) async fn supervise_development_generative(
             frozen,
             &conversation,
             &body,
-            &handoff,
+            handoff,
             config,
             Some(&mut sink),
         )
@@ -141,7 +150,7 @@ pub(crate) async fn supervise_development_generative(
                     )));
                 }
                 return settle_development_error(
-                    database, &handoff, request, output_seq, config, sent, error,
+                    database, handoff, request, output_seq, config, sent, error,
                 )
                 .await;
             }
@@ -152,7 +161,7 @@ pub(crate) async fn supervise_development_generative(
                 "incomplete execution evidence; ownership remains held",
             )));
         }
-        record_answered_request(database, &handoff, token.job, request, &result).await?;
+        record_answered_request(database, &execution, token.job, request, &result).await?;
         let Some(tools) = tools.as_ref().filter(|_| result.requests_tools()) else {
             let mut value = providers::result_value(&result);
             #[cfg(unix)]
@@ -166,12 +175,12 @@ pub(crate) async fn supervise_development_generative(
                 value: Some(value),
             });
             return database
-                .finalize_development_job(&handoff, output_seq, finalization)
+                .finalize_development_job(handoff, output_seq, finalization)
                 .await;
         };
         let site = CallSite {
             database,
-            handoff: &handoff,
+            handoff,
             request,
         };
         let answers = match answer_calls(
@@ -193,11 +202,11 @@ pub(crate) async fn supervise_development_generative(
                     value: Some(providers::result_value(&result)),
                 });
                 return database
-                    .finalize_development_job(&handoff, output_seq, finalization)
+                    .finalize_development_job(handoff, output_seq, finalization)
                     .await;
             }
             Err(stop) => {
-                return settle_tool_stop(database, &handoff, output_seq, Some(&result), stop).await;
+                return settle_tool_stop(database, handoff, output_seq, Some(&result), stop).await;
             }
         };
         conversation.messages.push(assistant_message(&result));
@@ -215,7 +224,7 @@ pub(crate) async fn supervise_development_generative(
         let next = match next {
             Ok(next) => next,
             Err(stop) => {
-                return settle_tool_stop(database, &handoff, output_seq, Some(&result), stop).await;
+                return settle_tool_stop(database, handoff, output_seq, Some(&result), stop).await;
             }
         };
         if let Some(window) = limits.context_window
@@ -223,7 +232,7 @@ pub(crate) async fn supervise_development_generative(
         {
             return settle_tool_stop(
                 database,
-                &handoff,
+                handoff,
                 output_seq,
                 Some(&result),
                 ToolLoopStop::ContextWindow,
@@ -240,7 +249,7 @@ pub(crate) async fn supervise_development_generative(
                 let stop = ToolLoopStop::ResponseUnserializable {
                     message: error.to_string(),
                 };
-                return settle_tool_stop(database, &handoff, output_seq, Some(&result), stop).await;
+                return settle_tool_stop(database, handoff, output_seq, Some(&result), stop).await;
             }
         };
         if matches!(policy, EndpointPolicy::ScheduledExternal(_)) {
@@ -254,7 +263,7 @@ pub(crate) async fn supervise_development_generative(
                         .endpoint
                         .as_deref()
                         .is_some_and(|ep| live_grant.permits_endpoint(ep))
-                        && config.destination == live_grant.destination();
+                        && live_grant.permits_destination(&config.destination);
                     if !ep_ok {
                         Err("the scheduled external endpoint or route is no longer authorized")
                     } else if body_bytes > live_grant.limits().max_request_bytes {
@@ -272,7 +281,7 @@ pub(crate) async fn supervise_development_generative(
                     index: 0,
                     violation: Violation::InvalidValue("scheduled_external_policy", reason),
                 };
-                return settle_tool_stop(database, &handoff, output_seq, Some(&result), stop).await;
+                return settle_tool_stop(database, handoff, output_seq, Some(&result), stop).await;
             }
         }
         request = next;
@@ -508,7 +517,7 @@ fn has_usage_counts(usage: &crate::db::entities::NormalizedUsage) -> bool {
 
 async fn record_answered_request(
     database: &DatabaseHandle,
-    handoff: &crate::db::DevelopmentHandoff,
+    execution: &DevelopmentExecution,
     job: crate::db::entities::JobId,
     request: RequestNumber,
     result: &ProviderExecutionResult,
@@ -526,9 +535,9 @@ async fn record_answered_request(
             "response cannot be recorded",
         ))
     })?;
-    database
-        .record_development_provider_answer(
-            handoff,
+    execution
+        .record_answer(
+            database,
             crate::db::entities::ProviderAnswer {
                 stat: AvailabilityStat {
                     job,
@@ -576,17 +585,19 @@ async fn settle_tool_stop(
 
 pub(crate) async fn supervise_development_decision(
     database: &DatabaseHandle,
-    handoff: crate::db::DevelopmentHandoff,
+    execution: DevelopmentExecution,
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
 ) -> Result<AppendedOutput, DatabaseError> {
-    let (frozen, request, body, conversation) =
+    let handoff = &execution.handoff;
+    let (frozen, request, body) =
         handoff
             .decision_inputs()
             .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
                 "handoff",
                 "Decision handoff required",
             )))?;
+    let conversation = execution.conversation.as_ref();
     let job = handoff.job();
     let endpoint = match frozen {
         crate::db::entities::FrozenDecisionConfig::Native(native) => native.endpoint.as_deref(),
@@ -605,7 +616,7 @@ pub(crate) async fn supervise_development_decision(
     if let Some(message) = local_rejection {
         return settle_development_unsent(
             database,
-            &handoff,
+            handoff,
             RequestNumber::FIRST,
             1,
             config,
@@ -616,7 +627,7 @@ pub(crate) async fn supervise_development_decision(
     }
     let mut sink = DevelopmentLoopbackSink {
         database,
-        handoff: &handoff,
+        execution: &execution,
         request: RequestNumber::FIRST,
         prepared: body,
         cancellation: &config.cancellation,
@@ -630,7 +641,7 @@ pub(crate) async fn supervise_development_decision(
         frozen,
         request,
         (body, conversation),
-        &handoff,
+        handoff,
         config,
         crate::db::entities::RequestRef {
             job,
@@ -650,7 +661,7 @@ pub(crate) async fn supervise_development_decision(
             }
             return settle_development_error(
                 database,
-                &handoff,
+                handoff,
                 RequestNumber::FIRST,
                 sink.output_seq,
                 config,
@@ -691,9 +702,9 @@ pub(crate) async fn supervise_development_decision(
     } else {
         Vec::new()
     };
-    database
-        .record_development_provider_answer(
-            &handoff,
+    execution
+        .record_answer(
+            database,
             crate::db::entities::ProviderAnswer {
                 stat: AvailabilityStat {
                     job,
@@ -713,7 +724,7 @@ pub(crate) async fn supervise_development_decision(
         )
         .await?;
     database
-        .finalize_development_decision(&handoff, sink.output_seq, result.result)
+        .finalize_development_decision(handoff, sink.output_seq, result.result)
         .await
 }
 
@@ -891,7 +902,7 @@ async fn settle_development_unsent(
 
 struct DevelopmentLoopbackSink<'a> {
     database: &'a DatabaseHandle,
-    handoff: &'a crate::db::DevelopmentHandoff,
+    execution: &'a DevelopmentExecution,
     request: RequestNumber,
     prepared: &'a serde_json::Value,
     cancellation: &'a CancellationToken,
@@ -914,8 +925,8 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                 });
             }
             match self
-                .database
-                .record_development_request(self.handoff, self.request, body, Timestamp::now())
+                .execution
+                .record_request(self.database, self.request, body, Timestamp::now())
                 .await
             {
                 Ok(()) => {}
@@ -944,14 +955,14 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
         Box::pin(async move {
             self.streamed.push_str(text);
-            if self.handoff.contains_secret(&self.streamed) {
+            if self.execution.handoff.contains_secret(&self.streamed) {
                 return Err(OutputSinkError {
                     message: "output contains credential material".into(),
                 });
             }
             self.database
                 .append_development_output(
-                    self.handoff,
+                    &self.execution.handoff,
                     self.output_seq,
                     JobOutput {
                         kind,
@@ -983,7 +994,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                 return;
             }
             let metrics = Metrics {
-                job: self.handoff.job(),
+                job: self.execution.handoff.job(),
                 request: self.request,
                 observed_at: observation.observed_at,
                 measurements: Measurements {
@@ -994,7 +1005,11 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
             };
             if self
                 .database
-                .record_development_partial_usage(self.handoff, self.request, vec![metrics])
+                .record_development_partial_usage(
+                    &self.execution.handoff,
+                    self.request,
+                    vec![metrics],
+                )
                 .await
                 .is_err()
             {

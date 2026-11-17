@@ -4,6 +4,7 @@ use super::{
     ProviderFailure, Timestamp, UsageFinality, Value,
 };
 use crate::db::entities::ChatFinishReason;
+use crate::network::http::LoopbackProxy;
 
 pub trait CredentialResolver: Send + Sync {
     fn resolve<'a>(
@@ -91,16 +92,16 @@ pub enum DestinationPolicy {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct LoopbackProxy(std::net::SocketAddr);
-
-impl LoopbackProxy {
-    pub fn new(address: std::net::SocketAddr) -> Option<Self> {
-        (address.ip().is_loopback() && address.port() != 0).then_some(Self(address))
-    }
-
-    pub fn address(self) -> std::net::SocketAddr {
-        self.0
+impl DestinationPolicy {
+    pub(crate) fn scheduled_external(
+        policy: &crate::db::entities::ScheduledExternalPolicyConfig,
+    ) -> Self {
+        let (host, port) = policy.endpoint_origin();
+        Self::ApprovedHttps {
+            host: host.to_owned(),
+            port,
+            proxy: policy.proxy(),
+        }
     }
 }
 

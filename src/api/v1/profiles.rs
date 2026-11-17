@@ -612,7 +612,7 @@ async fn plan_headers(
             fields: merge(&global.fields, &connection),
         },
         &ProbeResolver {
-            stored: database.credential_resolver(),
+            stored: Arc::new(database.clone()),
             supplied,
         },
     )
@@ -1845,7 +1845,6 @@ pub(crate) async fn provider_models(
                     return Err(INVALID_CREDENTIAL_REF);
                 }
                 database
-                    .credential_resolver()
                     .resolve(Some(reference))
                     .await
                     .map_err(|_| INVALID_CREDENTIAL_REF)?

@@ -553,64 +553,13 @@ impl DatabaseHandle {
             .map_err(DatabaseError::RolledBack)
     }
 
-    pub(crate) async fn resolve_credential(
+    pub(crate) async fn stored_credential(
         &self,
         reference: &str,
-    ) -> Result<Option<String>, crate::ai::providers::ProviderExecutionError> {
-        use crate::ai::providers::{
-            CredentialResolver, EnvironmentCredentialResolver, ProviderExecutionError,
-        };
-        let reference = reference.trim();
-        if reference.is_empty() {
-            return Ok(None);
-        }
+    ) -> Result<redb::StoredCredential, DatabaseError> {
         let name = reference.to_owned();
         let key = self.shared.credential_key();
-        let stored = self
-            .read(move |database| redb::read_credential(database, &name, key.as_deref()))
+        self.read(move |database| redb::read_credential(database, &name, key.as_deref()))
             .await
-            .map_err(|error| ProviderExecutionError::Build {
-                message: format!("credential store could not be read: {error}"),
-            })?;
-        match stored {
-            redb::StoredCredential::Decrypted(secret) => Ok(Some(secret.into_inner())),
-            redb::StoredCredential::Undecryptable => Err(ProviderExecutionError::Build {
-                message: "stored credential cannot be decrypted; enter the key again".to_owned(),
-            }),
-            redb::StoredCredential::Absent => {
-                EnvironmentCredentialResolver.resolve(Some(reference)).await
-            }
-        }
-    }
-
-    pub fn credential_resolver(&self) -> Arc<dyn crate::ai::providers::CredentialResolver> {
-        Arc::new(LocalCredentialResolver {
-            database: self.clone(),
-        })
-    }
-}
-
-struct LocalCredentialResolver {
-    database: DatabaseHandle,
-}
-
-impl crate::ai::providers::CredentialResolver for LocalCredentialResolver {
-    fn resolve<'a>(
-        &'a self,
-        credential_ref: Option<&'a str>,
-    ) -> std::pin::Pin<
-        Box<
-            dyn std::future::Future<
-                    Output = Result<Option<String>, crate::ai::providers::ProviderExecutionError>,
-                > + Send
-                + 'a,
-        >,
-    > {
-        Box::pin(async move {
-            let Some(name) = credential_ref else {
-                return Ok(None);
-            };
-            self.database.resolve_credential(name).await
-        })
     }
 }

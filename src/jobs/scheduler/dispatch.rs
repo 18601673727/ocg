@@ -262,19 +262,21 @@ async fn start_and_exchange(
     let mut tooling = NativeTooling::new(data_directory, stops.clone(), cancellation.clone());
     let handoff = loop {
         let result = async {
-            use crate::db::classify_unstarted;
-            use crate::db::entities::{JobQueuePriority, Violation};
-            use crate::jobs::{
-                DevelopmentResolvedCandidate, DevelopmentToolContext, prepare_development_handoff,
+            use crate::ai::development::{
+                DevelopmentResolvedCandidate, prepare_development_handoff,
                 resolve_development_candidate,
             };
+            use crate::db::classify_unstarted;
+            use crate::db::entities::{JobQueuePriority, Violation};
+            use crate::jobs::DevelopmentToolContext;
+            use crate::jobs::authorization::authorize_development_candidate;
             let invalid = |reason| {
                 classify_unstarted(DatabaseError::Rejected(Violation::InvalidValue(
                     "handoff", reason,
                 )))
             };
             let snapshot = database
-                .development_execution_context(token)
+                .development_execution_context(token, &crate::ai::compact::DevelopmentContextBudget)
                 .await
                 .map_err(classify_unstarted)?;
             let resolved = resolve_development_candidate(database, snapshot).await?;
@@ -297,13 +299,17 @@ async fn start_and_exchange(
             } else {
                 None
             };
+            authorize_development_candidate(&resolved, offer.as_ref())
+                .map_err(classify_unstarted)?;
             let mut prepared = prepare_development_handoff(resolved, offer.as_ref())
                 .map_err(classify_unstarted)?;
-            database.load_handoff_credentials(&mut prepared).await?;
+            database
+                .load_handoff_credentials(&mut prepared.evidence)
+                .await?;
             let policy = match grant {
-                None => prepared_native_policy(&prepared),
+                None => prepared_native_policy(&prepared.evidence),
                 Some(grant) => grant
-                    .check_prepared(&prepared)
+                    .check_prepared(&prepared.evidence)
                     .map(|()| EndpointPolicy::ScheduledExternal(grant))
                     .map_err(|refusal| {
                         log::warn!(
@@ -316,7 +322,11 @@ async fn start_and_exchange(
                     }),
             }
             .map_err(invalid)?;
-            let handoff = database.start_development_handoff(prepared).await?;
+            let handoff = database
+                .start_development_handoff(prepared.evidence)
+                .await?;
+            let handoff =
+                crate::ai::development::DevelopmentExecution::new(handoff, prepared.conversation);
             Ok((handoff, policy))
         }
         .await;
@@ -333,7 +343,8 @@ async fn start_and_exchange(
         Ok((handoff, policy)) => {
             let tools = tooling.into_execution();
             let exchange = within_deadline(cancellation, DISPATCH_TIMEOUT, async {
-                if operation == ExecutionOperation::Decision || handoff.decision_inputs().is_some()
+                if operation == ExecutionOperation::Decision
+                    || handoff.handoff.decision_inputs().is_some()
                 {
                     supervise_development_decision(database, handoff, &config, policy).await
                 } else {
