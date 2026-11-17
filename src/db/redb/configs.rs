@@ -545,6 +545,8 @@ impl Batch {
         &mut self,
         policy: &crate::db::entities::CompactionPolicy,
     ) -> Result<(), BatchError> {
+        use crate::db::entities::DecisionCapability;
+
         if let Err(reason) = policy.validate() {
             return self.reject(Violation::InvalidValue("compaction_policy", reason));
         }
@@ -567,11 +569,16 @@ impl Batch {
             for model in body.models {
                 let record = self.require_config_kind(model, ConfigKind::DecisionModel)?;
                 if selected == Some(model)
-                    && !matches!(record.body, ConfigBody::DecisionModel(model) if model.declared_capabilities.contains(&crate::db::entities::DecisionCapability::Choice))
+                    && !matches!(
+                        record.body,
+                        ConfigBody::DecisionModel(model)
+                            if model.declared_capabilities.contains(&DecisionCapability::Choice)
+                                && model.declared_capabilities.contains(&DecisionCapability::BinaryProbability)
+                    )
                 {
                     return self.reject(Violation::InvalidValue(
                         "decision_agent",
-                        "context prediction requires Choice capability",
+                        "context prediction requires Choice and BinaryProbability capabilities",
                     ));
                 }
             }

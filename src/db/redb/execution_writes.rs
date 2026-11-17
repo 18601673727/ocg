@@ -957,9 +957,7 @@ impl Batch {
                 "result does not match the frozen Decision request",
             ));
         }
-        let is_predictive_compaction =
-            request.state.get("kind").and_then(|v| v.as_str()) == Some("predictive_compaction");
-        let predictive_accept = if is_predictive_compaction {
+        let predictive_accept = if jobs::is_predictive_helper(&job) {
             match &result.outcome {
                 crate::db::entities::DecisionOutcome::Answer {
                     answer:

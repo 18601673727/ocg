@@ -551,10 +551,14 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
         {
             return Err(StorageError::corrupted("invalid standalone Decision Job"));
         }
+        let indexed_turn = turns.get((job.parent_id.get(), job.id.get()))?.is_some();
+        // A Decision turn can carry the same request state.
+        let predictive_child = !indexed_turn && jobs::is_predictive_helper(&job);
         let expected = job.phase != crate::db::entities::MutableJobPhase::Unsubmitted
             && job.summary_source.is_none()
-            && !spec.is_chunk_group();
-        if turns.get((job.parent_id.get(), job.id.get()))?.is_some() != expected {
+            && !spec.is_chunk_group()
+            && !predictive_child;
+        if indexed_turn != expected {
             return Err(StorageError::corrupted("turn index differs from its Job"));
         }
     }

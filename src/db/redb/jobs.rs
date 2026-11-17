@@ -438,6 +438,15 @@ pub(super) fn decode_mutable_job(
     })
 }
 
+pub(super) fn is_predictive_helper(job: &crate::db::entities::MutableJob) -> bool {
+    matches!(
+        &job.input.content,
+        crate::db::entities::MutableJobContent::Decision { request, .. }
+            if request.state.get("kind").and_then(|value| value.as_str())
+                == Some("predictive_compaction")
+    )
+}
+
 pub(super) fn validate_retry_source(
     job: &crate::db::entities::MutableJob,
     original: &crate::db::entities::MutableJob,

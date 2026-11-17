@@ -1,13 +1,15 @@
 use super::StorageError;
 use crate::db::entities::{
-    AppendedOutput, DependencyCondition, DependencyState, ExecutionConfiguration,
-    ExecutionEventKind, FrozenConfiguration, FrozenDecisionConfig, FrozenExecutionConfig, JobId,
-    JobSpec, MutableJobPhase, Origin, OutcomeCause, OutcomeKind, OutcomeRecord, OutputKind,
-    ProfileId, ProjectId, RecordRef, ToolCallRef, ToolDecision, ToolOutcome, Violation,
+    AppendedOutput, DependencyCondition, DependencyState, ExecutionEventKind, FrozenConfiguration,
+    FrozenExecutionConfig, JobId, JobSpec, MutableJobPhase, Origin, OutcomeCause, OutcomeKind,
+    OutcomeRecord, OutputKind, ProjectId, RecordRef, ToolCallRef, ToolDecision, ToolOutcome,
+    Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::codec::Code;
-use crate::db::redb::jobs::{TurnMembership, decode_mutable_job, mutable_priority};
+use crate::db::redb::jobs::{
+    TurnMembership, decode_mutable_job, is_predictive_helper, mutable_priority,
+};
 use crate::db::redb::reservations::mutable_configuration_requirement;
 use crate::db::redb::rows::decode_output;
 use crate::db::redb::schema::{
@@ -110,11 +112,7 @@ impl Batch {
                     {
                         summary_blocked = true;
                     }
-                } else if let crate::db::entities::MutableJobContent::Decision { request, .. } =
-                    &child_job.input.content
-                    && request.state.get("kind").and_then(|v| v.as_str())
-                        == Some("predictive_compaction")
-                {
+                } else if is_predictive_helper(&child_job) {
                     pred_count = pred_count.saturating_add(1);
                     if outcome.is_none()
                         || (pred_interval_micros > 0
@@ -147,6 +145,13 @@ impl Batch {
             && pred_count < pred.max_preparations
             && total_tokens >= (trigger as usize).saturating_mul(3) / 4
         {
+            if self
+                .require_mutable_conversation(conversation)?
+                .parent_id
+                .is_some()
+            {
+                return Ok(());
+            }
             let decision_request = crate::db::entities::DecisionRequest {
                 question: crate::db::entities::DecisionQuestion::BinaryProbability {
                     prompt: "Predict whether context compaction should be prepared before the next turn."
@@ -159,55 +164,49 @@ impl Batch {
                     "trigger": trigger,
                 }),
             };
-            let cfg = ExecutionConfiguration {
-                reasoning_effort: None,
-                agent_profile: None,
-                llm_profile: ProfileId::new(pred.decision_agent.get()),
-            };
-            if let Ok(frozen_cfg) = self.freeze_configuration(cfg) {
-                let decision_frozen = match frozen_cfg {
-                    FrozenConfiguration::Decision(d) => d,
-                    FrozenConfiguration::Generative(g) => FrozenDecisionConfig::Generative(g, None),
-                };
-                let wrapped = FrozenConfiguration::Decision(decision_frozen.clone());
-                if let Ok(storable) = self.storable_frozen(&wrapped) {
-                    let input = crate::db::entities::MutableJobInput {
-                        priority: crate::db::entities::JobQueuePriority::Speculative,
-                        content: crate::db::entities::MutableJobContent::Decision {
-                            profile: decision_frozen.profile_ref().id,
-                            references: decision_frozen.references().collect(),
-                            request: decision_request,
-                        },
-                    };
-                    let pred_id = JobId::new(self.next_id()?);
-                    let pred_job = crate::db::entities::MutableJob {
-                        id: pred_id,
-                        parent_id: conversation,
-                        previous: None,
-                        retry: None,
-                        composer_context: crate::db::entities::ComposerContextId::new(
-                            self.next_id()?,
-                        ),
-                        created_at: self.now,
-                        submitted_at: Some(self.now),
-                        revision: 1,
-                        phase: crate::db::entities::MutableJobPhase::Queued,
-                        input,
-                        context_selection:
-                            crate::db::entities::MutableContextSelection::FullHistory,
-                        summary_source: None,
-                        frozen: Some(storable),
-                    };
-                    let req_tag = mutable_configuration_requirement(&wrapped);
-                    self.enqueue_mutable_job(
-                        &pred_job,
-                        req_tag,
-                        TurnMembership::NonTurn,
-                        false,
-                        true,
-                    )?;
+            let decision_frozen = match self.freeze_decision_profile(pred.decision_agent) {
+                Err(BatchError(Failure::Rejected(reason))) => {
+                    log::warn!(
+                        "predictive compaction skipped for conversation {conversation}: {reason}"
+                    );
+                    return Ok(());
                 }
+                result => result?,
+            };
+            if let Err(reason) = decision_request.validate(&decision_frozen.capabilities()) {
+                log::warn!(
+                    "predictive compaction skipped for conversation {conversation}: {reason}"
+                );
+                return Ok(());
             }
+            let input = crate::db::entities::MutableJobInput {
+                priority: crate::db::entities::JobQueuePriority::Speculative,
+                content: crate::db::entities::MutableJobContent::Decision {
+                    profile: decision_frozen.profile_ref().id,
+                    references: decision_frozen.references().collect(),
+                    request: decision_request,
+                },
+            };
+            let wrapped = FrozenConfiguration::Decision(decision_frozen);
+            let storable = self.storable_frozen(&wrapped)?;
+            let pred_id = JobId::new(self.next_id()?);
+            let pred_job = crate::db::entities::MutableJob {
+                id: pred_id,
+                parent_id: conversation,
+                previous: None,
+                retry: None,
+                composer_context: crate::db::entities::ComposerContextId::new(self.next_id()?),
+                created_at: self.now,
+                submitted_at: Some(self.now),
+                revision: 1,
+                phase: crate::db::entities::MutableJobPhase::Queued,
+                input,
+                context_selection: crate::db::entities::MutableContextSelection::FullHistory,
+                summary_source: None,
+                frozen: Some(storable),
+            };
+            let req_tag = mutable_configuration_requirement(&wrapped);
+            self.enqueue_mutable_job(&pred_job, req_tag, TurnMembership::NonTurn, false, true)?;
         }
         Ok(())
     }
@@ -438,20 +437,17 @@ impl Batch {
         else {
             return Ok(false);
         };
-        let llm_profile = policy
-            .decision_profile
-            .map_or(generative.llm.model.id.into(), |id| {
-                ProfileId::new(id.get())
-            });
-        let cfg = ExecutionConfiguration {
-            reasoning_effort: None,
-            agent_profile: None,
-            llm_profile,
-        };
-        let frozen_decision = match self.freeze_configuration(cfg) {
-            Ok(FrozenConfiguration::Decision(d)) => d,
-            Ok(FrozenConfiguration::Generative(g)) => FrozenDecisionConfig::Generative(g, None),
-            Err(_) => FrozenDecisionConfig::Generative(generative.clone(), None),
+        let frozen_decision = match policy.decision_profile {
+            Some(profile) => match self.freeze_decision_profile(profile) {
+                Err(BatchError(Failure::Rejected(reason))) => {
+                    log::warn!(
+                        "project planning for {project_id} fell back to the turn configuration: {reason}"
+                    );
+                    FrozenDecisionConfig::Generative(generative.clone(), None)
+                }
+                result => result?,
+            },
+            None => FrozenDecisionConfig::Generative(generative.clone(), None),
         };
         let wrapped = FrozenConfiguration::Decision(frozen_decision.clone());
         let storable = self.storable_frozen(&wrapped)?;
