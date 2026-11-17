@@ -438,13 +438,46 @@ pub(super) fn decode_mutable_job(
     })
 }
 
-pub(super) fn is_predictive_helper(job: &crate::db::entities::MutableJob) -> bool {
-    matches!(
+pub(super) fn is_predictive_helper(
+    tx: &impl super::TxRead,
+    job: &crate::db::entities::MutableJob,
+) -> Result<bool, StorageError> {
+    use crate::db::entities::{JobQueuePriority, MutableContextSelection, MutableJobPhase};
+
+    if job.phase == MutableJobPhase::Unsubmitted
+        || job.input.priority != JobQueuePriority::Speculative
+        || job.previous.is_some()
+        || job.retry.is_some()
+        || job.summary_source.is_some()
+        || job.frozen.is_none()
+        || job.submitted_at != Some(job.created_at)
+        || job.context_selection != MutableContextSelection::FullHistory
+        || !matches!(
         &job.input.content,
         crate::db::entities::MutableJobContent::Decision { request, .. }
             if request.state.get("kind").and_then(|value| value.as_str())
                 == Some("predictive_compaction")
-    )
+        )
+    {
+        return Ok(false);
+    }
+    // Public Decisions are Turns (including the first Turn). Only the system
+    // enqueues this kind of non-Turn child of a root conversation.
+    let key = (job.parent_id.get(), job.id.get());
+    if tx.table(TURNS)?.get(key)?.is_some() || tx.table(CHILDREN)?.get(key)?.is_none() {
+        return Ok(false);
+    }
+    let conversations = tx.table(CONVERSATIONS)?;
+    let Some(parent) = conversations.get(job.parent_id.get())? else {
+        return Err(StorageError::corrupted(format!(
+            "predictive Helper {} has missing Group {}",
+            job.id, job.parent_id
+        )));
+    };
+    let parent = JobSpec::decode_at(job.parent_id.get(), parent.value())?;
+    Ok(parent.parent_id.is_none()
+        && !parent.is_chunk_group()
+        && !parent.is_standalone_decision_group())
 }
 
 pub(super) fn validate_retry_source(

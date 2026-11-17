@@ -52,34 +52,53 @@ const SUMMARY_MAX_BYTES: usize = 128 * 1024 * 1024;
 
 const SUMMARY_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 
+pub(crate) enum NativeSourceError {
+    Unavailable(&'static str),
+    Storage(StorageError),
+}
+
+impl From<StorageError> for NativeSourceError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<::redb::StorageError> for NativeSourceError {
+    fn from(error: ::redb::StorageError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
 pub(crate) struct SummaryBudget {
     pub(crate) bytes: usize,
     pub(crate) outputs: usize,
 }
 
 impl SummaryBudget {
-    fn bytes(&mut self, n: usize) -> Result<(), StorageError> {
+    fn bytes(&mut self, n: usize) -> Result<(), NativeSourceError> {
         if n > SUMMARY_MAX_RECORD_BYTES {
-            return Err(context_unavailable(
+            return Err(NativeSourceError::Unavailable(
                 "summary verification record exceeds byte limit",
             ));
         }
         self.bytes = self
             .bytes
             .checked_add(n)
-            .ok_or_else(|| context_unavailable("summary verification byte budget exceeded"))?;
+            .ok_or(NativeSourceError::Unavailable(
+                "summary verification byte budget exceeded",
+            ))?;
         if self.bytes > SUMMARY_MAX_BYTES {
-            return Err(context_unavailable(
+            return Err(NativeSourceError::Unavailable(
                 "summary verification byte budget exceeded",
             ));
         }
         Ok(())
     }
 
-    fn output(&mut self) -> Result<(), StorageError> {
+    fn output(&mut self) -> Result<(), NativeSourceError> {
         self.outputs += 1;
         if self.outputs > SUMMARY_MAX_OUTPUTS {
-            return Err(context_unavailable(
+            return Err(NativeSourceError::Unavailable(
                 "summary verification output budget exceeded",
             ));
         }
@@ -91,7 +110,7 @@ fn native_summary_frame(
     hash: &mut aws_lc_rs::digest::Context,
     budget: &mut SummaryBudget,
     bytes: &[u8],
-) -> Result<(), StorageError> {
+) -> Result<(), NativeSourceError> {
     budget.bytes(bytes.len())?;
     hash.update(&(bytes.len() as u64).to_le_bytes());
     hash.update(bytes);
@@ -103,7 +122,7 @@ fn native_summary_owner(
     executors: &impl ReadableTable<u128, &'static [u8]>,
     allocation: &crate::db::entities::PoolAllocation,
     budget: &mut SummaryBudget,
-) -> Result<(), StorageError> {
+) -> Result<(), NativeSourceError> {
     let pool = pools
         .get(allocation.token.pool.get())?
         .ok_or_else(|| StorageError::corrupted("summary allocation Pool missing"))?;
@@ -122,7 +141,7 @@ fn native_summary_owner(
             .capabilities
             .contains(&(allocation.operation, allocation.protocol))
     {
-        return Err(context_unavailable(
+        return Err(NativeSourceError::Unavailable(
             "summary allocation ownership is inconsistent",
         ));
     }
@@ -145,7 +164,7 @@ pub(crate) fn native_source_boundary<J, S, A, O, AT, T, P, E>(
     id: JobId,
     conversation: JobId,
     budget: &mut SummaryBudget,
-) -> Result<(crate::db::entities::NativeSummaryBoundary, Option<JobId>), StorageError>
+) -> Result<(crate::db::entities::NativeSummaryBoundary, Option<JobId>), NativeSourceError>
 where
     J: ReadableTable<u128, &'static [u8]>,
     S: ReadableTable<u128, &'static [u8]>,
@@ -181,7 +200,7 @@ where
         job.input.content,
         crate::db::entities::MutableJobContent::Decision { .. }
     ) {
-        return Err(context_unavailable(
+        return Err(NativeSourceError::Unavailable(
             "Decision Jobs cannot be summary sources",
         ));
     }
@@ -214,7 +233,7 @@ where
             .as_ref()
             .is_some_and(|outcome| outcome.at >= allocation.claimed_at)
     {
-        return Err(context_unavailable(
+        return Err(NativeSourceError::Unavailable(
             "summary source is not a settled conversation Job",
         ));
     }
@@ -225,7 +244,7 @@ where
         .transpose()?
         .is_some()
     {
-        return Err(context_unavailable(
+        return Err(NativeSourceError::Unavailable(
             "summary source tool evidence is not supported",
         ));
     }
@@ -241,7 +260,9 @@ where
         native_summary_frame(&mut hash, budget, bytes.value())?;
         let attachment = decode_attachment(id.get(), bytes.value())?;
         if !attachment.is_available() {
-            return Err(context_unavailable("summary source attachment unavailable"));
+            return Err(NativeSourceError::Unavailable(
+                "summary source attachment unavailable",
+            ));
         }
     }
     let mut through = 0u32;
@@ -253,11 +274,11 @@ where
         if seq
             != through
                 .checked_add(1)
-                .ok_or_else(|| context_unavailable("summary source output overflow"))?
+                .ok_or(NativeSourceError::Unavailable(
+                    "summary source output overflow",
+                ))?
         {
-            return Err(StorageError::corrupted(
-                "summary source output sequence has a gap",
-            ));
+            return Err(StorageError::corrupted("summary source output sequence has a gap").into());
         }
         native_summary_frame(&mut hash, budget, bytes.value())?;
         let output = decode_output(key.value(), bytes.value())?;
@@ -267,22 +288,20 @@ where
                 .as_ref()
                 .is_none_or(|outcome| output.created_at > outcome.at)
         {
-            return Err(context_unavailable(
+            return Err(NativeSourceError::Unavailable(
                 "summary source output timing is inconsistent",
             ));
         }
         if final_result {
-            return Err(StorageError::corrupted(
-                "summary source output follows its final result",
-            ));
+            return Err(
+                StorageError::corrupted("summary source output follows its final result").into(),
+            );
         }
         final_result = output.kind == OutputKind::Result;
         through = seq;
     }
     if through == 0 || !final_result {
-        return Err(StorageError::corrupted(
-            "summary source final output missing",
-        ));
+        return Err(StorageError::corrupted("summary source final output missing").into());
     }
     let digest: [u8; 32] = hash
         .finish()

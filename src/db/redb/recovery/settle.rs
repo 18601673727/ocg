@@ -1,7 +1,7 @@
 use crate::db::entities::{
     ChatFinishReason, ExecutionOperation, JobId, OutcomeKind, OutputKind, RequestNumber,
 };
-use crate::db::redb::batch::{Batch, BatchError};
+use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::jobs;
 use crate::db::redb::schema::{
     JOB_OUTPUTS, JOBS, LIVE_CHILDREN, MESSAGES, POOL_ALLOCATIONS, REQUEST_EVENTS, TOOL_CALLS,
@@ -188,18 +188,60 @@ pub(crate) fn confirmed_answer(
     }))
 }
 
-pub(crate) fn settle_confirmed_answers(batch: &mut Batch) -> Result<(), BatchError> {
-    let candidates = batch.step(|tx| {
-        let mut found = Vec::new();
-        for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
-            let (key, value) = entry?;
-            let allocation = allocations::decode_pool_allocation(key.value(), value.value())?;
-            if let Some(result) = confirmed_answer(tx, &allocation)? {
-                found.push((allocation, result));
-            }
+pub(super) fn settlement_failure(
+    error: BatchError,
+    operation: &str,
+    job: Option<JobId>,
+    group: Option<JobId>,
+) -> StorageError {
+    let job = job.map_or_else(|| "unidentified".to_owned(), |id| id.to_string());
+    let group = group.map_or_else(|| "unidentified".to_owned(), |id| id.to_string());
+    let context = format!("recovery {operation} (Job {job}, Group {group})");
+    match error.0 {
+        Failure::Storage(mut error) => {
+            error.detail = format!("{context}: {}", error.detail);
+            error
         }
-        Ok(found)
-    })?;
+        Failure::Rejected(violation) => StorageError {
+            kind: super::StorageErrorKind::Other,
+            os_error: None,
+            detail: format!(
+                "{context}: business rejection; recovery cannot safely continue: {violation}"
+            ),
+        },
+    }
+}
+
+pub(crate) fn settle_confirmed_answers(batch: &mut Batch) -> Result<(), StorageError> {
+    let candidates = batch
+        .step(|tx| {
+            let mut found = Vec::new();
+            for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
+                let (key, value) = entry?;
+                let allocation = allocations::decode_pool_allocation(key.value(), value.value())
+                    .map_err(|error| {
+                        settlement_failure(
+                            BatchError(Failure::Storage(error)),
+                            "decode confirmed answer Allocation",
+                            Some(JobId::new(key.value())),
+                            None,
+                        )
+                    })?;
+                let result = confirmed_answer(tx, &allocation).map_err(|error| {
+                    settlement_failure(
+                        BatchError(Failure::Storage(error)),
+                        "verify confirmed answer",
+                        Some(allocation.token.job),
+                        None,
+                    )
+                })?;
+                if let Some(result) = result {
+                    found.push((allocation, result));
+                }
+            }
+            Ok(found)
+        })
+        .map_err(|error| settlement_failure(error, "scan confirmed answers", None, None))?;
     for (allocation, result) in candidates {
         batch.settle_confirmed_answer(allocation, result)?;
     }
@@ -211,41 +253,71 @@ impl Batch {
         &mut self,
         allocation: crate::db::entities::PoolAllocation,
         mut result: crate::db::entities::FinalResult,
-    ) -> Result<(), BatchError> {
-        let Some(job) = self.mutable_job(allocation.token.job)? else {
-            return self.corrupted("confirmed answer Job is missing".to_owned());
+    ) -> Result<(), StorageError> {
+        let job_id = allocation.token.job;
+        let Some(job) = self.mutable_job(job_id).map_err(|error| {
+            settlement_failure(error, "load confirmed answer Job", Some(job_id), None)
+        })?
+        else {
+            return Err(StorageError::corrupted(format!(
+                "confirmed answer Job {job_id} is missing"
+            )));
         };
-        self.normalize_summary_output(&job, &mut result)?;
-        self.settle_mutable_outcome(allocation.token, &job, OutcomeKind::Completed, result)?;
+        let failure = |error, operation| {
+            settlement_failure(error, operation, Some(job_id), Some(job.parent_id))
+        };
+        self.normalize_summary_output(&job, &mut result)
+            .map_err(|error| failure(error, "normalize confirmed summary"))?;
+        self.settle_mutable_outcome(allocation.token, &job, OutcomeKind::Completed, result)
+            .map_err(|error| failure(error, "settle confirmed outcome"))?;
         let mut released = allocation.clone();
         released.phase = crate::db::entities::AllocationPhase::Released;
-        self.put_pool_allocation(&released, Some(&allocation))?;
-        self.settle_summary_membership(&job)?;
-        self.settle_standalone_decision(&job)?;
+        self.put_pool_allocation(&released, Some(&allocation))
+            .map_err(|error| failure(error, "release confirmed Allocation"))?;
+        self.settle_summary_membership(&job)
+            .map_err(|error| failure(error, "settle confirmed summary membership"))?;
+        self.settle_standalone_decision(&job)
+            .map_err(|error| failure(error, "settle confirmed standalone Decision"))?;
         self.freed_capacity = true;
         Ok(())
     }
 }
 
-pub(crate) fn finish_closing_groups(batch: &mut Batch) -> Result<(), BatchError> {
+pub(crate) fn finish_closing_groups(batch: &mut Batch) -> Result<(), StorageError> {
     use std::ops::Bound::{Excluded, Unbounded};
     let mut after = None;
     loop {
-        let next = batch.step(|tx| {
-            let groups = tx.open_table(LIVE_CHILDREN)?;
-            let entry = groups
-                .range((after.map_or(Unbounded, Excluded), Unbounded))?
-                .next()
-                .transpose()?;
-            Ok(entry.map(|(key, _)| key.value()))
-        })?;
+        let next = batch
+            .step(|tx| {
+                let groups = tx.open_table(LIVE_CHILDREN)?;
+                let entry = groups
+                    .range((after.map_or(Unbounded, Excluded), Unbounded))?
+                    .next()
+                    .transpose()?;
+                Ok(entry.map(|(key, _)| key.value()))
+            })
+            .map_err(|error| {
+                settlement_failure(
+                    error,
+                    "scan closing Groups",
+                    None,
+                    after.map(|key: (u128, u128)| JobId::new(key.1)),
+                )
+            })?;
         let Some(key) = next else {
             return Ok(());
         };
         after = Some(key);
-        let spec = batch.require_mutable_conversation(JobId::new(key.1))?;
+        let group = JobId::new(key.1);
+        let spec = batch.job(group).map_err(|error| {
+            settlement_failure(error, "load closing Group", None, Some(group))
+        })?.ok_or_else(|| StorageError::corrupted(format!(
+            "recovery load closing Group {group}: LIVE_CHILDREN of Group {} references a missing Group", JobId::new(key.0)
+        )))?;
         if spec.is_chunk_group() {
-            batch.recover_chunk_group(&spec)?;
+            batch.recover_chunk_group(&spec).map_err(|error| {
+                settlement_failure(error, "recover closing Chunk Group", None, Some(group))
+            })?;
         }
     }
 }

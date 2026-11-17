@@ -4,7 +4,7 @@ use crate::db::entities::{
     JobState, LlmTransport, OutputKind, Recurrence,
 };
 use crate::db::entities::{JobId, OutcomeKind, Timestamp};
-use crate::db::redb::batch::{Batch, BatchError, Commit, Failure};
+use crate::db::redb::batch::{Batch, Commit};
 use crate::db::redb::codec::{Code, Enc, TAG_GLOBAL_COMPACTION};
 use crate::db::redb::rows::ConfigRow;
 use crate::db::redb::schema::{
@@ -552,8 +552,7 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
             return Err(StorageError::corrupted("invalid standalone Decision Job"));
         }
         let indexed_turn = turns.get((job.parent_id.get(), job.id.get()))?.is_some();
-        // A Decision turn can carry the same request state.
-        let predictive_child = !indexed_turn && jobs::is_predictive_helper(&job);
+        let predictive_child = jobs::is_predictive_helper(tx, &job)?;
         let expected = job.phase != crate::db::entities::MutableJobPhase::Unsubmitted
             && job.summary_source.is_none()
             && !spec.is_chunk_group()
@@ -1481,18 +1480,11 @@ fn initialize(database: &Database, fresh: bool) -> Result<u64, StorageError> {
 
     let mut batch = Batch::new(tx, epoch);
     batch.commit_mode = Some(Commit::Durable);
-    settle_confirmed_answers(&mut batch).map_err(|BatchError(failure)| match failure {
-        Failure::Storage(error) => error,
-        Failure::Rejected(violation) => {
-            StorageError::corrupted(format!("confirmed answer settlement refused: {violation}"))
-        }
-    })?;
-    finish_closing_groups(&mut batch).map_err(|BatchError(failure)| match failure {
-        Failure::Storage(error) => error,
-        Failure::Rejected(violation) => {
-            StorageError::corrupted(format!("group settlement refused: {violation}"))
-        }
-    })?;
+    settle_confirmed_answers(&mut batch)?;
+    finish_closing_groups(&mut batch)?;
+    batch
+        .check_failure()
+        .map_err(|error| settlement_failure(error, "commit initialization", None, None))?;
     batch.tx.commit()?;
     Ok(epoch)
 }

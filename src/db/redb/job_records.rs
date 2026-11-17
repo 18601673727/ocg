@@ -230,7 +230,13 @@ impl Batch {
                     &mut summary_budget,
                 ) {
                     Ok(pair) => pair,
-                    Err(_) => return Ok(None),
+                    Err(reads::execution_context::NativeSourceError::Unavailable(reason)) => {
+                        log::debug!("compaction source {id} unavailable: {reason}");
+                        return Ok(None);
+                    }
+                    Err(reads::execution_context::NativeSourceError::Storage(error)) => {
+                        return Err(error);
+                    }
                 };
                 boundaries.push(boundary);
                 cursor = prev;
@@ -406,148 +412,150 @@ impl Batch {
         } else {
             JobQueuePriority::Foreground
         };
-        self.put_message(&manifest_body)?;
-        let producer_id = JobId::new(self.next_id()?);
-        let mut dependency_ids = Vec::new();
-        if chunked {
-            let chunk_group = JobId::new(self.next_id()?);
-            let group_row = JobSpec {
-                id: chunk_group,
-                created_at: self.now,
-                parent_id: Some(conversation),
-                agent: None,
-                project: None,
-                origin: Origin::System,
-                keep_open: false,
-            };
-            self.insert(
-                CONVERSATIONS,
-                chunk_group.get(),
-                group_row.encode().as_slice(),
-            )?;
-            self.put_job_state(chunk_group, &JobState::new(chunk_group))?;
-            self.put_job_lifecycle(chunk_group, &JobLifecycle::default())?;
-            self.step(|tx| state::set_pending(tx, chunk_group, Some((0, 0))))?;
-            self.insert(CHILDREN, (conversation.get(), chunk_group.get()), ())?;
-            self.link_job_group(conversation, chunk_group)?;
-            self.adjust_open_children(conversation, 1)?;
-            for (idx, stage) in stages.iter().enumerate() {
-                if let SummarizationStage::Chunk { start, end, .. } = *stage {
-                    let chunk_slice = &source_text[start as usize..end as usize];
-                    let chunk_msg = MessageBody::new(&serde_json::json!({
-                        "source": source_digest,
-                        "chunk_index": idx,
-                        "text": chunk_slice,
-                    }))
-                    .map_err(|e| {
-                        BatchError(Failure::Storage(StorageError::corrupted(e.to_string())))
-                    })?;
-                    self.put_message(&chunk_msg)?;
-                    let chunk_id = JobId::new(self.next_id()?);
-                    let chunk_prompt = format!(
-                        "Summarize chunk {} (digest {}) for source {} into a JSON object matching {{\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens.\n\n{}",
-                        idx + 1,
-                        chunk_msg.digest(),
-                        source_digest,
-                        target,
-                        chunk_slice
-                    );
-                    let chunk_job = MutableJob {
-                        id: chunk_id,
-                        parent_id: chunk_group,
-                        previous: None,
-                        retry: None,
-                        composer_context: ComposerContextId::new(self.next_id()?),
-                        created_at: self.now,
-                        submitted_at: Some(self.now),
-                        revision: 1,
-                        phase: MutableJobPhase::Queued,
-                        input: MutableJobInput {
-                            priority,
-                            content: MutableJobContent::Generative {
-                                text: chunk_prompt,
-                                attachments: Vec::new(),
-                                configuration: Some(configuration),
+        self.atomic(|batch| {
+            batch.put_message(&manifest_body)?;
+            let producer_id = JobId::new(batch.next_id()?);
+            let mut dependency_ids = Vec::new();
+            if chunked {
+                let chunk_group = JobId::new(batch.next_id()?);
+                let group_row = JobSpec {
+                    id: chunk_group,
+                    created_at: batch.now,
+                    parent_id: Some(conversation),
+                    agent: None,
+                    project: None,
+                    origin: Origin::System,
+                    keep_open: false,
+                };
+                batch.insert(
+                    CONVERSATIONS,
+                    chunk_group.get(),
+                    group_row.encode().as_slice(),
+                )?;
+                batch.put_job_state(chunk_group, &JobState::new(chunk_group))?;
+                batch.put_job_lifecycle(chunk_group, &JobLifecycle::default())?;
+                batch.step(|tx| state::set_pending(tx, chunk_group, Some((0, 0))))?;
+                batch.insert(CHILDREN, (conversation.get(), chunk_group.get()), ())?;
+                batch.link_job_group(conversation, chunk_group)?;
+                batch.adjust_open_children(conversation, 1)?;
+                for (idx, stage) in stages.iter().enumerate() {
+                    if let SummarizationStage::Chunk { start, end, .. } = *stage {
+                        let chunk_slice = &source_text[start as usize..end as usize];
+                        let chunk_msg = MessageBody::new(&serde_json::json!({
+                            "source": source_digest,
+                            "chunk_index": idx,
+                            "text": chunk_slice,
+                        }))
+                        .map_err(|e| {
+                            BatchError(Failure::Storage(StorageError::corrupted(e.to_string())))
+                        })?;
+                        batch.put_message(&chunk_msg)?;
+                        let chunk_id = JobId::new(batch.next_id()?);
+                        let chunk_prompt = format!(
+                            "Summarize chunk {} (digest {}) for source {} into a JSON object matching {{\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens.\n\n{}",
+                            idx + 1,
+                            chunk_msg.digest(),
+                            source_digest,
+                            target,
+                            chunk_slice
+                        );
+                        let chunk_job = MutableJob {
+                            id: chunk_id,
+                            parent_id: chunk_group,
+                            previous: None,
+                            retry: None,
+                            composer_context: ComposerContextId::new(batch.next_id()?),
+                            created_at: batch.now,
+                            submitted_at: Some(batch.now),
+                            revision: 1,
+                            phase: MutableJobPhase::Queued,
+                            input: MutableJobInput {
+                                priority,
+                                content: MutableJobContent::Generative {
+                                    text: chunk_prompt,
+                                    attachments: Vec::new(),
+                                    configuration: Some(configuration),
+                                },
                             },
-                        },
-                        context_selection: MutableContextSelection::FullHistory,
-                        summary_source: None,
-                        frozen: Some(MutableFrozenConfiguration::Generative(frozen.clone())),
-                    };
-                    self.insert_native_summary_job(&chunk_job, &frozen, 0, true)?;
-                    self.insert(
-                        DEPENDENCY_WAITERS,
-                        (chunk_id.get(), producer_id.get()),
-                        DependencyCondition::Success.code(),
-                    )?;
-                    dependency_ids.push(chunk_id);
+                            context_selection: MutableContextSelection::FullHistory,
+                            summary_source: None,
+                            frozen: Some(MutableFrozenConfiguration::Generative(frozen.clone())),
+                        };
+                        batch.insert_native_summary_job(&chunk_job, &frozen, 0, true)?;
+                        batch.insert(
+                            DEPENDENCY_WAITERS,
+                            (chunk_id.get(), producer_id.get()),
+                            DependencyCondition::Success.code(),
+                        )?;
+                        dependency_ids.push(chunk_id);
+                    }
                 }
             }
-        }
-        let producer_prompt = if chunked {
-            format!(
-                "Merge {} chunk summaries for source {} into a single JSON object matching {{\"source\":\"{}\",\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens.",
-                dependency_ids.len(),
-                source_digest,
-                source_digest,
-                target
-            )
-        } else {
-            format!(
-                "Summarize conversation source {} into a single JSON object matching {{\"source\":\"{}\",\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens. Output ONLY valid JSON.",
-                source_digest, source_digest, target
-            )
-        };
-        let producer_job = MutableJob {
-            id: producer_id,
-            parent_id: conversation,
-            previous: None,
-            retry: None,
-            composer_context: ComposerContextId::new(self.next_id()?),
-            created_at: self.now,
-            submitted_at: Some(self.now),
-            revision: 1,
-            phase: MutableJobPhase::Queued,
-            input: MutableJobInput {
-                priority,
-                content: MutableJobContent::Generative {
-                    text: producer_prompt,
-                    attachments: Vec::new(),
-                    configuration: Some(configuration),
+            let producer_prompt = if chunked {
+                format!(
+                    "Merge {} chunk summaries for source {} into a single JSON object matching {{\"source\":\"{}\",\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens.",
+                    dependency_ids.len(),
+                    source_digest,
+                    source_digest,
+                    target
+                )
+            } else {
+                format!(
+                    "Summarize conversation source {} into a single JSON object matching {{\"source\":\"{}\",\"summary\":\"...\",\"omitted_details\":[...]}}. Target <= {} tokens. Output ONLY valid JSON.",
+                    source_digest, source_digest, target
+                )
+            };
+            let producer_job = MutableJob {
+                id: producer_id,
+                parent_id: conversation,
+                previous: None,
+                retry: None,
+                composer_context: ComposerContextId::new(batch.next_id()?),
+                created_at: batch.now,
+                submitted_at: Some(batch.now),
+                revision: 1,
+                phase: MutableJobPhase::Queued,
+                input: MutableJobInput {
+                    priority,
+                    content: MutableJobContent::Generative {
+                        text: producer_prompt,
+                        attachments: Vec::new(),
+                        configuration: Some(configuration),
+                    },
                 },
-            },
-            context_selection: MutableContextSelection::FullHistory,
-            summary_source: Some(source_digest),
-            frozen: Some(MutableFrozenConfiguration::Generative(frozen.clone())),
-        };
-        self.insert_native_summary_job(
-            &producer_job,
-            &frozen,
-            dependency_ids.len() as u32,
-            dependency_ids.is_empty(),
-        )?;
-        for prerequisite in &dependency_ids {
-            self.record_execution_event(
-                producer_id,
-                crate::db::entities::ExecutionEventKind::DependencyAdded {
-                    prerequisite: *prerequisite,
-                    condition: DependencyCondition::Success,
-                },
+                context_selection: MutableContextSelection::FullHistory,
+                summary_source: Some(source_digest),
+                frozen: Some(MutableFrozenConfiguration::Generative(frozen.clone())),
+            };
+            batch.insert_native_summary_job(
+                &producer_job,
+                &frozen,
+                dependency_ids.len() as u32,
+                dependency_ids.is_empty(),
             )?;
-        }
-        self.record_mutable_submission(&SubmissionRecord {
-            key: submission.key,
-            fingerprint: submission.fingerprint,
-            job: producer_id,
-            seq: 1,
-            recorded_at: self.now,
-        })?;
-        Ok(crate::db::entities::CompactionRequest::Prepared {
-            job: producer_id,
-            conversation,
-            through,
-            subsequent: active.is_some(),
-            already: false,
+            for prerequisite in &dependency_ids {
+                batch.record_execution_event(
+                    producer_id,
+                    crate::db::entities::ExecutionEventKind::DependencyAdded {
+                        prerequisite: *prerequisite,
+                        condition: DependencyCondition::Success,
+                    },
+                )?;
+            }
+            batch.record_mutable_submission(&SubmissionRecord {
+                key: submission.key,
+                fingerprint: submission.fingerprint,
+                job: producer_id,
+                seq: 1,
+                recorded_at: batch.now,
+            })?;
+            Ok(crate::db::entities::CompactionRequest::Prepared {
+                job: producer_id,
+                conversation,
+                through,
+                subsequent: active.is_some(),
+                already: false,
+            })
         })
     }
 

@@ -957,7 +957,7 @@ impl Batch {
                 "result does not match the frozen Decision request",
             ));
         }
-        let predictive_accept = if jobs::is_predictive_helper(&job) {
+        let predictive_accept = if self.step(|tx| jobs::is_predictive_helper(tx, &job))? {
             match &result.outcome {
                 crate::db::entities::DecisionOutcome::Answer {
                     answer:
@@ -991,39 +991,50 @@ impl Batch {
                 goal_reached: None,
                 value: Some(value),
             }),
-        );
-        if outcome.is_ok()
-            && let Some(true_probability) = predictive_accept
-            && let Ok((policy, _)) =
-                self.step(|tx| reads::catalog::effective_context_policy(&tx.open_table(META)?))
-            && let Some(pred) = &policy.predictive
-            && pred.mode == crate::db::entities::PredictionMode::Prepare
-        {
-            let min_prob = pred
-                .acceptance
-                .as_ref()
-                .map_or(500_000, |a| a.minimum_probability_millionths);
-            if true_probability * 1_000_000.0 >= f64::from(min_prob) {
-                let summarizer = policy.summarization_model.or(match &decision_frozen {
-                    FrozenDecisionConfig::Generative(g, _) => Some(g.llm.model.id),
-                    FrozenDecisionConfig::Native(_) => None,
-                });
-                if let Some(summarizer) = summarizer {
-                    let mut ctx = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-                    ctx.update(b"native-predictive-compaction");
-                    ctx.update(&job.parent_id.get().to_le_bytes());
-                    ctx.update(&job_id.get().to_le_bytes());
-                    let digest: [u8; 32] = ctx.finish().as_ref().try_into().unwrap_or([0; 32]);
-                    let submission = crate::db::entities::Submission {
-                        key: crate::db::entities::SubmissionKey::from_digest(digest),
-                        fingerprint: crate::db::entities::RequestFingerprint::from_digest(digest),
-                    };
-                    let _ =
-                        self.request_compaction_for(job.parent_id, summarizer, submission, None);
+        )?;
+        if let Some(true_probability) = predictive_accept {
+            self.automatic_compaction(|batch| {
+                let (policy, _) = batch
+                    .step(|tx| reads::catalog::effective_context_policy(&tx.open_table(META)?))?;
+                let Some(pred) = &policy.predictive else {
+                    return Ok(());
+                };
+                if pred.mode != crate::db::entities::PredictionMode::Prepare {
+                    return Ok(());
                 }
-            }
+                let min_prob = pred
+                    .acceptance
+                    .as_ref()
+                    .map_or(500_000, |a| a.minimum_probability_millionths);
+                if true_probability * 1_000_000.0 >= f64::from(min_prob) {
+                    let summarizer = policy.summarization_model.or(match &decision_frozen {
+                        FrozenDecisionConfig::Generative(g, _) => Some(g.llm.model.id),
+                        FrozenDecisionConfig::Native(_) => None,
+                    });
+                    if let Some(summarizer) = summarizer {
+                        let mut ctx = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+                        ctx.update(b"native-predictive-compaction");
+                        ctx.update(&job.parent_id.get().to_le_bytes());
+                        ctx.update(&job_id.get().to_le_bytes());
+                        let digest: [u8; 32] = ctx.finish().as_ref().try_into().unwrap_or([0; 32]);
+                        let submission = crate::db::entities::Submission {
+                            key: crate::db::entities::SubmissionKey::from_digest(digest),
+                            fingerprint: crate::db::entities::RequestFingerprint::from_digest(
+                                digest,
+                            ),
+                        };
+                        batch.request_compaction_for(
+                            job.parent_id,
+                            summarizer,
+                            submission,
+                            None,
+                        )?;
+                    }
+                }
+                Ok(())
+            })?;
         }
-        outcome
+        Ok(outcome)
     }
 
     pub(crate) fn finalize_development_job(
@@ -1153,7 +1164,9 @@ impl Batch {
             && let Some(crate::db::entities::MutableFrozenConfiguration::Generative(frozen)) =
                 &job.frozen
         {
-            let _ = self.maybe_trigger_native_compaction(job.parent_id, frozen);
+            self.automatic_compaction(|batch| {
+                batch.maybe_trigger_native_compaction(job.parent_id, frozen)
+            })?;
         }
         Ok(crate::db::entities::AppendedOutput {
             output: id,

@@ -15,7 +15,7 @@ use crate::db::redb::rows::{ConfigRow, decode_project};
 use crate::db::redb::schema::{CONFIGS, CREDENTIALS, JOB_RUNTIME, META, PROJECTS};
 use crate::db::redb::state::JobRuntime;
 use ::redb::ReadableTable;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 impl Batch {
     pub(crate) fn set_global_compaction_settings(
@@ -569,22 +569,18 @@ impl Batch {
                     "predictive compaction requires a configured decision model",
                 ));
             }
-            let selected = body.default_model.or_else(|| body.models.first().copied());
             for model in body.models {
-                let record = self.require_config_kind(model, ConfigKind::DecisionModel)?;
-                if selected == Some(model)
-                    && !matches!(
-                        record.body,
-                        ConfigBody::DecisionModel(model)
-                            if model.declared_capabilities.contains(&DecisionCapability::Choice)
-                                && model.declared_capabilities.contains(&DecisionCapability::BinaryProbability)
-                    )
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "decision_agent",
-                        "context prediction requires Choice and BinaryProbability capabilities",
-                    ));
-                }
+                self.require_config_kind(model, ConfigKind::DecisionModel)?;
+            }
+            let frozen = self.freeze_decision_profile(predictive.decision_agent)?;
+            let capabilities = frozen.capabilities();
+            if !capabilities.contains(&DecisionCapability::Choice)
+                || !capabilities.contains(&DecisionCapability::BinaryProbability)
+            {
+                return self.reject(Violation::InvalidValue(
+                    "decision_agent",
+                    "context prediction requires Choice and BinaryProbability capabilities",
+                ));
             }
         }
         Ok(())
@@ -916,39 +912,51 @@ impl Batch {
                 emptied.insert(row.id);
             }
         }
-        let clear_policy = |policy: &mut crate::db::entities::CompactionPolicy| {
-            if policy
-                .summarization_model
-                .is_some_and(|model| ids.contains(&model))
-            {
-                policy.summarization_model = None;
+        let mut policies = self.step(|tx| {
+            let mut policies = Vec::new();
+            for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
+                let (key, bytes) = entry?;
+                if let Some(policy) = JobRuntime::decode_at(key.value(), bytes.value())?
+                    .lifecycle
+                    .compaction_policy
+                {
+                    policies.push(policy);
+                }
             }
-            if policy
-                .predictive
-                .as_ref()
-                .is_some_and(|prediction| emptied.contains(&prediction.decision_agent))
-            {
-                policy.predictive = None;
-            } else if let Some(prediction) = &mut policy.predictive
-                && prediction
-                    .acceptance
-                    .as_ref()
-                    .is_some_and(|pin| ids.contains(&pin.model.id))
-            {
-                prediction.mode = crate::db::entities::PredictionMode::Shadow;
-                prediction.acceptance = None;
-            }
-        };
+            policies
+                .push(reads::catalog::global_compaction_settings(&tx.open_table(META)?)?.policy);
+            Ok(policies)
+        })?;
+        policies.extend(agents.iter().filter_map(|row| match &row.body {
+            ConfigBody::Agent(agent) => agent.compaction_policy.clone(),
+            ConfigBody::Connection(_)
+            | ConfigBody::Model(_)
+            | ConfigBody::DecisionModel(_)
+            | ConfigBody::DecisionAgent(_) => None,
+        }));
+        let predictive_agents: BTreeSet<_> = policies
+            .iter()
+            .filter_map(|policy| policy.predictive.as_ref().map(|p| p.decision_agent))
+            .collect();
+        if !ids.is_disjoint(&predictive_agents) {
+            return self.reject(Violation::InvalidValue(
+                "archive",
+                "an enabled prediction policy still depends on this Decision Agent",
+            ));
+        }
+        let mut replacements = BTreeMap::new();
+        // Update Decision targets before validating policies that refer to them.
+        let mut agents = agents;
+        agents.sort_by_key(|row| row.kind != ConfigKind::DecisionAgent);
+        let mut changed_agents = Vec::new();
         for mut agent_row in agents {
             let before = agent_row.body.clone();
             match &mut agent_row.body {
                 ConfigBody::Agent(agent) => {
                     agent.models.retain(|model| !ids.contains(model));
-                    if let Some(policy) = &mut agent.compaction_policy {
-                        clear_policy(policy);
-                    }
                 }
                 ConfigBody::DecisionAgent(agent) => {
+                    let affected = agent.models.iter().any(|model| ids.contains(model));
                     agent.models.retain(|model| !ids.contains(model));
                     if agent
                         .default_model
@@ -956,12 +964,96 @@ impl Batch {
                     {
                         agent.default_model = None;
                     }
+                    if affected && predictive_agents.contains(&agent_row.id) {
+                        let mut replacement = None;
+                        for candidate in agent
+                            .default_model
+                            .into_iter()
+                            .chain(agent.models.iter().copied())
+                        {
+                            let record =
+                                self.require_config_kind(candidate, ConfigKind::DecisionModel)?;
+                            let ConfigBody::DecisionModel(model) = &record.body else {
+                                return self.corrupted("mismatched Decision Model body".into());
+                            };
+                            if !model
+                                .declared_capabilities
+                                .contains(&DecisionCapability::Choice)
+                                || !model
+                                    .declared_capabilities
+                                    .contains(&DecisionCapability::BinaryProbability)
+                            {
+                                continue;
+                            }
+                            let frozen = self.freeze_system_configuration(ExecutionConfiguration {
+                                reasoning_effort: None,
+                                agent_profile: Some(agent_row.id.into()),
+                                llm_profile: candidate.into(),
+                            });
+                            match frozen {
+                                Ok(FrozenConfiguration::Decision(frozen))
+                                    if frozen.validate().is_ok() =>
+                                {
+                                    replacement = Some((candidate, frozen));
+                                    break;
+                                }
+                                Ok(
+                                    FrozenConfiguration::Decision(_)
+                                    | FrozenConfiguration::Generative(_),
+                                )
+                                | Err(BatchError(Failure::Rejected(_))) => {}
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        let Some((model, frozen)) = replacement else {
+                            return self.reject(Violation::InvalidValue(
+                                "archive",
+                                "prediction still depends on this Decision Agent; no remaining model supports Choice and BinaryProbability",
+                            ));
+                        };
+                        agent.default_model = Some(model);
+                        replacements.insert(agent_row.id, frozen);
+                    }
                 }
                 ConfigBody::Connection(_) | ConfigBody::Model(_) | ConfigBody::DecisionModel(_) => {
                 }
             }
-            if agent_row.body != before {
+            if matches!(agent_row.body, ConfigBody::Agent(_)) {
+                changed_agents.push((agent_row, before));
+            } else if agent_row.body != before {
                 self.update_config(agent_row.id, agent_row.name, agent_row.body)?;
+            }
+        }
+        let clear_policy = |policy: &mut crate::db::entities::CompactionPolicy| {
+            if policy
+                .summarization_model
+                .is_some_and(|model| ids.contains(&model))
+            {
+                policy.summarization_model = None;
+            }
+            if let Some(prediction) = &mut policy.predictive
+                && let Some(pin) = &mut prediction.acceptance
+                && ids.contains(&pin.model.id)
+                && let Some(replacement) = replacements.get(&prediction.decision_agent)
+            {
+                pin.model = replacement.model_ref();
+                pin.reported_model.clear();
+                pin.confidence_semantics = replacement.confidence_semantics().to_owned();
+            }
+        };
+        // Agent policies also retain their mode and acceptance thresholds.
+        for policy in &mut policies {
+            clear_policy(policy);
+            self.check_compaction_policy(policy)?;
+        }
+        for (mut row, before) in changed_agents {
+            if let ConfigBody::Agent(agent) = &mut row.body
+                && let Some(policy) = &mut agent.compaction_policy
+            {
+                clear_policy(policy);
+            }
+            if row.body != before {
+                self.update_config(row.id, row.name, row.body)?;
             }
         }
         let conversations = self.step(|tx| {

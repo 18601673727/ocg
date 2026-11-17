@@ -90,6 +90,7 @@ pub(crate) struct Batch {
     pub(super) probe: Option<Probe>,
     pub(super) resource_deltas: Vec<NativeResourceDelta>,
     pub(super) execution_transaction: Option<u64>,
+    failure: Option<Failure>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -138,7 +139,11 @@ pub(crate) fn run_batch_declinable<T>(
         Ok(batch) => batch,
         Err(error) => return (BatchOutcome::failed_storage(error), false),
     };
-    match body(&mut batch) {
+    let result = body(&mut batch);
+    if let Some(failure) = batch.failure.take() {
+        return (finish_abort(batch.tx, failure), false);
+    }
+    match result {
         Err(BatchError(failure)) => (finish_abort(batch.tx, failure), false),
         Ok(Continue(value)) => (commit_batch(batch, value, commit), false),
         Ok(Break(value)) => match batch.tx.abort() {
@@ -253,6 +258,7 @@ impl Batch {
             probe: None,
             resource_deltas: Vec::new(),
             execution_transaction: None,
+            failure: None,
         }
     }
 
@@ -265,16 +271,50 @@ impl Batch {
     }
 
     pub(crate) fn corrupted<T>(&mut self, detail: String) -> Result<T, BatchError> {
-        Err(BatchError(Failure::Storage(StorageError::corrupted(
-            detail,
-        ))))
+        let failure = Failure::Storage(StorageError::corrupted(detail));
+        self.remember_failure(&failure);
+        Err(BatchError(failure))
+    }
+
+    fn remember_failure(&mut self, failure: &Failure) {
+        if self.failure.is_none()
+            || (matches!(self.failure, Some(Failure::Rejected(_)))
+                && matches!(failure, Failure::Storage(_)))
+        {
+            self.failure = Some(failure.clone());
+        }
+    }
+
+    pub(super) fn check_failure(&self) -> Result<(), BatchError> {
+        match &self.failure {
+            Some(failure) => Err(BatchError(failure.clone())),
+            None => Ok(()),
+        }
+    }
+
+    // Once writes start, even a caught business rejection must abort the batch.
+    pub(super) fn atomic<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<T, BatchError>,
+    ) -> Result<T, BatchError> {
+        self.check_failure()?;
+        let result = body(self);
+        if let Err(BatchError(failure)) = &result {
+            self.remember_failure(failure);
+        }
+        result
     }
 
     pub(super) fn step<T>(
         &mut self,
         f: impl FnOnce(&WriteTransaction) -> Result<T, StorageError>,
     ) -> Result<T, BatchError> {
-        f(&self.tx).map_err(|error| BatchError(Failure::Storage(error)))
+        self.check_failure()?;
+        let result = f(&self.tx).map_err(|error| BatchError(Failure::Storage(error)));
+        if let Err(BatchError(failure)) = &result {
+            self.remember_failure(failure);
+        }
+        result
     }
 
     pub(super) fn insert<'k, 'v, K, V>(

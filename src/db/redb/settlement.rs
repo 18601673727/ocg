@@ -20,6 +20,24 @@ use crate::db::redb::{reads, state};
 use ::redb::ReadableTable;
 
 impl Batch {
+    pub(super) fn automatic_compaction(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> Result<(), BatchError>,
+    ) -> Result<(), BatchError> {
+        let probe = self.probe;
+        let result = body(self);
+        // The caller's durable outcome remains the confirmation target.
+        self.probe = probe;
+        self.check_failure()?;
+        match result {
+            Err(BatchError(Failure::Rejected(reason))) => {
+                log::debug!("automatic compaction declined before writes: {reason}");
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
     pub(super) fn maybe_trigger_native_compaction(
         &mut self,
         conversation: JobId,
@@ -112,7 +130,7 @@ impl Batch {
                     {
                         summary_blocked = true;
                     }
-                } else if is_predictive_helper(&child_job) {
+                } else if is_predictive_helper(tx, &child_job)? {
                     pred_count = pred_count.saturating_add(1);
                     if outcome.is_none()
                         || (pred_interval_micros > 0
@@ -138,7 +156,7 @@ impl Batch {
                 key: crate::db::entities::SubmissionKey::from_digest(digest),
                 fingerprint: crate::db::entities::RequestFingerprint::from_digest(digest),
             };
-            let _ = self.request_compaction_for(conversation, summarizer, submission, Some(recipe));
+            self.request_compaction_for(conversation, summarizer, submission, Some(recipe))?;
         } else if let Some(pred) = &policy.predictive
             && pred.mode == crate::db::entities::PredictionMode::Prepare
             && !pred_blocked
@@ -164,20 +182,9 @@ impl Batch {
                     "trigger": trigger,
                 }),
             };
-            let decision_frozen = match self.freeze_decision_profile(pred.decision_agent) {
-                Err(BatchError(Failure::Rejected(reason))) => {
-                    log::warn!(
-                        "predictive compaction skipped for conversation {conversation}: {reason}"
-                    );
-                    return Ok(());
-                }
-                result => result?,
-            };
+            let decision_frozen = self.freeze_decision_profile(pred.decision_agent)?;
             if let Err(reason) = decision_request.validate(&decision_frozen.capabilities()) {
-                log::warn!(
-                    "predictive compaction skipped for conversation {conversation}: {reason}"
-                );
-                return Ok(());
+                return self.reject(Violation::InvalidValue("decision_agent", reason));
             }
             let input = crate::db::entities::MutableJobInput {
                 priority: crate::db::entities::JobQueuePriority::Speculative,
@@ -189,24 +196,26 @@ impl Batch {
             };
             let wrapped = FrozenConfiguration::Decision(decision_frozen);
             let storable = self.storable_frozen(&wrapped)?;
-            let pred_id = JobId::new(self.next_id()?);
-            let pred_job = crate::db::entities::MutableJob {
-                id: pred_id,
-                parent_id: conversation,
-                previous: None,
-                retry: None,
-                composer_context: crate::db::entities::ComposerContextId::new(self.next_id()?),
-                created_at: self.now,
-                submitted_at: Some(self.now),
-                revision: 1,
-                phase: crate::db::entities::MutableJobPhase::Queued,
-                input,
-                context_selection: crate::db::entities::MutableContextSelection::FullHistory,
-                summary_source: None,
-                frozen: Some(storable),
-            };
-            let req_tag = mutable_configuration_requirement(&wrapped);
-            self.enqueue_mutable_job(&pred_job, req_tag, TurnMembership::NonTurn, false, true)?;
+            self.atomic(|batch| {
+                let pred_id = JobId::new(batch.next_id()?);
+                let pred_job = crate::db::entities::MutableJob {
+                    id: pred_id,
+                    parent_id: conversation,
+                    previous: None,
+                    retry: None,
+                    composer_context: crate::db::entities::ComposerContextId::new(batch.next_id()?),
+                    created_at: batch.now,
+                    submitted_at: Some(batch.now),
+                    revision: 1,
+                    phase: crate::db::entities::MutableJobPhase::Queued,
+                    input,
+                    context_selection: crate::db::entities::MutableContextSelection::FullHistory,
+                    summary_source: None,
+                    frozen: Some(storable),
+                };
+                let req_tag = mutable_configuration_requirement(&wrapped);
+                batch.enqueue_mutable_job(&pred_job, req_tag, TurnMembership::NonTurn, false, true)
+            })?;
         }
         Ok(())
     }
