@@ -9,6 +9,7 @@ import { ApiError, type ApiClient } from "../runtime/api-client";
 import type { ConversationCard, ChildConversation, TaskPlan } from "../contracts";
 import { useConversationError } from "./conversation-errors";
 import { ApprovalRequest } from "./approval-request";
+import { ElicitationForm } from "@/components/assistant-ui/elements/elicitation-form";
 import { outputDisplayText } from "./job-transcript-model";
 import { DispatchSelectionCard } from "./dispatch-selection-card";
 
@@ -297,35 +298,39 @@ function ConversationQuestion({
   question,
   disabled,
   answer,
+  dismiss,
 }: {
   question: string;
   disabled: boolean;
   answer: (text: string) => void;
+  dismiss: () => void;
 }) {
   const { t } = useI18n();
   const [text, setText] = useState("");
   return (
-    <form
-      className="mt-2 flex flex-col gap-2"
-      onSubmit={(event) => {
-        event.preventDefault();
-        answer(text);
-      }}
-    >
-      <label className="flex flex-col gap-1">
-        {question}
-        <textarea
-          className="rounded border border-border bg-background p-2"
-          value={text}
-          onChange={(event) => setText(event.target.value)}
-          placeholder={t("chat.card.answerPlaceholder")}
-          disabled={disabled}
-        />
-      </label>
-      <Button type="submit" size="xs" disabled={disabled || !text.trim()}>
-        {t("chat.card.answer")}
-      </Button>
-    </form>
+    <ElicitationForm
+      state="request"
+      className="max-w-none"
+      server={t("chat.card.question")}
+      requestLabel=""
+      message={question}
+      fields={[
+        {
+          name: "answer",
+          label: t("chat.card.answer"),
+          kind: "multiline",
+          placeholder: t("chat.card.answerPlaceholder"),
+          value: text,
+          required: true,
+        },
+      ]}
+      disabled={disabled}
+      onFieldChange={(_, value) => setText(value)}
+      onAccept={() => answer(text)}
+      onDecline={dismiss}
+      acceptLabel={t("chat.card.answer")}
+      declineLabel={t("chat.card.dismiss")}
+    />
   );
 }
 
@@ -471,78 +476,58 @@ export function ConversationCardStrip({
           </div>
         )}
         {group.cards.map((card) => {
+          const key = `${card.kind}:${card.approval.join(":")}`;
+          const reject = () => void act(card, { decision: "reject" });
+          if (card.kind === "approval") {
+            return (
+              <ApprovalRequest
+                key={key}
+                tool={card.tool}
+                arguments={card.arguments}
+                assessment={card.assessment}
+                disabled={pending}
+                onApprove={() => void act(card, { decision: "approve" })}
+                onReject={reject}
+              />
+            );
+          }
+          if (card.kind === "question") {
+            return (
+              <ConversationQuestion
+                key={key}
+                question={card.question}
+                disabled={pending}
+                answer={(text) => void act(card, { answer: text })}
+                dismiss={reject}
+              />
+            );
+          }
+          if (!api) return null;
           return (
             <div
               className="w-full rounded-xl border border-border bg-card p-4 text-xs shadow-xs"
-              key={`${card.kind}:${card.approval.join(":")}`}
+              key={key}
             >
               <div className="mb-2 flex items-center justify-between gap-2">
                 <span className="text-sm font-medium text-foreground">
-                  {t(`chat.card.${card.kind}`)}
+                  {t("chat.card.dispatch")}
                 </span>
               </div>
-              {card.kind === "approval" && (
-                <>
-                  <ApprovalRequest
-                    tool={card.tool}
-                    arguments={card.arguments}
-                    assessment={card.assessment}
-                  />
-                  <div className="mt-3 flex gap-2">
-                    <Button
-                      size="xs"
-                      disabled={pending}
-                      onClick={() => void act(card, { decision: "approve" })}
-                    >
-                      {t("chat.card.approve")}
-                    </Button>
-                    <Button
-                      size="xs"
-                      variant="outline"
-                      disabled={pending}
-                      onClick={() => void act(card, { decision: "reject" })}
-                    >
-                      {t("chat.card.reject")}
-                    </Button>
-                  </div>
-                </>
-              )}
-              {card.kind === "dispatch" && api && (
-                <>
-                  <DispatchSelectionCard
-                    client={api}
-                    arguments={card.arguments}
-                    disabled={pending}
-                    onSelect={(selection) => void act(card, { answer: JSON.stringify(selection) })}
-                  />
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    className="mt-3"
-                    disabled={pending}
-                    onClick={() => void act(card, { decision: "reject" })}
-                  >
-                    {t("chat.card.dismiss")}
-                  </Button>
-                </>
-              )}
-              {card.kind === "question" && (
-                <>
-                  <ConversationQuestion
-                    question={card.question}
-                    disabled={pending}
-                    answer={(text) => void act(card, { answer: text })}
-                  />
-                  <Button
-                    size="xs"
-                    variant="outline"
-                    disabled={pending}
-                    onClick={() => void act(card, { decision: "reject" })}
-                  >
-                    {t("chat.card.dismiss")}
-                  </Button>
-                </>
-              )}
+              <DispatchSelectionCard
+                client={api}
+                arguments={card.arguments}
+                disabled={pending}
+                onSelect={(selection) => void act(card, { answer: JSON.stringify(selection) })}
+              />
+              <Button
+                size="xs"
+                variant="outline"
+                className="mt-3"
+                disabled={pending}
+                onClick={reject}
+              >
+                {t("chat.card.dismiss")}
+              </Button>
             </div>
           );
         })}

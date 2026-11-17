@@ -20,7 +20,6 @@ use crate::db::redb::schema::{
     ATTACHMENTS, CHILDREN, CONVERSATIONS, DEPENDENCY_WAITERS, EXECUTORS, JOB_OBSERVATIONS,
     JOB_OUTPUTS, JOB_RUNTIME, JOBS, LIVE_CHILDREN, MESSAGES, META, MUTABLE_READY, P_MAX, PENDING,
     POOL_ALLOCATIONS, POOLS, PROJECTS, REQUEST_EVENTS, REQUEST_TIMELINE, SUBMISSIONS, TOOL_CALLS,
-    TURNS,
 };
 use crate::db::redb::{allocations, indexes, reads, reservations, rows, state};
 use ::redb::ReadableTable;
@@ -587,7 +586,7 @@ impl Batch {
     }
 
     pub(crate) fn group_head(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
-        self.step(|tx| reads::jobs::turn_head(&tx.open_table(TURNS)?, conversation))
+        self.step(|tx| reads::jobs::turn_head(tx, conversation))
     }
     pub(crate) fn active_job(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
         self.step(|tx| Ok(reads::jobs::active_job_in(tx, conversation)?.map(|job| job.id)))

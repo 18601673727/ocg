@@ -12,7 +12,7 @@ use crate::db::redb::reservations::mutable_configuration_requirement;
 use crate::db::redb::rows::decode_output;
 use crate::db::redb::schema::{
     CHILDREN, DEPENDENCY_WAITERS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, META, MUTABLE_READY,
-    RECURRENCE_DUE, RECURRENCES, TURNS,
+    RECURRENCE_DUE, RECURRENCES,
 };
 use crate::db::redb::{reads, state};
 use ::redb::ReadableTable;
@@ -43,8 +43,7 @@ impl Batch {
         };
         let summarizer = policy.summarization_model.unwrap_or(frozen.llm.model.id);
         let total_tokens = self.step(|tx| {
-            let turns = tx.open_table(TURNS)?;
-            let Some(tip) = reads::jobs::turn_head(&turns, conversation)? else {
+            let Some(tip) = reads::jobs::turn_head(tx, conversation)? else {
                 return Ok(0usize);
             };
             let jobs = tx.open_table(JOBS)?;

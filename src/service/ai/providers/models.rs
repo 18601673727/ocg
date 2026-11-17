@@ -1,12 +1,11 @@
 use std::collections::BTreeMap;
 
-use super::{ACCEPT, Duration, Value, anthropic};
-use crate::system::http::{DiscoveryClientError, authorization, discovery_client};
+use super::{ACCEPT, DestinationPolicy, Duration, Value, anthropic};
+use crate::system::http::{authorization, provider_client_for};
 
 pub(crate) use crate::db::entities::DiscoveredModel as ProviderModel;
 
 pub(crate) enum ModelListError {
-    NotAuthorized,
     Unreachable,
     Rejected { status_code: u16, message: String },
     NotListed,
@@ -18,9 +17,6 @@ pub(crate) async fn list_models(
     protocol: Option<crate::db::entities::LlmTransport>,
     headers: &crate::system::http::RequestHeaders,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
-    if !crate::system::http::direct_diagnostic_loopback(endpoint) {
-        return Err(ModelListError::NotAuthorized);
-    }
     let base = super::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;
     let anthropic = protocol == Some(crate::db::entities::LlmTransport::AnthropicMessages);
     let decision = protocol.is_none();
@@ -33,12 +29,10 @@ pub(crate) async fn list_models(
         .transpose()
         .map_err(|_| ModelListError::Unreachable)?;
     ntex::time::timeout(Duration::from_secs(30), async {
-        let client = discovery_client(Duration::from_secs(30), endpoint)
-            .await
-            .map_err(|error| match error {
-                DiscoveryClientError::NotAuthorized => ModelListError::NotAuthorized,
-                DiscoveryClientError::Unavailable => ModelListError::Unreachable,
-            })?;
+        let client =
+            provider_client_for(Duration::from_secs(30), &DestinationPolicy::Standard, &base)
+                .await
+                .map_err(|_| ModelListError::Unreachable)?;
         let mut endpoint = if anthropic {
             format!("{base}?limit=1000")
         } else {

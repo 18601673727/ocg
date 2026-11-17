@@ -281,32 +281,15 @@ impl Batch {
             if self.unsupported_start_context(&job)?.is_some() || !eligible(&frozen, summary_work) {
                 continue;
             }
-            let external_target = match &frozen {
-                FrozenConfiguration::Generative(target)
-                | FrozenConfiguration::Decision(FrozenDecisionConfig::Generative(target, _)) => {
-                    Some(target)
-                }
-                FrozenConfiguration::Decision(FrozenDecisionConfig::Native(_)) => None,
-            };
-            let scheduled_external = if let Some(target) = external_target {
-                match self.scheduled_external_policy_for(target)? {
-                    ScheduledPolicyMatch::One { id, revision } => Some((id, revision)),
-                    ScheduledPolicyMatch::Ambiguous => continue,
-                    ScheduledPolicyMatch::None => {
-                        if !target
-                            .llm
-                            .provider
-                            .endpoint
-                            .as_deref()
-                            .is_some_and(crate::system::http::direct_diagnostic_loopback)
-                        {
-                            continue;
-                        }
-                        None
+            let scheduled_external = match &frozen {
+                FrozenConfiguration::Generative(target) => {
+                    match self.scheduled_external_policy_for(target)? {
+                        ScheduledPolicyMatch::One { id, revision } => Some((id, revision)),
+                        ScheduledPolicyMatch::Ambiguous => continue,
+                        ScheduledPolicyMatch::None => None,
                     }
                 }
-            } else {
-                None
+                FrozenConfiguration::Decision(_) => None,
             };
             let (operation, protocol) = match &frozen {
                 FrozenConfiguration::Generative(frozen) => (
@@ -886,6 +869,7 @@ impl Batch {
         self.store_mutable_job(&job)?;
         let previous = self.allocation_for_token(allocation.token)?;
         self.put_pool_allocation(&allocation, Some(&previous))?;
+        self.catalog_changed = true;
         self.probe = Some(Probe::MutableJobStarted(allocation.token, job.revision));
         Ok(job)
     }

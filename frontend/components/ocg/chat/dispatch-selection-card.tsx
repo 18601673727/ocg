@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { OptionList } from "@/components/assistant-ui/elements/option-list";
 import {
   Select,
   SelectContent,
@@ -235,45 +236,30 @@ export function DispatchSelectionCard({
         <ScrollArea
           className="max-h-56 rounded-md border border-border"
           viewportProps={{ className: "ocg-subtle-scrollbar" }}
-          contentProps={{ className: "space-y-2 p-2" }}
         >
-          {catalog?.projects.map((project) => (
-            <label
-              key={project.id}
-              className="flex items-start gap-2 rounded p-2 hover:bg-muted/40"
-            >
-              <input
-                type="checkbox"
-                className="mt-1 accent-primary"
-                checked={validProjects.includes(project.id)}
-                disabled={!validProjects.includes(project.id) && validProjects.length >= 16}
-                onChange={() =>
-                  setProjects((current) =>
-                    current.includes(project.id)
-                      ? current.filter((id) => id !== project.id)
-                      : [...current, project.id],
-                  )
-                }
-              />
-              <span className="min-w-0">
-                <span className="block">{project.name}</span>
-                <span className="block break-all text-xs text-muted-foreground">
-                  {project.root}
-                </span>
-                <span className="text-xs text-muted-foreground">
-                  {t("chat.dispatch.commands", {
-                    count: project.commands.filter((command) => command.status === "allowed")
-                      .length,
-                  })}{" "}
-                  ·{" "}
-                  {project.commands
-                    .filter((command) => command.status === "allowed")
-                    .map((command) => command.name)
-                    .join(", ")}
-                </span>
-              </span>
-            </label>
-          ))}
+          <OptionList
+            aria-label={t("chat.project")}
+            className="max-w-none rounded-none border-0 bg-transparent dark:bg-transparent"
+            selectionMode="multiple"
+            selected={validProjects}
+            maxSelections={16}
+            onSelectionChange={setProjects}
+            options={(catalog?.projects ?? []).map((project) => {
+              const commands = project.commands.filter((command) => command.status === "allowed");
+              return {
+                id: project.id,
+                label: project.name,
+                description: (
+                  <>
+                    <span className="block break-all">{project.root}</span>
+                    {t("chat.dispatch.commands", { count: commands.length })}
+                    {commands.length > 0 &&
+                      ` · ${commands.map((command) => command.name).join(", ")}`}
+                  </>
+                ),
+              };
+            })}
+          />
         </ScrollArea>
         {needsProject && !validProjects.length && (
           <p className="text-xs text-muted-foreground">{t("chat.dispatch.projectRequired")}</p>

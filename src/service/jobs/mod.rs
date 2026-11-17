@@ -142,15 +142,15 @@ pub(crate) fn prepare_development_handoff(
         DevelopmentResolvedCandidate::Generative(context) => {
             let snapshot = &context.snapshot;
             let frozen = &snapshot.configuration;
-            let granted = frozen
-                .agent
-                .as_ref()
-                .is_some_and(|agent| agent.workspace_grant().is_some());
+            let is_summary = snapshot.is_summary_work();
+            let granted = !is_summary
+                && frozen
+                    .workspace_enabled(snapshot.project.is_some())
+                    .map_err(|_| unavailable())?;
             let manages = frozen
                 .agent
                 .as_ref()
                 .is_some_and(|agent| agent.manages_jobs());
-            let is_summary = snapshot.is_summary_work();
             if is_summary {
                 if frozen.provider_refusal().is_some() || offer.is_some() {
                     return Err(unavailable());
@@ -266,9 +266,6 @@ pub(crate) fn prepare_development_handoff(
                 ContextNotices::default(),
             )
             .ok_or_else(unavailable)?;
-            if granted && snapshot.project.is_none() {
-                return Err(unavailable());
-            }
             if offer.is_none_or(|offer| offer.grant.is_none())
                 && let Some(project) = &snapshot.project
             {

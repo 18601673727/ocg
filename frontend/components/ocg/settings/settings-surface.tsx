@@ -2,7 +2,7 @@
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { useCallback, useEffect, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { Monitor, Moon, Sun } from "lucide-react";
+import { Moon, Sun } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -29,7 +29,7 @@ import {
   type ApiClient,
 } from "@/components/ocg/runtime/api-client";
 import { cn } from "@/lib/utils";
-import { Section, describeError } from "./settings-parts";
+import { ApiKeyInput, Section, describeError } from "./settings-parts";
 import { ProjectsSection } from "./projects-section";
 import { ProviderModelImport } from "./provider-model-import";
 import {
@@ -980,8 +980,7 @@ export function SettingsSurface({
                           </label>
                           <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
                             {t("settings.llm.apiKey")}
-                            <Input
-                              type="password"
+                            <ApiKeyInput
                               value={llmSecret}
                               onChange={(e) => setLlmSecret(e.target.value)}
                               placeholder={
@@ -989,8 +988,6 @@ export function SettingsSurface({
                                   ? t("settings.llm.apiKeyKeep")
                                   : t("settings.llm.apiKeyPlaceholder")
                               }
-                              autoComplete="new-password"
-                              spellCheck={false}
                             />
                           </label>
                         </div>
@@ -1575,11 +1572,6 @@ export function SettingsSurface({
                   value={theme.preferences.theme}
                   onChange={theme.setTheme}
                   options={[
-                    {
-                      value: "system",
-                      label: t("settings.theme.system"),
-                      preview: <Monitor aria-hidden="true" className="size-4" />,
-                    },
                     {
                       value: "light",
                       label: t("settings.theme.light"),

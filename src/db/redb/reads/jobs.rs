@@ -1,9 +1,10 @@
 use crate::db::derived::ActivityProjection;
 use crate::db::entities::{ConfigBody, ConfigId, DependencyState, OutcomeKind, ToolCallRef};
 use crate::db::entities::{
-    DependencyCondition, JobId, JobLifecycle, JobOutputId, JobOutputRecord, JobSearchPage, JobSpec,
-    JobState, JobTree, JobUsage, MutableConfiguration, MutableJobDetails, NativeJobItem, Origin,
-    OutputKind, Recurrence, RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
+    DependencyCondition, ExecutionEventKind, JobId, JobLifecycle, JobOutputId, JobOutputRecord,
+    JobSearchPage, JobSpec, JobState, JobTree, JobUsage, MutableConfiguration, MutableJob,
+    MutableJobContent, MutableJobDetails, NativeJobItem, Origin, OutputKind, Recurrence,
+    RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
 };
 use crate::db::redb::approvals::approved_calls;
 use crate::db::redb::batch::Batch;
@@ -11,9 +12,9 @@ use crate::db::redb::reads::conversations::{conversation_summary, conversation_t
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::{ConfigRow, decode_output, decode_tool_evidence, tool_call_ref};
 use crate::db::redb::schema::{
-    ACTIVE_ALLOCATIONS, APPROVALS, CHILDREN, CONFIGS, CONVERSATIONS, JOB_OBSERVATIONS, JOB_OUTPUTS,
-    JOB_RUNTIME, JOBS, MAX_OBSERVATION_SCAN, MAX_PAGE, OPEN_APPROVALS, POOL_ALLOCATIONS,
-    RECURRENCES, REQUEST_EVENTS, TOOL_CALLS, TURNS,
+    ACTIVE_ALLOCATIONS, APPROVALS, CHILDREN, CONFIGS, CONVERSATIONS, JOB_EVENTS, JOB_OBSERVATIONS,
+    JOB_OUTPUTS, JOB_RUNTIME, JOBS, MAX_OBSERVATION_SCAN, MAX_PAGE, OPEN_APPROVALS,
+    POOL_ALLOCATIONS, RECURRENCES, REQUEST_EVENTS, TOOL_CALLS, TURNS,
 };
 use crate::db::redb::{StorageError, TxRead, allocations, rows, state};
 use crate::db::redb::{execution, observations};
@@ -41,15 +42,70 @@ pub(crate) fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobState, St
     Ok(state::require(rx, id)?.state)
 }
 
-pub(crate) fn turn_head(
-    turns: &impl ReadableTable<(u128, u128), ()>,
-    group: JobId,
-) -> Result<Option<JobId>, StorageError> {
-    Ok(turns
+pub(crate) fn turn_head(tx: &impl TxRead, group: JobId) -> Result<Option<JobId>, StorageError> {
+    let turns = tx.table(TURNS)?;
+    let jobs = tx.table(JOBS)?;
+    for entry in turns
         .range((group.get(), 0)..=(group.get(), u128::MAX))?
-        .next_back()
+        .rev()
+    {
+        let id = entry?.0.value().1;
+        let row = jobs
+            .get(id)?
+            .ok_or_else(|| StorageError::corrupted("turn has no source Job"))?;
+        let job = crate::db::redb::jobs::decode_mutable_job(id, row.value())?;
+        if project_planning_target(tx, &job)?.is_none() {
+            return Ok(Some(job.id));
+        }
+    }
+    Ok(None)
+}
+
+pub(super) fn project_planning_target(
+    tx: &impl TxRead,
+    job: &MutableJob,
+) -> Result<Option<JobId>, StorageError> {
+    let MutableJobContent::Decision { request, .. } = &job.input.content else {
+        return Ok(None);
+    };
+    if request.state.get("kind").and_then(|value| value.as_str())
+        != Some("project_planning_decision")
+    {
+        return Ok(None);
+    }
+    let Some(target) = request
+        .state
+        .get("target_job")
+        .and_then(|value| value.as_str())
+        .and_then(|id| id.parse::<u128>().ok())
+    else {
+        return Ok(None);
+    };
+    // The planning dependency is recorded in the transaction that creates the Decision.
+    let events = tx.table(JOB_EVENTS)?;
+    let Some((key, bytes)) = events
+        .range((job.id.get(), 0)..=(job.id.get(), u64::MAX))?
+        .next()
         .transpose()?
-        .map(|(key, _)| JobId::new(key.value().1)))
+    else {
+        return Ok(None);
+    };
+    let transaction = execution::decode_event(key.value(), bytes.value())?.transaction;
+    for entry in events.range((target, transaction)..=(target, u64::MAX))? {
+        let (key, bytes) = entry?;
+        let event = execution::decode_event(key.value(), bytes.value())?;
+        if event.transaction != transaction {
+            break;
+        }
+        if matches!(
+            event.kind,
+            ExecutionEventKind::DependencyAdded { prerequisite, condition: DependencyCondition::Success }
+                if prerequisite == job.id
+        ) {
+            return Ok(Some(JobId::new(target)));
+        }
+    }
+    Ok(None)
 }
 
 pub(crate) fn turn_first(
@@ -79,12 +135,13 @@ pub(crate) fn mutable_job_record_in(
     let state = state::decode_state(id.get(), state.value())?;
     let parent = read_conversation_row(rx, job.parent_id)?
         .ok_or_else(|| StorageError::corrupted("mutable Job conversation missing"))?;
-    Ok(Some(crate::db::entities::MutableJobRecord {
+    let record = crate::db::entities::MutableJobRecord {
         job,
         outcome: state.outcome,
         project: parent.project,
         event_seq: execution::latest_seq(rx, id)?,
-    }))
+    };
+    Ok(Some(record))
 }
 
 fn native_job_item(
@@ -336,12 +393,10 @@ fn dependency_state(
     condition: DependencyCondition,
 ) -> Result<DependencyState, StorageError> {
     let target = match read_conversation_row(rx, dependency)? {
-        Some(row) if !row.is_chunk_group() => {
-            match turn_head(&rx.open_table(TURNS)?, dependency)? {
-                Some(head) => head,
-                None => return Ok(DependencyState::Waiting),
-            }
-        }
+        Some(row) if !row.is_chunk_group() => match turn_head(rx, dependency)? {
+            Some(head) => head,
+            None => return Ok(DependencyState::Waiting),
+        },
         Some(_) | None => dependency,
     };
     let state = rx

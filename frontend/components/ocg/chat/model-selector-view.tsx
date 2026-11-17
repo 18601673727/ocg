@@ -10,7 +10,7 @@ import {
 } from "@/components/ui/select";
 import { Popover } from "@base-ui/react/popover";
 import { ChevronDown, Cpu, Folder } from "lucide-react";
-import { useId } from "react";
+import { useId, type Ref } from "react";
 import { useI18n } from "../i18n";
 import { useConversationError } from "./conversation-errors";
 
@@ -22,6 +22,7 @@ type SelectorField = {
 
 export type ModelSelectorViewProps = {
   providerLabel?: string;
+  triggerRef?: Ref<HTMLButtonElement>;
   defaultEffort?: string | null;
   status: string;
   disabled: boolean;
@@ -44,6 +45,7 @@ export function ModelSelectorView({
   effort,
   providerLabel,
   defaultEffort,
+  triggerRef,
 }: ModelSelectorViewProps) {
   const { t } = useI18n();
   const id = useId();
@@ -57,7 +59,7 @@ export function ModelSelectorView({
       ? `${providerName} / ${modelName} / ${effortName}`
       : t(loading ? "chat.modelsLoading" : "chat.noModels");
   const compactClass =
-    "h-11 min-w-0 rounded-lg border border-border/70 bg-card px-2.5 text-sm text-foreground transition-colors hover:border-ring/50 hover:bg-muted outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 pointer-fine:h-9";
+    "h-11 min-w-0 rounded-full border border-transparent bg-transparent px-2.5 text-sm text-muted-foreground transition-colors hover:bg-muted/65 hover:text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 pointer-fine:h-8";
   const selectClass =
     "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
 
@@ -83,7 +85,7 @@ export function ModelSelectorView({
           >
             <SelectTrigger
               aria-label={t("chat.project")}
-              className={`${compactClass} max-w-full data-[size=default]:h-11 pointer-fine:data-[size=default]:h-9`}
+              className={`${compactClass} max-w-full data-[size=default]:h-11 pointer-fine:data-[size=default]:h-8`}
             >
               <Folder className="size-3.5 text-muted-foreground" aria-hidden="true" />
               <SelectValue className="min-w-0 truncate" />
@@ -101,6 +103,7 @@ export function ModelSelectorView({
         <div className="min-w-0 flex-1">
           <Popover.Root>
             <Popover.Trigger
+              ref={triggerRef}
               disabled={disabled}
               aria-label={`${t("chat.executionSettings")} · ${selectionLabel}`}
               title={selectionLabel}

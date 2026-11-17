@@ -211,7 +211,7 @@ where
             log::info!(
                 "autonomous scheduling: {}",
                 if execution.is_autonomous() {
-                    "enabled for stored jobs (loopback endpoints direct; external endpoints require an active scheduled external policy and grant)"
+                    "enabled for stored jobs using their configured Provider endpoints"
                 } else {
                     "disabled"
                 }
@@ -291,9 +291,6 @@ async fn serve_api<F>(
     if let Some(address) = listener.as_ref().map(ApiServer::address) {
         log::info!("API server listening on http://{address}");
         eprintln!("OCG API server listening on http://{address}");
-    }
-    if let Some(pairing) = listener.as_ref().and_then(ApiServer::pairing_code) {
-        eprintln!("OCG local browser pairing code: {pairing}");
     }
     eprintln!("OCG host running");
     until_stopped(handle).await;

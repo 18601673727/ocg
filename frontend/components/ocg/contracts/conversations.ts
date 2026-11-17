@@ -150,7 +150,8 @@ export function projectConversation(page: Api.Turns): Conversation {
       const decision = nativeDecision(turn.native_decision);
       if (
         (turn.content_kind === "decision" && !decision) ||
-        (turn.content_kind === "generative" && decision)
+        (turn.content_kind === "generative" && decision) ||
+        (turn.planning_target !== undefined && !decision)
       )
         throw new Error("Inconsistent Conversation content kind.");
       const entries = turn.entries.map((entry) => ({
@@ -165,6 +166,7 @@ export function projectConversation(page: Api.Turns): Conversation {
       return {
         job: turn.job,
         native_decision: decision,
+        planning_target: turn.planning_target,
         content_kind: turn.content_kind,
         entries,
         compaction: turn.compaction,

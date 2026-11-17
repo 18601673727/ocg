@@ -2,6 +2,7 @@
 
 import { useI18n, type I18nKey } from "../i18n";
 import type { ApprovalAssessment } from "../contracts/api";
+import { ApprovalCard } from "@/components/assistant-ui/elements/approval-card";
 
 const ACTION_LABELS: Record<string, I18nKey> = {
   job_plan: "chat.card.plan",
@@ -17,10 +18,16 @@ export function ApprovalRequest({
   tool,
   arguments: raw,
   assessment,
+  disabled,
+  onApprove,
+  onReject,
 }: {
   tool: string;
   arguments: string;
   assessment?: ApprovalAssessment;
+  disabled: boolean;
+  onApprove: () => void;
+  onReject: () => void;
 }) {
   const { t, locale } = useI18n();
   const percent = (value: number) =>
@@ -81,9 +88,19 @@ export function ApprovalRequest({
         ? t("chat.card.commandGrantNote")
         : t("chat.card.review");
   return (
-    <div className="space-y-2">
-      <p className="text-sm font-medium">{t(ACTION_LABELS[tool] ?? "chat.card.action")}</p>
-      <p className="text-muted-foreground">{note}</p>
+    <ApprovalCard
+      state="request"
+      className="max-w-none text-xs"
+      title={t(ACTION_LABELS[tool] ?? "chat.card.action")}
+      subtitle={t("chat.card.approval")}
+      description={note}
+      command={target ?? undefined}
+      disabled={disabled}
+      allowOnceLabel={t("chat.card.approve")}
+      denyLabel={t("chat.card.reject")}
+      onAllowOnce={onApprove}
+      onDeny={onReject}
+    >
       {plan && (
         <ol className="space-y-3 py-1" aria-label={t("chat.card.plan")}>
           {plan.map((step, index) => (
@@ -131,7 +148,6 @@ export function ApprovalRequest({
           ))}
         </ol>
       )}
-      {target && <p className="break-all rounded-md bg-muted/50 px-3 py-2 font-mono">{target}</p>}
       {assessment && (
         <div
           className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground"
@@ -171,6 +187,6 @@ export function ApprovalRequest({
           </pre>
         </div>
       </details>
-    </div>
+    </ApprovalCard>
   );
 }

@@ -140,11 +140,6 @@ const WRONG_PROFILE_KIND: Refusal = Refusal::new(
     "wrong_profile_kind",
     "a Profile's kind cannot be changed after creation",
 );
-const PROVIDER_DISCOVERY_DISABLED: Refusal = Refusal::new(
-    StatusCode::FORBIDDEN,
-    "provider_discovery_disabled",
-    "model discovery against this endpoint is disabled in this build; only a literal loopback endpoint is permitted",
-);
 const PROFILE_CHANGED: Refusal = Refusal::new(
     StatusCode::CONFLICT,
     "profile_changed",
@@ -375,14 +370,9 @@ fn default_credential_ref(name: &str) -> String {
 
 pub(crate) fn map_mutation_error(error: DatabaseError) -> Refusal {
     match error {
-        DatabaseError::Rejected(Violation::InvalidValue(
-            "executor",
-            "no enabled native Executor supports this operation and protocol",
-        )) => Refusal::new(
-            StatusCode::CONFLICT,
-            "executor_unavailable",
-            "no enabled Executor supports this operation and protocol",
-        ),
+        DatabaseError::Rejected(Violation::InvalidValue("executor", reason)) => {
+            Refusal::new(StatusCode::CONFLICT, "executor_unavailable", reason)
+        }
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
         DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
         DatabaseError::Rejected(Violation::ProfileChanged) => PROFILE_CHANGED,
@@ -1845,9 +1835,6 @@ pub(crate) async fn provider_models(
     if request.credential.is_some() && request.credential_ref.is_some() {
         return Err(INVALID_PROFILE_BODY);
     }
-    if !crate::system::http::direct_diagnostic_loopback(&request.endpoint) {
-        return Err(PROVIDER_DISCOVERY_DISABLED);
-    }
     let saved_connection = request.credential.is_none();
     let credential = match request.credential {
         Some(credential) => Some(credential),
@@ -1925,7 +1912,6 @@ pub(crate) async fn provider_models(
                 models
             }))));
         }
-        Err(ModelListError::NotAuthorized) => return Err(PROVIDER_DISCOVERY_DISABLED),
         Err(ModelListError::Unreachable) => (
             "provider_unreachable",
             "could not connect to the provider".to_owned(),

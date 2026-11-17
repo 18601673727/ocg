@@ -1,18 +1,40 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  ComposerPrimitive,
+  unstable_useSlashCommandAdapter,
+  useAui,
+  type Unstable_SlashCommand,
+} from "@assistant-ui/react";
+import { Cpu, Paperclip } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Textarea } from "@/components/ui/textarea";
-import Image from "next/image";
+import {
+  AttachmentTile,
+  AttachmentTileRemove,
+} from "@/components/assistant-ui/elements/attachment.aui";
+import {
+  Composer,
+  ComposerActions,
+  ComposerAttachButton,
+  ComposerAttachments,
+  ComposerBar,
+  ComposerSend,
+  ComposerToolbar,
+} from "@/components/assistant-ui/elements/composer";
+import { ComposerTriggerPopover } from "@/components/assistant-ui/elements/composer-trigger-popover.aui";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { ApiError, type MutableJob, type MutableJobInput } from "../runtime/api-client";
 import type { ChatModelSelection, ChatImage } from "../contracts";
 import { ModelSelector, type ModelImageSupport } from "./model-selector";
+import { useI18n } from "../i18n";
 
 export const MUTABLE_CONTEXT_KEY = "ocg.mutable-composer.context.v1";
 const QUEUED_KEY = "ocg.mutable-composer.queued.v1";
 const UNFINISHED_KEY = "ocg.mutable-composer.unfinished.v1";
 const PENDING_KEY = "ocg.mutable-composer.pending-submission.v1";
+const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
+const SHORTCUT_ICONS = { attach: Paperclip, model: Cpu };
 const contexts = new Map<string, string>();
 let navigationGuard: (() => Promise<boolean>) | null = null;
 export async function confirmMutableComposerNavigation(): Promise<boolean> {
@@ -194,6 +216,8 @@ export function MutableComposer({
   onPreference,
 }: Props) {
   const { api, client } = useOcgRuntime();
+  const aui = useAui();
+  const { t } = useI18n();
   const work = useRef<Work>({
     context,
     job: null,
@@ -217,6 +241,7 @@ export function MutableComposer({
   const [uncertain, setUncertain] = useState(false);
   const [conflict, setConflict] = useState(false);
   const [uploading, setUploading] = useState(0);
+  const [dragActive, setDragActive] = useState(false);
   const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
   const pendingImagesRef = useRef<PendingImage[]>([]);
   const uploadTask = useRef<Promise<void> | null>(null);
@@ -227,10 +252,42 @@ export function MutableComposer({
   const [unfinished, setUnfinished] = useState<MutableJob[]>([]);
   const [editingQueue, setEditingQueue] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const modelTriggerRef = useRef<HTMLButtonElement>(null);
   const explicitSelection = useRef(false);
   const [support, setSupport] = useState<ModelImageSupport | null>(null);
   const imageSupport = useCallback((value: ModelImageSupport) => setSupport(value), []);
   const [queuedLoading, setQueuedLoading] = useState(false);
+  const inputDisabled = !ready || busy || conflict || uncertain;
+  const canAttach = !inputDisabled && uploading === 0 && Boolean(support?.supported);
+  const sendDisabled =
+    inputDisabled ||
+    pendingImages.length > 0 ||
+    (!editingQueue && !input.text.trim() && !input.attachments.length);
+  const commands: Unstable_SlashCommand[] = [];
+  if (canAttach) {
+    commands.push({
+      id: "attach",
+      icon: "attach",
+      description: t("chat.composer.attachImage"),
+      execute: () => executeShortcut(() => inputRef.current?.click()),
+    });
+  }
+  if (!inputDisabled && selection?.llmProfile) {
+    commands.push({
+      id: "model",
+      icon: "model",
+      description: t("chat.executionSettings"),
+      execute: () => executeShortcut(() => modelTriggerRef.current?.click()),
+    });
+  }
+  const slash = unstable_useSlashCommandAdapter({
+    commands,
+    removeOnExecute: true,
+    iconMap: SHORTCUT_ICONS,
+  });
+  useEffect(() => {
+    if (aui.composer.getState().text !== input.text) aui.composer.setText(input.text);
+  }, [aui, input.text]);
 
   useEffect(() => {
     const beforeUnload = (event: BeforeUnloadEvent) => {
@@ -534,6 +591,17 @@ export function MutableComposer({
       void flush().catch(() => {});
     }
   }
+  function changeText(text: string) {
+    change({
+      ...work.current.desired,
+      text,
+      configuration: work.current.desired.configuration ?? config(selection),
+    });
+  }
+  function executeShortcut(action: () => void) {
+    changeText(aui.composer.getState().text);
+    action();
+  }
   function setPending(next: PendingImage[]) {
     pendingImagesRef.current = next;
     if (alive.current) setPendingImages(next);
@@ -600,8 +668,8 @@ export function MutableComposer({
       if (uploadTask.current === task) uploadTask.current = null;
     });
   }
-  function selectImages(files: FileList | null) {
-    if (!files?.length) return;
+  function selectImages(files: readonly File[]) {
+    if (!files.length || !canAttach || uploadTask.current) return;
     if (
       work.current.desired.attachments.length + pendingImagesRef.current.length + files.length >
       8
@@ -609,7 +677,7 @@ export function MutableComposer({
       setError("At most eight images are supported.");
       return;
     }
-    const selected = Array.from(files, (file) => ({
+    const selected = files.map((file) => ({
       file,
       url: URL.createObjectURL(file),
       failed: false,
@@ -1009,7 +1077,7 @@ export function MutableComposer({
     }
   }
   return (
-    <div className="space-y-2 border-t border-border p-3">
+    <Composer className="max-w-none space-y-2">
       {unfinished.some((job) => job.id !== confirmed?.id) && (
         <div aria-label="Unsubmitted Jobs" className="space-y-1 text-sm">
           {unfinished
@@ -1041,7 +1109,7 @@ export function MutableComposer({
                 title={
                   job.autonomous_loopback_eligibility &&
                   !job.autonomous_loopback_eligibility.eligible
-                    ? `Not eligible for autonomous loopback scheduling (${job.autonomous_loopback_eligibility.code}): ${job.autonomous_loopback_eligibility.detail}`
+                    ? `Not eligible for automatic dispatch (${job.autonomous_loopback_eligibility.code}): ${job.autonomous_loopback_eligibility.detail}`
                     : undefined
                 }
               >
@@ -1078,190 +1146,236 @@ export function MutableComposer({
           ))}
         </div>
       )}
-      <label className="sr-only" htmlFor="mutable-job-input">
-        Message
-      </label>
-      <Textarea
-        id="mutable-job-input"
-        placeholder="Describe a task or ask a question…"
-        value={input.text}
-        disabled={!ready || busy || conflict || uncertain}
-        onChange={(event) =>
-          change({
-            ...work.current.desired,
-            text: event.target.value,
-            configuration: work.current.desired.configuration ?? config(selection),
-          })
-        }
-      />
-      <div className="flex flex-wrap gap-2">
-        {images.map((image) => (
-          <div key={image.id} className="flex items-center gap-1">
-            <Image
-              src={image.url}
-              alt={image.name}
-              width={48}
-              height={48}
-              unoptimized
-              className="h-12 w-12 rounded object-cover"
-            />
-            <Button
-              type="button"
-              size="xs"
-              variant="ghost"
-              disabled={busy || uncertain || conflict}
-              onClick={() => {
-                setImages((old) => old.filter((item) => item.id !== image.id));
-                change({
-                  ...work.current.desired,
-                  attachments: work.current.desired.attachments.filter((id) => id !== image.id),
-                });
+      <ComposerPrimitive.TriggerPopoverRoot>
+        <ComposerPrimitive.Root
+          className="aui-composer-root relative"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!sendDisabled) void send();
+          }}
+          onDragOver={(event) => {
+            if (!event.dataTransfer.types.includes("Files")) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = canAttach ? "copy" : "none";
+            if (canAttach) setDragActive(true);
+          }}
+          onDragLeave={(event) => {
+            if (
+              event.relatedTarget instanceof Node &&
+              event.currentTarget.contains(event.relatedTarget)
+            )
+              return;
+            setDragActive(false);
+          }}
+          onDrop={(event) => {
+            setDragActive(false);
+            if (!event.dataTransfer.files.length) return;
+            event.preventDefault();
+            selectImages(
+              Array.from(event.dataTransfer.files).filter((file) =>
+                IMAGE_TYPES.includes(file.type),
+              ),
+            );
+          }}
+        >
+          <ComposerBar
+            dragActive={dragActive && canAttach}
+            className="border-border shadow-sm focus-within:border-ring/50"
+          >
+            <ComposerAttachments className="aui-composer-attachments px-2 pt-1 empty:hidden">
+              {images.map((image) => (
+                <AttachmentTile
+                  key={image.id}
+                  src={image.url}
+                  name={image.name}
+                  isComposer
+                  remove={
+                    <AttachmentTileRemove
+                      name={image.name}
+                      disabled={busy || uncertain || conflict}
+                      onClick={() => {
+                        setImages((old) => old.filter((item) => item.id !== image.id));
+                        change({
+                          ...work.current.desired,
+                          attachments: work.current.desired.attachments.filter(
+                            (id) => id !== image.id,
+                          ),
+                        });
+                      }}
+                    />
+                  }
+                />
+              ))}
+              {pendingImages.map((item) => (
+                <AttachmentTile
+                  key={item.url}
+                  src={item.url}
+                  name={item.file.name}
+                  isComposer
+                  isUploading={!item.failed}
+                  isError={item.failed}
+                  errorMessage={item.failed ? "Upload failed" : undefined}
+                  remove={
+                    item.failed && (
+                      <AttachmentTileRemove
+                        name={item.file.name}
+                        onClick={() => {
+                          setPending(pendingImagesRef.current.filter((entry) => entry !== item));
+                          URL.revokeObjectURL(item.url);
+                        }}
+                      />
+                    )
+                  }
+                />
+              ))}
+            </ComposerAttachments>
+            <ComposerPrimitive.Input
+              id="mutable-job-input"
+              data-slot="composer-input"
+              className="aui-composer-input max-h-48 min-h-11 w-full resize-none overflow-y-auto bg-transparent px-3 py-2 text-base leading-6 caret-primary outline-none placeholder:text-muted-foreground"
+              placeholder={t("aui.composerPlaceholder")}
+              aria-label={t("aui.composerLabel")}
+              rows={1}
+              maxRows={8}
+              value={input.text}
+              disabled={inputDisabled}
+              submitMode="none"
+              cancelOnEscape={false}
+              addAttachmentOnPaste={false}
+              onChange={(event) => changeText(event.currentTarget.value)}
+              onPaste={(event) => {
+                if (!canAttach) return;
+                const images = Array.from(event.clipboardData.files).filter((file) =>
+                  IMAGE_TYPES.includes(file.type),
+                );
+                if (!images.length) return;
+                event.preventDefault();
+                selectImages(images);
               }}
-            >
-              Remove
-            </Button>
-          </div>
-        ))}
-      </div>
-      <div className="flex flex-wrap gap-2">
-        {pendingImages.map((item) => (
-          <div key={item.url} className="flex items-center gap-1">
-            <Image
-              src={item.url}
-              alt={item.file.name}
-              width={48}
-              height={48}
-              unoptimized
-              className="h-12 w-12 rounded object-cover"
             />
-            <span className="text-xs">{item.failed ? "Upload failed" : "Uploading…"}</span>
-            {item.failed && (
-              <Button
-                type="button"
-                size="xs"
-                variant="ghost"
-                onClick={() => {
-                  setPending(pendingImagesRef.current.filter((entry) => entry !== item));
-                  URL.revokeObjectURL(item.url);
+            <input
+              ref={inputRef}
+              type="file"
+              accept={IMAGE_TYPES.join(",")}
+              multiple
+              hidden
+              onChange={(event) => {
+                selectImages(Array.from(event.target.files ?? []));
+                event.target.value = "";
+              }}
+            />
+            {pendingImages.some((item) => item.failed) && (
+              <div role="alert" className="text-xs text-destructive">
+                Image upload failed.{" "}
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  disabled={busy || uploading > 0}
+                  onClick={() => {
+                    const retry = pendingImagesRef.current
+                      .filter((item) => item.failed)
+                      .map((item) => ({ ...item, failed: false }));
+                    setPending([
+                      ...pendingImagesRef.current.filter((item) => !item.failed),
+                      ...retry,
+                    ]);
+                    startUploads(retry);
+                  }}
+                >
+                  Retry upload
+                </Button>
+              </div>
+            )}
+            <ComposerToolbar className="gap-2">
+              <ComposerAttachButton
+                aria-label={t("chat.composer.attachImage")}
+                title={t("chat.composer.attachImage")}
+                className="shrink-0"
+                disabled={!canAttach}
+                onClick={() => inputRef.current?.click()}
+              />
+              <div
+                className="min-w-0 flex-1"
+                onPointerDownCapture={() => {
+                  explicitSelection.current = true;
+                }}
+                onKeyDownCapture={() => {
+                  explicitSelection.current = true;
                 }}
               >
-                Remove
-              </Button>
-            )}
-          </div>
-        ))}
-      </div>
-      <input
-        ref={inputRef}
-        type="file"
-        accept="image/png,image/jpeg,image/gif,image/webp"
-        multiple
-        hidden
-        onChange={(event) => {
-          selectImages(event.target.files);
-          event.target.value = "";
-        }}
-      />
-      {pendingImages.some((item) => item.failed) && (
-        <div role="alert" className="text-xs text-destructive">
-          Image upload failed.{" "}
-          <Button
-            type="button"
-            size="xs"
-            variant="ghost"
-            disabled={busy || uploading > 0}
-            onClick={() => {
-              const retry = pendingImagesRef.current
-                .filter((item) => item.failed)
-                .map((item) => ({ ...item, failed: false }));
-              setPending([...pendingImagesRef.current.filter((item) => !item.failed), ...retry]);
-              startUploads(retry);
-            }}
-          >
-            Retry upload
-          </Button>
-        </div>
-      )}
-      <div className="flex flex-wrap items-center gap-2">
-        <div
-          className="min-w-0 flex-1"
-          onPointerDownCapture={() => {
-            explicitSelection.current = true;
-          }}
-          onKeyDownCapture={() => {
-            explicitSelection.current = true;
-          }}
-        >
-          <ModelSelector
-            sessionId={sessionId}
-            selection={selection}
-            onChange={(value) => {
-              const projectChanged = value.project !== selection?.project;
-              onSelectionChange(value);
-              if (ready && explicitSelection.current) {
-                explicitSelection.current = false;
-                if (!projectChanged)
-                  change({ ...work.current.desired, configuration: config(value) });
-              }
-            }}
-            onPreference={onPreference}
-            onImageSupportChange={imageSupport}
-            busy={busy || !ready || uncertain || conflict}
-            statusText={
-              conflict
-                ? "Review the Job conflict before continuing."
-                : uncertain
-                  ? "Waiting to reconcile submission."
-                  : busy
-                    ? "Saving Job…"
-                    : undefined
-            }
-            projectLocked={Boolean(conversation || confirmed || work.current.association)}
-            lockedProject={
-              confirmed
-                ? confirmed.project
-                : conversation
-                  ? project
-                  : work.current.association?.project
-            }
-          />
-        </div>
-        <Button
-          type="button"
-          size="sm"
-          variant="outline"
-          disabled={!ready || busy || uncertain || conflict || uploading > 0 || !support?.supported}
-          onClick={() => inputRef.current?.click()}
-        >
-          Attach image
-        </Button>
-        {confirmed && !editingQueue && (
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            disabled={busy || uncertain || conflict || pendingImages.length > 0}
-            onClick={() => void discard()}
-          >
-            Discard
-          </Button>
-        )}
-        <Button
-          type="button"
-          size="sm"
-          disabled={
-            !ready ||
-            busy ||
-            pendingImages.length > 0 ||
-            conflict ||
-            uncertain ||
-            (!editingQueue && !input.text.trim() && !input.attachments.length)
-          }
-          onClick={() => void send()}
-        >
-          {editingQueue ? "Save queued Job" : "Send"}
-        </Button>
-      </div>
+                <ModelSelector
+                  triggerRef={modelTriggerRef}
+                  sessionId={sessionId}
+                  selection={selection}
+                  onChange={(value) => {
+                    const projectChanged = value.project !== selection?.project;
+                    onSelectionChange(value);
+                    if (ready && explicitSelection.current) {
+                      explicitSelection.current = false;
+                      if (!projectChanged)
+                        change({ ...work.current.desired, configuration: config(value) });
+                    }
+                  }}
+                  onPreference={onPreference}
+                  onImageSupportChange={imageSupport}
+                  busy={busy || !ready || uncertain || conflict}
+                  statusText={
+                    conflict
+                      ? "Review the Job conflict before continuing."
+                      : uncertain
+                        ? "Waiting to reconcile submission."
+                        : busy
+                          ? "Saving Job…"
+                          : undefined
+                  }
+                  projectLocked={Boolean(conversation || confirmed || work.current.association)}
+                  lockedProject={
+                    confirmed
+                      ? confirmed.project
+                      : conversation
+                        ? project
+                        : work.current.association?.project
+                  }
+                />
+              </div>
+              <ComposerActions className="shrink-0">
+                {confirmed && !editingQueue && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy || uncertain || conflict || pendingImages.length > 0}
+                    onClick={() => void discard()}
+                  >
+                    Discard
+                  </Button>
+                )}
+                {editingQueue ? (
+                  <Button type="submit" size="sm" disabled={sendDisabled}>
+                    Save queued Job
+                  </Button>
+                ) : (
+                  <ComposerSend
+                    type="submit"
+                    idle={sendDisabled}
+                    disabled={sendDisabled}
+                    aria-label={t("aui.sendMessage")}
+                    title={t("aui.sendMessage")}
+                  />
+                )}
+              </ComposerActions>
+            </ComposerToolbar>
+          </ComposerBar>
+          {commands.length > 0 && (
+            <ComposerTriggerPopover
+              char="/"
+              emptyItemsLabel={t("chat.composer.noCommands")}
+              {...slash}
+            />
+          )}
+        </ComposerPrimitive.Root>
+      </ComposerPrimitive.TriggerPopoverRoot>
       <p role="status" className="text-xs text-muted-foreground">
         {pendingImages.length ? "Images not yet saved" : status}
         {confirmed ? ` · revision ${confirmed.revision}` : ""}
@@ -1303,6 +1417,6 @@ export function MutableComposer({
           )}
         </div>
       )}
-    </div>
+    </Composer>
   );
 }

@@ -7,7 +7,7 @@ import type { DecisionLimits as DecisionLimits } from "../contracts/api";
 import type { ApiClient, ProfileWriteRequest } from "../runtime/api-client";
 import { isProfileConflict } from "../runtime/api-client";
 import { useI18n } from "../i18n";
-import { Section, describeError, selectableLlmProfiles } from "./settings-parts";
+import { ApiKeyInput, Section, describeError, selectableLlmProfiles } from "./settings-parts";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import {
@@ -239,9 +239,7 @@ function ProfileEditor({
               </label>
               <label className="grid gap-1 text-xs">
                 {t("decision.credential")}
-                <Input
-                  type="password"
-                  autoComplete="new-password"
+                <ApiKeyInput
                   value={credential}
                   onChange={(event) => setCredential(event.target.value)}
                 />

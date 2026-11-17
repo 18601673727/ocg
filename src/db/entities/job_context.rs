@@ -628,6 +628,7 @@ pub(crate) struct MutableConversationPage {
 }
 
 pub(crate) struct MutableConversationTurn {
+    pub planning_target: Option<JobId>,
     pub details: MutableJobDetails,
     pub outputs: Vec<JobOutputRecord>,
     pub outputs_truncated: bool,

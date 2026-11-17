@@ -6,6 +6,7 @@ import { useOcgRuntime } from "./runtime-context";
 import { createOcgExternalStoreAdapter, type OcgConversationState } from "./assistant-ui-adapter";
 import { useOcgApiUrl } from "../profile/api-url";
 import { useI18n } from "../i18n";
+import { planningConclusion } from "../chat/planning-decision";
 
 type OcgReloadConfig = {
   parentId: string | null;
@@ -29,7 +30,9 @@ export const OcgAssistantProvider: FC<OcgAssistantProviderProps> = ({
   const apiBaseUrl = useOcgApiUrl();
 
   const messages = useMemo(() => {
-    return runtime.snapshot.messagesBySession[sessionId] ?? [];
+    return (runtime.snapshot.messagesBySession[sessionId] ?? []).filter(
+      (message) => !message.planningTarget || !planningConclusion(message),
+    );
   }, [runtime.snapshot.messagesBySession, sessionId]);
 
   const hasEarlier = runtime.client.hasEarlierHistory?.(sessionId) ?? false;

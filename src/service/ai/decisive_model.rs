@@ -15,7 +15,6 @@ use crate::db::entities::{
     NormalizedUsage, RequestRef,
 };
 
-pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1";
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct DecisionExecution {
@@ -35,19 +34,13 @@ async fn execute_native_with_sink(
     reference: RequestRef,
     sink: &mut dyn super::providers::ProviderOutputSink,
 ) -> Result<DecisionExecution, ProviderExecutionError> {
-    if frozen
+    let endpoint = frozen
         .endpoint
         .as_deref()
-        .is_none_or(|endpoint| !crate::system::http::direct_diagnostic_loopback(endpoint))
-    {
-        return Err(ProviderExecutionError::Build {
-            message: "direct loopback endpoint required".into(),
-        });
-    }
-    let endpoint = super::providers::endpoint(
-        frozen.endpoint.as_deref().unwrap_or(DEFAULT_ENDPOINT),
-        "systemone",
-    )?;
+        .ok_or_else(|| ProviderExecutionError::Build {
+            message: "explicit endpoint required".into(),
+        })?;
+    let endpoint = super::providers::endpoint(endpoint, "systemone")?;
     let (response, started, redactor) = super::providers::send(
         endpoint,
         (frozen.credential_ref.as_deref(), &frozen.headers),

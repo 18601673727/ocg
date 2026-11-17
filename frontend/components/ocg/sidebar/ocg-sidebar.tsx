@@ -54,6 +54,7 @@ import { SELECTED_ROW } from "../primitives/selection";
 import type { Project } from "../contracts";
 import { usePinnedConversations } from "./sidebar-preferences";
 import { SidebarConversationChildren } from "./conversation-children";
+import { ConversationStatus } from "./conversation-status";
 import { HoverMarquee } from "./hover-marquee";
 
 const subscribePlatform = () => () => {};
@@ -664,9 +665,13 @@ export function OcgSidebar({
                         const canExpand =
                           canLoadChildren &&
                           (session.hasChildren ?? childAvailability[session.id] === true);
-                        const running = session.jobState
-                          ? session.jobState === "running"
-                          : runningSessionIds.has(session.id);
+                        const jobState =
+                          session.jobState ??
+                          (runningSessionIds.has(session.id) ? "running" : undefined);
+                        const status =
+                          jobState === "queued" || jobState === "running" ? (
+                            <ConversationStatus state={jobState} />
+                          ) : null;
                         const pinId = session.conversationId ?? session.id;
                         const isPinned = pinned.has(pinId);
                         const hasActions = Boolean(session.conversationId && (onRename || onHide));
@@ -681,7 +686,7 @@ export function OcgSidebar({
                               )}
                             >
                               <span className="flex w-9 shrink-0 items-center justify-center">
-                                {canExpand && (
+                                {canExpand ? (
                                   <button
                                     type="button"
                                     aria-expanded={expanded}
@@ -705,6 +710,8 @@ export function OcgSidebar({
                                       aria-hidden="true"
                                     />
                                   </button>
+                                ) : (
+                                  status
                                 )}
                               </span>
                               <button
@@ -716,8 +723,9 @@ export function OcgSidebar({
                                 }}
                                 aria-current={active ? "true" : undefined}
                                 title={session.title || t("sidebar.newChat")}
-                                className="flex h-full min-w-0 flex-1 items-center pr-2 text-left text-[13px] leading-5 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+                                className="flex h-full min-w-0 flex-1 items-center gap-1.5 pr-2 text-left text-[13px] leading-5 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-sidebar-ring"
                               >
+                                {canExpand && status}
                                 <HoverMarquee className="min-w-0 flex-1">
                                   {session.title || t("sidebar.newChat")}
                                 </HoverMarquee>
@@ -731,23 +739,14 @@ export function OcgSidebar({
                                     isMenuOpen && "opacity-0",
                                   )}
                                 >
-                                  {running ? (
-                                    <LoaderCircle
-                                      className="size-3.5 animate-spin text-primary motion-reduce:animate-none"
-                                      aria-label={t("sidebar.running")}
-                                    />
-                                  ) : (
-                                    <>
-                                      <time
-                                        dateTime={session.updatedAt}
-                                        title={new Date(session.updatedAt).toLocaleString(locale)}
-                                      >
-                                        {relativeTime(session.updatedAt)}
-                                      </time>
-                                      {isPinned && (
-                                        <Pin className="size-3" aria-label={t("sidebar.pinned")} />
-                                      )}
-                                    </>
+                                  <time
+                                    dateTime={session.updatedAt}
+                                    title={new Date(session.updatedAt).toLocaleString(locale)}
+                                  >
+                                    {relativeTime(session.updatedAt)}
+                                  </time>
+                                  {isPinned && (
+                                    <Pin className="size-3" aria-label={t("sidebar.pinned")} />
                                   )}
                                 </span>
                                 {hasActions && (
@@ -770,21 +769,7 @@ export function OcgSidebar({
                                         <Pin className="size-3.5" />
                                       )}
                                     </button>
-                                    {onHide && session.sessionId && (
-                                      <button
-                                        type="button"
-                                        className="flex size-6 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
-                                        aria-label={t("sidebar.hideChat")}
-                                        title={t("sidebar.hideChat")}
-                                        onClick={() => {
-                                          setHideError(null);
-                                          setHideTarget(session);
-                                        }}
-                                      >
-                                        <Archive className="size-3.5" />
-                                      </button>
-                                    )}
-                                    {onRename && session.sessionId && (
+                                    {(onRename || onHide) && session.sessionId && (
                                       <DropdownMenu
                                         open={isMenuOpen}
                                         onOpenChange={(open) =>
@@ -803,17 +788,31 @@ export function OcgSidebar({
                                           </button>
                                         </DropdownMenuTrigger>
                                         <DropdownMenuContent align="end">
-                                          <DropdownMenuItem
-                                            onSelect={() => {
-                                              openRename(
-                                                session.id,
-                                                session.title || "",
-                                                "session",
-                                              );
-                                            }}
-                                          >
-                                            {t("sidebar.renameChat")}
-                                          </DropdownMenuItem>
+                                          {onRename && (
+                                            <DropdownMenuItem
+                                              onSelect={() =>
+                                                openRename(
+                                                  session.id,
+                                                  session.title || "",
+                                                  "session",
+                                                )
+                                              }
+                                            >
+                                              {t("sidebar.renameChat")}
+                                            </DropdownMenuItem>
+                                          )}
+                                          {onHide && (
+                                            <DropdownMenuItem
+                                              className="gap-2"
+                                              onSelect={() => {
+                                                setHideError(null);
+                                                setHideTarget(session);
+                                              }}
+                                            >
+                                              <Archive className="size-3.5" aria-hidden="true" />
+                                              {t("sidebar.hideChat")}
+                                            </DropdownMenuItem>
+                                          )}
                                         </DropdownMenuContent>
                                       </DropdownMenu>
                                     )}

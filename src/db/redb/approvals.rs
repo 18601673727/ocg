@@ -172,12 +172,19 @@ impl Batch {
                 "decisions cannot continue a closing conversation",
             ));
         }
-        if decision == ApprovalDecision::Approved {
-            self.grant_project_command(&call, conversation)?;
-        }
+        let approved_command = if decision == ApprovalDecision::Approved {
+            self.grant_project_command(&call, conversation)?
+        } else {
+            None
+        };
         let text = match self.perform_decided_job_call(approval, conversation, &call, &decision)? {
             Some(text) => text,
-            None => continuation_text(&call.name, &decision),
+            None => match approved_command {
+                Some(name) => format!(
+                    "I approved the Project command `{name}`. Call `workspace_run_command` with command `{name}` and no extra arguments to run the approved argv, then continue with the actual result."
+                ),
+                None => continuation_text(&call.name, &decision),
+            },
         };
         self.put_approval(approval, decision, Actor::User)?;
         self.step(|tx| {
@@ -335,18 +342,19 @@ impl Batch {
         &mut self,
         call: &crate::db::entities::ToolEvidenceRecord,
         conversation: JobId,
-    ) -> Result<(), BatchError> {
+    ) -> Result<Option<String>, BatchError> {
         use crate::db::entities::{CommandOwner, Violation, validate_project_commands};
         let Some(mut project) = self.command_project(conversation)? else {
-            return Ok(());
+            return Ok(None);
         };
         let Some(input) = self.command_input(call, &project)? else {
-            return Ok(());
+            return Ok(None);
         };
-        if call.name == "workspace_request_command" {
+        let registered = if call.name == "workspace_request_command" {
             let mut command = input.command;
             command.owner = CommandOwner::User;
             command.proposal = None;
+            let name = command.name.clone();
             if let Some(index) = project
                 .commands
                 .iter()
@@ -356,15 +364,17 @@ impl Batch {
             } else {
                 project.commands.push(command);
             }
+            Some(name)
         } else if let Some(command) = project
             .commands
             .iter_mut()
             .find(|command| command.name == input.command.name)
         {
             command.owner = CommandOwner::User;
+            None
         } else {
-            return Ok(());
-        }
+            return Ok(None);
+        };
         if let Err(reason) = validate_project_commands(&project.commands) {
             return self.reject(Violation::InvalidValue(
                 match reason {
@@ -376,7 +386,8 @@ impl Batch {
             ));
         }
         project.updated_at = self.now;
-        self.insert_project(&project)
+        self.insert_project(&project)?;
+        Ok(registered)
     }
 
     pub(crate) fn void_approvals(

@@ -1,22 +1,19 @@
 import { APPEARANCE_STORAGE_KEY, DEFAULT_APPEARANCE } from "./theme-domain";
 
 export const THEME_BOOTSTRAP_SCRIPT = `(function () {
+  var fallback = ${JSON.stringify(DEFAULT_APPEARANCE)};
+  var theme = fallback.theme;
+  var accent = fallback.accent;
   try {
-    var stored = ${JSON.stringify(APPEARANCE_STORAGE_KEY)};
-    var fallback = ${JSON.stringify(DEFAULT_APPEARANCE)};
-    var raw = window.localStorage.getItem(stored);
+    var raw = window.localStorage.getItem(${JSON.stringify(APPEARANCE_STORAGE_KEY)});
     var saved = raw ? JSON.parse(raw) : null;
-    var mode = saved && (saved.theme === "light" || saved.theme === "dark" || saved.theme === "system")
-      ? saved.theme
-      : fallback.theme;
-    var dark = mode === "dark" || (mode === "system" && window.matchMedia("(prefers-color-scheme: dark)").matches);
-    var root = document.documentElement;
-    root.classList.toggle("dark", dark);
-    root.dataset.theme = dark ? "dark" : "light";
     if (saved) {
-      root.dataset.accent = saved.accent || fallback.accent;
+      if (saved.theme === "light" || saved.theme === "dark") theme = saved.theme;
+      if (saved.accent === "ochre" || saved.accent === "slate" || saved.accent === "teal") accent = saved.accent;
     }
-  } catch (error) {
-    document.documentElement.dataset.theme = "light";
-  }
+  } catch {}
+  var root = document.documentElement;
+  root.classList.toggle("dark", theme === "dark");
+  root.dataset.theme = theme;
+  root.dataset.accent = accent;
 })();`;

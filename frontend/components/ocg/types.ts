@@ -28,6 +28,7 @@ export type MessageStatus =
 
 export type ChatMessage = {
   decision?: import("./contracts/conversations").NativeDecisionTurn;
+  planningTarget?: string;
   agentInstruction?: boolean;
   compaction?: import("./contracts").ConversationTurn["compaction"];
   withdrawn?: boolean;

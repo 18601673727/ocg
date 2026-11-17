@@ -10,8 +10,9 @@ import {
   type FC,
   type ReactNode,
 } from "react";
-import { Thread } from "@/components/assistant-ui/elements/thread.aui";
+import { AssistantMessage, Thread } from "@/components/assistant-ui/elements/thread.aui";
 import { useAuiState } from "@assistant-ui/react";
+import { ChevronRight } from "lucide-react";
 import { OcgAssistantProvider } from "../runtime/assistant-ui-provider";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { ConversationChildrenStrip, ConversationCardStrip } from "./chat-view";
@@ -21,15 +22,17 @@ import { ConversationArtifacts } from "./conversation-artifacts";
 import { FileChanges } from "./file-changes";
 import { readModelPreference, writeModelPreference } from "./model-preference";
 import { useI18n } from "../i18n";
-import { executionDetail, executionLabel } from "../runtime/job-status";
 import type { ChatSession } from "../types";
 import type { ChatModelSelection } from "../contracts";
 import { ContextTranscript } from "./context-transcript";
 import { MutableComposer, contextForSession } from "./mutable-composer";
+import { DecisionDetails } from "./decision-details";
+import { planningBlocker } from "./planning-decision";
 
 export interface ChatScreenProps {
   session: ChatSession;
   onOpenConversation: (conversation: string) => void;
+  onOpenPlanningDecision: (decisionId: string) => void;
   backButton?: ReactNode;
 }
 
@@ -38,6 +41,7 @@ type ChatComposerContextValue = {
   selection?: ChatModelSelection;
   setSelection: (selection: ChatModelSelection) => void;
   onPreference: (selection: ChatModelSelection) => void;
+  onOpenPlanningDecision: (decisionId: string) => void;
 };
 
 const ChatComposerContext = createContext<ChatComposerContextValue | null>(null);
@@ -106,68 +110,17 @@ const Welcome: FC = () => {
 };
 
 function MessageFileChanges() {
-  const { t } = useI18n();
   const value = useContext(ChatComposerContext);
   const id = useAuiState((state) => state.message.id);
   const { snapshot } = useOcgRuntime();
   const messages = value ? (snapshot.messagesBySession[value.session.id] ?? []) : [];
   const message = messages.find((message) => message.id === id);
-  if (message?.decision) {
-    const { request, result } = message.decision;
+  if (message?.decision)
     return (
       <section className="my-3 rounded-lg border p-3" aria-label="Decision">
-        <strong>Decision · {request.question.kind.replaceAll("_", " ")}</strong>
-        <p className="mt-2 whitespace-pre-wrap">{request.question.prompt}</p>
-        {request.question.options?.map((option) => (
-          <p key={option.id}>
-            {option.id}: {option.description}
-          </p>
-        ))}
-        {request.question.levels?.map((level) => (
-          <p key={level.value}>
-            {level.value}: {level.description}
-          </p>
-        ))}
-        <details className="mt-2">
-          <summary>Caller state</summary>
-          <pre className="overflow-x-auto whitespace-pre-wrap">
-            {JSON.stringify(request.state, null, 2)}
-          </pre>
-        </details>
-        {result ? (
-          <>
-            <strong>Result</strong>
-            <pre className="overflow-x-auto whitespace-pre-wrap">
-              {JSON.stringify(result.outcome, null, 2)}
-            </pre>
-          </>
-        ) : (
-          <div className="mt-2" role="status">
-            <p>
-              <strong>
-                {message.execution
-                  ? executionLabel(t, message.execution)
-                  : message.status === "pending"
-                    ? "Pending"
-                    : `Job ${message.status}`}
-              </strong>
-              {message.decision.failure ? `: ${message.decision.failure}` : ""}
-            </p>
-            {message.execution && executionDetail(t, message.execution) && (
-              <p className="text-muted-foreground">{executionDetail(t, message.execution)}</p>
-            )}
-            {message.status === "unknown" &&
-              message.failureReason === undefined &&
-              !(message.execution && executionDetail(t, message.execution)) && (
-                <p className="text-muted-foreground">
-                  The outcome could not be established; it is not reported as stopped.
-                </p>
-              )}
-          </div>
-        )}
+        <DecisionDetails decision={message.decision} message={message} />
       </section>
     );
-  }
   if (
     !message?.jobId ||
     messages.findLast((item) => item.role === "assistant" && item.jobId === message.jobId)?.id !==
@@ -181,14 +134,54 @@ function MessageFileChanges() {
   return <FileChanges changes={calls.map((call) => ({ job, call }))} />;
 }
 
+function PlanningDecisionNotice() {
+  const value = useContext(ChatComposerContext);
+  const id = useAuiState((state) => state.message.id);
+  const { snapshot } = useOcgRuntime();
+  const { t } = useI18n();
+  if (!value) return null;
+  const message = snapshot.messagesBySession[value.session.id]?.find((item) => item.id === id);
+  if (!message?.jobId) return null;
+  const decisionId = message.jobId;
+  const reason = t("planning.blocked", { reason: planningBlocker(t, message) });
+  return (
+    <div className="flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
+      <span className="min-w-0 truncate" title={reason} role="status">
+        {reason}
+      </span>
+      <button
+        id={`planning-notice-${decisionId}`}
+        type="button"
+        className="inline-flex shrink-0 items-center gap-1 rounded-sm py-1 text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+        aria-controls="chat-inspector"
+        onClick={() => value.onOpenPlanningDecision(decisionId)}
+      >
+        {t("planning.openExecution")}
+        <ChevronRight aria-hidden="true" className="size-3" />
+      </button>
+    </div>
+  );
+}
+
+function ChatAssistantMessage() {
+  const planning = useAuiState((state) => state.message.metadata.custom.planningTarget);
+  return planning ? <PlanningDecisionNotice /> : <AssistantMessage />;
+}
+
 const THREAD_COMPONENTS = {
+  AssistantMessage: ChatAssistantMessage,
   Composer: ChatComposerSlot,
   Welcome,
   ToolFallback: WorkspaceToolFallback,
   MessageFooter: MessageFileChanges,
 };
 
-export const ChatScreen: FC<ChatScreenProps> = ({ session, onOpenConversation, backButton }) => {
+export const ChatScreen: FC<ChatScreenProps> = ({
+  session,
+  onOpenConversation,
+  onOpenPlanningDecision,
+  backButton,
+}) => {
   const runtime = useOcgRuntime();
   const [selection, setSelection] = useState<ChatModelSelection | undefined>(() => {
     if (session.llmProfile) {
@@ -216,8 +209,8 @@ export const ChatScreen: FC<ChatScreenProps> = ({ session, onOpenConversation, b
     [session.id, session.projectId, session.conversationId],
   );
   const composerValue = useMemo<ChatComposerContextValue>(
-    () => ({ session, selection, setSelection, onPreference }),
-    [session, selection, onPreference],
+    () => ({ session, selection, setSelection, onPreference, onOpenPlanningDecision }),
+    [session, selection, onPreference, onOpenPlanningDecision],
   );
   return (
     <OcgAssistantProvider sessionId={session.id} projectId={session.projectId ?? ""}>

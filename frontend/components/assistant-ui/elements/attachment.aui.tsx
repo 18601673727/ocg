@@ -1,19 +1,13 @@
 "use client";
 
-import { type PropsWithChildren, useState, type FC, isValidElement } from "react";
+import { type PropsWithChildren, useState, type FC, type ReactNode, isValidElement } from "react";
 import { XIcon, PlusIcon, FileText, Loader2Icon, AlertCircleIcon } from "lucide-react";
-import {
-  AttachmentPrimitive,
-  ComposerPrimitive,
-  MessagePrimitive,
-  useAuiState,
-  useAui,
-} from "@assistant-ui/react";
+import { AttachmentPrimitive, ComposerPrimitive, MessagePrimitive } from "@assistant-ui/react";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { Dialog, DialogTitle, DialogContent, DialogTrigger } from "@/components/ui/dialog";
 import { Avatar, AvatarImage, AvatarFallback } from "@/components/ui/avatar";
 import { TooltipIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
-import { useAttachmentSrc } from "@/hooks/use-attachment-src";
+import { useAttachmentState } from "./attachment-state";
 import { cn } from "@/lib/utils";
 
 type AttachmentPreviewProps = {
@@ -80,47 +74,44 @@ const AttachmentThumb: FC<{ src: string | undefined }> = ({ src }) => {
 };
 
 const AttachmentUI: FC = () => {
-  const aui = useAui();
-  const isComposer = aui.attachment.source !== "message";
-  const src = useAttachmentSrc();
-
-  const isImage = useAuiState((s) => s.attachment.type === "image");
-  const name = useAuiState((s) => s.attachment.name);
-  const typeLabel = useAuiState((s) => {
-    const type = s.attachment.type;
-    switch (type) {
-      case "image":
-        return "Image";
-      case "document":
-        return "Document";
-      case "file":
-        return "File";
-      default:
-        return type;
-    }
-  });
-
-  const uploadState = useAuiState((s) =>
-    s.attachment.status.type === "incomplete" && s.attachment.status.reason === "error"
-      ? "error"
-      : s.attachment.status.type === "running" ||
-          (s.optional.message?.submission !== undefined && s.attachment.status.type !== "complete")
-        ? "uploading"
-        : undefined,
+  const state = useAttachmentState();
+  return (
+    <AttachmentTile
+      {...state}
+      scoped
+      remove={state.isComposer ? <AttachmentRemove name={state.name} /> : undefined}
+    />
   );
-  const isUploading = uploadState === "uploading";
-  const isError = uploadState === "error";
+};
 
-  const errorMessage = useAuiState((s) =>
-    s.attachment.status.type === "incomplete" && s.attachment.status.reason === "error"
-      ? (s.attachment.status.message ?? "Upload failed")
-      : undefined,
-  );
-
+export function AttachmentTile({
+  src,
+  name,
+  isComposer = false,
+  isImage = true,
+  typeLabel = "Image",
+  isUploading,
+  isError,
+  errorMessage,
+  remove,
+  scoped = false,
+}: {
+  src?: string;
+  name: string;
+  isComposer?: boolean;
+  isImage?: boolean;
+  typeLabel?: string;
+  isUploading?: boolean;
+  isError?: boolean;
+  errorMessage?: string;
+  remove?: ReactNode;
+  scoped?: boolean;
+}) {
+  const Root = scoped ? AttachmentPrimitive.Root : "div";
   return (
     <TooltipProvider>
       <Tooltip>
-        <AttachmentPrimitive.Root
+        <Root
           className={cn(
             "aui-attachment-root relative",
             isComposer && "animate-in fade-in-0 zoom-in-95 duration-200 motion-reduce:animate-none",
@@ -163,16 +154,39 @@ const AttachmentUI: FC = () => {
               )}
             </TooltipTrigger>
           </AttachmentPreviewDialog>
-          {isComposer && <AttachmentRemove name={name} />}
-        </AttachmentPrimitive.Root>
+          {remove}
+        </Root>
         <TooltipContent side="top">
-          <AttachmentPrimitive.Name />
+          {name}
           {errorMessage && <p className="aui-attachment-error-message">{errorMessage}</p>}
         </TooltipContent>
       </Tooltip>
     </TooltipProvider>
   );
-};
+}
+
+export function AttachmentTileRemove({
+  name,
+  disabled,
+  onClick,
+}: {
+  name: string;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <TooltipIconButton
+      type="button"
+      tooltip={`Remove ${name}`}
+      disabled={disabled}
+      onClick={onClick}
+      className="aui-attachment-tile-remove absolute end-1 top-1 size-5 rounded-full bg-black/50! text-white hover:bg-black/70! hover:text-white!"
+      side="top"
+    >
+      <XIcon className="size-3 stroke-[2.5]" aria-hidden="true" />
+    </TooltipIconButton>
+  );
+}
 
 const AttachmentRemove: FC<{ name: string }> = ({ name }) => {
   return (

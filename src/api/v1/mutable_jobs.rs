@@ -265,7 +265,7 @@ pub(super) fn add_editable_state(
         && matches!(job.input.content, MutableJobContent::Generative { .. });
     if queued_generative {
         body["autonomous_loopback_eligibility"] =
-            crate::system::native_scheduler::loopback_eligibility(job.frozen.as_ref()).to_json();
+            crate::system::native_scheduler::endpoint_eligibility(job.frozen.as_ref()).to_json();
     }
     if let Some(unsupported) = unsupported_decision_history {
         body["unsupported_decision_history"] = Value::Bool(

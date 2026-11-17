@@ -42,7 +42,7 @@ impl<'a> NativeTooling<'a> {
         context: DevelopmentToolContext,
     ) -> Result<Option<DevelopmentToolOffer>, &'static str> {
         let agent = frozen.agent.as_ref();
-        let workspace = agent.is_some_and(|agent| agent.workspace_grant().is_some());
+        let workspace = frozen.workspace_enabled(project.is_some())?;
         let tools = frozen
             .llm
             .config
@@ -52,14 +52,7 @@ impl<'a> NativeTooling<'a> {
         if !workspace && !jobs {
             return Ok(None);
         }
-        let project = if workspace {
-            let Some(project) = project else {
-                return Err("workspace_unavailable");
-            };
-            Some(project)
-        } else {
-            None
-        };
+        let project = project.filter(|_| workspace);
         let ask = context.decider && context.nested && tools;
         let wiring = Wiring {
             ask,

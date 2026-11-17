@@ -9,7 +9,6 @@ import { LoaderCircle, RotateCw } from "lucide-react";
 import { AccessScreen } from "../login/access-screen";
 import { Button } from "@/components/ui/button";
 import { ApiError, createApiClient, type ApiClient } from "@/components/ocg/runtime/api-client";
-import { OperatorLogin, type OperatorSession } from "@/components/ocg/login/operator-login";
 import { OcgRuntimeProvider } from "../runtime/runtime-context";
 import { SessionActions } from "../login/access-boundary";
 import { AppShell } from "@/components/ocg/layout/app-shell";
@@ -18,6 +17,7 @@ import { useI18n } from "../i18n";
 type Phase = "checking" | "out" | "in" | "unreachable";
 
 type Health = Api.Health;
+type OperatorSession = Awaited<ReturnType<ApiClient["readSession"]>>;
 
 export function OperatorConsole() {
   const { t } = useI18n();
@@ -30,6 +30,7 @@ export function OperatorConsole() {
   const csrf = useRef("");
 
   useEffect(() => {
+    const controller = new AbortController();
     const created = createApiClient({
       baseUrl: window.location.origin,
       fetch: window.fetch.bind(window),
@@ -37,57 +38,58 @@ export function OperatorConsole() {
     });
     setClient(created);
     created
-      .readSession()
+      .readSession(controller.signal)
       .then((signed) => {
+        if (controller.signal.aborted) return;
         csrf.current = signed.csrfToken;
         setSession(signed);
         setPhase("in");
       })
-      .catch((error: unknown) => {
-        if (error instanceof ApiError && error.status === 401) {
-          setPhase("out");
-        } else {
-          setPhase("unreachable");
-        }
+      .catch(() => {
+        if (!controller.signal.aborted) setPhase("unreachable");
       });
-    return () => created.close();
+    return () => {
+      controller.abort();
+      created.close();
+    };
   }, []);
 
   useEffect(() => {
-    if (phase !== "in" || !client) return;
-    let alive = true;
+    if (phase !== "in" || !client || signingOut) return;
+    const controller = new AbortController();
+    const { signal } = controller;
     let reading = false;
     const unauthorized = (error: unknown) => error instanceof ApiError && error.status === 401;
-    const signedOut = () => {
+    const disconnected = () => {
       csrf.current = "";
       setSession(null);
-      setPhase("out");
+      setPhase("unreachable");
     };
     const read = async () => {
       if (reading) return;
       reading = true;
       try {
-        const answer = await client.readHealth();
-        if (alive) setHealth(answer);
+        const answer = await client.readHealth(signal);
+        if (!signal.aborted) setHealth(answer);
       } catch (error: unknown) {
-        if (!alive) return;
+        if (signal.aborted) return;
         setHealth(null);
         if (!unauthorized(error)) return;
         let renewed: OperatorSession;
         try {
-          renewed = await client.readSession();
+          renewed = await client.readSession(signal);
         } catch {
-          if (alive) signedOut();
+          if (!signal.aborted) disconnected();
           return;
         }
-        if (!alive) return;
+        if (signal.aborted) return;
         csrf.current = renewed.csrfToken;
         setSession(renewed);
         try {
-          const answer = await client.readHealth();
-          if (alive) setHealth(answer);
+          const answer = await client.readHealth(signal);
+          if (!signal.aborted) setHealth(answer);
         } catch (retry: unknown) {
-          if (alive && unauthorized(retry)) signedOut();
+          if (!signal.aborted && unauthorized(retry)) disconnected();
         }
       } finally {
         reading = false;
@@ -96,24 +98,17 @@ export function OperatorConsole() {
     const unsubscribe = client.subscribeCatalog(
       () => void read(),
       () => {
-        if (alive) setHealth(null);
+        if (!signal.aborted) setHealth(null);
       },
     );
     const timer = setInterval(() => void read(), 5000);
     void read();
     return () => {
-      alive = false;
+      controller.abort();
       clearInterval(timer);
       unsubscribe();
     };
-  }, [client, phase]);
-
-  function signedIn(next: OperatorSession) {
-    setSignOutError(null);
-    csrf.current = next.csrfToken;
-    setSession(next);
-    setPhase("in");
-  }
+  }, [client, phase, signingOut]);
 
   async function signOut() {
     if (!client || signingOut) return;
@@ -150,20 +145,22 @@ export function OperatorConsole() {
     );
   }
 
-  if (phase === "unreachable") {
+  if (phase === "unreachable" || phase === "out") {
+    const signedOut = phase === "out";
     return (
-      <AccessScreen title={t("session.offlineTitle")} description={t("session.unreachable")}>
+      <AccessScreen
+        title={t(signedOut ? "session.signedOutTitle" : "session.offlineTitle")}
+        description={t(signedOut ? "session.signedOutDescription" : "session.unreachable")}
+      >
         <Button className="self-start" onClick={() => window.location.reload()}>
           <RotateCw aria-hidden="true" />
-          {t("session.retry")}
+          {t(signedOut ? "session.reopen" : "session.retry")}
         </Button>
       </AccessScreen>
     );
   }
 
-  if (phase === "out" || !client) {
-    return client ? <OperatorLogin client={client} onSignedIn={signedIn} /> : null;
-  }
+  if (!client) return null;
 
   return (
     <SessionActions onSignOut={signOut}>

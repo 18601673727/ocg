@@ -85,11 +85,11 @@ pub(crate) use update::UpdateView;
 
 use security::{Caller, Destination, admit};
 use wire::{
-    BODY_NOT_ACCEPTED, BODY_TOO_LARGE, DATABASE_BUSY, DATABASE_UNAVAILABLE, FORBIDDEN_HOST,
-    FORBIDDEN_ORIGIN, HEADERS_TOO_LARGE, INCONSISTENT_RECORD, INTERNAL, INVALID_REQUEST,
-    JOB_NOT_FOUND, LENGTH_REQUIRED, METHOD_NOT_ALLOWED, NOT_FOUND, ONLY_POST, OUTPUT_TOO_LARGE,
-    PROFILE_METHODS, Refusal, Reply, SESSION_METHODS, SHUTTING_DOWN, UNAUTHENTICATED,
-    UNSUPPORTED_MEDIA_TYPE, URI_TOO_LONG, answer, read_body, single, submission_body,
+    BODY_NOT_ACCEPTED, DATABASE_BUSY, DATABASE_UNAVAILABLE, FORBIDDEN_HOST, FORBIDDEN_ORIGIN,
+    HEADERS_TOO_LARGE, INCONSISTENT_RECORD, INTERNAL, INVALID_REQUEST, JOB_NOT_FOUND,
+    METHOD_NOT_ALLOWED, NOT_FOUND, ONLY_POST, OUTPUT_TOO_LARGE, PROFILE_METHODS, Refusal, Reply,
+    SESSION_METHODS, SHUTTING_DOWN, UNAUTHENTICATED, URI_TOO_LONG, answer, read_body, single,
+    submission_body,
 };
 
 struct Shared {
@@ -104,7 +104,7 @@ struct Shared {
     admission_wait: Duration,
     stream_limits: events::StreamLimits,
     assets: Option<assets::UiAssets>,
-    browser: Option<browser::State>,
+    browser: browser::State,
     streams: AtomicUsize,
     closing: AtomicBool,
 }

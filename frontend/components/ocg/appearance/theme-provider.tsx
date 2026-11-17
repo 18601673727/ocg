@@ -4,22 +4,16 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useState } 
 import type { ReactNode } from "react";
 import {
   APPEARANCE_STORAGE_KEY,
-  appearanceRootState,
   DEFAULT_APPEARANCE,
   readAppearancePreferences,
-  resolveEffectiveTheme,
   serializeAppearancePreferences,
   type AppearancePreferences,
   type AccentPreference,
-  type ResolvedTheme,
   type ThemePreference,
 } from "./theme-domain";
 
 type ThemeContextValue = {
   preferences: AppearancePreferences;
-  theme: ThemePreference;
-  resolvedTheme: ResolvedTheme;
-  accent: AccentPreference;
   hydrated: boolean;
   setTheme: (theme: ThemePreference) => void;
   setAccent: (accent: AccentPreference) => void;
@@ -28,53 +22,38 @@ type ThemeContextValue = {
 
 const ThemeContext = createContext<ThemeContextValue | null>(null);
 
-function applyRootAppearance(preferences: AppearancePreferences, systemTheme: ResolvedTheme) {
+function applyRootAppearance({ theme, accent }: AppearancePreferences) {
   const root = document.documentElement;
-  const state = appearanceRootState(preferences, systemTheme);
-  root.classList.toggle("dark", state.theme === "dark");
-  root.dataset.theme = state.theme;
-  root.dataset.accent = state.accent;
+  root.classList.toggle("dark", theme === "dark");
+  root.dataset.theme = theme;
+  root.dataset.accent = accent;
 }
 
 export function ThemeProvider({ children }: { children: ReactNode }) {
   const [preferences, setPreferences] = useState<AppearancePreferences>(() => ({
     ...DEFAULT_APPEARANCE,
   }));
-  const [systemTheme, setSystemTheme] = useState<ResolvedTheme>("light");
   const [hydrated, setHydrated] = useState(false);
 
   useEffect(() => {
-    const media = window.matchMedia("(prefers-color-scheme: dark)");
-    const stored = readAppearancePreferences(window.localStorage);
-    const system = media.matches ? "dark" : "light";
     const loadTimer = window.setTimeout(() => {
+      const stored = readAppearancePreferences();
       setPreferences(stored);
-      setSystemTheme(system);
-      applyRootAppearance(stored, system);
       setHydrated(true);
     }, 0);
-
-    const onSystemThemeChange = (event: MediaQueryListEvent) => {
-      const next = event.matches ? "dark" : "light";
-      setSystemTheme(next);
-    };
-    media.addEventListener?.("change", onSystemThemeChange);
-    return () => {
-      window.clearTimeout(loadTimer);
-      media.removeEventListener?.("change", onSystemThemeChange);
-    };
+    return () => window.clearTimeout(loadTimer);
   }, []);
 
   useEffect(() => {
     if (!hydrated) return;
-    applyRootAppearance(preferences, systemTheme);
+    applyRootAppearance(preferences);
     try {
       window.localStorage.setItem(
         APPEARANCE_STORAGE_KEY,
         serializeAppearancePreferences(preferences),
       );
     } catch {}
-  }, [hydrated, preferences, systemTheme]);
+  }, [hydrated, preferences]);
 
   const setTheme = useCallback(
     (theme: ThemePreference) => setPreferences((current) => ({ ...current, theme })),
@@ -88,15 +67,12 @@ export function ThemeProvider({ children }: { children: ReactNode }) {
   const value = useMemo(
     () => ({
       preferences,
-      theme: preferences.theme,
-      resolvedTheme: resolveEffectiveTheme(preferences.theme, systemTheme),
-      accent: preferences.accent,
       hydrated,
       setTheme,
       setAccent,
       resetAppearance,
     }),
-    [hydrated, preferences, resetAppearance, setAccent, setTheme, systemTheme],
+    [hydrated, preferences, resetAppearance, setAccent, setTheme],
   );
 
   return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;

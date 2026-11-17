@@ -20,18 +20,19 @@ type OcgMetadata = Record<string, unknown>;
 type MessageContext = { activityId: string | undefined; retryId: string | undefined };
 
 function messageContext(messages: readonly ChatMessage[]): MessageContext {
+  const transcript = messages.filter((message) => !message.planningTarget);
   const activity =
-    messages.find(
+    transcript.find(
       (item) => item.role === "assistant" && !item.intermediate && item.status === "streaming",
     ) ??
-    messages.find(
+    transcript.find(
       (item) => item.role === "assistant" && !item.intermediate && item.status === "pending",
     );
-  const lastAssistant = messages.findLast((item) => item.role === "assistant");
+  const lastAssistant = transcript.findLast((item) => item.role === "assistant");
   return {
     activityId: activity?.id,
     retryId:
-      lastAssistant && retryInput(messages, lastAssistant.id) !== null
+      lastAssistant && retryInput(transcript, lastAssistant.id) !== null
         ? lastAssistant.id
         : undefined,
   };
@@ -44,6 +45,7 @@ function metadataFor(message: ChatMessage, context: MessageContext): OcgMetadata
     ocgStatus: message.status,
     commandId: message.commandId,
     jobId: message.jobId,
+    planningTarget: message.planningTarget,
     optimistic: message.optimistic,
     reasoning: message.reasoning,
     sourceSnapshots: message.sourceSnapshots,

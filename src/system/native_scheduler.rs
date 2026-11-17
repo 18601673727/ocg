@@ -37,13 +37,13 @@ const DECISION_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) =
     (ExecutionOperation::Decision, None);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct LoopbackEligibility {
-    pub(crate) code: &'static str,
-    pub(crate) detail: &'static str,
-    pub(crate) endpoint: Option<crate::system::http::LoopbackEndpointClass>,
+pub(crate) struct EndpointEligibility {
+    code: &'static str,
+    detail: &'static str,
+    endpoint_class: Option<&'static str>,
 }
 
-pub(crate) const NOT_ASSESSED: [&str; 7] = [
+const NOT_ASSESSED: [&str; 7] = [
     "conversation_start_context",
     "predecessor_settlement",
     "attachment_availability",
@@ -53,94 +53,64 @@ pub(crate) const NOT_ASSESSED: [&str; 7] = [
     "reservation_and_writer_admission",
 ];
 
-impl LoopbackEligibility {
-    pub(crate) fn eligible(self) -> bool {
-        self.code == "eligible"
-    }
-
+impl EndpointEligibility {
     pub(crate) fn to_json(self) -> serde_json::Value {
         serde_json::json!({
-            "eligible": self.eligible(),
+            "eligible": self.code == "eligible",
             "code": self.code,
             "detail": self.detail,
-            "endpoint_class": self.endpoint.map(crate::system::http::LoopbackEndpointClass::name),
+            "endpoint_class": self.endpoint_class,
             "scope": "autonomous_loopback_dispatch_policy",
             "not_assessed": NOT_ASSESSED,
         })
     }
 }
 
-pub(crate) fn loopback_eligibility(
+pub(crate) fn endpoint_eligibility(
     frozen: Option<&crate::db::entities::MutableFrozenConfiguration>,
-) -> LoopbackEligibility {
+) -> EndpointEligibility {
     use crate::db::entities::MutableFrozenConfiguration;
-    use crate::system::http::{LoopbackEndpointClass, classify_loopback_endpoint};
-    let none = |code, detail| LoopbackEligibility {
+    use crate::service::ai::providers::provider_uri;
+    let rejected = |code, detail| EndpointEligibility {
         code,
         detail,
-        endpoint: None,
+        endpoint_class: None,
     };
-    let (endpoint, kind_label) = match frozen {
-        None => {
-            return none(
-                "not_frozen",
-                "the Job has no frozen configuration; only a submitted Job is scheduled",
-            );
-        }
-        Some(MutableFrozenConfiguration::Decision(decision)) => {
-            (decision.endpoint.as_deref(), "native Decision")
-        }
+    let endpoint = match frozen {
         Some(MutableFrozenConfiguration::Generative(frozen)) => {
             if frozen.native_execution_refusal().is_some() {
-                return none(
-                    "not_single_request_generative",
-                    "the frozen configuration cannot run as a native Generative execution (a chat or coding Agent, the OpenAI Chat Completions protocol and a declared context window are required)",
+                return rejected(
+                    "unsupported_configuration",
+                    "the frozen configuration cannot run as a native Generative execution",
                 );
             }
-            (frozen.llm.provider.endpoint.as_deref(), "native Generative")
+            frozen.llm.provider.endpoint.as_deref()
+        }
+        Some(MutableFrozenConfiguration::Decision(frozen)) => frozen.endpoint.as_deref(),
+        None => {
+            return rejected(
+                "configuration_missing",
+                "the Job has no frozen configuration",
+            );
         }
     };
     let Some(endpoint) = endpoint else {
-        return none("endpoint_missing", "the frozen Provider has no endpoint");
+        return rejected("endpoint_missing", "the frozen Provider has no endpoint");
     };
-    let class = classify_loopback_endpoint(endpoint);
-    let detail = match class {
-        LoopbackEndpointClass::LiteralDirect => {
-            let detail = match kind_label {
-                "native Decision" => {
-                    "the frozen endpoint is a literal http://127.0.0.1:<port> endpoint no proxy intercepts, and the frozen configuration is a native Decision execution; this is not a claim that the Job will run: see not_assessed for what the scheduler also asks"
-                }
-                _ => {
-                    "the frozen endpoint is a literal http://127.0.0.1:<port> endpoint no proxy intercepts, and the frozen configuration is a native Generative execution; this is not a claim that the Job will run: see not_assessed for what the scheduler also asks"
-                }
-            };
-            return LoopbackEligibility {
-                code: "eligible",
-                detail,
-                endpoint: Some(class),
-            };
-        }
-        LoopbackEndpointClass::LiteralProxied => {
-            "the frozen endpoint is literal 127.0.0.1 but the configured proxy would intercept it; exclude it with NO_PROXY=127.0.0.1 or unset the proxy for the host, then resubmit"
-        }
-        LoopbackEndpointClass::LiteralMalformed => {
-            "the frozen endpoint names 127.0.0.1 but is not http://127.0.0.1:<explicit non-zero port> without credentials or a query; freeze the Provider endpoint in that form and resubmit"
-        }
-        LoopbackEndpointClass::LocalhostName => {
-            "the frozen endpoint names `localhost`, which configuration accepts but autonomous loopback scheduling never resolves; freeze the Provider endpoint as http://127.0.0.1:<port> and resubmit, or run the Job through a separately authorized workflow"
-        }
-        LoopbackEndpointClass::Ipv6Loopback => {
-            "the frozen endpoint is the IPv6 loopback `::1`, which configuration accepts but autonomous loopback scheduling never reaches; freeze the Provider endpoint as http://127.0.0.1:<port> and resubmit, or run the Job through a separately authorized workflow"
-        }
-        LoopbackEndpointClass::External => {
-            "the frozen endpoint is not a loopback endpoint; loopback dispatch never reaches it, and an external destination is admitted only by an active scheduled external policy and grant under scheduled_external_transport, or by a manual external execution"
-        }
-        LoopbackEndpointClass::Unparseable => "the frozen endpoint is not a URI",
+    let Some(uri) = provider_uri(endpoint) else {
+        return rejected(
+            "invalid_endpoint",
+            "the configured Provider endpoint is invalid",
+        );
     };
-    LoopbackEligibility {
-        code: "endpoint_not_literal_loopback",
-        detail,
-        endpoint: Some(class),
+    EndpointEligibility {
+        code: "eligible",
+        detail: "the Job can use the configured Provider endpoint",
+        endpoint_class: Some(if uri.scheme_str() == Some("https") {
+            "external"
+        } else {
+            "configured_local_http"
+        }),
     }
 }
 
@@ -149,23 +119,25 @@ fn can_schedule(
     summary_work: bool,
 ) -> bool {
     use crate::db::entities::{FrozenConfiguration, FrozenDecisionConfig};
-    match configuration {
-        FrozenConfiguration::Generative(frozen) => {
-            let refusal = if summary_work {
+    use crate::service::ai::providers::provider_uri;
+    let (endpoint, refusal) = match configuration {
+        FrozenConfiguration::Generative(frozen) => (
+            frozen.llm.provider.endpoint.as_deref(),
+            if summary_work {
                 frozen.provider_refusal()
             } else {
                 frozen.native_execution_refusal()
-            };
-            refusal.is_none()
+            },
+        ),
+        FrozenConfiguration::Decision(FrozenDecisionConfig::Native(native)) => {
+            (native.endpoint.as_deref(), None)
         }
-        FrozenConfiguration::Decision(FrozenDecisionConfig::Native(native)) => native
-            .endpoint
-            .as_deref()
-            .is_some_and(crate::system::http::direct_diagnostic_loopback),
-        FrozenConfiguration::Decision(FrozenDecisionConfig::Generative(frozen, _)) => {
-            frozen.llm.provider.transport.execution_refusal().is_none()
-        }
-    }
+        FrozenConfiguration::Decision(FrozenDecisionConfig::Generative(frozen, _)) => (
+            frozen.llm.provider.endpoint.as_deref(),
+            frozen.llm.provider.transport.execution_refusal(),
+        ),
+    };
+    refusal.is_none() && endpoint.and_then(provider_uri).is_some()
 }
 
 #[derive(Clone, Default)]
@@ -233,7 +205,7 @@ pub(crate) async fn run(
         shutdown.cancelled().await;
         return;
     }
-    log::info!("native scheduler running: native Generative Jobs, loopback endpoints only");
+    log::info!("native scheduler running with configured Provider endpoints");
     if let Err(error) = database.settle_unreported_children().await {
         log::warn!("native scheduler: unreported child conversations were not settled ({error})");
     }
@@ -621,9 +593,9 @@ impl Dispatched {
     }
 }
 
-fn check_prepared_native(
+fn prepared_native_policy(
     prepared: &crate::db::PreparedDevelopmentHandoff,
-) -> Result<(), &'static str> {
+) -> Result<EndpointPolicy<'static>, &'static str> {
     if let Some(decision) = prepared.decision_configuration() {
         let endpoint = match decision {
             crate::db::entities::FrozenDecisionConfig::Native(native) => native.endpoint.as_deref(),
@@ -631,10 +603,8 @@ fn check_prepared_native(
                 generative.llm.provider.endpoint.as_deref()
             }
         };
-        if !endpoint.is_some_and(crate::system::http::direct_diagnostic_loopback) {
-            return Err("endpoint_not_loopback");
-        }
-        return Ok(());
+        return EndpointPolicy::from_model_endpoint(endpoint.ok_or("endpoint_missing")?)
+            .ok_or("endpoint_not_supported");
     }
     let Some(frozen) = prepared.generative_configuration() else {
         return Err("generative_required");
@@ -647,22 +617,20 @@ fn check_prepared_native(
     if refusal.is_some() {
         return Err("not_single_request_generative");
     }
-    if !frozen
+    let endpoint = frozen
         .llm
         .provider
         .endpoint
         .as_deref()
-        .is_some_and(crate::system::http::direct_diagnostic_loopback)
-    {
-        return Err("endpoint_not_loopback");
-    }
+        .ok_or("endpoint_missing")?;
+    let policy = EndpointPolicy::from_model_endpoint(endpoint).ok_or("endpoint_not_supported")?;
     let request = prepared.request();
     if request.get("tool_choice").is_some()
         || request.get("stream") != Some(&serde_json::Value::Bool(true))
     {
         return Err("request_not_tool_free_stream");
     }
-    Ok(())
+    Ok(policy)
 }
 
 async fn within_deadline<F: std::future::Future>(
@@ -756,28 +724,22 @@ async fn dispatch(
     };
     let detail = match admitted {
         Ok(grant) => {
-            let (config, policy) = match &grant {
-                Some(grant) => (
-                    grant.provider_config(cancellation.clone()),
-                    EndpointPolicy::ScheduledExternal(grant),
-                ),
-                None => (
-                    ProviderExecutionConfig {
-                        timeout: DISPATCH_TIMEOUT,
-                        first_delta_timeout: Some(DISPATCH_TIMEOUT),
-                        max_output_bytes: MAX_RESPONSE_BYTES,
-                        cancellation: cancellation.clone(),
-                        ..ProviderExecutionConfig::default()
-                    },
-                    EndpointPolicy::Loopback,
-                ),
-            };
+            let config = grant.as_ref().map_or_else(
+                || ProviderExecutionConfig {
+                    timeout: DISPATCH_TIMEOUT,
+                    first_delta_timeout: Some(DISPATCH_TIMEOUT),
+                    max_output_bytes: MAX_RESPONSE_BYTES,
+                    cancellation: cancellation.clone(),
+                    ..ProviderExecutionConfig::default()
+                },
+                |grant| grant.provider_config(cancellation.clone()),
+            );
             start_and_exchange(
                 database,
                 token,
                 allocation.operation,
-                &config,
-                policy,
+                config,
+                grant.as_ref(),
                 workspace_tools.data_directory(),
                 stops,
             )
@@ -809,8 +771,8 @@ async fn start_and_exchange(
     database: &DatabaseHandle,
     token: AllocationToken,
     operation: ExecutionOperation,
-    config: &ProviderExecutionConfig,
-    policy: EndpointPolicy<'_>,
+    config: ProviderExecutionConfig,
+    grant: Option<&crate::system::scheduled_external::ScheduledExternalGrant>,
     data_directory: &crate::system::data_directory::DataDirectory,
     stops: &NativeStops,
 ) -> String {
@@ -856,10 +818,12 @@ async fn start_and_exchange(
             let mut prepared = prepare_development_handoff(resolved, offer.as_ref())
                 .map_err(classify_unstarted)?;
             database.load_handoff_credentials(&mut prepared).await?;
-            match policy {
-                EndpointPolicy::Loopback => check_prepared_native(&prepared),
-                EndpointPolicy::ScheduledExternal(grant) => {
-                    grant.check_prepared(&prepared).map_err(|refusal| {
+            let policy = match grant {
+                None => prepared_native_policy(&prepared),
+                Some(grant) => grant
+                    .check_prepared(&prepared)
+                    .map(|()| EndpointPolicy::ScheduledExternal(grant))
+                    .map_err(|refusal| {
                         log::warn!(
                             "native scheduler: Job {} scheduled external start refused ({}): {}",
                             token.job,
@@ -867,11 +831,11 @@ async fn start_and_exchange(
                             refusal.detail,
                         );
                         refusal.code
-                    })
-                }
+                    }),
             }
             .map_err(invalid)?;
-            database.start_development_handoff(prepared).await
+            let handoff = database.start_development_handoff(prepared).await?;
+            Ok((handoff, policy))
         }
         .await;
         match result {
@@ -884,14 +848,15 @@ async fn start_and_exchange(
         }
     };
     match handoff {
-        Ok(handoff) => {
+        Ok((handoff, policy)) => {
             let tools = tooling.into_execution();
             let exchange = within_deadline(cancellation, DISPATCH_TIMEOUT, async {
                 if operation == ExecutionOperation::Decision || handoff.decision_inputs().is_some()
                 {
-                    supervise_development_decision(database, handoff, config, policy).await
+                    supervise_development_decision(database, handoff, &config, policy).await
                 } else {
-                    supervise_development_generative(database, handoff, config, policy, tools).await
+                    supervise_development_generative(database, handoff, &config, policy, tools)
+                        .await
                 }
             })
             .await;

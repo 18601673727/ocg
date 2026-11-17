@@ -2977,19 +2977,6 @@ export function createApiClient(options: ApiClientOptions) {
       return answer.input as Api.Stop;
     },
 
-    async createSession(pairingCode: string, signal?: AbortSignal) {
-      const answer = await send("POST", "/api/v1/session", {
-        body: { pairing_code: pairingCode },
-        signal,
-      });
-      const session = (answer.input as Api.SessionResponse).session;
-      if (!session.authenticated) throw new ContractError("session", "a signed-in session");
-      return {
-        csrfToken: session.csrf_token,
-        expiresAtUs: session.expires_at_us,
-      };
-    },
-
     async readSession(signal?: AbortSignal) {
       const answer = await send("GET", "/api/v1/session", { signal });
       const session = (answer.input as Api.SessionResponse).session;

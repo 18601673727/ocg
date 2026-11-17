@@ -8,14 +8,16 @@ use crate::db::entities::{
     ConversationEntry, ConversationsPage, JobLifecycle, JobLimits, JobSpec,
     MutableConversationPage, MutableConversationTurn, Origin, OutputKind, Recurrence,
 };
-use crate::db::entities::{ConfigId, ConfigRecord, ExecutionOperation, OutcomeKind};
+use crate::db::entities::{
+    ConfigId, ConfigRecord, ExecutionOperation, MutableJobPhase, OutcomeKind,
+};
 use crate::db::redb::allocations::pools_offering_capability;
 use crate::db::redb::batch::{BatchError, Failure};
 use crate::db::redb::reads::execution_context::verify_native_summary_in;
 use crate::db::redb::reads::jobs::{
-    active_job, first_entry_text, mutable_job_details_in, mutable_job_record_in,
-    read_conversation_row, read_job_lifecycle, read_state, turn_first, turn_head,
-    unstarted_settlement_in,
+    active_job_in, first_entry_text, mutable_job_details_in, mutable_job_record_in,
+    project_planning_target, read_conversation_row, read_job_lifecycle, read_state, turn_first,
+    turn_head, unstarted_settlement_in,
 };
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::{ConfigRow, decode_output, decode_project};
@@ -112,6 +114,7 @@ pub(crate) fn read_mutable_conversation_turn_page(
             Vec::new()
         };
         rows.push(MutableConversationTurn {
+            planning_target: project_planning_target(&rx, &details.record.job)?,
             details,
             outputs,
             outputs_truncated,
@@ -143,14 +146,17 @@ fn conversation_job_state(
             return Ok("waiting_for_user");
         }
     }
-    let turn = active_job(rx, conversation)?
-        .map(|(id, _, _)| id)
+    let active = active_job_in(rx, conversation)?;
+    let turn = active
+        .as_ref()
+        .map(|job| job.id)
         .or(tip)
         .map(|id| state::require(rx, id))
         .transpose()?;
     let runtime = turn.as_ref().unwrap_or(runtime);
     Ok(match &runtime.state.outcome {
         Some(outcome) => outcome_label(outcome.kind),
+        None if active.is_some_and(|job| job.phase == MutableJobPhase::Executing) => "running",
         None if runtime
             .pending
             .is_some_and(|(dependencies, _)| dependencies > 0) =>
@@ -258,7 +264,7 @@ pub(crate) fn conversation_tip(
     if row.is_chunk_group() {
         return Ok(None);
     }
-    turn_head(&rx.open_table(TURNS)?, row.id)?
+    turn_head(rx, row.id)?
         .map(Some)
         .ok_or_else(|| StorageError::corrupted(format!("{} has no tip", row.id)))
 }
@@ -350,7 +356,7 @@ fn conversation_page(
         if metadata.hidden_at.is_some() {
             continue;
         }
-        let Some(tip) = turn_head(&rx.open_table(TURNS)?, conversation)? else {
+        let Some(tip) = turn_head(&rx, conversation)? else {
             continue;
         };
         let matches = if terms.is_empty() {
@@ -558,7 +564,7 @@ pub(crate) fn read_context_state(
         return Ok(None);
     };
     let (mut policy, revision) = effective_context_policy(&rx.open_table(META)?)?;
-    let tip = turn_head(&rx.open_table(TURNS)?, conversation)?;
+    let tip = turn_head(&rx, conversation)?;
     let tip_details = tip
         .map(|tip| mutable_job_details_in(&rx, tip, None, false))
         .transpose()?

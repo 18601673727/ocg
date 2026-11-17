@@ -186,6 +186,7 @@ async function readPartialToolBoundaries(
 type Turn = {
   content_kind?: ConversationTurn["content_kind"];
   native_decision?: ConversationTurn["native_decision"];
+  planning_target?: ConversationTurn["planning_target"];
   compaction?: ConversationTurn["compaction"];
   details?: JobDetails;
   entries?: ConversationTurn["entries"];
@@ -552,7 +553,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       this.unlisted.add(id);
       this.roots.set(root, id);
     }
-    job = conversation.turns.at(-1)?.job.id ?? job;
+    const lastTurn = conversation.turns.findLast((turn) => !turn.planning_target);
+    job = lastTurn?.job.id ?? job;
     if (!this.getSnapshot().sessions.some((session) => session.id === id)) {
       this.emit({
         type: "conversation.session-created",
@@ -595,7 +597,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     this.tips.set(id, job);
     const session = this.getSnapshot().sessions.find((session) => session.id === id);
     if (!session) return id;
-    const lastConfig = conversation.turns.at(-1)?.input.configuration;
+    const lastConfig = lastTurn?.input.configuration;
     this.emit({
       type: "conversation.session-updated",
       session: {
@@ -611,8 +613,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     this.publish(id);
     for (const turn of conversation.turns)
       if (
-        this.turns.get(turn.job.id)?.details?.mutable_phase !== "queued" &&
+        (turn.native_decision ||
+          this.turns.get(turn.job.id)?.details?.mutable_phase !== "queued") &&
         (turn.job.settlement.state === "unsettled" ||
+          (turn.native_decision && turn.job.settlement.state === "unknown") ||
           taskPlanActive(this.turns.get(turn.job.id)?.details?.task_plan))
       )
         this.watch(turn.job.id);
@@ -735,6 +739,12 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           if (!turn || !this.historyTurnIsCurrent(turn)) continue;
           for (const image of turn.images) this.images.set(image.id, image);
           this.turns.set(turn.state.job.id, turn.state);
+          if (
+            turn.state.planning_target &&
+            (turn.state.job.settlement.state === "unsettled" ||
+              turn.state.job.settlement.state === "unknown")
+          )
+            this.watch(turn.state.job.id);
         }
         this.earlier.set(sessionId, next);
         this.publish(sessionId);
@@ -955,6 +965,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
             role: "assistant" as const,
             content: "",
             decision: turn.native_decision,
+            planningTarget: turn.planning_target,
+            failureReason: turn.unknownReason ?? undefined,
             status: state === "unsettled" ? ("pending" as const) : state,
             execution: nativeExecutionStatus(turn.job.execution_phase, turn.details),
             createdAt: new Date(turn.job.created_at_us / 1000).toISOString(),
@@ -1142,15 +1154,17 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         const details = await this.api.readJobDetails(jobId, this.lifetime.signal);
         const readReplies = turn.outputs.firstSeq === 1;
         const evidenceRevision = turn.evidenceRevision;
-        const evidence = await readTranscriptEvidence(this.api, jobId, {
-          signal: this.lifetime.signal,
-          previous: turn.responses,
-          settled:
-            readReplies &&
-            details.settlement.state !== "unsettled" &&
-            details.settlement.state !== "unknown",
-          readReplies,
-        });
+        const evidence = turn.native_decision
+          ? null
+          : await readTranscriptEvidence(this.api, jobId, {
+              signal: this.lifetime.signal,
+              previous: turn.responses,
+              settled:
+                readReplies &&
+                details.settlement.state !== "unsettled" &&
+                details.settlement.state !== "unknown",
+              readReplies,
+            });
         if (entry.stopped || this.disposed) return;
         if (turn.job.conversation) {
           const page = await this.api.readConversationTurns(
@@ -1162,6 +1176,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           const stored = page.turns.find((item) => item.job.id === jobId);
           if (stored) {
             turn.content_kind = stored.content_kind;
+            turn.native_decision = stored.native_decision;
+            turn.planning_target = stored.planning_target;
             turn.entries = stored.entries;
             turn.compaction = stored.compaction;
             turn.input = stored.input;
@@ -1208,12 +1224,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
             turn.outputRevision = (turn.outputRevision ?? 0) + 1;
           }
         }
-        const evidenceApplied = this.applyTranscriptEvidence(
-          turn,
-          evidenceRevision,
-          evidence,
-          readReplies,
-        );
+        const evidenceApplied =
+          evidence && this.applyTranscriptEvidence(turn, evidenceRevision, evidence, readReplies);
         if (
           turn.outputs.firstSeq > 1 &&
           details.settlement.state === "completed" &&
@@ -1258,9 +1270,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           connect();
         }
         const evidenceCurrent =
-          evidenceApplied &&
-          turn.evidenceRevision === evidenceRevision + 1 &&
-          (readReplies || turn.outputs.firstSeq > 1);
+          evidence === null ||
+          (evidenceApplied &&
+            turn.evidenceRevision === evidenceRevision + 1 &&
+            (readReplies || turn.outputs.firstSeq > 1));
         if (!evidenceCurrent) {
           queued = true;
         } else if (!active) {
@@ -1381,6 +1394,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       compaction: stored?.compaction,
       entries: stored?.entries,
       native_decision: stored?.native_decision,
+      planning_target: stored?.planning_target,
       details: record,
       sessionId,
       job: record,
@@ -1410,6 +1424,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     const current = this.turns.get(job);
     if (current && !this.historyTurnIsCurrent({ state: turn, previous, snapshot })) {
       current.content_kind = turn.content_kind;
+      current.native_decision = turn.native_decision;
+      current.planning_target = turn.planning_target;
       current.entries = turn.entries;
       current.input = turn.input;
       current.compaction = turn.compaction;
@@ -1493,7 +1509,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         type: "conversation.session-updated",
         session: { ...session, sessionId: result.turn, updatedAt: new Date().toISOString() },
       });
-      await this.trackTurn(sessionId, result.turn);
+      await this.openConversation(result.turn);
     } finally {
       this.sending.delete(sessionId);
     }

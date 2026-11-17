@@ -1,9 +1,9 @@
 use super::{
     BODY_NOT_ACCEPTED, FORBIDDEN_HOST, FORBIDDEN_ORIGIN, HEADERS_TOO_LARGE, HeaderMap, HttpRequest,
-    INTERNAL, MAX_ATTACHMENT_UPLOAD_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, MAX_PATH_BYTES,
-    MAX_QUERY_BYTES, MAX_SUBMISSION_BYTES, METHOD_NOT_ALLOWED, Method, NOT_FOUND, ONLY_POST,
-    PROFILE_METHODS, Refusal, SESSION_METHODS, Shared, Token, UNAUTHENTICATED, URI_TOO_LONG,
-    browser, header, single, submission_body, update,
+    MAX_ATTACHMENT_UPLOAD_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, MAX_PATH_BYTES, MAX_QUERY_BYTES,
+    MAX_SUBMISSION_BYTES, METHOD_NOT_ALLOWED, Method, ONLY_POST, PROFILE_METHODS, Refusal,
+    SESSION_METHODS, Shared, Token, UNAUTHENTICATED, URI_TOO_LONG, browser, header, single,
+    submission_body, update,
 };
 
 const MEMBER_COLLECTIONS: [&str; 5] = [
@@ -161,13 +161,13 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
         return Err(URI_TOO_LONG);
     }
     let path = request.path();
-    let login = path == "/api/v1/session";
-    let api = login || path.starts_with("/api/");
+    let session_route = path == "/api/v1/session";
+    let api = path.starts_with("/api/");
     let takes_post = takes_post(path);
     let takes_delete = takes_delete(path);
     let method = request.method();
-    let allowed = if login {
-        *method == Method::GET || *method == Method::POST || *method == Method::DELETE
+    let allowed = if session_route {
+        *method == Method::GET || *method == Method::DELETE
     } else if api {
         *method == Method::GET
             || (takes_post && *method == Method::POST)
@@ -176,7 +176,7 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
         *method == Method::GET
     };
     if !allowed {
-        return Err(if login {
+        return Err(if session_route {
             SESSION_METHODS
         } else if takes_post {
             if takes_delete {
@@ -197,39 +197,24 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
     if !api {
         return Ok(Destination::Asset);
     }
-    let caller = if login && method == Method::POST {
-        if headers.get_all(header::AUTHORIZATION).count() != 0 {
-            return Err(NOT_FOUND);
-        }
-        Caller::Anonymous
-    } else if login
+    let caller = if session_route
         && *method == Method::GET
-        && shared.assets.is_some()
         && headers.get_all(header::AUTHORIZATION).count() == 0
     {
         authenticate(headers, shared).unwrap_or(Caller::Anonymous)
     } else {
         authenticate(headers, shared)?
     };
-    if matches!(caller, Caller::Operator(_)) && method != Method::GET {
-        let Caller::Operator(session) = &caller else {
-            return Err(INTERNAL);
-        };
-        if !shared
-            .browser
-            .as_ref()
-            .is_some_and(|browser| browser.csrf_matches(session, headers))
-        {
-            return Err(browser::FORBIDDEN_CSRF);
-        }
+    if let Caller::Operator(session) = &caller
+        && method != Method::GET
+        && !shared.browser.csrf_matches(session, headers)
+    {
+        return Err(browser::FORBIDDEN_CSRF);
     }
     if method == Method::POST
         && let Some(limit) = json_post_limit(path)
     {
         return submission_body(headers, limit).map(|()| Destination::Api(caller));
-    }
-    if login && method == Method::POST {
-        return browser::login_body(headers).map(|()| Destination::Api(caller));
     }
     let length = headers.get_all(header::CONTENT_LENGTH).collect::<Vec<_>>();
     if headers.contains_key(header::TRANSFER_ENCODING)
@@ -253,8 +238,7 @@ fn authenticate(headers: &HeaderMap, shared: &Shared) -> Result<Caller, Refusal>
         }
         (0, browser::Presented::One(_)) => shared
             .browser
-            .as_ref()
-            .and_then(|browser| browser.session(&presented))
+            .session(&presented)
             .map(Caller::Operator)
             .ok_or(UNAUTHENTICATED),
         _ => Err(UNAUTHENTICATED),

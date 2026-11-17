@@ -14,8 +14,9 @@ use crate::db::{DatabaseError, DatabaseHandle};
 use crate::service::ai::compact::{ContextLimits, estimate_request_tokens};
 use crate::service::ai::providers::openai_compatible::{ChatMessage, ChatToolCallWire};
 use crate::service::ai::providers::{
-    self, CancellationToken, OutputSinkError, ProviderExecutionConfig, ProviderExecutionError,
-    ProviderExecutionResult, ProviderFact, ProviderObservation, ProviderOutputSink,
+    self, CancellationToken, DestinationPolicy, OutputSinkError, ProviderExecutionConfig,
+    ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
+    ProviderOutputSink,
 };
 
 pub(crate) struct DevelopmentExecutionReturn<'a> {
@@ -30,14 +31,21 @@ impl<'a> DevelopmentExecutionReturn<'a> {
 
 #[derive(Clone, Copy)]
 pub(crate) enum EndpointPolicy<'a> {
-    Loopback,
+    Configured,
     ScheduledExternal(&'a crate::system::scheduled_external::ScheduledExternalGrant),
 }
 
 impl EndpointPolicy<'_> {
+    pub(crate) fn from_model_endpoint(endpoint: &str) -> Option<Self> {
+        providers::provider_uri(endpoint).map(|_| Self::Configured)
+    }
+
     fn permits(self, endpoint: &str, config: &ProviderExecutionConfig) -> bool {
         match self {
-            EndpointPolicy::Loopback => crate::system::http::direct_diagnostic_loopback(endpoint),
+            EndpointPolicy::Configured => {
+                providers::provider_uri(endpoint).is_some()
+                    && config.destination == DestinationPolicy::Standard
+            }
             EndpointPolicy::ScheduledExternal(grant) => {
                 grant.permits_endpoint(endpoint) && config.destination == grant.destination()
             }
@@ -46,7 +54,7 @@ impl EndpointPolicy<'_> {
 
     fn refusal(self) -> &'static str {
         match self {
-            EndpointPolicy::Loopback => "direct loopback endpoint required",
+            EndpointPolicy::Configured => "valid configured Provider endpoint required",
             EndpointPolicy::ScheduledExternal(_) => {
                 "the durable scheduled external endpoint is required"
             }
@@ -603,7 +611,7 @@ pub(crate) async fn supervise_development_decision(
         }
     };
     let local_rejection = match endpoint {
-        None => Some("explicit loopback endpoint required"),
+        None => Some("explicit endpoint required"),
         Some(endpoint) if !policy.permits(endpoint, config) => Some(policy.refusal()),
         Some(_) if config.cancellation.is_cancelled() => {
             Some("Execution was cancelled before the provider request.")

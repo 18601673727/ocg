@@ -18,57 +18,6 @@ use crate::service::ai::providers::ProviderExecutionError;
 
 static PROXY: OnceLock<Result<Option<Proxy>, String>> = OnceLock::new();
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum LoopbackEndpointClass {
-    LiteralDirect,
-    LiteralProxied,
-    LiteralMalformed,
-    LocalhostName,
-    Ipv6Loopback,
-    External,
-    Unparseable,
-}
-
-impl LoopbackEndpointClass {
-    pub(crate) const fn name(self) -> &'static str {
-        match self {
-            LoopbackEndpointClass::LiteralDirect => "literal_direct_loopback",
-            LoopbackEndpointClass::LiteralProxied => "literal_loopback_proxied",
-            LoopbackEndpointClass::LiteralMalformed => "literal_loopback_malformed",
-            LoopbackEndpointClass::LocalhostName => "localhost_name",
-            LoopbackEndpointClass::Ipv6Loopback => "ipv6_loopback",
-            LoopbackEndpointClass::External => "external",
-            LoopbackEndpointClass::Unparseable => "unparseable",
-        }
-    }
-}
-
-pub(crate) fn classify_loopback_endpoint(endpoint: &str) -> LoopbackEndpointClass {
-    let Ok(uri) = endpoint.parse::<Uri>() else {
-        return LoopbackEndpointClass::Unparseable;
-    };
-    match uri.host() {
-        Some("127.0.0.1") => {
-            if direct_diagnostic_loopback(endpoint) {
-                LoopbackEndpointClass::LiteralDirect
-            } else if uri.scheme_str() == Some("http")
-                && uri
-                    .authority()
-                    .is_some_and(|authority| !authority.as_str().contains('@'))
-                && uri.query().is_none()
-                && uri.port_u16().is_some_and(|port| port != 0)
-            {
-                LoopbackEndpointClass::LiteralProxied
-            } else {
-                LoopbackEndpointClass::LiteralMalformed
-            }
-        }
-        Some("localhost") => LoopbackEndpointClass::LocalhostName,
-        Some("::1" | "[::1]") => LoopbackEndpointClass::Ipv6Loopback,
-        Some(_) | None => LoopbackEndpointClass::External,
-    }
-}
-
 pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
     let Ok(uri) = endpoint.parse::<Uri>() else {
         return false;
@@ -176,10 +125,15 @@ pub(crate) async fn resolve_request_headers(
     Ok(resolved)
 }
 
-async fn standard_client(timeout: Duration) -> Result<Client, ProviderExecutionError> {
+async fn standard_client(timeout: Duration, uri: &Uri) -> Result<Client, ProviderExecutionError> {
+    let connector = if uri.scheme_str() == Some("http") {
+        Connector::default()
+    } else {
+        connector()?
+    };
     Client::builder()
         .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-        .connector::<()>(connector()?)
+        .connector::<()>(connector)
         .disable_redirects()
         .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
         .response_payload_timeout(Millis::ZERO)
@@ -201,14 +155,12 @@ pub(crate) async fn provider_client_for(
     use crate::service::ai::providers::DestinationPolicy;
     match destination {
         DestinationPolicy::Standard => {
-            if !direct_diagnostic_loopback(endpoint) {
-                return Err(ProviderExecutionError::Build {
-                    message:
-                        "this build sends Provider requests to a literal loopback endpoint only"
-                            .to_owned(),
-                });
-            }
-            standard_client(timeout).await
+            let uri = crate::service::ai::providers::provider_uri(endpoint).ok_or_else(|| {
+                ProviderExecutionError::Build {
+                    message: "invalid configured Provider endpoint".to_owned(),
+                }
+            })?;
+            standard_client(timeout, &uri).await
         }
         DestinationPolicy::ApprovedHttps { host, port, proxy } => Client::builder()
             .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
@@ -225,23 +177,6 @@ pub(crate) async fn provider_client_for(
                 message: "provider HTTP client could not be initialized".to_owned(),
             }),
     }
-}
-
-pub(crate) enum DiscoveryClientError {
-    NotAuthorized,
-    Unavailable,
-}
-
-pub(crate) async fn discovery_client(
-    timeout: Duration,
-    endpoint: &str,
-) -> Result<Client, DiscoveryClientError> {
-    if !direct_diagnostic_loopback(endpoint) {
-        return Err(DiscoveryClientError::NotAuthorized);
-    }
-    standard_client(timeout)
-        .await
-        .map_err(|_| DiscoveryClientError::Unavailable)
 }
 
 pub(crate) async fn release_client() -> Result<Client, ProviderExecutionError> {

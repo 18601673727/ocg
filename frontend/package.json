@@ -11,7 +11,7 @@
     "contracts:check": "cargo run --locked --quiet --bin ocg-rs-ts -- --check"
   },
   "dependencies": {
-    "@assistant-ui/react": "^0.15.31",
+    "@assistant-ui/react": "^0.15.36",
     "@base-ui/react": "^1.9.0",
     "@crafter/mermaid": "^0.0.3",
     "class-variance-authority": "^0.7.1",

@@ -1,7 +1,23 @@
-import type { ReactNode } from "react";
+import type { ComponentProps, ReactNode } from "react";
+import { Input } from "@/components/ui/input";
+import { cn } from "@/lib/utils";
 import type { LlmProfile } from "../contracts";
 import { ApiError } from "../runtime/api-client";
 import type { I18nKey, TranslateFn } from "../i18n";
+
+export function ApiKeyInput({ className, ...props }: Omit<ComponentProps<"input">, "type">) {
+  return (
+    <Input
+      {...props}
+      type="text"
+      className={cn("[&:not(:placeholder-shown)]:[-webkit-text-security:disc]", className)}
+      autoComplete="off"
+      autoCapitalize="none"
+      autoCorrect="off"
+      spellCheck={false}
+    />
+  );
+}
 
 export function Section({
   id,
@@ -34,6 +50,7 @@ export function Section({
 
 export function describeError(error: unknown, t: TranslateFn): string {
   if (error instanceof ApiError) {
+    if (error.code === "executor_unavailable") return t("settings.error.executorUnavailable");
     return error.detail
       ? `${error.detail} (${error.code})`
       : t("settings.error.refused", { code: error.code, status: error.status });

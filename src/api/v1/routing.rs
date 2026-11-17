@@ -150,7 +150,6 @@ pub(super) enum Route {
     AttachmentUpload,
     Attachment(AttachmentId),
     AttachmentContent(AttachmentId),
-    SessionCreate,
     SessionStatus,
     SessionRevoke,
 }
@@ -166,11 +165,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::NativeExecutorArchive(_)
             | Route::NativePoolCreate,
         ) => true,
-        (Caller::Anonymous, Route::SessionCreate | Route::SessionStatus) => true,
-        (
-            Caller::Programmatic,
-            Route::SessionCreate | Route::SessionStatus | Route::SessionRevoke,
-        ) => false,
+        (Caller::Anonymous, Route::SessionStatus) => true,
+        (Caller::Programmatic, Route::SessionStatus | Route::SessionRevoke) => false,
         (Caller::Programmatic, _) => true,
         (
             Caller::Operator(_),
@@ -238,7 +234,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::SessionStatus
             | Route::SessionRevoke,
         ) => true,
-        (Caller::Operator(_) | Caller::Anonymous, _) => false,
+        (Caller::Anonymous, _) => false,
     };
     if allowed { Ok(route) } else { Err(NOT_FOUND) }
 }
@@ -312,7 +308,6 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             }
             ["conversations", job] => Route::JobEdit(job_id(job)?),
             ["attachments"] => Route::AttachmentUpload,
-            ["session"] => Route::SessionCreate,
             _ => return Err(NOT_FOUND),
         };
         no_query(query)?;
@@ -824,24 +819,13 @@ pub(super) async fn respond(
             attachments::upload(database, &body).await
         }
         Route::Attachment(attachment) => attachments::metadata(database, attachment).await,
-        Route::SessionCreate => {
-            let body = read_body(payload, browser::MAX_LOGIN_BYTES).await?;
-            let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
-            browser.login(&body)
-        }
         Route::SessionStatus => match caller {
             Caller::Operator(session) => Ok(Reply::ok(browser::described(session))),
-            Caller::Anonymous if shared.assets.is_some() => {
-                let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
-                browser.begin_session()
-            }
-            Caller::Programmatic | Caller::Anonymous => Err(NOT_FOUND),
+            Caller::Anonymous => shared.browser.begin_session(),
+            Caller::Programmatic => Err(NOT_FOUND),
         },
         Route::SessionRevoke => match caller {
-            Caller::Operator(session) => {
-                let browser = shared.browser.as_ref().ok_or(NOT_FOUND)?;
-                Ok(browser.logout(session))
-            }
+            Caller::Operator(session) => Ok(shared.browser.logout(session)),
             Caller::Programmatic | Caller::Anonymous => Err(NOT_FOUND),
         },
         Route::Events { .. } | Route::Subscription(_) => Err(INTERNAL),

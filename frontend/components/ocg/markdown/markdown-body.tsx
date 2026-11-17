@@ -59,7 +59,8 @@ function MermaidDiagram({
   errorLabel: string;
   diagramLabel: string;
 }) {
-  const { resolvedTheme, hydrated } = useTheme();
+  const { preferences, hydrated } = useTheme();
+  const { theme } = preferences;
   const containerRef = useRef<HTMLDivElement>(null);
   const [error, setError] = useState<string | null>(null);
   const [svg, setSvg] = useState("");
@@ -82,7 +83,7 @@ function MermaidDiagram({
       .then(({ render, THEMES }) => {
         if (cancelled || attempt.current !== token) return;
         const rendered = render(code, {
-          theme: resolvedTheme === "dark" ? THEMES["zinc-dark"] : THEMES["zinc-light"],
+          theme: theme === "dark" ? THEMES["zinc-dark"] : THEMES["zinc-light"],
           transparent: true,
         });
         container.innerHTML = rendered;
@@ -97,7 +98,7 @@ function MermaidDiagram({
     return () => {
       cancelled = true;
     };
-  }, [code, errorLabel, hydrated, resolvedTheme]);
+  }, [code, errorLabel, hydrated, theme]);
 
   return (
     <div className={cn("group relative my-3", inMuted && "text-muted-foreground")}>

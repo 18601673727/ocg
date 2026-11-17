@@ -59,10 +59,6 @@ impl ApiServer {
             ),
             None => None,
         };
-        let browser =
-            Some(browser::State::start().map_err(|_| {
-                StartError::Serve(std::io::Error::other("no randomness for sign-in"))
-            })?);
         let shared = Arc::new(Shared {
             database,
             logs,
@@ -75,7 +71,7 @@ impl ApiServer {
             admission_wait: config.admission_wait,
             stream_limits: config.stream_limits,
             assets,
-            browser,
+            browser: browser::State::default(),
             streams: AtomicUsize::new(0),
             closing: AtomicBool::new(false),
         });
@@ -113,19 +109,6 @@ impl ApiServer {
 
     pub fn address(&self) -> SocketAddr {
         self.address
-    }
-
-    pub fn pairing_code(&self) -> Option<String> {
-        self.shared
-            .assets
-            .is_none()
-            .then(|| {
-                self.shared
-                    .browser
-                    .as_ref()
-                    .map(|browser| browser.pairing_code().to_owned())
-            })
-            .flatten()
     }
 
     pub async fn stop(self) -> Result<(), StopError> {

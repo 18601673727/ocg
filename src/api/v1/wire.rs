@@ -123,8 +123,8 @@ pub(super) const ONLY_POST: Refusal = METHOD_NOT_ALLOWED
     .with_message("only POST is accepted")
     .with_allow("POST");
 pub(super) const SESSION_METHODS: Refusal = METHOD_NOT_ALLOWED
-    .with_message("only GET, POST or DELETE is accepted")
-    .with_allow("GET, POST, DELETE");
+    .with_message("only GET or DELETE is accepted")
+    .with_allow("GET, DELETE");
 pub(super) const PROFILE_METHODS: Refusal = METHOD_NOT_ALLOWED
     .with_message("only POST or DELETE is accepted")
     .with_allow("POST, DELETE");

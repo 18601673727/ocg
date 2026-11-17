@@ -482,6 +482,19 @@ pub struct FrozenExecutionConfig {
 }
 
 impl FrozenExecutionConfig {
+    pub(crate) fn workspace_enabled(&self, has_project: bool) -> Result<bool, &'static str> {
+        let Some(agent) = self.agent.as_ref() else {
+            return Ok(false);
+        };
+        if agent.workspace_grant().is_none() {
+            return Ok(false);
+        }
+        if !has_project && !agent.manages_jobs() {
+            return Err("workspace_unavailable");
+        }
+        Ok(has_project)
+    }
+
     pub fn single_request_refusal(&self) -> Option<&'static str> {
         match &self.agent {
             None => return Some("an Agent is required"),

@@ -584,6 +584,9 @@ pub(crate) struct TurnView {
     native_decision: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    planning_target: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     content_kind: Option<TurnContentKind>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
@@ -665,6 +668,7 @@ pub(super) async fn conversation_turns(
                     content_kind: Some(if decision.is_some() { TurnContentKind::Decision } else { TurnContentKind::Generative }),
                     submitted_at_us: turn.job.submitted_at.map(|at| at.as_unix_micros()),
                     native_decision: decision.clone(),
+                    planning_target: item.planning_target.map(|job| job.to_string()),
                     job: super::jobs::mutable_job_view(
                         turn,
                         item.details.allocation.as_ref(),

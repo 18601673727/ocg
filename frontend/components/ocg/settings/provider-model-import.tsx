@@ -17,7 +17,7 @@ import type { ProviderModel } from "../contracts/api";
 import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
 import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
-import { describeError } from "./settings-parts";
+import { ApiKeyInput, describeError } from "./settings-parts";
 import { HeadersEditor } from "./headers-editor";
 import { type HeaderDraft, type HeaderDraftError, draftsToInputs } from "./header-drafts";
 
@@ -351,13 +351,10 @@ function ImportContent({
               </label>
               <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
                 {t("settings.llm.apiKey")}
-                <Input
-                  type="password"
+                <ApiKeyInput
                   value={newSecret}
                   disabled={saving}
                   onChange={(event) => changeNewConnection(() => setNewSecret(event.target.value))}
-                  autoComplete="new-password"
-                  spellCheck={false}
                 />
               </label>
               <div className="sm:col-span-2">

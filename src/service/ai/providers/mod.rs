@@ -61,21 +61,7 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
         .or_else(|| endpoint.strip_suffix("/models"))
         .unwrap_or(endpoint);
     let url = format!("{base}/{resource}");
-    let uri = url.parse::<ntex::http::Uri>().ok();
-    if uri.as_ref().is_none_or(|uri| {
-        !(uri.scheme_str() == Some("https")
-            || (uri.scheme_str() == Some("http")
-                && matches!(
-                    uri.host(),
-                    Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
-                )))
-            || uri.host().is_none_or(str::is_empty)
-            || uri
-                .authority()
-                .is_some_and(|authority| authority.as_str().contains('@'))
-            || uri.query().is_some()
-    }) || url.contains('#')
-    {
+    if provider_uri(&url).is_none() {
         return Err(ProviderExecutionError::Build {
             message:
                 "provider endpoint must use https (or http on localhost, 127.0.0.1 or ::1) without credentials, query or fragment"
@@ -83,6 +69,24 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
         });
     }
     Ok(url)
+}
+
+pub(crate) fn provider_uri(url: &str) -> Option<ntex::http::Uri> {
+    let uri = url.parse::<ntex::http::Uri>().ok()?;
+    let supported_scheme = uri.scheme_str() == Some("https")
+        || (uri.scheme_str() == Some("http")
+            && matches!(
+                uri.host(),
+                Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
+            ));
+    (supported_scheme
+        && uri.host().is_some_and(|host| !host.is_empty())
+        && uri
+            .authority()
+            .is_some_and(|authority| !authority.as_str().contains('@'))
+        && uri.query().is_none()
+        && !url.contains('#'))
+    .then_some(uri)
 }
 
 pub(super) async fn send(

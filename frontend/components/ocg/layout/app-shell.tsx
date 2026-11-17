@@ -146,6 +146,7 @@ function AppShellContent({
     return () => desktop.removeEventListener("change", closeOnDesktop);
   }, [mobile]);
   const [inspectorOpen, setInspectorOpen] = useState(false);
+  const [planningFocus, setPlanningFocus] = useState<{ sessionId: string; decisionId: string }>();
   const [openedJob, setOpenedJob] = useState<string | null>(null);
   const opening =
     location.view === "chat" &&
@@ -228,18 +229,26 @@ function AppShellContent({
   }, [runtime.snapshot.status, runtime.client, conversationKey, location.view, report, t]);
   const closeInspector = useCallback(() => {
     setInspectorOpen(false);
-    requestAnimationFrame(() => document.getElementById("chat-inspector-toggle")?.focus());
-  }, []);
+    setPlanningFocus(undefined);
+    requestAnimationFrame(() => {
+      const trigger =
+        planningFocus?.sessionId === sessionId
+          ? document.getElementById(`planning-notice-${planningFocus.decisionId}`)
+          : null;
+      (trigger ?? document.getElementById("chat-inspector-toggle"))?.focus();
+    });
+  }, [planningFocus, sessionId]);
 
   useEffect(() => {
     if (!inspectorOpen || location.view !== "chat" || detailJob !== null) return;
-    document.getElementById("chat-inspector-close")?.focus();
+    if (planningFocus?.sessionId !== sessionId)
+      document.getElementById("chat-inspector-close")?.focus();
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") closeInspector();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [inspectorOpen, location.view, detailJob, closeInspector]);
+  }, [inspectorOpen, location.view, detailJob, closeInspector, planningFocus, sessionId]);
 
   useEffect(() => {
     const pop = () => {
@@ -426,6 +435,7 @@ function AppShellContent({
       if (!allowed) return;
       setSessionId("");
       setInspectorOpen(false);
+      setPlanningFocus(undefined);
       goDirect("chat");
     });
   }
@@ -555,6 +565,10 @@ function AppShellContent({
                         <ChatScreen
                           key={session.id}
                           onOpenConversation={(job) => void openNestedConversation(job)}
+                          onOpenPlanningDecision={(decisionId) => {
+                            setPlanningFocus({ sessionId: session.id, decisionId });
+                            setInspectorOpen(true);
+                          }}
                           backButton={
                             ancestors.length > 1 ? (
                               <FloatingIconButton
@@ -631,6 +645,7 @@ function AppShellContent({
             <ChatInspector
               session={session}
               messages={session ? (runtime.snapshot.messagesBySession[session.id] ?? []) : []}
+              planningFocus={planningFocus?.sessionId === session?.id ? planningFocus : undefined}
               onClose={closeInspector}
               onOpenJob={setDetailJob}
             />

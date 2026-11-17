@@ -2,7 +2,7 @@
 
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { ExternalLink } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useState, type Ref } from "react";
 import type { ChatModelSelection, AgentProfile, Project } from "../contracts";
 import { ModelSelectorView } from "./model-selector-view";
 import { useOcgRuntime } from "../runtime/runtime-context";
@@ -25,6 +25,7 @@ export function ModelSelector({
   projectLocked = false,
   lockedProject,
   statusText,
+  triggerRef,
 }: {
   sessionId?: string;
   selection?: ChatModelSelection;
@@ -35,6 +36,7 @@ export function ModelSelector({
   projectLocked?: boolean;
   lockedProject?: string | null;
   statusText?: string;
+  triggerRef?: Ref<HTMLButtonElement>;
 }) {
   const { api, client, snapshot } = useOcgRuntime();
   const { t } = useI18n();
@@ -173,6 +175,7 @@ export function ModelSelector({
   return (
     <div className="min-w-0 flex-1">
       <ModelSelectorView
+        triggerRef={triggerRef}
         status={statusText ?? (busy ? t("chat.settingsLocked") : t("chat.settingsNextTurn"))}
         disabled={disabled}
         loading={!catalog && !error}

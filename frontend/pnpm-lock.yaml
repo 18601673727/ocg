@@ -167,8 +167,8 @@ importers:
   .:
     dependencies:
       '@assistant-ui/react':
-        specifier: ^0.15.31
-        version: 0.15.31(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(use-sync-external-store@1.7.0(react@19.3.1))
+        specifier: ^0.15.36
+        version: 0.15.36(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(use-sync-external-store@1.7.0(react@19.3.1))
       '@base-ui/react':
         specifier: ^1.9.0
         version: 1.9.0(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
@@ -252,11 +252,11 @@ packages:
     resolution: {integrity: sha512-U4+70Pc5ZS9osnCBCE5Jha/ciHM+Yp+CNMNC/7HvYbNRk1Ldd+f7qO65W5qfhu/TCv+/ozljlXXe9Nj8419DMA==}
     engines: {node: '>=10'}
 
-  '@assistant-ui/core@0.3.31':
-    resolution: {integrity: sha512-NrTSgdUTM0SVmos3YMAAvPqDDNlxFmwVTjnA06T+4A7DcXswsKrBw65BsfSEn4m1DFSwaD3rfMlIFTEK3ei4uQ==}
+  '@assistant-ui/core@0.3.36':
+    resolution: {integrity: sha512-/LTpkA5tDBWcJoitUYihDtDFjMfSdQvh+40S1HLrrNfuUoGc9Qq16qtiAcO//9l0pALRxs9YxX0CEPw6WYA0Aw==}
     peerDependencies:
-      '@assistant-ui/store': ^0.3.22
-      '@assistant-ui/tap': ^0.9.24
+      '@assistant-ui/store': ^0.3.23
+      '@assistant-ui/tap': ^0.9.26
       '@types/react': '*'
       react: ^18 || ^19
     peerDependenciesMeta:
@@ -265,8 +265,8 @@ packages:
       react:
         optional: true
 
-  '@assistant-ui/react@0.15.31':
-    resolution: {integrity: sha512-vTTcI2963DO5CYrKh8CYkJ0stQcu0JXxUQM0nepsP2Zy4QfrovVuiYkAhKM1U4jMnGHy3sQ9ovxH0VTZrScnZg==}
+  '@assistant-ui/react@0.15.36':
+    resolution: {integrity: sha512-cFaOFrPIRTZgzHMh7tCUEf6fjLcodUZU/fynDq6eZhlZFVldJYORPU025/GZbw+fkNIyoJs8V7Nq89MpFYFQzg==}
     peerDependencies:
       '@types/react': '*'
       '@types/react-dom': '*'
@@ -278,10 +278,10 @@ packages:
       '@types/react-dom':
         optional: true
 
-  '@assistant-ui/store@0.3.22':
-    resolution: {integrity: sha512-aXp4m42mmtZOQUE0lzxJ8Z9EZKknOWBk+DDg1Pj2gNhhBGYXmfrScYD1N1e/9/8wTKSwL0g4z2fSZqr+5fWbxg==}
+  '@assistant-ui/store@0.3.23':
+    resolution: {integrity: sha512-s0//CJ0miZO+LydznY8rcYD6cA9KnnMXeupaBXnGBPUNgFIwDFMtieTxnBvT8Io8PUGqDDcVEzQrLSLy8v4fRw==}
     peerDependencies:
-      '@assistant-ui/tap': ^0.9.24
+      '@assistant-ui/tap': ^0.9.25
       '@types/react': '*'
       react: ^18 || ^19
     peerDependenciesMeta:
@@ -290,8 +290,8 @@ packages:
       react:
         optional: true
 
-  '@assistant-ui/tap@0.9.24':
-    resolution: {integrity: sha512-6O0hf2HkKbrylIwNlFUimHf2V/6Gq5UXF0y0r2Fbw5wSvvO8ZDmv0AEkMwwygSfJgbpnQgiC8Xs+2VFaeO0RBw==}
+  '@assistant-ui/tap@0.9.26':
+    resolution: {integrity: sha512-Rbau9i+EfPPNfXZBv0rXqZxbexR572xfKMnRXOrudRLfTYbzT2nfkyDh5NCpEutUV9uAJi1bBRoZqKrSQBpAKQ==}
     peerDependencies:
       '@types/react': '*'
       react: ^18 || ^19
@@ -1960,8 +1960,8 @@ packages:
     resolution: {integrity: sha512-BNoCY6SXXPQ7gF2opIP4GBE+Xw7U+pHMYKuzjgCN3GwiaIR09UUeKfheyIry77QtrCBlC0KK0q5/TER/tYh3PQ==}
     engines: {node: '>= 0.4'}
 
-  assistant-cloud@0.2.8:
-    resolution: {integrity: sha512-KCFwGcDgGUvKoQNw0zyEeFrS7F5B6QXfDaZ/QCNAjDWs7FxomFtLrXxlFGwlvueE+QK5vlOAdNnvKc9QfRzcqA==}
+  assistant-cloud@0.2.12:
+    resolution: {integrity: sha512-ZxDFzaSbmQf7PzM1X5eD9WLF6bioBtRu+IlQsZONt/SAHvoJt0ivqPv5fzLNfZX+6U2Vif1V9YvZjunq6p99pg==}
     peerDependencies:
       '@opentelemetry/api': ^1.9.0
       '@opentelemetry/exporter-trace-otlp-http': '>=0.200.0'
@@ -1977,8 +1977,8 @@ packages:
       ai:
         optional: true
 
-  assistant-stream@0.3.54:
-    resolution: {integrity: sha512-Jed48fZg12rzHHWDoTIRKLAO7SovX942f5VXCZ/GifGhaBH0fS1wZhhWhT8BVldJ4uDnCAMlszPGl82eZwO+vw==}
+  assistant-stream@0.3.57:
+    resolution: {integrity: sha512-R+dAUoKcAGGjoTzbgSUhaVer2H8rNu/cY1GwdeRZ+gbsrV+DDc7QXuYDpKOp6HGO9o2Q5+7l3Dvp4qYNx8UpSg==}
     peerDependencies:
       ai: ^6.0.0 || ^7.0.0
       ioredis: ^5.10.1 || ^6.0.0
@@ -4091,12 +4091,12 @@ snapshots:
 
   '@alloc/quick-lru@5.3.0': {}
 
-  '@assistant-ui/core@0.3.31(@assistant-ui/store@0.3.22(@assistant-ui/tap@0.9.24(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1))(@assistant-ui/tap@0.9.24(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)':
+  '@assistant-ui/core@0.3.36(@assistant-ui/store@0.3.23(@assistant-ui/tap@0.9.26(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1))(@assistant-ui/tap@0.9.26(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)':
     dependencies:
-      '@assistant-ui/store': 0.3.22(@assistant-ui/tap@0.9.24(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)
-      '@assistant-ui/tap': 0.9.24(@types/react@19.3.0)(react@19.3.1)
-      assistant-cloud: 0.2.8
-      assistant-stream: 0.3.54
+      '@assistant-ui/store': 0.3.23(@assistant-ui/tap@0.9.26(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)
+      '@assistant-ui/tap': 0.9.26(@types/react@19.3.0)(react@19.3.1)
+      assistant-cloud: 0.2.12
+      assistant-stream: 0.3.57
       nanoid: 6.0.2
     optionalDependencies:
       '@types/react': 19.3.0
@@ -4109,13 +4109,13 @@ snapshots:
       - ioredis
       - redis
 
-  '@assistant-ui/react@0.15.31(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(use-sync-external-store@1.7.0(react@19.3.1))':
+  '@assistant-ui/react@0.15.36(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)(use-sync-external-store@1.7.0(react@19.3.1))':
     dependencies:
-      '@assistant-ui/core': 0.3.31(@assistant-ui/store@0.3.22(@assistant-ui/tap@0.9.24(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1))(@assistant-ui/tap@0.9.24(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)
-      '@assistant-ui/store': 0.3.22(@assistant-ui/tap@0.9.24(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)
-      '@assistant-ui/tap': 0.9.24(@types/react@19.3.0)(react@19.3.1)
-      assistant-cloud: 0.2.8
-      assistant-stream: 0.3.54
+      '@assistant-ui/core': 0.3.36(@assistant-ui/store@0.3.23(@assistant-ui/tap@0.9.26(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1))(@assistant-ui/tap@0.9.26(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)
+      '@assistant-ui/store': 0.3.23(@assistant-ui/tap@0.9.26(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)
+      '@assistant-ui/tap': 0.9.26(@types/react@19.3.0)(react@19.3.1)
+      assistant-cloud: 0.2.12
+      assistant-stream: 0.3.57
       radix-ui: 1.8.1(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.1(react@19.3.1))(react@19.3.1)
       react: 19.3.1
       react-dom: 19.3.1(react@19.3.1)
@@ -4136,14 +4136,14 @@ snapshots:
       - redis
       - use-sync-external-store
 
-  '@assistant-ui/store@0.3.22(@assistant-ui/tap@0.9.24(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)':
+  '@assistant-ui/store@0.3.23(@assistant-ui/tap@0.9.26(@types/react@19.3.0)(react@19.3.1))(@types/react@19.3.0)(react@19.3.1)':
     dependencies:
-      '@assistant-ui/tap': 0.9.24(@types/react@19.3.0)(react@19.3.1)
+      '@assistant-ui/tap': 0.9.26(@types/react@19.3.0)(react@19.3.1)
     optionalDependencies:
       '@types/react': 19.3.0
       react: 19.3.1
 
-  '@assistant-ui/tap@0.9.24(@types/react@19.3.0)(react@19.3.1)':
+  '@assistant-ui/tap@0.9.26(@types/react@19.3.0)(react@19.3.1)':
     optionalDependencies:
       '@types/react': 19.3.0
       react: 19.3.1
@@ -5886,14 +5886,14 @@ snapshots:
       get-intrinsic: 1.3.0
       is-array-buffer: 3.0.5
 
-  assistant-cloud@0.2.8:
+  assistant-cloud@0.2.12:
     dependencies:
-      assistant-stream: 0.3.54
+      assistant-stream: 0.3.57
     transitivePeerDependencies:
       - ioredis
       - redis
 
-  assistant-stream@0.3.54:
+  assistant-stream@0.3.57:
     dependencies:
       '@standard-schema/spec': 1.1.0
       '@types/json-schema': 7.0.15
