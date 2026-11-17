@@ -18,21 +18,12 @@ use crate::db::entities::{
     Violation,
 };
 use crate::db::{DatabaseError, DatabaseHandle};
-
-pub(crate) struct DevelopmentExecutionReturn<'a> {
-    handoff: &'a crate::db::DevelopmentHandoff,
-}
-
-impl<'a> DevelopmentExecutionReturn<'a> {
-    pub(crate) fn handoff(&self) -> &'a crate::db::DevelopmentHandoff {
-        self.handoff
-    }
-}
+use crate::jobs::authorization::scheduled::ScheduledExternalGrant;
 
 #[derive(Clone, Copy)]
 pub(crate) enum EndpointPolicy<'a> {
     Configured,
-    ScheduledExternal(&'a crate::jobs::authorization::scheduled::ScheduledExternalGrant),
+    ScheduledExternal(&'a ScheduledExternalGrant),
 }
 
 impl EndpointPolicy<'_> {
@@ -174,9 +165,8 @@ pub(crate) async fn supervise_development_generative(
                 goal_reached: None,
                 value: Some(value),
             });
-            let returned = DevelopmentExecutionReturn { handoff: &handoff };
             return database
-                .finalize_development_job(returned, output_seq, finalization)
+                .finalize_development_job(&handoff, output_seq, finalization)
                 .await;
         };
         let site = CallSite {
@@ -202,9 +192,8 @@ pub(crate) async fn supervise_development_generative(
                     goal_reached: None,
                     value: Some(providers::result_value(&result)),
                 });
-                let returned = DevelopmentExecutionReturn { handoff: &handoff };
                 return database
-                    .finalize_development_job(returned, output_seq, finalization)
+                    .finalize_development_job(&handoff, output_seq, finalization)
                     .await;
             }
             Err(stop) => {
@@ -255,7 +244,7 @@ pub(crate) async fn supervise_development_generative(
             }
         };
         if matches!(policy, EndpointPolicy::ScheduledExternal(_)) {
-            let recheck = match database.scheduled_external_grant(token.job).await {
+            let recheck = match ScheduledExternalGrant::load(database, token.job).await {
                 Ok(Some(live_grant)) => {
                     let body_bytes =
                         serde_json::to_vec(&body).map_or(usize::MAX, |bytes| bytes.len());
@@ -565,7 +554,7 @@ async fn settle_tool_stop(
     if stop.is_unknown() {
         database
             .record_development_uncertain(
-                DevelopmentExecutionReturn { handoff },
+                handoff,
                 crate::db::entities::UncertaintyReason::StopRequestedWithoutConfirmedTermination,
             )
             .await?;
@@ -581,12 +570,7 @@ async fn settle_tool_stop(
         value: last.map(providers::result_value),
     };
     database
-        .finalize_development_failure(
-            DevelopmentExecutionReturn { handoff },
-            expected_seq,
-            JobFinalization::Failed(result),
-            None,
-        )
+        .finalize_development_failure(handoff, expected_seq, JobFinalization::Failed(result), None)
         .await
 }
 
@@ -728,9 +712,8 @@ pub(crate) async fn supervise_development_decision(
             usages,
         )
         .await?;
-    let returned = DevelopmentExecutionReturn { handoff: &handoff };
     database
-        .finalize_development_decision(returned, sink.output_seq, result.result)
+        .finalize_development_decision(&handoff, sink.output_seq, result.result)
         .await
 }
 
@@ -840,7 +823,7 @@ async fn settle_development_error(
             };
             database
                 .finalize_development_failure(
-                    DevelopmentExecutionReturn { handoff },
+                    handoff,
                     expected_seq,
                     JobFinalization::Failed(result),
                     Some((request, Timestamp::now(), observation)),
@@ -849,7 +832,7 @@ async fn settle_development_error(
         }
         DevelopmentSettlement::Held(reason) => {
             database
-                .record_development_uncertain(DevelopmentExecutionReturn { handoff }, reason)
+                .record_development_uncertain(handoff, reason)
                 .await?;
             Err(DatabaseError::Rejected(Violation::InvalidValue(
                 "execution",
@@ -872,7 +855,7 @@ async fn settle_development_unsent(
     if cancelled && request != RequestNumber::FIRST {
         database
             .record_development_uncertain(
-                DevelopmentExecutionReturn { handoff },
+                handoff,
                 crate::db::entities::UncertaintyReason::StopRequestedWithoutConfirmedTermination,
             )
             .await?;
@@ -894,7 +877,7 @@ async fn settle_development_unsent(
     };
     database
         .finalize_development_failure(
-            DevelopmentExecutionReturn { handoff },
+            handoff,
             expected_seq,
             if cancelled {
                 JobFinalization::Cancelled(result)

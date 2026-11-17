@@ -1,7 +1,7 @@
 use crate::db::entities::identity::{ConfigId, JobId, ProjectId};
 use crate::db::entities::{
-    AllocationToken, ConfigRef, ContentDigest, FrozenLlmConfig, JobOutputRecord, MutableJobDetails,
-    Timestamp, ToolCallRef, ToolEvidenceRecord,
+    AllocationToken, ConfigRef, ContentDigest, FrozenDecisionConfig, FrozenLlmConfig,
+    JobOutputRecord, MutableJobDetails, Timestamp, ToolCallRef, ToolEvidenceRecord,
 };
 
 pub const MAX_JOB_DEPTH: u8 = 16;
@@ -226,6 +226,25 @@ pub struct ResolvedCompaction {
 }
 
 impl CompactionPolicy {
+    pub(in crate::db) fn bind_prediction(&mut self, decision: &FrozenDecisionConfig) {
+        let mut binding = self.predictive.take().unwrap_or_else(|| {
+            PredictiveCompaction::automatic(decision.profile_ref().id, decision.model_ref())
+        });
+        binding.decision_agent = decision.profile_ref().id;
+        binding.mode = PredictionMode::Prepare;
+        let acceptance = binding.acceptance.get_or_insert(PredictionAcceptance {
+            model: decision.model_ref(),
+            reported_model: String::new(),
+            confidence_semantics: decision.confidence_semantics().into(),
+            minimum_probability_millionths: 800_000,
+            minimum_confidence_millionths: 800_000,
+        });
+        acceptance.model = decision.model_ref();
+        acceptance.reported_model.clear();
+        acceptance.confidence_semantics = decision.confidence_semantics().into();
+        self.predictive = Some(binding);
+    }
+
     pub fn recipe(
         &self,
         window: Option<u32>,

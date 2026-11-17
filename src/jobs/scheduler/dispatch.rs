@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 use crate::ai::providers::{CancellationToken, ProviderExecutionConfig};
 use crate::db::entities::{
     AllocationPhase, AllocationToken, ExecutionOperation, JobId, OutcomeKind, PoolAllocation,
-    UnstartedCause,
+    SCHEDULED_EXTERNAL_MAX_TIMEOUT, UnstartedCause,
 };
 use crate::db::{DatabaseError, DatabaseHandle, DevelopmentHandoffError};
-use crate::jobs::authorization::external::MAX_TIMEOUT_CEILING;
+use crate::jobs::authorization::scheduled::ScheduledExternalGrant;
 use crate::jobs::execution::runtime::{
     EndpointPolicy, WorkspaceTools, supervise_development_decision,
     supervise_development_generative,
@@ -14,7 +14,7 @@ use crate::jobs::execution::runtime::{
 use crate::jobs::execution::stops::NativeStops;
 use crate::jobs::execution::tools::native::NativeTooling;
 
-const DISPATCH_TIMEOUT: Duration = MAX_TIMEOUT_CEILING;
+const DISPATCH_TIMEOUT: Duration = SCHEDULED_EXTERNAL_MAX_TIMEOUT;
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
 #[derive(Debug)]
@@ -190,7 +190,7 @@ pub(super) async fn dispatch(
             "cancelled before the start".to_owned(),
         ))
     } else {
-        match database.scheduled_external_grant(token.job).await {
+        match ScheduledExternalGrant::load(database, token.job).await {
             Ok(Some(_)) if allocation.operation == ExecutionOperation::Decision => Err((
                 UnstartedCause::StartRefused,
                 "Decision execution is not permitted under a scheduled external grant".to_owned(),
@@ -254,7 +254,7 @@ async fn start_and_exchange(
     token: AllocationToken,
     operation: ExecutionOperation,
     config: ProviderExecutionConfig,
-    grant: Option<&crate::jobs::authorization::scheduled::ScheduledExternalGrant>,
+    grant: Option<&ScheduledExternalGrant>,
     data_directory: &crate::host::data_directory::DataDirectory,
     stops: &NativeStops,
 ) -> String {

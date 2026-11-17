@@ -533,11 +533,10 @@ impl DatabaseHandle {
 
     pub(crate) async fn finalize_development_job(
         &self,
-        returned: crate::jobs::execution::runtime::DevelopmentExecutionReturn<'_>,
+        handoff: &DevelopmentHandoff,
         expected_seq: u32,
         finalization: JobFinalization,
     ) -> Result<AppendedOutput, DatabaseError> {
-        let handoff = returned.handoff();
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         if let Some(secret) = &handoff.prepared.credentials.spellings {
             let result = finalization.result();
@@ -574,11 +573,10 @@ impl DatabaseHandle {
 
     pub(crate) async fn finalize_development_decision(
         &self,
-        returned: crate::jobs::execution::runtime::DevelopmentExecutionReturn<'_>,
+        handoff: &DevelopmentHandoff,
         expected_seq: u32,
         result: entities::DecisionResult,
     ) -> Result<AppendedOutput, DatabaseError> {
-        let handoff = returned.handoff();
         if !matches!(
             &handoff.prepared.candidate,
             crate::db::entities::DevelopmentCandidate::Decision(_)
@@ -624,7 +622,7 @@ impl DatabaseHandle {
 
     pub(crate) async fn finalize_development_failure(
         &self,
-        returned: crate::jobs::execution::runtime::DevelopmentExecutionReturn<'_>,
+        handoff: &DevelopmentHandoff,
         expected_seq: u32,
         finalization: JobFinalization,
         rejection: Option<(
@@ -633,7 +631,6 @@ impl DatabaseHandle {
             entities::AvailabilityObservation,
         )>,
     ) -> Result<AppendedOutput, DatabaseError> {
-        let handoff = returned.handoff();
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let token = proof.token;
         if let Some(secret) = &handoff.prepared.credentials.spellings {
@@ -715,10 +712,9 @@ impl DatabaseHandle {
 
     pub(crate) async fn record_development_uncertain(
         &self,
-        returned: crate::jobs::execution::runtime::DevelopmentExecutionReturn<'_>,
+        handoff: &DevelopmentHandoff,
         reason: entities::UncertaintyReason,
     ) -> Result<(), DatabaseError> {
-        let handoff = returned.handoff();
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self
             .write(

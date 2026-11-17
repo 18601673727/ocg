@@ -8,7 +8,6 @@ use std::time::Duration;
 
 pub use crate::db::attachments::{AttachmentContent, AttachmentError, Reclamation, StoreError};
 use crate::db::entities::{AvailabilityStatId, JobId, MetricsId};
-pub(crate) use crate::db::redb::{Batch, BatchError, Failure};
 pub use crate::db::redb::{StorageError, StorageErrorKind};
 
 pub const COMMAND_QUEUE_CAPACITY: usize = 256;

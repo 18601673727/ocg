@@ -1,7 +1,7 @@
 use super::StorageError;
 use crate::db::entities::{
-    CursorPage, FrozenConfiguration, FrozenExecutionConfig, JobId, ScheduledExternalPolicyId,
-    Violation,
+    CursorPage, FrozenConfiguration, FrozenExecutionConfig, JobId, ScheduledExternalPolicyConfig,
+    ScheduledExternalPolicyId, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::codec::{
@@ -50,21 +50,21 @@ impl Batch {
 
     pub(crate) fn create_scheduled_external_policy(
         &mut self,
-        draft: &crate::jobs::authorization::scheduled::ScheduledExternalPolicyDraft,
+        config: &ScheduledExternalPolicyConfig,
     ) -> Result<crate::db::entities::ScheduledExternalPolicyRecord, BatchError> {
         use crate::db::entities::{ScheduledExternalPolicyId, ScheduledExternalPolicyRecord};
         let id = ScheduledExternalPolicyId::new(self.next_id()?);
         let now = self.now;
         let record = ScheduledExternalPolicyRecord {
             id,
-            endpoint: draft.endpoint().to_owned(),
-            credential_ref: draft.credential_ref().to_owned(),
-            model: draft.model().to_owned(),
-            proxy: draft.proxy().to_owned(),
-            max_request_bytes: u32::try_from(draft.limits().max_request_bytes)
+            endpoint: config.endpoint().to_owned(),
+            credential_ref: config.credential_ref().to_owned(),
+            model: config.model().to_owned(),
+            proxy: config.proxy().address().to_string(),
+            max_request_bytes: u32::try_from(config.limits().max_request_bytes)
                 .map_err(|_| self.invalid("scheduled_external_policy"))?,
-            max_output_tokens: draft.limits().max_output_tokens,
-            timeout_secs: u32::try_from(draft.limits().timeout.as_secs())
+            max_output_tokens: config.limits().max_output_tokens,
+            timeout_secs: u32::try_from(config.limits().timeout.as_secs())
                 .map_err(|_| self.invalid("scheduled_external_policy"))?,
             enabled: false,
             revoked: false,
@@ -132,7 +132,7 @@ impl Batch {
         &mut self,
         id: crate::db::entities::ScheduledExternalPolicyId,
         expected_revision: u32,
-        draft: &crate::jobs::authorization::scheduled::ScheduledExternalPolicyDraft,
+        config: &ScheduledExternalPolicyConfig,
     ) -> Result<crate::db::entities::ScheduledExternalPolicyRecord, BatchError> {
         self.mutate_scheduled_external_policy(
             id,
@@ -140,14 +140,14 @@ impl Batch {
             Some("a revoked policy is immutable; create a new one"),
             |batch, record| {
                 Ok(Some(crate::db::entities::ScheduledExternalPolicyRecord {
-                    endpoint: draft.endpoint().to_owned(),
-                    credential_ref: draft.credential_ref().to_owned(),
-                    model: draft.model().to_owned(),
-                    proxy: draft.proxy().to_owned(),
-                    max_request_bytes: u32::try_from(draft.limits().max_request_bytes)
+                    endpoint: config.endpoint().to_owned(),
+                    credential_ref: config.credential_ref().to_owned(),
+                    model: config.model().to_owned(),
+                    proxy: config.proxy().address().to_string(),
+                    max_request_bytes: u32::try_from(config.limits().max_request_bytes)
                         .map_err(|_| batch.invalid("scheduled_external_policy"))?,
-                    max_output_tokens: draft.limits().max_output_tokens,
-                    timeout_secs: u32::try_from(draft.limits().timeout.as_secs())
+                    max_output_tokens: config.limits().max_output_tokens,
+                    timeout_secs: u32::try_from(config.limits().timeout.as_secs())
                         .map_err(|_| batch.invalid("scheduled_external_policy"))?,
                     ..record
                 }))
@@ -199,9 +199,7 @@ impl Batch {
             for entry in table.iter()? {
                 let (key, row) = entry?;
                 let record = decode_scheduled_external_policy(key.value(), row.value())?;
-                if record.is_live()
-                    && crate::jobs::authorization::scheduled::record_admits(&record, frozen)
-                {
+                if record.is_live() && record.admits(frozen) {
                     matching = match matching {
                         ScheduledPolicyMatch::None => ScheduledPolicyMatch::One {
                             id: record.id,
@@ -258,7 +256,7 @@ impl Batch {
                 "a scheduled external Job must be Generative",
             ));
         };
-        if !crate::jobs::authorization::scheduled::record_admits(&record, frozen) {
+        if !record.admits(frozen) {
             return self.reject(Violation::InvalidValue(
                 "scheduled_external_policy",
                 "the Job's frozen configuration no longer matches the bound policy",

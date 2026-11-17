@@ -1,9 +1,6 @@
 pub(crate) mod authorization;
-mod configuration;
 pub mod execution;
 pub mod scheduler;
-
-pub(crate) use configuration::{ConfigurationResolver, bind_prediction};
 
 use crate::db::entities::{
     self, AttachmentId, DevelopmentCandidate, DevelopmentDecisionContext,

@@ -1,16 +1,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::db::entities::{ScheduledExternalPolicyId, ScheduledExternalPolicyRecord, Timestamp};
+use crate::db::entities::{
+    ScheduledExternalPolicyConfig, ScheduledExternalPolicyId, ScheduledExternalPolicyRecord,
+    Timestamp,
+};
 use crate::host::data_directory::DataDirectory;
 use crate::host::execution_features::SCHEDULED_EXTERNAL;
-use crate::jobs::authorization::scheduled::ScheduledExternalPolicyDraft;
 
 pub(super) const COMMAND: &str = "scheduled-external-policy";
 
 enum Action {
     Create {
-        draft: ScheduledExternalPolicyDraft,
+        draft: ScheduledExternalPolicyConfig,
     },
     List {
         after: Option<ScheduledExternalPolicyId>,
@@ -22,7 +24,7 @@ enum Action {
     Update {
         id: ScheduledExternalPolicyId,
         revision: u32,
-        draft: ScheduledExternalPolicyDraft,
+        draft: ScheduledExternalPolicyConfig,
     },
     SetEnabled {
         id: ScheduledExternalPolicyId,
@@ -235,7 +237,7 @@ impl PoliciesFields {
         Ok(())
     }
 
-    fn draft(self) -> Result<ScheduledExternalPolicyDraft, Box<dyn std::error::Error>> {
+    fn draft(self) -> Result<ScheduledExternalPolicyConfig, Box<dyn std::error::Error>> {
         let endpoint = self.endpoint.ok_or_else(|| missing("--endpoint"))?;
         let credential_ref = self
             .credential_ref
@@ -256,7 +258,7 @@ impl PoliciesFields {
             self.timeout_secs.ok_or_else(|| missing("--timeout-secs"))?,
             "--timeout-secs",
         )?;
-        ScheduledExternalPolicyDraft::new(
+        ScheduledExternalPolicyConfig::new(
             &endpoint,
             &credential_ref,
             &model,
@@ -271,7 +273,7 @@ impl PoliciesFields {
 
 fn parse_draft(
     arguments: &mut std::vec::IntoIter<String>,
-) -> Result<ScheduledExternalPolicyDraft, Box<dyn std::error::Error>> {
+) -> Result<ScheduledExternalPolicyConfig, Box<dyn std::error::Error>> {
     let mut fields = PoliciesFields::default();
     while let Some(flag) = arguments.next() {
         fields.set(&flag, next_value(arguments, &flag)?)?;
