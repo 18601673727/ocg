@@ -33,6 +33,7 @@ export const MUTABLE_CONTEXT_KEY = "ocg.mutable-composer.context.v1";
 const QUEUED_KEY = "ocg.mutable-composer.queued.v1";
 const UNFINISHED_KEY = "ocg.mutable-composer.unfinished.v1";
 const PENDING_KEY = "ocg.mutable-composer.pending-submission.v1";
+const AUTOSAVE_DELAY_MS = 1500;
 const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 const SHORTCUT_ICONS = { attach: Paperclip, model: Cpu };
 const contexts = new Map<string, string>();
@@ -191,7 +192,7 @@ type Props = {
   conversation?: string;
   project?: string;
   selection?: ChatModelSelection;
-  onSelectionChange: (value: ChatModelSelection) => void;
+  onSelectionChange: (value: ChatModelSelection | undefined) => void;
   onPreference: (value: ChatModelSelection) => void;
 };
 type Work = {
@@ -205,6 +206,23 @@ type Work = {
   promise: Promise<void> | null;
 };
 type PendingImage = { file: File; url: string; failed: boolean };
+
+function isEmptyDraft(
+  job: MutableJob | null,
+  input: MutableJobInput,
+  images: readonly PendingImage[],
+) {
+  return (
+    job?.phase === "unsubmitted" &&
+    input.text === "" &&
+    input.attachments.length === 0 &&
+    images.length === 0
+  );
+}
+
+function hasDraftContent(input: MutableJobInput) {
+  return input.text.trim().length > 0 || input.attachments.length > 0;
+}
 
 export function MutableComposer({
   sessionId,
@@ -228,6 +246,12 @@ export function MutableComposer({
     conflict: false,
     promise: null,
   });
+  const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const draftBeforeQueueEdit = useRef<{
+    work: Work;
+    images: ChatImage[];
+    selection?: ChatModelSelection;
+  } | null>(null);
   const scope = useRef({ conversation, project: selection?.project ?? project });
   scope.current = { conversation, project: selection?.project ?? project };
   const alive = useRef(true);
@@ -450,10 +474,24 @@ export function MutableComposer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [api, context, loadImages, refreshQueue, refreshUnfinished]);
 
+  const cancelAutosave = useCallback(() => {
+    if (autosaveTimer.current === null) return;
+    clearTimeout(autosaveTimer.current);
+    autosaveTimer.current = null;
+  }, []);
+  useEffect(() => cancelAutosave, [cancelAutosave]);
+
   const flush = useCallback(
-    function flushWork(): Promise<void> {
+    async function flushWork(autosave = false): Promise<void> {
+      if (!autosave) cancelAutosave();
+      else if (!alive.current || autosaveTimer.current !== null) return;
       const state = work.current;
-      if (state.promise) return state.promise;
+      if (state.promise) {
+        await state.promise;
+        if (work.current === state && state.dirty) await flushWork(autosave);
+        return;
+      }
+      if (!state.dirty || state.conflict) return;
       const run = async () => {
         while (state.dirty && !state.conflict) {
           if (alive.current) {
@@ -491,6 +529,28 @@ export function MutableComposer({
                 throw new ApiError("mutable_job_conflict", 409, false);
               }
               rememberUnfinished(state.context);
+            } else if (isEmptyDraft(state.job, state.desired, pendingImagesRef.current)) {
+              const id = state.job.id;
+              try {
+                await api.discardMutableJob(state.context, id, state.job.revision);
+              } catch (cause) {
+                if (
+                  cause instanceof ApiError &&
+                  cause.status >= 400 &&
+                  cause.status < 500 &&
+                  cause.status !== 404
+                ) {
+                  throw cause;
+                }
+                const current = await api.currentMutableJob(state.context).catch(() => undefined);
+                if (current !== null) throw cause;
+              }
+              forgetUnfinished(state.context);
+              state.context = rotateContext(sessionId, scope.current.conversation);
+              state.job = null;
+              state.initial = null;
+              state.association = null;
+              if (alive.current) setUnfinished((jobs) => jobs.filter((job) => job.id !== id));
             } else if (!same(state.job.input, state.desired)) {
               state.job = await api.updateMutableJob(
                 state.context,
@@ -499,11 +559,23 @@ export function MutableComposer({
                 structuredClone(state.desired),
               );
             }
-            state.dirty = !same(state.job.input, state.desired);
+            state.dirty = state.job
+              ? !same(state.job.input, state.desired) ||
+                isEmptyDraft(state.job, state.desired, pendingImagesRef.current)
+              : hasDraftContent(state.desired);
             if (alive.current) {
               setConfirmed(state.job);
-              setStatus(state.dirty ? "Saving…" : "Saved");
+              setStatus(
+                state.dirty
+                  ? autosave
+                    ? "Waiting to save…"
+                    : "Saving…"
+                  : state.job
+                    ? "Saved"
+                    : "New Job",
+              );
             }
+            if (autosave) break;
           } catch (cause) {
             if (
               cause instanceof ApiError &&
@@ -529,23 +601,34 @@ export function MutableComposer({
           }
         }
       };
-      let failed = false;
-      state.promise = run()
-        .catch((cause: unknown) => {
-          failed = true;
-          throw cause;
-        })
-        .finally(() => {
-          state.promise = null;
-          if (!failed && state.dirty && !state.conflict)
-            queueMicrotask(() => {
-              void flushWork().catch(() => {});
-            });
-        });
-      return state.promise;
+      state.promise = run().finally(() => {
+        state.promise = null;
+      });
+      await state.promise;
     },
-    [api],
+    [api, cancelAutosave, sessionId],
   );
+
+  const scheduleAutosave = useCallback(() => {
+    cancelAutosave();
+    const state = work.current;
+    if (state.conflict || uncertainRef.current) return;
+    if (isEmptyDraft(state.job, state.desired, pendingImagesRef.current)) state.dirty = true;
+    if (!state.dirty) {
+      setStatus(state.job ? "Saved" : "New Job");
+      return;
+    }
+    setStatus("Waiting to save…");
+    autosaveTimer.current = setTimeout(() => {
+      autosaveTimer.current = null;
+      void flush(true).catch(() => {});
+    }, AUTOSAVE_DELAY_MS);
+  }, [cancelAutosave, flush]);
+  useEffect(() => {
+    const state = work.current;
+    if (ready && isEmptyDraft(state.job, state.desired, pendingImagesRef.current))
+      scheduleAutosave();
+  }, [ready, scheduleAutosave]);
   useEffect(() => {
     const guard = async () => {
       const timeout = () => new Promise<void>((resolve) => setTimeout(resolve, 2000));
@@ -580,16 +663,16 @@ export function MutableComposer({
     },
     [],
   );
-  function change(next: MutableJobInput, meaningful = true) {
+  function change(next: MutableJobInput) {
     if (busyRef.current || uncertain) return;
     const state = work.current;
+    if (same(state.desired, next)) return;
     state.desired = next;
-    if (meaningful || state.job) state.dirty = true;
+    state.dirty = state.job
+      ? state.promise !== null || !same(state.job.input, next)
+      : state.initial !== null || hasDraftContent(next);
     setInput(next);
-    if (state.dirty) {
-      setStatus("Local changes not saved");
-      void flush().catch(() => {});
-    }
+    scheduleAutosave();
   }
   function changeText(text: string) {
     change({
@@ -604,7 +687,10 @@ export function MutableComposer({
   }
   function setPending(next: PendingImage[]) {
     pendingImagesRef.current = next;
-    if (alive.current) setPendingImages(next);
+    if (!alive.current) return;
+    setPendingImages(next);
+    const state = work.current;
+    if (isEmptyDraft(state.job, state.desired, next)) scheduleAutosave();
   }
   async function add(pending: PendingImage[]) {
     if (!client.uploadChatImage) {
@@ -616,13 +702,6 @@ export function MutableComposer({
       setError("Image upload is unavailable.");
       return;
     }
-    change(
-      {
-        ...work.current.desired,
-        configuration: work.current.desired.configuration ?? config(selection),
-      },
-      true,
-    );
     setUploading((n) => n + pending.length);
     for (const item of pending) {
       try {
@@ -638,6 +717,7 @@ export function MutableComposer({
           state.desired = {
             ...state.desired,
             attachments: [...state.desired.attachments, image.id],
+            configuration: state.desired.configuration ?? config(selection),
           };
           state.dirty = true;
           void flush().catch(() => {});
@@ -647,6 +727,7 @@ export function MutableComposer({
         change({
           ...work.current.desired,
           attachments: [...work.current.desired.attachments, image.id],
+          configuration: work.current.desired.configuration ?? config(selection),
         });
       } catch (cause) {
         setPending(
@@ -703,19 +784,18 @@ export function MutableComposer({
       if (!state.job || state.dirty || state.conflict)
         throw new Error("Save the Job before sending.");
       if (editingQueue) {
+        const draft = draftBeforeQueueEdit.current;
         if (!client.presentMutableJob)
           throw new Error("The saved Job cannot yet be opened in history.");
+        if (!draft) throw new Error("The original draft could not be restored.");
         await client.presentMutableJob(sessionId, state.job);
+        work.current = draft.work;
+        draftBeforeQueueEdit.current = null;
         setEditingQueue(false);
-        state.context = contextForSession(sessionId, state.job.conversation);
-        state.job = null;
-        state.initial = null;
-        state.association = null;
-        state.dirty = false;
-        state.desired = empty();
-        setInput(empty());
-        setConfirmed(null);
-        setImages([]);
+        setInput(draft.work.desired);
+        setConfirmed(draft.work.job);
+        setImages(draft.images);
+        onSelectionChange(draft.selection);
         await refreshQueue();
         setStatus("Saved queued Job");
         return;
@@ -874,24 +954,38 @@ export function MutableComposer({
     }
   }
   async function editQueued(job: MutableJob) {
-    if (!api || busyRef.current || uncertain || work.current.job || work.current.dirty) {
-      setError("Finish or discard the current Job before editing a queued Job.");
+    if (
+      !api ||
+      busyRef.current ||
+      uncertain ||
+      work.current.conflict ||
+      pendingImagesRef.current.length ||
+      editingQueue
+    ) {
       return;
     }
     busyRef.current = true;
     setBusy(true);
     setQueuedLoading(true);
     try {
+      await flush();
       const latest = await api.readMutableJob(job.context, job.id);
       if (conversation && latest.conversation !== conversation)
         throw new Error("This Job belongs to another conversation.");
       if (latest.phase !== "queued")
         throw new Error(`This Job is ${latest.phase} and can no longer be edited.`);
       const restored = await loadImages(latest.input.attachments);
-      work.current.context = latest.context;
-      work.current.job = latest;
-      work.current.desired = latest.input;
-      work.current.initial = null;
+      draftBeforeQueueEdit.current = { work: work.current, images, selection };
+      work.current = {
+        context: latest.context,
+        job: latest,
+        desired: latest.input,
+        initial: null,
+        association: null,
+        dirty: false,
+        conflict: false,
+        promise: null,
+      };
       setInput(latest.input);
       setConfirmed(latest);
       setImages(restored);
@@ -948,43 +1042,6 @@ export function MutableComposer({
       if (alive.current) setBusy(false);
     }
   }
-  async function discard() {
-    if (
-      !api ||
-      !work.current.job ||
-      editingQueue ||
-      uncertain ||
-      busyRef.current ||
-      pendingImagesRef.current.length
-    )
-      return;
-    busyRef.current = true;
-    setBusy(true);
-    try {
-      await flush();
-      const state = work.current;
-      if (!state.job) return;
-      await api.discardMutableJob(state.context, state.job.id, state.job.revision);
-      forgetUnfinished(state.context);
-      state.context = rotateContext(sessionId, conversation);
-      state.job = null;
-      state.initial = null;
-      state.association = null;
-      state.dirty = false;
-      state.desired = empty();
-      setInput(empty());
-      setConfirmed(null);
-      setImages([]);
-      setStatus("Job discarded");
-      setError(null);
-      await refreshUnfinished();
-    } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      busyRef.current = false;
-      setBusy(false);
-    }
-  }
   async function loadSaved() {
     if (!api || !work.current.job || busyRef.current || uploadTask.current) return;
     if (
@@ -992,6 +1049,7 @@ export function MutableComposer({
       !window.confirm("Loading the saved version replaces your unsaved text. Continue?")
     )
       return;
+    cancelAutosave();
     busyRef.current = true;
     setBusy(true);
     try {
@@ -1022,6 +1080,7 @@ export function MutableComposer({
             : null,
       );
       setStatus(work.current.dirty ? "Local image changes not saved" : "Saved");
+      if (isEmptyDraft(job, desired, pendingImagesRef.current)) scheduleAutosave();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -1060,6 +1119,7 @@ export function MutableComposer({
       setConfirmed(latest);
       setImages(restored);
       setStatus("Saved");
+      if (isEmptyDraft(latest, latest.input, pendingImagesRef.current)) scheduleAutosave();
       setError(null);
       if (latest.input.configuration)
         onSelectionChange({
@@ -1124,7 +1184,13 @@ export function MutableComposer({
                 type="button"
                 size="xs"
                 variant="outline"
-                disabled={job.phase !== "queued" || queuedLoading || busy || uncertain}
+                disabled={
+                  job.phase !== "queued" ||
+                  queuedLoading ||
+                  inputDisabled ||
+                  pendingImages.length > 0 ||
+                  editingQueue
+                }
                 onClick={() => void editQueued(job)}
               >
                 Edit
@@ -1340,17 +1406,6 @@ export function MutableComposer({
                 />
               </div>
               <ComposerActions className="shrink-0">
-                {confirmed && !editingQueue && (
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    disabled={busy || uncertain || conflict || pendingImages.length > 0}
-                    onClick={() => void discard()}
-                  >
-                    Discard
-                  </Button>
-                )}
                 {editingQueue ? (
                   <Button type="submit" size="sm" disabled={sendDisabled}>
                     Save queued Job

@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
 import { HoverMarquee } from "./hover-marquee";
 import { ConversationStatus } from "./conversation-status";
+import { ConversationPreview } from "./conversation-preview";
 import { runtimeStateLabel, useI18n } from "../i18n";
 import type { ChildConversation } from "../contracts";
 import type { ApiClient } from "../runtime/api-client";
@@ -13,6 +14,7 @@ export function SidebarConversationChildren({
   conversation,
   api,
   activeChild,
+  project,
   expanded,
   sessionId,
   onAvailabilityChange,
@@ -22,6 +24,7 @@ export function SidebarConversationChildren({
   conversation: string;
   api: ApiClient;
   activeChild?: string;
+  project?: string | null;
   expanded: boolean;
   sessionId: string;
   onAvailabilityChange: (sessionId: string, available: boolean) => void;
@@ -63,26 +66,34 @@ export function SidebarConversationChildren({
                 ? t(`chat.child.hold.${child.on_hold.by.kind}`)
                 : null;
             const jobState = child.job_state;
+            const title = child.title || t("chat.child.untitled");
+            const stateLabel = hold ?? runtimeStateLabel(t, jobState);
             const status =
               !hold && (jobState === "queued" || jobState === "running") ? jobState : null;
             return (
               <li key={child.id} data-sidebar-level="2" className="min-w-0 max-w-full">
-                <button
-                  type="button"
-                  onClick={() => onOpen(child.id)}
-                  onDoubleClick={() => onRename?.(child)}
-                  aria-current={activeChild === child.id ? "true" : undefined}
-                  title={`${child.title || t("chat.child.untitled")} · ${hold ?? runtimeStateLabel(t, jobState)}`}
-                  className={cn(
-                    "grid w-full min-w-0 max-w-full grid-cols-[minmax(0,1fr)_auto] items-center overflow-hidden rounded-md px-2 py-1.5 text-left text-sm leading-5",
-                    activeChild === child.id
-                      ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
-                      : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-foreground",
-                  )}
+                <ConversationPreview
+                  title={title}
+                  project={project}
+                  status={stateLabel}
+                  trigger={
+                    <button
+                      type="button"
+                      onClick={() => onOpen(child.id)}
+                      onDoubleClick={() => onRename?.(child)}
+                      aria-current={activeChild === child.id ? "true" : undefined}
+                      className={cn(
+                        "grid w-full min-w-0 max-w-full grid-cols-[minmax(0,1fr)_auto] items-center overflow-hidden rounded-md px-2 py-1.5 text-left text-sm leading-5",
+                        activeChild === child.id
+                          ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+                          : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-foreground",
+                      )}
+                    />
+                  }
                 >
                   <span className="flex min-w-0 items-center gap-1.5">
                     {status && <ConversationStatus state={status} />}
-                    <HoverMarquee>{child.title || t("chat.child.untitled")}</HoverMarquee>
+                    <HoverMarquee>{title}</HoverMarquee>
                   </span>
                   {!status && (
                     <span
@@ -91,10 +102,10 @@ export function SidebarConversationChildren({
                         jobState === "failed" && "text-destructive",
                       )}
                     >
-                      {hold ?? runtimeStateLabel(t, jobState)}
+                      {stateLabel}
                     </span>
                   )}
-                </button>
+                </ConversationPreview>
               </li>
             );
           })}

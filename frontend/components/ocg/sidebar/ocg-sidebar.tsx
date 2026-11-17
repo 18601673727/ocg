@@ -18,7 +18,6 @@ import {
   FolderOpen,
   Pin,
   PinOff,
-  Archive,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -47,7 +46,7 @@ import { ApiError, type ApiClient } from "../runtime/api-client";
 import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
 import { AccountMenu } from "./account-menu";
 import { ConversationSearch } from "./conversation-search";
-import { useI18n } from "../i18n";
+import { runtimeStateLabel, useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
 import { OcgLogo } from "../primitives/ocg-logo";
 import { SELECTED_ROW } from "../primitives/selection";
@@ -55,6 +54,7 @@ import type { Project } from "../contracts";
 import { usePinnedConversations } from "./sidebar-preferences";
 import { SidebarConversationChildren } from "./conversation-children";
 import { ConversationStatus } from "./conversation-status";
+import { ConversationPreview, type ConversationPreviewDetails } from "./conversation-preview";
 import { HoverMarquee } from "./hover-marquee";
 
 const subscribePlatform = () => () => {};
@@ -129,32 +129,37 @@ function RailButton({
   children,
   active = false,
   shortcut,
+  preview,
 }: {
   label: string;
   onClick?: () => void;
   children: React.ReactNode;
   active?: boolean;
   shortcut?: string;
+  preview?: ConversationPreviewDetails;
 }) {
+  const trigger = (
+    <button
+      type="button"
+      aria-label={label}
+      title={preview ? undefined : shortcut ? `${label} (${shortcut})` : label}
+      onClick={onClick}
+      aria-current={active ? "page" : undefined}
+      className={cn(
+        "flex size-9 items-center justify-center rounded-lg border border-transparent text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring",
+        active && cn(SELECTED_ROW, "font-medium"),
+      )}
+    />
+  );
+  if (preview)
+    return (
+      <ConversationPreview title={label} trigger={trigger} {...preview}>
+        {children}
+      </ConversationPreview>
+    );
   return (
     <Tooltip>
-      <TooltipTrigger
-        render={
-          <button
-            type="button"
-            aria-label={label}
-            title={shortcut ? `${label} (${shortcut})` : label}
-            onClick={onClick}
-            aria-current={active ? "page" : undefined}
-            className={cn(
-              "flex size-9 items-center justify-center rounded-lg border border-transparent text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring",
-              active && cn(SELECTED_ROW, "font-medium"),
-            )}
-          >
-            {children}
-          </button>
-        }
-      />
+      <TooltipTrigger render={trigger}>{children}</TooltipTrigger>
       <TooltipContent side="right">
         {label}
         {shortcut && ` (${shortcut})`}
@@ -230,6 +235,15 @@ export function OcgSidebar({
     const timer = setInterval(() => setNow(Date.now()), 60000);
     return () => clearInterval(timer);
   }, []);
+  const projectNames = new Map(projects.map(({ id, name }) => [id, name]));
+  const previewFor = (session: ChatSession): ConversationPreviewDetails => {
+    const status = session.jobState ?? (runningSessionIds.has(session.id) ? "running" : undefined);
+    return {
+      project: session.projectId ? projectNames.get(session.projectId) : null,
+      status: status && runtimeStateLabel(t, status),
+      updatedAt: session.updatedAt,
+    };
+  };
   const groups = [
     ...sessions.reduce((groups, session) => {
       const id = session.projectId ?? "";
@@ -240,7 +254,7 @@ export function OcgSidebar({
     }, new Map<string, ChatSession[]>()),
   ].map(([id, items]) => ({
     id,
-    name: projects.find((project) => project.id === id)?.name ?? (id || t("sidebar.noProject")),
+    name: projectNames.get(id) ?? (id || t("sidebar.noProject")),
     items: [...items].sort(
       (a, b) =>
         Number(pinned.has(b.conversationId ?? b.id)) -
@@ -470,6 +484,7 @@ export function OcgSidebar({
               <RailButton
                 key={session.id}
                 label={session.title || t("sidebar.newChat")}
+                preview={previewFor(session)}
                 active={
                   activeView === "chat" &&
                   (session.id === activeSessionId ||
@@ -668,6 +683,7 @@ export function OcgSidebar({
                         const jobState =
                           session.jobState ??
                           (runningSessionIds.has(session.id) ? "running" : undefined);
+                        const preview = previewFor(session);
                         const status =
                           jobState === "queued" || jobState === "running" ? (
                             <ConversationStatus state={jobState} />
@@ -679,11 +695,18 @@ export function OcgSidebar({
                           "opacity-0 group-hover/session:opacity-100 group-focus-within/session:opacity-100 [@media(hover:none)]:opacity-100";
                         return (
                           <li key={session.id} className="min-w-0" data-sidebar-level="1">
-                            <div
-                              className={cn(
-                                "group/session relative flex h-9 min-w-0 items-center rounded-lg text-sidebar-foreground/90 transition-colors hover:bg-sidebar-accent",
-                                active && cn(SELECTED_ROW, "font-medium"),
-                              )}
+                            <ConversationPreview
+                              title={session.title || t("sidebar.newChat")}
+                              {...preview}
+                              suppressed={isMenuOpen}
+                              trigger={
+                                <div
+                                  className={cn(
+                                    "group/session relative flex h-9 min-w-0 items-center rounded-lg text-sidebar-foreground/90 transition-colors hover:bg-sidebar-accent",
+                                    active && cn(SELECTED_ROW, "font-medium"),
+                                  )}
+                                />
+                              }
                             >
                               <span className="flex w-9 shrink-0 items-center justify-center">
                                 {canExpand ? (
@@ -722,27 +745,28 @@ export function OcgSidebar({
                                     openRename(session.id, session.title || "", "session");
                                 }}
                                 aria-current={active ? "true" : undefined}
-                                title={session.title || t("sidebar.newChat")}
-                                className="flex h-full min-w-0 flex-1 items-center gap-1.5 pr-2 text-left text-[13px] leading-5 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+                                className="flex h-full min-w-0 flex-1 items-center gap-1.5 pr-1 text-left text-[13px] leading-5 outline-none focus-visible:rounded focus-visible:ring-2 focus-visible:ring-sidebar-ring"
                               >
                                 {canExpand && status}
                                 <HoverMarquee className="min-w-0 flex-1">
                                   {session.title || t("sidebar.newChat")}
                                 </HoverMarquee>
                               </button>
-                              <div className="relative mr-2 flex h-full w-18 shrink-0 items-center justify-end">
+                              <div
+                                className={cn(
+                                  "relative mr-2 flex h-full shrink-0 items-center justify-end",
+                                  hasActions && "min-w-12",
+                                )}
+                              >
                                 <span
                                   className={cn(
-                                    "flex items-center gap-1 text-xs tabular-nums text-muted-foreground transition-opacity",
+                                    "flex items-center gap-1 text-xs whitespace-nowrap tabular-nums text-muted-foreground transition-opacity",
                                     hasActions &&
                                       "group-hover/session:opacity-0 group-focus-within/session:opacity-0 [@media(hover:none)]:opacity-0",
                                     isMenuOpen && "opacity-0",
                                   )}
                                 >
-                                  <time
-                                    dateTime={session.updatedAt}
-                                    title={new Date(session.updatedAt).toLocaleString(locale)}
-                                  >
+                                  <time dateTime={session.updatedAt}>
                                     {relativeTime(session.updatedAt)}
                                   </time>
                                   {isPinned && (
@@ -803,13 +827,11 @@ export function OcgSidebar({
                                           )}
                                           {onHide && (
                                             <DropdownMenuItem
-                                              className="gap-2"
                                               onSelect={() => {
                                                 setHideError(null);
                                                 setHideTarget(session);
                                               }}
                                             >
-                                              <Archive className="size-3.5" aria-hidden="true" />
                                               {t("sidebar.hideChat")}
                                             </DropdownMenuItem>
                                           )}
@@ -819,7 +841,7 @@ export function OcgSidebar({
                                   </div>
                                 )}
                               </div>
-                            </div>
+                            </ConversationPreview>
                             {canExpand &&
                               expanded &&
                               api &&
@@ -830,6 +852,7 @@ export function OcgSidebar({
                                   conversation={session.conversationId}
                                   api={api}
                                   activeChild={activeAncestors?.[1]}
+                                  project={preview.project}
                                   expanded
                                   sessionId={session.id}
                                   onAvailabilityChange={handleChildAvailability}

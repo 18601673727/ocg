@@ -613,6 +613,7 @@ export const AssistantMessage: FC = () => {
   const compaction = useAuiState((s) => s.message.metadata.custom.compaction);
   const agentInstruction = useAuiState((s) => s.message.metadata.custom.agentInstruction === true);
   const intermediate = useAuiState((s) => s.message.metadata.custom.intermediate === true);
+  const usesRecordedTiming = useAuiState((s) => s.message.metadata.custom.ocgRole === "assistant");
   const storedReasoningDuration = useAuiState((s) => {
     const value = s.message.metadata.custom.reasoningDurationMs;
     return typeof value === "number" && Number.isFinite(value) && value >= 0
@@ -767,7 +768,10 @@ export const AssistantMessage: FC = () => {
                   <ReasoningRoot streaming={running}>
                     <ReasoningTrigger
                       active={unsettled}
-                      duration={storedReasoningDuration ?? reasoningDuration(part.timing)}
+                      duration={
+                        storedReasoningDuration ??
+                        (usesRecordedTiming ? undefined : reasoningDuration(part.timing))
+                      }
                       tokens={estimateReasoningTokens(
                         part.indices
                           .map((index) => {

@@ -766,11 +766,9 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     if (this.streams.has(turn.job.id) || !isCurrent()) return null;
     const previous = this.turns.get(turn.job.id);
     const snapshot = previous ? { ...previous } : undefined;
-    const window =
-      turn.outputs_truncated ||
-      (turn.job.settlement.state === "unsettled" && (turn.outputs.at(-1)?.seq ?? 0) > 200)
-        ? (await readOutputWindow(this.api, turn.job.id, { signal: this.lifetime.signal })).outputs
-        : turn.outputs.slice(-200);
+    const window = turn.outputs_truncated
+      ? (await readOutputWindow(this.api, turn.job.id, { signal: this.lifetime.signal })).outputs
+      : turn.outputs;
     let outputs = mergeOutputHistory(window);
     if (previous?.outputs.length && window.length) {
       const last = previous.outputs.lastSeq;
@@ -875,10 +873,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   }
 
   private readonly images = new Map<string, ChatImage>();
-  private projectTurn(
-    turn: Turn,
-    partial: boolean,
-  ): { transcript: TranscriptTurn[]; result: OutputView | null } {
+  private projectTurn(turn: Turn): { transcript: TranscriptTurn[]; result: OutputView | null } {
     let cached = this.projections.get(turn);
     if (!cached || cached.outputs !== turn.outputs || cached.length > turn.outputs.length) {
       cached = { outputs: turn.outputs, length: 0, aggregate: new TranscriptAccumulator() };
@@ -898,7 +893,6 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       turn.tools,
       turn.responses,
       turn.partialToolBoundaries,
-      partial,
       turn.details?.mutable_phase,
     ];
     if (!cached.arguments || args.some((value, index) => value !== cached!.arguments![index])) {
@@ -912,7 +906,6 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         turn.tools,
         turn.job.previous === null,
         turn.responses,
-        partial,
         turn.partialToolBoundaries,
         cached.aggregate,
       );
@@ -973,7 +966,6 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           },
         ];
       }
-      const partial = turn.outputs.firstSeq > 1;
       const entries = materializeUserEntries(turn.entries ?? []);
       const queued =
         turn.job.previous !== null &&
@@ -1017,7 +1009,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         !turn.outputs.length &&
         !turn.tools.length &&
         !turn.responses.length;
-      const projected = this.projectTurn(turn, partial);
+      const projected = this.projectTurn(turn);
       const transcript = withdrawnBeforeStart ? [] : projected.transcript;
       return [
         ...boundary,
@@ -1358,22 +1350,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   private async trackTurn(sessionId: string, job: string) {
     const previous = this.turns.get(job);
     const snapshot = previous ? { ...previous } : undefined;
-    const [record, frozen, window] = await Promise.all([
+    const [record, frozen] = await Promise.all([
       this.api.readJobDetails(job),
       this.api.readJobInput(job),
-      readOutputWindow(this.api, job, { signal: this.lifetime.signal }),
     ]);
-    let outputs = mergeOutputHistory(window.outputs);
-    if (previous?.outputs.length && window.outputs.length) {
-      const gap = await readMissingOutputs(
-        this.api,
-        job,
-        previous.outputs.lastSeq,
-        window.outputs[0].seq - 1,
-        this.lifetime.signal,
-      );
-      outputs = mergeOutputHistory(previous.outputs, gap, window.outputs);
-    }
     const page = record.conversation
       ? await this.api.readConversationTurns(
           record.conversation,
@@ -1383,6 +1363,21 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         )
       : null;
     const stored = page?.turns.find((turn) => turn.job.id === job);
+    const window =
+      stored && !stored.outputs_truncated
+        ? stored.outputs
+        : (await readOutputWindow(this.api, job, { signal: this.lifetime.signal })).outputs;
+    let outputs = mergeOutputHistory(window);
+    if (previous?.outputs.length && window.length) {
+      const gap = await readMissingOutputs(
+        this.api,
+        job,
+        previous.outputs.lastSeq,
+        window[0].seq - 1,
+        this.lifetime.signal,
+      );
+      outputs = mergeOutputHistory(previous.outputs, gap, window);
+    }
     const evidence = stored?.native_decision
       ? { tools: [], responses: [], error: undefined }
       : await readTranscriptEvidence(this.api, job, {

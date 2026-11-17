@@ -39,7 +39,7 @@ export interface ChatScreenProps {
 type ChatComposerContextValue = {
   session: ChatSession;
   selection?: ChatModelSelection;
-  setSelection: (selection: ChatModelSelection) => void;
+  setSelection: (selection: ChatModelSelection | undefined) => void;
   onPreference: (selection: ChatModelSelection) => void;
   onOpenPlanningDecision: (decisionId: string) => void;
 };

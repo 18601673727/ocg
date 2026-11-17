@@ -45,11 +45,14 @@ export class TranscriptAccumulator {
 
   append(output: OutputView) {
     if (output.kind === "progress") this.progress += outputDisplayText(output);
-    if (output.kind === "reasoning") this.reasoning += outputDisplayText(output);
     if (output.kind === "result") this.result = output;
-    if (output.kind === "reasoning" && outputText(output)) {
-      this.reasoningStartedAt ??= output.created_at_us;
-    } else if (output.kind !== "reasoning" && this.reasoningStartedAt !== null) {
+    if (output.kind === "reasoning") {
+      const text = outputDisplayText(output);
+      if (text) {
+        this.reasoning += text;
+        this.reasoningStartedAt ??= output.created_at_us;
+      }
+    } else if (this.reasoningStartedAt !== null) {
       this.reasoningDurationUs += Math.max(0, output.created_at_us - this.reasoningStartedAt);
       this.reasoningStartedAt = null;
     }
@@ -111,11 +114,13 @@ class ProviderProjection {
     while (this.index < this.through.length - 1 && output.created_at_us > this.through[this.index])
       this.index++;
     const interval = this.intervals[this.index];
-    const text = outputText(output);
-    if (output.kind === "reasoning" && text) {
-      interval.text += text;
-      interval.started ??= output.created_at_us;
-      interval.at ??= output.created_at_us;
+    if (output.kind === "reasoning") {
+      const text = outputDisplayText(output);
+      if (text) {
+        interval.text += text;
+        interval.started ??= output.created_at_us;
+        interval.at ??= output.created_at_us;
+      }
     } else if (interval.started !== null) {
       interval.duration += Math.max(0, output.created_at_us - interval.started);
       interval.started = null;
@@ -143,13 +148,13 @@ export function jobTranscript(
   tools?: readonly ToolCall[],
   titleMetadata = false,
   responses?: readonly ProviderResponse[],
-  partialOutput = false,
   partialToolBoundaries?: readonly PartialToolBoundary[] | null,
   accumulated?: TranscriptAccumulator,
 ): TranscriptTurn[] {
   const aggregate = accumulated ?? new TranscriptAccumulator();
   if (!accumulated) for (const output of outputs) aggregate.append(output);
   const { progress, reasoning, result } = aggregate;
+  const partialOutput = (outputs.at(0)?.seq ?? 1) > 1;
   const state = settlement?.state ?? "unsettled";
   const visibleAnswer = (text: string) => {
     if (!titleMetadata) return text;
@@ -184,7 +189,9 @@ export function jobTranscript(
     role: "assistant" as const,
     createdAtUs: aggregate.lastAt,
     tools,
-    ...(reasoning ? { reasoning, reasoningDurationMs: reasoningDurationUs / 1000 } : {}),
+    ...(reasoning
+      ? { reasoning, reasoningDurationMs: partialOutput ? undefined : reasoningDurationUs / 1000 }
+      : {}),
   };
   const hasUserTurn = objective !== null || (attachments && attachments.length > 0);
   const user: TranscriptTurn[] = !hasUserTurn
@@ -380,7 +387,7 @@ function providerMessages(
         id,
         content: "",
         reasoning: text,
-        reasoningDurationMs: duration / 1000,
+        reasoningDurationMs: partialOutput ? undefined : duration / 1000,
         createdAtUs: at,
         tools: undefined,
         status: live ? answer.status : "completed",
