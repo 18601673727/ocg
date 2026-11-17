@@ -3,7 +3,7 @@ use super::{
     Ipv4Addr, MAX_HEADERS, NativeStops, Ordering, Seconds, Server, ServerConfig, Shared, SharedCfg,
     SocketAddr, TcpListener, UI_VARIABLE, answer, assets, browser, submissions, web,
 };
-use crate::system::logger::LogStore;
+use crate::host::logger::LogStore;
 
 const STOP_TIMEOUT: Seconds = Seconds(5);
 
@@ -45,7 +45,7 @@ impl ApiServer {
         database: DatabaseHandle,
         logs: Arc<LogStore>,
         native_stops: NativeStops,
-        workspace_tools: crate::system::executor::execution_runtime::WorkspaceTools,
+        workspace_tools: crate::jobs::execution::runtime::WorkspaceTools,
     ) -> Result<Self, StartError> {
         let bind = |source| StartError::Bind {
             port: config.port,

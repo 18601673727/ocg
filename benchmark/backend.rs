@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ocg::system::data_directory::DataDirectory;
+use ocg::host::data_directory::DataDirectory;
 use serde_json::{Value, json};
 
 #[path = "mod.rs"]
@@ -293,7 +293,7 @@ const SEARCH_QUERIES: [(&str, &str); 7] = [
 fn validate_corpus_plan(
     files: usize,
     sizes: [usize; 4],
-    limits: &ocg::service::fts::FtsLimits,
+    limits: &ocg::workspace::search::fts::FtsLimits,
     within_content_bound: bool,
 ) -> Result<u64> {
     if files == 0 || files > limits.files {
@@ -348,7 +348,7 @@ fn corpus(source: &std::path::Path, files: usize, sizes: [usize; 4]) -> Result<(
 
 #[cfg(unix)]
 fn queries(
-    index: &ocg::service::fts::WorkspaceFts,
+    index: &ocg::workspace::search::fts::WorkspaceFts,
     prefix: &str,
     parameters: &Value,
     iterations: usize,
@@ -394,8 +394,8 @@ fn queries(
 
 #[cfg(unix)]
 fn search_scale(options: &Options) -> Result<()> {
-    use ocg::service::fts::{FtsLimits, WorkspaceFts};
-    use ocg::system::executor::workspace_read::Workspace;
+    use ocg::workspace::files::read::Workspace;
+    use ocg::workspace::search::fts::{FtsLimits, WorkspaceFts};
 
     let limits = FtsLimits::default();
     let plans = [1u64, 4, 16, 64]
@@ -440,7 +440,9 @@ fn search_scale(options: &Options) -> Result<()> {
             {
                 return Err(format!("partial search fixture: {:?}", built.coverage).into());
             }
-            if !within && built.coverage.limit != Some(ocg::service::fts::BuildLimit::ContentBytes)
+            if !within
+                && built.coverage.limit
+                    != Some(ocg::workspace::search::fts::BuildLimit::ContentBytes)
             {
                 return Err(format!(
                     "oversized corpus did not reach the content-byte limit: {:?}",

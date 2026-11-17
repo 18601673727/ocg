@@ -273,8 +273,8 @@ impl<F: Unpin, N: Future<Output = Option<(Bytes, F)>>> Stream for Body<F, N> {
 
 struct Feed {
     shared: Arc<Shared>,
-    changes: crate::system::notification::Subscription,
-    outputs: crate::system::notification::Subscription,
+    changes: crate::support::notification::Subscription,
+    outputs: crate::support::notification::Subscription,
     job: JobId,
     cursor: Option<i64>,
     record: NativeJobItem,

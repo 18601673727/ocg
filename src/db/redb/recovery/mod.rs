@@ -55,7 +55,7 @@ pub(crate) fn open(directory: &Path) -> Result<OpenedFile, StorageError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             let mut create = std::fs::OpenOptions::new();
             create.read(true).write(true).create_new(true);
-            let file = crate::system::data_directory::private_file(&mut create)
+            let file = crate::host::data_directory::private_file(&mut create)
                 .open(&path)
                 .map_err(io_storage_error)?;
             (file, true)
@@ -1381,7 +1381,7 @@ fn preflight(
                 options.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE);
                 options.custom_flags(DELETE_ON_CLOSE);
             }
-            let copy = crate::system::data_directory::private_file(&mut options)
+            let copy = crate::host::data_directory::private_file(&mut options)
                 .open(&copy_path)
                 .map_err(io_storage_error)?;
             cleanup.copy_identity = Some(copy.metadata().map_err(io_storage_error)?);

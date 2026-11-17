@@ -251,7 +251,7 @@ impl DatabaseHandle {
 
     pub(crate) async fn create_scheduled_external_policy(
         &self,
-        draft: crate::system::scheduled_external::ScheduledExternalPolicyDraft,
+        draft: crate::jobs::authorization::scheduled::ScheduledExternalPolicyDraft,
     ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
         self.write(
             8192,
@@ -266,7 +266,7 @@ impl DatabaseHandle {
         &self,
         id: entities::ScheduledExternalPolicyId,
         expected_revision: u32,
-        draft: crate::system::scheduled_external::ScheduledExternalPolicyDraft,
+        draft: crate::jobs::authorization::scheduled::ScheduledExternalPolicyDraft,
     ) -> Result<entities::ScheduledExternalPolicyRecord, DatabaseError> {
         self.write(
             8192,
@@ -311,7 +311,7 @@ impl DatabaseHandle {
     pub(crate) async fn scheduled_external_grant(
         &self,
         job: entities::JobId,
-    ) -> Result<Option<crate::system::scheduled_external::ScheduledExternalGrant>, DatabaseError>
+    ) -> Result<Option<crate::jobs::authorization::scheduled::ScheduledExternalGrant>, DatabaseError>
     {
         let pair = self
             .read(move |database| redb::read_scheduled_external_binding_with_policy(database, job))
@@ -325,7 +325,7 @@ impl DatabaseHandle {
                 "the bound policy revision changed since reservation",
             )));
         }
-        crate::system::scheduled_external::ScheduledExternalGrant::from_record(&policy)
+        crate::jobs::authorization::scheduled::ScheduledExternalGrant::from_record(&policy)
             .map(Some)
             .map_err(|refusal| {
                 DatabaseError::Rejected(Violation::InvalidValue(

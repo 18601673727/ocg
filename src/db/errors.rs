@@ -3,10 +3,10 @@ use crate::db::attachments::StoreError;
 use crate::db::entities::{OperationId, Violation};
 use crate::db::redb;
 use crate::db::redb::{Probe, StorageError};
-use crate::system::monitor::{
+use crate::host::monitor::{
     FilesystemConfigError, ProtectionLock, ProtectionReason, SpaceShortage,
 };
-use crate::system::policy::SystemPolicyError;
+use crate::host::policy::SystemPolicyError;
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]

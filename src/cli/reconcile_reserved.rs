@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 
 use crate::db::entities::{ContentDigest, JobId};
 use crate::db::{DATABASE_FILE_NAME, storage_format_versions};
-use crate::system::data_directory::{DATABASE_LOCK_FILE, private_file};
+use crate::host::data_directory::{DATABASE_LOCK_FILE, private_file};
 
 const USAGE: &str = "usage: ocg reconcile-reserved <data-directory> <job-id> --confirm-no-start | ocg reconcile-reserved <data-directory> --finalize";
 const HELD_USAGE: &str =

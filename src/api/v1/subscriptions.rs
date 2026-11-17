@@ -12,8 +12,8 @@ use super::{
     INVALID_REQUEST, Refusal, SHUTTING_DOWN, Shared, catalog, dashboard, events, projects,
 };
 use crate::db::entities::{JobId, ProjectId};
-use crate::system::notification::JournalCursor;
-use crate::system::notification::Subscription;
+use crate::support::notification::JournalCursor;
+use crate::support::notification::Subscription;
 
 pub(super) fn change_cursor(query: &str) -> Result<Option<JournalCursor>, Refusal> {
     if query.is_empty() {

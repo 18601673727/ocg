@@ -15,7 +15,7 @@ pub(crate) struct UpdateView {
     reason: Option<String>,
     log_path: Option<String>,
     #[cfg(unix)]
-    state: Option<crate::system::update::State>,
+    state: Option<crate::host::update::State>,
     #[cfg(not(unix))]
     state: Option<serde_json::Value>,
 }
@@ -24,10 +24,10 @@ pub(crate) struct UpdateView {
 fn inspect() -> (
     bool,
     Option<String>,
-    Option<crate::system::update::State>,
+    Option<crate::host::update::State>,
     Option<String>,
 ) {
-    use crate::system::update::{self, Phase};
+    use crate::host::update::{self, Phase};
     let Ok(install) = update::install() else {
         return (false, Some("not_installed".into()), None, None);
     };
@@ -66,7 +66,7 @@ pub(super) async fn get(latest: bool) -> Result<Reply, Refusal> {
     #[cfg(unix)]
     let lookup = if latest {
         Some(
-            crate::system::update::lookup(None)
+            crate::host::update::lookup(None)
                 .await
                 .map(|(_, _, _, version, _)| version)
                 .map_err(|e| e.to_string()),
@@ -86,8 +86,8 @@ pub(super) async fn get(latest: bool) -> Result<Reply, Refusal> {
     #[cfg(unix)]
     let available = latest
         .as_deref()
-        .and_then(crate::system::update::Version::parse)
-        .zip(crate::system::update::Version::parse(env!(
+        .and_then(crate::host::update::Version::parse)
+        .zip(crate::host::update::Version::parse(env!(
             "CARGO_PKG_VERSION"
         )))
         .is_some_and(|(latest, running)| latest > running);
@@ -96,7 +96,7 @@ pub(super) async fn get(latest: bool) -> Result<Reply, Refusal> {
     let release_page = latest
         .as_deref()
         .filter(|_| available)
-        .and_then(crate::system::update::release_page);
+        .and_then(crate::host::update::release_page);
     Ok(Reply::ok(envelope(serde_json::json!(UpdateView {
         running: env!("CARGO_PKG_VERSION").into(),
         latest,
@@ -132,7 +132,7 @@ pub(super) async fn post(database: &DatabaseHandle, body: &[u8]) -> Result<Reply
     }
     #[cfg(unix)]
     {
-        use crate::system::update::{self, Phase, State, Version};
+        use crate::host::update::{self, Phase, State, Version};
         let version = Version::parse(&input.version).ok_or(INVALID_REQUEST)?;
         if input.prepare {
             return prepare(database).await;
@@ -167,7 +167,7 @@ pub(super) async fn post(database: &DatabaseHandle, body: &[u8]) -> Result<Reply
 
 #[cfg(unix)]
 async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
-    use crate::system::update;
+    use crate::host::update;
     use std::time::Instant;
     let database = database.clone();
     let paused = ntex::rt::spawn_blocking(move || {
@@ -217,8 +217,8 @@ async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
 }
 
 #[cfg(unix)]
-fn launch(mut state: crate::system::update::State) -> Result<std::process::Child, Refusal> {
-    use crate::system::update::{self, Phase};
+fn launch(mut state: crate::host::update::State) -> Result<std::process::Child, Refusal> {
+    use crate::host::update::{self, Phase};
     use std::os::unix::fs::OpenOptionsExt;
     use std::process::{Command, Stdio};
     let install = update::install().map_err(|_| CONFLICT)?;

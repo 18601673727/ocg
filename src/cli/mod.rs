@@ -1,5 +1,5 @@
 use crate::api::v1::ServerConfig;
-use crate::system::data_directory::DataDirectory;
+use crate::host::data_directory::DataDirectory;
 
 mod llm_target;
 #[cfg(unix)]
@@ -57,9 +57,7 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     let server_config = ServerConfig::from_environment()?;
     let data_directory = DataDirectory::from_environment()?;
     eprintln!("OCG data directory: {}", data_directory.root().display());
-    crate::system::runtime::run_server(&data_directory, true, server_config, |_| {
-        until_signalled()
-    })?;
+    crate::host::runtime::run_server(&data_directory, true, server_config, |_| until_signalled())?;
     Ok(())
 }
 

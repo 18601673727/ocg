@@ -690,7 +690,7 @@ pub(super) async fn respond(
         }
         Route::ActiveSystemSettings => Ok(Reply::ok(envelope(serde_json::json!(
             super::system::ActiveSystemSettingsView {
-                path: crate::system::policy::SystemPolicy::path(&database.data_directory())
+                path: crate::host::policy::SystemPolicy::path(&database.data_directory())
                     .display()
                     .to_string(),
                 content: database.active_system_policy().to_conf(),

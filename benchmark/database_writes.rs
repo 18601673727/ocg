@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use ocg::db::entities::Project;
 use ocg::db::{DatabaseError, DatabaseHandle, DatabaseWorker};
-use ocg::system::data_directory::DataDirectory;
+use ocg::host::data_directory::DataDirectory;
 
 type BenchResult<T> = Result<T, Box<dyn std::error::Error>>;
 

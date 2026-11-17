@@ -50,7 +50,7 @@ impl Batch {
 
     pub(crate) fn create_scheduled_external_policy(
         &mut self,
-        draft: &crate::system::scheduled_external::ScheduledExternalPolicyDraft,
+        draft: &crate::jobs::authorization::scheduled::ScheduledExternalPolicyDraft,
     ) -> Result<crate::db::entities::ScheduledExternalPolicyRecord, BatchError> {
         use crate::db::entities::{ScheduledExternalPolicyId, ScheduledExternalPolicyRecord};
         let id = ScheduledExternalPolicyId::new(self.next_id()?);
@@ -132,7 +132,7 @@ impl Batch {
         &mut self,
         id: crate::db::entities::ScheduledExternalPolicyId,
         expected_revision: u32,
-        draft: &crate::system::scheduled_external::ScheduledExternalPolicyDraft,
+        draft: &crate::jobs::authorization::scheduled::ScheduledExternalPolicyDraft,
     ) -> Result<crate::db::entities::ScheduledExternalPolicyRecord, BatchError> {
         self.mutate_scheduled_external_policy(
             id,
@@ -200,7 +200,7 @@ impl Batch {
                 let (key, row) = entry?;
                 let record = decode_scheduled_external_policy(key.value(), row.value())?;
                 if record.is_live()
-                    && crate::system::scheduled_external::record_admits(&record, frozen)
+                    && crate::jobs::authorization::scheduled::record_admits(&record, frozen)
                 {
                     matching = match matching {
                         ScheduledPolicyMatch::None => ScheduledPolicyMatch::One {
@@ -258,7 +258,7 @@ impl Batch {
                 "a scheduled external Job must be Generative",
             ));
         };
-        if !crate::system::scheduled_external::record_admits(&record, frozen) {
+        if !crate::jobs::authorization::scheduled::record_admits(&record, frozen) {
             return self.reject(Violation::InvalidValue(
                 "scheduled_external_policy",
                 "the Job's frozen configuration no longer matches the bound policy",

@@ -737,7 +737,7 @@ impl std::fmt::Debug for CredentialSecret {
 
 impl Drop for CredentialSecret {
     fn drop(&mut self) {
-        crate::system::secrets::wipe_string(&mut self.0);
+        crate::support::secrets::wipe_string(&mut self.0);
     }
 }
 
@@ -745,14 +745,14 @@ impl CredentialSecret {
     pub(crate) fn new(secret: impl Into<String>) -> Result<Self, &'static str> {
         let mut secret = secret.into();
         if secret.is_empty() || secret.len() > 4096 {
-            crate::system::secrets::wipe_string(&mut secret);
+            crate::support::secrets::wipe_string(&mut secret);
             return Err("credential secret must be 1..=4096 bytes");
         }
         let mut header = format!("Bearer {secret}");
         let valid = ntex::http::header::HeaderValue::try_from(header.as_str()).is_ok();
-        crate::system::secrets::wipe_string(&mut header);
+        crate::support::secrets::wipe_string(&mut header);
         if !valid {
-            crate::system::secrets::wipe_string(&mut secret);
+            crate::support::secrets::wipe_string(&mut secret);
             return Err("credential secret is not a valid HTTP Bearer token");
         }
         Ok(Self(secret))

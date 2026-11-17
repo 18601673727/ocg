@@ -1,0 +1,510 @@
+use super::{
+    ClientError, ClientResponse, ProviderExecutionConfig, ProviderExecutionError,
+    ProviderExecutionResult, ProviderFact, ProviderFailure, ProviderObservation,
+    ProviderOutputSink, ResponseFacts, Timestamp, Value,
+};
+
+pub(crate) fn unannounced_fact(error: &ProviderExecutionError) -> ProviderFact {
+    match error {
+        ProviderExecutionError::Build { .. } | ProviderExecutionError::NotDelivered { .. } => {
+            ProviderFact::NotDelivered
+        }
+        ProviderExecutionError::Unknown { .. }
+        | ProviderExecutionError::StreamFailure { .. }
+        | ProviderExecutionError::Rejected { .. }
+        | ProviderExecutionError::Incomplete { .. }
+        | ProviderExecutionError::Interrupted { .. }
+        | ProviderExecutionError::Stopped { .. }
+        | ProviderExecutionError::CompletionUnpersisted { .. } => ProviderFact::Delivered,
+        ProviderExecutionError::OutputPersistence { stream, .. } => unannounced_fact(stream),
+    }
+}
+
+pub(crate) async fn announce(sink: Option<&mut (dyn ProviderOutputSink + '_)>, fact: ProviderFact) {
+    announce_at(sink, Timestamp::now(), fact).await;
+}
+
+pub(crate) async fn announce_at(
+    sink: Option<&mut (dyn ProviderOutputSink + '_)>,
+    observed_at: Timestamp,
+    fact: ProviderFact,
+) {
+    if let Some(sink) = sink {
+        sink.observe(ProviderObservation { observed_at, fact })
+            .await;
+    }
+}
+
+pub(crate) async fn bounded_bytes(response: ClientResponse, limit: usize) -> Option<Vec<u8>> {
+    response
+        .body()
+        .limit(limit)
+        .await
+        .ok()
+        .map(|body| body.to_vec())
+}
+
+async fn bounded_body(response: ClientResponse, limit: usize) -> Option<String> {
+    response
+        .body()
+        .limit(limit)
+        .await
+        .ok()
+        .and_then(|body| String::from_utf8(body.to_vec()).ok())
+}
+
+const REDACTED: &str = "[redacted]";
+
+#[derive(Debug, Default)]
+pub(crate) struct Redactor {
+    secrets: crate::support::secrets::Spellings,
+}
+
+impl Redactor {
+    pub(in crate::ai) fn request_id(&self, response: &ClientResponse) -> Option<String> {
+        response
+            .header("x-request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(|value| self.text(value))
+    }
+
+    pub(crate) fn new(credential: Option<&str>) -> Self {
+        Self {
+            secrets: crate::support::secrets::Spellings::new(credential.unwrap_or_default()),
+        }
+    }
+
+    pub(crate) fn with_secrets(mut self, extra: &[String]) -> Self {
+        for secret in extra {
+            self.secrets.extend(secret);
+        }
+        self
+    }
+
+    pub(crate) fn text(&self, text: &str) -> String {
+        let mut text = text.to_owned();
+        for secret in self.secrets.iter() {
+            text = text.replace(secret, REDACTED);
+        }
+        text
+    }
+
+    fn json(&self, value: &mut Value) {
+        match value {
+            Value::String(text) => *text = self.text(text),
+            Value::Array(values) => values.iter_mut().for_each(|value| self.json(value)),
+            Value::Object(values) => {
+                *values = std::mem::take(values)
+                    .into_iter()
+                    .map(|(key, mut value)| {
+                        self.json(&mut value);
+                        (self.text(&key), value)
+                    })
+                    .collect();
+            }
+            Value::Null | Value::Bool(_) | Value::Number(_) => {}
+        }
+    }
+
+    pub(crate) fn json_value(&self, mut value: Value) -> Value {
+        self.json(&mut value);
+        value
+    }
+
+    pub(crate) fn body(&self, body: &str) -> String {
+        if self.secrets.is_empty() {
+            return body.to_owned();
+        }
+        match serde_json::from_str::<Value>(body) {
+            Ok(mut value) => {
+                self.json(&mut value);
+                value.to_string()
+            }
+            Err(_) => self.text(body),
+        }
+    }
+
+    fn optional(&self, text: Option<String>) -> Option<String> {
+        text.map(|text| self.text(&text))
+    }
+
+    fn facts(&self, mut facts: ResponseFacts) -> ResponseFacts {
+        facts.raw_finish_reason = self.optional(facts.raw_finish_reason);
+        facts
+    }
+
+    pub(crate) fn failure(&self, mut failure: ProviderFailure) -> ProviderFailure {
+        failure.message = self.text(&failure.message);
+        failure.provider_code = self.optional(failure.provider_code);
+        failure.response_body = failure.response_body.map(|body| self.body(&body));
+        failure.request_id = self.optional(failure.request_id);
+        failure
+    }
+
+    pub(crate) fn error(&self, error: ProviderExecutionError) -> ProviderExecutionError {
+        match error {
+            ProviderExecutionError::Build { message } => ProviderExecutionError::Build {
+                message: self.text(&message),
+            },
+            ProviderExecutionError::NotDelivered { message } => {
+                ProviderExecutionError::NotDelivered {
+                    message: self.text(&message),
+                }
+            }
+            ProviderExecutionError::Unknown {
+                message,
+                facts,
+                finished,
+            } => ProviderExecutionError::Unknown {
+                message: self.text(&message),
+                facts: facts.map(|facts| self.facts(facts)),
+                finished,
+            },
+            ProviderExecutionError::StreamFailure {
+                failure,
+                facts,
+                finished,
+            } => ProviderExecutionError::StreamFailure {
+                failure: Box::new(self.failure(*failure)),
+                facts: self.facts(facts),
+                finished,
+            },
+            ProviderExecutionError::Rejected { failure } => ProviderExecutionError::Rejected {
+                failure: self.failure(failure),
+            },
+            ProviderExecutionError::Incomplete { message, facts } => {
+                ProviderExecutionError::Incomplete {
+                    message: self.text(&message),
+                    facts: self.facts(facts),
+                }
+            }
+            ProviderExecutionError::Interrupted { message } => {
+                ProviderExecutionError::Interrupted {
+                    message: self.text(&message),
+                }
+            }
+            ProviderExecutionError::Stopped { message, facts } => ProviderExecutionError::Stopped {
+                message: self.text(&message),
+                facts: self.facts(facts),
+            },
+            ProviderExecutionError::OutputPersistence { message, stream } => {
+                ProviderExecutionError::OutputPersistence {
+                    message: self.text(&message),
+                    stream: Box::new(self.error(*stream)),
+                }
+            }
+            ProviderExecutionError::CompletionUnpersisted {
+                message,
+                mut result,
+            } => {
+                result.raw_finish_reason = self.optional(result.raw_finish_reason);
+                result.request_id = self.optional(result.request_id);
+                ProviderExecutionError::CompletionUnpersisted {
+                    message: self.text(&message),
+                    result,
+                }
+            }
+        }
+    }
+}
+
+pub(in crate::ai) async fn reject_response(
+    response: ClientResponse,
+    request_id: Option<String>,
+    config: &ProviderExecutionConfig,
+    redactor: &Redactor,
+    carries_images: bool,
+) -> ProviderExecutionError {
+    let status = response.status().as_u16();
+    let retry_after = response
+        .header("retry-after")
+        .and_then(|value| value.to_str().ok())
+        .and_then(retry_after_ms);
+    let body = if carries_images {
+        None
+    } else {
+        match ntex::util::select(
+            config.cancellation.cancelled(),
+            ntex::time::timeout(
+                config.timeout,
+                bounded_body(response, super::MAX_PROVIDER_ERROR_BYTES),
+            ),
+        )
+        .await
+        {
+            ntex::util::Either::Right(Ok(body)) => body.map(|body| redactor.body(&body)),
+            ntex::util::Either::Left(()) | ntex::util::Either::Right(Err(())) => None,
+        }
+    };
+    let mut failure = provider_failure(status, request_id, body);
+    if carries_images {
+        failure.message = format!("provider rejected image request (HTTP {status})");
+    }
+    ProviderExecutionError::Rejected {
+        failure: with_retry_after(redactor.failure(failure), retry_after),
+    }
+}
+
+fn retryable_status(status_code: u16) -> bool {
+    matches!(status_code, 408 | 409 | 425 | 429 | 500..=599)
+}
+
+pub(crate) fn provider_failure(
+    status_code: u16,
+    request_id: Option<String>,
+    response_body: Option<String>,
+) -> ProviderFailure {
+    let (message, provider_code) = response_body
+        .as_deref()
+        .and_then(parse_provider_error)
+        .unwrap_or_else(|| (format!("provider returned HTTP {status_code}"), None));
+    ProviderFailure {
+        message,
+        status_code: Some(status_code),
+        provider_code,
+        response_body,
+        request_id,
+        retry_after_ms: None,
+        retryable: retryable_status(status_code),
+    }
+}
+
+pub(crate) fn parse_provider_error(body: &str) -> Option<(String, Option<String>)> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let error = value.get("error").unwrap_or(&value);
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("message").and_then(Value::as_str))
+        .or_else(|| value.get("detail").and_then(Value::as_str))
+        .or_else(|| value.get("error").map(|_| "provider request failed"))?
+        .to_owned();
+    let code = error
+        .get("code")
+        .and_then(|code| match code {
+            Value::String(code) => Some(code.clone()),
+            Value::Number(code) => Some(code.to_string()),
+            _ => None,
+        })
+        .or_else(|| {
+            error
+                .get("type")
+                .and_then(Value::as_str)
+                .filter(|kind| *kind != "error")
+                .map(str::to_owned)
+        });
+    Some((message, code))
+}
+
+pub(crate) fn classify_client_error(error: ClientError) -> ProviderExecutionError {
+    let message = error.to_string();
+    match error {
+        ClientError::Url(_) | ClientError::Connect(_) => {
+            ProviderExecutionError::NotDelivered { message }
+        }
+        ClientError::Request(_) => ProviderExecutionError::NotDelivered { message },
+        ClientError::Send(_)
+        | ClientError::Timeout
+        | ClientError::Response(_)
+        | ClientError::Http(_)
+        | ClientError::H2(_)
+        | ClientError::TunnelNotSupported
+        | ClientError::Error(_) => ProviderExecutionError::Unknown {
+            message,
+            facts: None,
+            finished: false,
+        },
+    }
+}
+
+pub(crate) fn trim_ascii(value: &[u8]) -> &[u8] {
+    let start = value
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .unwrap_or(value.len());
+    let end = value
+        .iter()
+        .rposition(|byte| !byte.is_ascii_whitespace())
+        .map_or(start, |index| index + 1);
+    &value[start..end]
+}
+
+pub fn metrics(result: &ProviderExecutionResult) -> crate::db::entities::Measurements {
+    crate::db::entities::Measurements {
+        ttfb_ms: Some(result.ttfb.as_millis().min(u128::from(u64::MAX)) as u64),
+        request_finished_in_ms: Some(
+            result.finished_in.as_millis().min(u128::from(u64::MAX)) as u64
+        ),
+        ..crate::db::entities::Measurements::default()
+    }
+}
+
+pub fn error_observations(
+    error: &ProviderExecutionError,
+) -> Vec<crate::db::entities::AvailabilityObservation> {
+    use crate::db::entities::AvailabilityObservation;
+    let observed =
+        |facts: &ResponseFacts, failure: Option<ProviderFailure>| AvailabilityObservation {
+            status_code: Some(facts.status_code),
+            finish_reason: facts.finish_reason,
+            raw_finish_reason: facts.raw_finish_reason.clone(),
+            failure,
+        };
+    let failure = || ProviderFailure {
+        message: error.to_string(),
+        ..ProviderFailure::default()
+    };
+    let failure_only = || AvailabilityObservation {
+        status_code: None,
+        finish_reason: None,
+        raw_finish_reason: None,
+        failure: Some(failure()),
+    };
+    match error {
+        ProviderExecutionError::Build { .. }
+        | ProviderExecutionError::NotDelivered { .. }
+        | ProviderExecutionError::Interrupted { .. } => Vec::new(),
+        ProviderExecutionError::Stopped { facts, .. } => vec![observed(facts, None)],
+        ProviderExecutionError::Rejected { failure } => vec![AvailabilityObservation {
+            status_code: failure.status_code,
+            finish_reason: None,
+            raw_finish_reason: None,
+            failure: Some(failure.clone()),
+        }],
+        ProviderExecutionError::StreamFailure {
+            failure: detail,
+            facts,
+            finished,
+        } => {
+            let mut detail = detail.as_ref().clone();
+            detail.message = error.to_string();
+            if *finished {
+                vec![
+                    observed(facts, None),
+                    AvailabilityObservation {
+                        status_code: None,
+                        finish_reason: None,
+                        raw_finish_reason: None,
+                        failure: Some(detail),
+                    },
+                ]
+            } else {
+                vec![observed(facts, Some(detail))]
+            }
+        }
+        ProviderExecutionError::Unknown { facts: None, .. } => vec![failure_only()],
+        ProviderExecutionError::Unknown {
+            facts: Some(facts),
+            finished: true,
+            ..
+        } => vec![observed(facts, None), failure_only()],
+        ProviderExecutionError::Unknown {
+            facts: Some(facts),
+            finished: false,
+            ..
+        }
+        | ProviderExecutionError::Incomplete { facts, .. } => {
+            vec![observed(facts, Some(failure()))]
+        }
+        ProviderExecutionError::OutputPersistence { stream, .. } => error_observations(stream),
+        ProviderExecutionError::CompletionUnpersisted { result, .. } => {
+            let facts = ResponseFacts {
+                status_code: result.status_code,
+                finish_reason: result.finish_reason,
+                raw_finish_reason: result.raw_finish_reason.clone(),
+            };
+            vec![observed(&facts, None)]
+        }
+    }
+}
+
+pub fn success_observation(
+    result: &ProviderExecutionResult,
+) -> crate::db::entities::AvailabilityObservation {
+    crate::db::entities::AvailabilityObservation {
+        status_code: Some(result.status_code),
+        finish_reason: result.finish_reason,
+        raw_finish_reason: result.raw_finish_reason.clone(),
+        failure: None,
+    }
+}
+
+pub fn result_value(result: &ProviderExecutionResult) -> Value {
+    let mut value = serde_json::Map::new();
+    value.insert("text".to_owned(), Value::String(result.text.clone()));
+    if let Some(reason) = result.raw_finish_reason.as_deref() {
+        value.insert("finish_reason".to_owned(), Value::String(reason.to_owned()));
+    }
+    Value::Object(value)
+}
+
+pub(crate) fn with_retry_after(
+    mut failure: ProviderFailure,
+    retry_after_ms: Option<u64>,
+) -> ProviderFailure {
+    failure.retry_after_ms = retry_after_ms;
+    failure
+}
+
+fn retry_after_ms(value: &str) -> Option<u64> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(
+            value
+                .parse::<u64>()
+                .unwrap_or(u64::MAX)
+                .saturating_mul(1_000),
+        );
+    }
+    let parts: Vec<_> = value
+        .split(|character: char| {
+            character.is_ascii_whitespace() || matches!(character, ',' | '-' | ':')
+        })
+        .filter(|part| !part.is_empty())
+        .collect();
+    let (day, month, year, hour, minute, second) = match parts.as_slice() {
+        [_, day, month, year, hour, minute, second, "GMT"] => {
+            (*day, *month, *year, *hour, *minute, *second)
+        }
+        [_, month, day, hour, minute, second, year] => {
+            (*day, *month, *year, *hour, *minute, *second)
+        }
+        _ => return None,
+    };
+    let month = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    .iter()
+    .position(|name| *name == month)?
+        + 1;
+    let mut parsed_year: i32 = year.parse().ok()?;
+    if year.len() == 2 {
+        let current = time::OffsetDateTime::from_unix_timestamp(
+            Timestamp::now().as_unix_micros() / 1_000_000,
+        )
+        .ok()?
+        .year();
+        parsed_year += current / 100 * 100;
+        if parsed_year > current + 50 {
+            parsed_year -= 100;
+        }
+    }
+    let date = time::Date::from_calendar_date(
+        parsed_year,
+        time::Month::try_from(month as u8).ok()?,
+        day.parse().ok()?,
+    )
+    .ok()?;
+    let deadline = date
+        .with_hms(
+            hour.parse().ok()?,
+            minute.parse().ok()?,
+            second.parse().ok()?,
+        )
+        .ok()?
+        .assume_utc()
+        .unix_timestamp_nanos()
+        / 1_000_000;
+    let now = i128::from(Timestamp::now().as_unix_micros()) / 1_000;
+    Some(u64::try_from((deadline - now).max(0)).unwrap_or(u64::MAX))
+}

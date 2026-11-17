@@ -672,7 +672,7 @@ fn development_candidate_in(
             }),
     );
     selected_bytes = selected_bytes
-        .saturating_add(crate::service::ai::generative_model::CHART_INSTRUCTIONS.len())
+        .saturating_add(crate::ai::generative_model::CHART_INSTRUCTIONS.len())
         .saturating_add(
             configuration
                 .agent
@@ -695,7 +695,7 @@ fn development_candidate_in(
             .agent
             .as_ref()
             .and_then(|agent| agent.workspace_grant());
-        let grounding = crate::service::ai::generative_model::ground_project(
+        let grounding = crate::ai::generative_model::ground_project(
             &project.name,
             &project.root,
             grant,
@@ -754,8 +754,7 @@ fn development_candidate_in(
             ));
         }
         image_count = image_count.saturating_add(prior.job.input.attachments().len());
-        if image_count > crate::service::ai::providers::openai_compatible::image::MAX_REQUEST_IMAGES
-        {
+        if image_count > crate::ai::providers::openai_compatible::image::MAX_REQUEST_IMAGES {
             return Err(context_unavailable(
                 "selected execution context has too many images",
             ));
@@ -843,7 +842,7 @@ fn development_candidate_in(
         .saturating_add(u64::from(output_reserve));
     let window = model
         .context_window
-        .unwrap_or(crate::service::ai::compact::DEFAULT_CONTEXT_WINDOW);
+        .unwrap_or(crate::ai::compact::DEFAULT_CONTEXT_WINDOW);
     if estimated_tokens > u64::from(window) {
         return Err(context_unavailable(
             "selected execution context exceeds estimated model token budget",

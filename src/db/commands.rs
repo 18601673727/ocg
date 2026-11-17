@@ -5,7 +5,7 @@ use crate::db::redb;
 use crate::db::redb::{BatchError, Commit};
 use crate::db::shared::Shared;
 use crate::db::worker::{Executed, run};
-use crate::system::monitor::ProtectionReason;
+use crate::host::monitor::ProtectionReason;
 use ::redb::Database;
 use std::io::Write;
 use std::sync::Arc;

@@ -605,7 +605,7 @@ pub(crate) fn read_context_state(
     } else if !decision.enabled {
         Some("prediction is disabled by the project decision configuration".to_owned())
     } else if let Some(active) = &active {
-        let resolved = crate::service::jobs::ConfigurationResolver::new(|id| {
+        let resolved = crate::jobs::ConfigurationResolver::new(|id| {
             read_config_record(&rx, id).map_err(|error| BatchError(Failure::Storage(error)))
         })
         .project_decision(&decision, active);
@@ -614,7 +614,7 @@ pub(crate) fn read_context_state(
                 predictor = Some(frozen.profile_ref().id);
                 predictor_model = Some(frozen.model_ref().id);
                 policy.predictive = previous_binding;
-                crate::service::jobs::bind_prediction(&mut policy, &frozen);
+                crate::jobs::bind_prediction(&mut policy, &frozen);
                 if !decision_executor_available(&rx, &frozen)? {
                     Some("no enabled Executor offers the project decision model".to_owned())
                 } else if active.llm.config.context_window.is_none() {

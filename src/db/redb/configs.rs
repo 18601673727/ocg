@@ -1095,7 +1095,7 @@ impl Batch {
             ));
         }
         let global = self.global_headers()?;
-        crate::service::jobs::ConfigurationResolver::new(|id| {
+        crate::jobs::ConfigurationResolver::new(|id| {
             self.config(id)
                 .map(|row| row.map(reads::catalog::config_record))
         })
@@ -1108,7 +1108,7 @@ impl Batch {
         configuration: ExecutionConfiguration,
     ) -> Result<FrozenConfiguration, BatchError> {
         let global = self.global_headers()?;
-        crate::service::jobs::ConfigurationResolver::new(|id| {
+        crate::jobs::ConfigurationResolver::new(|id| {
             self.config(id)
                 .map(|row| row.map(reads::catalog::config_record))
         })

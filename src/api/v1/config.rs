@@ -13,8 +13,7 @@ const MIN_TOKEN_DISTINCT: usize = 8;
 pub const MAX_SUBMISSION_BYTES: usize = 64 * 1024;
 
 pub const MAX_ATTACHMENT_UPLOAD_BYTES: usize =
-    crate::service::ai::providers::openai_compatible::image::MAX_IMAGE_BYTES.div_ceil(3) * 4
-        + 4 * 1024;
+    crate::ai::providers::openai_compatible::image::MAX_IMAGE_BYTES.div_ceil(3) * 4 + 4 * 1024;
 
 pub const MAX_OUTPUT_PAGE: usize = 100;
 pub(super) const DEFAULT_OUTPUT_PAGE: usize = 50;

@@ -19,7 +19,7 @@ use crate::db::redb::schema::{
 };
 use crate::db::redb::state::JobRuntime;
 use crate::db::redb::{allocations, reads, rows, state};
-use crate::system::data_directory::{current_boot_id, current_host_id};
+use crate::host::data_directory::{current_boot_id, current_host_id};
 use ::redb::{ReadTransaction, ReadableDatabase, ReadableTable};
 
 #[derive(Clone, Debug)]

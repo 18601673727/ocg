@@ -1,9 +1,9 @@
+use crate::ai::providers::openai_compatible::ChatConversation;
 use crate::db::entities;
 use crate::db::entities::{AttachmentId, Violation};
 use crate::db::errors::{DatabaseError, OperationStatus};
 use crate::db::redb::StorageErrorKind;
 use crate::db::shared::Shared;
-use crate::service::ai::providers::openai_compatible::ChatConversation;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -19,7 +19,7 @@ pub(crate) struct PreparedDevelopmentHandoff {
 #[derive(Default)]
 pub(super) struct DevelopmentHandoffCredentials {
     pub(super) items: Vec<DevelopmentHandoffCredential>,
-    pub(super) spellings: Option<crate::system::secrets::Spellings>,
+    pub(super) spellings: Option<crate::support::secrets::Spellings>,
 }
 
 pub(super) struct DevelopmentHandoffCredential {
@@ -37,7 +37,7 @@ impl DevelopmentHandoffCredentials {
     ) {
         match &mut self.spellings {
             Some(spellings) => spellings.extend(secret.as_str()),
-            None => self.spellings = Some(crate::system::secrets::Spellings::new(secret.as_str())),
+            None => self.spellings = Some(crate::support::secrets::Spellings::new(secret.as_str())),
         }
         self.items.push(DevelopmentHandoffCredential {
             reference,
@@ -176,7 +176,7 @@ pub(crate) struct DevelopmentHandoff {
     pub(super) output_busy: AtomicBool,
     pub(super) output_uncertain: AtomicBool,
     pub(super) usage_checkpoint: std::sync::Mutex<DevelopmentUsageCheckpoint>,
-    pub(super) recorder: std::sync::Mutex<crate::service::ai::providers::RequestRecorder>,
+    pub(super) recorder: std::sync::Mutex<crate::ai::providers::RequestRecorder>,
 }
 
 impl DevelopmentHandoff {
@@ -237,17 +237,14 @@ impl DevelopmentHandoff {
     }
 }
 
-impl crate::service::ai::providers::CredentialResolver for DevelopmentHandoff {
+impl crate::ai::providers::CredentialResolver for DevelopmentHandoff {
     fn resolve<'a>(
         &'a self,
         reference: Option<&'a str>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<
-                        Option<String>,
-                        crate::service::ai::providers::ProviderExecutionError,
-                    >,
+                    Output = Result<Option<String>, crate::ai::providers::ProviderExecutionError>,
                 > + Send
                 + 'a,
         >,
@@ -263,11 +260,9 @@ impl crate::service::ai::providers::CredentialResolver for DevelopmentHandoff {
             match (reference, found) {
                 (None, _) if self.prepared.provider_credential_reference().is_none() => Ok(None),
                 (Some(_), Some(credential)) => Ok(Some(credential.secret.as_str().to_owned())),
-                _ => Err(
-                    crate::service::ai::providers::ProviderExecutionError::Build {
-                        message: "handoff credential reference mismatch".to_owned(),
-                    },
-                ),
+                _ => Err(crate::ai::providers::ProviderExecutionError::Build {
+                    message: "handoff credential reference mismatch".to_owned(),
+                }),
             }
         })
     }
@@ -327,7 +322,7 @@ impl Drop for DevelopmentOutputGuard<'_> {
 
 pub(super) fn development_contains_secret(
     value: &serde_json::Value,
-    secret: &crate::system::secrets::Spellings,
+    secret: &crate::support::secrets::Spellings,
 ) -> bool {
     match value {
         serde_json::Value::String(text) => secret.found_in(text),

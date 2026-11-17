@@ -556,8 +556,8 @@ impl DatabaseHandle {
     pub(crate) async fn resolve_credential(
         &self,
         reference: &str,
-    ) -> Result<Option<String>, crate::service::ai::providers::ProviderExecutionError> {
-        use crate::service::ai::providers::{
+    ) -> Result<Option<String>, crate::ai::providers::ProviderExecutionError> {
+        use crate::ai::providers::{
             CredentialResolver, EnvironmentCredentialResolver, ProviderExecutionError,
         };
         let reference = reference.trim();
@@ -583,9 +583,7 @@ impl DatabaseHandle {
         }
     }
 
-    pub fn credential_resolver(
-        &self,
-    ) -> Arc<dyn crate::service::ai::providers::CredentialResolver> {
+    pub fn credential_resolver(&self) -> Arc<dyn crate::ai::providers::CredentialResolver> {
         Arc::new(LocalCredentialResolver {
             database: self.clone(),
         })
@@ -596,17 +594,14 @@ struct LocalCredentialResolver {
     database: DatabaseHandle,
 }
 
-impl crate::service::ai::providers::CredentialResolver for LocalCredentialResolver {
+impl crate::ai::providers::CredentialResolver for LocalCredentialResolver {
     fn resolve<'a>(
         &'a self,
         credential_ref: Option<&'a str>,
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<
-                        Option<String>,
-                        crate::service::ai::providers::ProviderExecutionError,
-                    >,
+                    Output = Result<Option<String>, crate::ai::providers::ProviderExecutionError>,
                 > + Send
                 + 'a,
         >,

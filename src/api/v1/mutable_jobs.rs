@@ -265,7 +265,7 @@ pub(super) fn add_editable_state(
         && matches!(job.input.content, MutableJobContent::Generative { .. });
     if queued_generative {
         body["autonomous_loopback_eligibility"] =
-            crate::system::native_scheduler::endpoint_eligibility(job.frozen.as_ref()).to_json();
+            crate::jobs::scheduler::allocation::endpoint_eligibility(job.frozen.as_ref()).to_json();
     }
     if let Some(unsupported) = unsupported_decision_history {
         body["unsupported_decision_history"] = Value::Bool(
@@ -289,7 +289,7 @@ pub(super) async fn respond(
     request: &HttpRequest,
     payload: web::types::Payload,
     database: &DatabaseHandle,
-    stops: &crate::system::native_scheduler::NativeStops,
+    stops: &crate::jobs::execution::stops::NativeStops,
 ) -> Result<Reply, Refusal> {
     let context = context(request)?;
     match action {

@@ -13,8 +13,8 @@ use ntex::client::{Client, Connector};
 use ntex::http::header;
 use ntex::time::Millis;
 
-use crate::system::http;
-use crate::system::update::{self, Install, Phase, State, Version, fetch, install};
+use crate::host::update::{self, Install, Phase, State, Version, fetch, install};
+use crate::network::http;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 async fn write_progress(prefix: &Path, state: &State) -> Result<()> {

@@ -178,8 +178,8 @@ fn description(description: Option<String>) -> Result<Option<String>, Refusal> {
 
 #[cfg(unix)]
 async fn resolve_root(shared: &Shared, root: String) -> Result<String, Refusal> {
-    use crate::system::executor::blocking::{self, Kind};
-    use crate::system::executor::workspace_read::{Workspace, WorkspaceError};
+    use crate::workspace::blocking::{self, Kind};
+    use crate::workspace::files::read::{Workspace, WorkspaceError};
 
     const NOT_ABSOLUTE: Refusal = root_refusal("the Project root must be an absolute path");
     const UNRESOLVED: Refusal = root_refusal("the Project root cannot be resolved");

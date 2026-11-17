@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use ocg::system::data_directory::DataDirectory;
+use ocg::host::data_directory::DataDirectory;
 use serde_json::{Value, json};
 
 use crate::backend_process::{BackendConfig, BackendHandshake, BackendProcess};
@@ -2228,8 +2228,8 @@ fn measure_search(
     options: &Options,
     concurrency: usize,
 ) -> Result<()> {
-    use ocg::service::fts::{FtsLimits, WorkspaceFts};
-    use ocg::system::executor::workspace_read::Workspace;
+    use ocg::workspace::files::read::Workspace;
+    use ocg::workspace::search::fts::{FtsLimits, WorkspaceFts};
     let source = context
         .root
         .0

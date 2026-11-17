@@ -6,8 +6,8 @@ use crate::db::entities::{
     ModelConfig, ProfileId,
 };
 use crate::db::{DatabaseError, DatabaseHandle};
-use crate::system::data_directory::DataDirectory;
-use crate::system::runtime::{self, HostError};
+use crate::host::data_directory::DataDirectory;
+use crate::host::runtime::{self, HostError};
 
 pub const COMMAND: &str = "register-llm";
 pub const ENDPOINT_VARIABLE: &str = "OCG_PROVIDER_ENDPOINT";

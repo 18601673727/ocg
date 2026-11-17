@@ -300,7 +300,7 @@ pub fn lifetime_rusage() -> (Option<u64>, Option<f64>, Option<f64>) {
 }
 
 pub fn database_bytes(
-    directory: &ocg::system::data_directory::DataDirectory,
+    directory: &ocg::host::data_directory::DataDirectory,
 ) -> std::io::Result<u64> {
     let mut total = 0;
     for entry in std::fs::read_dir(directory.database_path())? {
@@ -317,7 +317,7 @@ pub fn database_bytes(
 }
 
 pub fn ocg_database_bytes(
-    directory: &ocg::system::data_directory::DataDirectory,
+    directory: &ocg::host::data_directory::DataDirectory,
 ) -> std::io::Result<u64> {
     Ok(std::fs::metadata(directory.database_path().join("ocg.redb"))?.len())
 }

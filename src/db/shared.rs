@@ -6,9 +6,9 @@ use crate::db::errors::{DatabaseError, MaintenanceError};
 use crate::db::redb;
 use crate::db::redb::{Probe, StorageError};
 use crate::db::scheduler_wake::{SchedulerWake, SchedulerWakeSubscription};
-use crate::system::data_directory::DataDirectory;
-use crate::system::monitor::{ProtectionCell, ProtectionLock};
-use crate::system::policy::SystemPolicy;
+use crate::host::data_directory::DataDirectory;
+use crate::host::monitor::{ProtectionCell, ProtectionLock};
+use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -66,9 +66,9 @@ pub(super) fn admitted(admission: &Admission) -> Result<(), DatabaseError> {
 
 pub(super) struct Shared {
     pub(super) data_directory: DataDirectory,
-    pub(super) output_changes: crate::system::notification::KeyedNotifications<u128>,
-    pub(super) catalog_changes: crate::system::notification::Notifications,
-    pub(super) observation_changes: crate::system::notification::Journal<ObservationChange>,
+    pub(super) output_changes: crate::support::notification::KeyedNotifications<u128>,
+    pub(super) catalog_changes: crate::support::notification::Notifications,
+    pub(super) observation_changes: crate::support::notification::Journal<ObservationChange>,
     pub(super) scheduler_wake: SchedulerWake,
     pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
     pub(super) active_policy: SystemPolicy,

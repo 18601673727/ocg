@@ -7,11 +7,11 @@ use ntex::web::HttpResponse;
 use serde::Deserialize;
 
 use super::{INTERNAL, INVALID_REQUEST, Refusal, Reply};
+use crate::ai::providers::openai_compatible::image::MAX_IMAGE_BYTES;
+use crate::ai::providers::openai_compatible::{ImageError, ImageInput, ImageMime};
 use crate::db::attachments::AttachmentError;
 use crate::db::entities::{Attachment, AttachmentId, AttachmentOrigin, AttachmentRecord};
 use crate::db::{DatabaseError, DatabaseHandle};
-use crate::service::ai::providers::openai_compatible::image::MAX_IMAGE_BYTES;
-use crate::service::ai::providers::openai_compatible::{ImageError, ImageInput, ImageMime};
 
 const INVALID_UPLOAD: Refusal = Refusal::new(
     StatusCode::BAD_REQUEST,

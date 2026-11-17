@@ -2,9 +2,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::db::entities::{ScheduledExternalPolicyId, ScheduledExternalPolicyRecord, Timestamp};
-use crate::system::data_directory::DataDirectory;
-use crate::system::execution_features::SCHEDULED_EXTERNAL;
-use crate::system::scheduled_external::ScheduledExternalPolicyDraft;
+use crate::host::data_directory::DataDirectory;
+use crate::host::execution_features::SCHEDULED_EXTERNAL;
+use crate::jobs::authorization::scheduled::ScheduledExternalPolicyDraft;
 
 pub(super) const COMMAND: &str = "scheduled-external-policy";
 
@@ -42,10 +42,8 @@ pub(super) fn run(
     let action = parse(arguments)?;
     let result = Rc::new(RefCell::new(None));
     let returned = result.clone();
-    let report = crate::system::runtime::run_hosted_reporting(
-        directory,
-        false,
-        move |database| async move {
+    let report =
+        crate::host::runtime::run_hosted_reporting(directory, false, move |database| async move {
             let outcome: Result<(), Box<dyn std::error::Error>> = async {
                 match action {
                     Action::Create { draft } => {
@@ -102,10 +100,9 @@ pub(super) fn run(
             }
             .await;
             *returned.borrow_mut() = Some(outcome);
-        },
-    );
+        });
     for failure in report.failures {
-        if failure.phase != crate::system::runtime::Phase::Logger {
+        if failure.phase != crate::host::runtime::Phase::Logger {
             return Err(failure.error.into());
         }
     }

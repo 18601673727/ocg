@@ -894,7 +894,7 @@ impl CredentialKey {
             )
             .is_err()
         {
-            crate::system::secrets::wipe_vec(&mut ciphertext);
+            crate::support::secrets::wipe_vec(&mut ciphertext);
             return Err(StorageError::corrupted("credential encryption failed"));
         }
         let mut encoded = Vec::with_capacity(2 + 8 + 12 + ciphertext.len());
@@ -926,15 +926,15 @@ impl CredentialKey {
             aws_lc_rs::aead::Aad::from(&aad),
             &mut buffer,
         ) else {
-            crate::system::secrets::wipe_vec(&mut buffer);
+            crate::support::secrets::wipe_vec(&mut buffer);
             return Ok(None);
         };
         let copy = plaintext.to_vec();
-        crate::system::secrets::wipe_vec(&mut buffer);
+        crate::support::secrets::wipe_vec(&mut buffer);
         let secret = match String::from_utf8(copy) {
             Ok(secret) => secret,
             Err(error) => {
-                crate::system::secrets::wipe_vec(&mut error.into_bytes());
+                crate::support::secrets::wipe_vec(&mut error.into_bytes());
                 return Err(StorageError::corrupted("decrypted credential is not UTF-8"));
             }
         };
@@ -953,7 +953,7 @@ pub(crate) fn load_credential_key(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(::redb::Error::Io(error).into()),
     };
-    let _ = crate::system::data_directory::restrict_file(&path);
+    let _ = crate::host::data_directory::restrict_file(&path);
     CredentialKey::from_bytes(&bytes)
         .map(std::sync::Arc::new)
         .map(Some)
@@ -984,7 +984,7 @@ pub(crate) fn create_credential_key(
         &mut options,
         rustix::fs::OFlags::NOFOLLOW.bits() as i32,
     );
-    crate::system::data_directory::private_file(&mut options);
+    crate::host::data_directory::private_file(&mut options);
     let mut file = options.open(&temp_path).map_err(::redb::Error::Io)?;
     if let Err(error) = file.write_all(&raw).and_then(|()| file.sync_all()) {
         drop(file);
@@ -1013,7 +1013,7 @@ pub(crate) fn create_credential_key(
     std::fs::File::open(directory)
         .and_then(|dir| dir.sync_all())
         .map_err(::redb::Error::Io)?;
-    let _ = crate::system::data_directory::restrict_file(&key_path);
+    let _ = crate::host::data_directory::restrict_file(&key_path);
     Ok(key)
 }
 

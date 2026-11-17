@@ -1,5 +1,9 @@
+pub mod ai;
 pub mod api;
 pub mod cli;
 pub mod db;
-pub mod service;
-pub mod system;
+pub mod host;
+pub mod jobs;
+pub mod network;
+pub(crate) mod support;
+pub mod workspace;

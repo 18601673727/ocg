@@ -21,13 +21,13 @@ use crate::db::shared::{
     flush_staged, serve_reads,
 };
 use crate::db::{entities, redb};
-use crate::system::data_directory::DataDirectory;
-use crate::system::monitor;
-use crate::system::monitor::{
+use crate::host::data_directory::DataDirectory;
+use crate::host::monitor;
+use crate::host::monitor::{
     FilesystemConfig, ProtectedArea, ProtectionCell, ProtectionLock, ProtectionReason,
     RecoveryError, RecoveryReport, ReopenFailure, SpaceMeasurement, SpaceShortage,
 };
-use crate::system::policy::SystemPolicy;
+use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -192,8 +192,7 @@ impl DatabaseWorker {
                         .ok();
                     return Ok(());
                 }
-                let _database_lock = match crate::system::data_directory::lock_database(&directory)
-                {
+                let _database_lock = match crate::host::data_directory::lock_database(&directory) {
                     Ok(lock) => lock,
                     Err(error) => {
                         ready_sender.send(Err(DatabaseError::Startup(error))).ok();

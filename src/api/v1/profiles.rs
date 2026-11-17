@@ -13,6 +13,8 @@ use super::wire::{
     DATABASE_BUSY, DATABASE_UNAVAILABLE, INCONSISTENT_RECORD, INTERNAL, INVALID_REQUEST, Refusal,
     Reply, SHUTTING_DOWN,
 };
+use crate::ai::providers::CredentialResolver;
+use crate::ai::providers::headers::{RequestHeaders, resolve_request_headers};
 use crate::db::entities::{
     AgentCapability, AgentConfig, Config, ConfigBody, ConfigId, ConfigKind, ConfigRecord,
     ConnectionConfig, CredentialSecret, DecisionAgentConfig, DecisionCapability, DecisionLimits,
@@ -28,8 +30,6 @@ use crate::db::mutations::{
     ModelProfileSave, ProfileCredentialRef,
 };
 use crate::db::{DatabaseError, DatabaseHandle};
-use crate::service::ai::providers::CredentialResolver;
-use crate::system::http::{RequestHeaders, resolve_request_headers};
 use std::sync::Arc;
 
 const MAX_PROFILE_NAME_BYTES: usize = 128;
@@ -299,7 +299,7 @@ fn normalize_endpoint(endpoint: Option<&str>) -> Result<Option<String>, Refusal>
         None => Ok(None),
         Some(url) => {
             if url.len() > MAX_ENDPOINT_BYTES
-                || crate::service::ai::providers::model_endpoint(url).is_err()
+                || crate::ai::providers::model_endpoint(url).is_err()
                 || url.chars().any(|ch| ch.is_whitespace() || ch.is_control())
             {
                 return Err(INVALID_ENDPOINT);
@@ -521,10 +521,7 @@ impl CredentialResolver for ProbeResolver {
     ) -> std::pin::Pin<
         Box<
             dyn std::future::Future<
-                    Output = Result<
-                        Option<String>,
-                        crate::service::ai::providers::ProviderExecutionError,
-                    >,
+                    Output = Result<Option<String>, crate::ai::providers::ProviderExecutionError>,
                 > + Send
                 + 'a,
         >,
@@ -1259,8 +1256,10 @@ pub(crate) async fn save_profile(
                     .reasoning_effort
                     .as_deref()
                     .is_some_and(|effort| {
-                        crate::service::ai::providers::openai_compatible::request::parse_reasoning_effort(effort)
-                            .is_err()
+                        crate::ai::providers::openai_compatible::request::parse_reasoning_effort(
+                            effort,
+                        )
+                        .is_err()
                     })
                 || parameters
                     .presence_penalty
@@ -1660,7 +1659,7 @@ pub(crate) async fn import_models(
             let endpoint = provider.endpoint.trim();
             if endpoint.len() > MAX_ENDPOINT_BYTES
                 || endpoint.chars().any(char::is_whitespace)
-                || crate::service::ai::providers::model_endpoint(endpoint).is_err()
+                || crate::ai::providers::model_endpoint(endpoint).is_err()
             {
                 return Err(INVALID_ENDPOINT);
             }
@@ -1828,7 +1827,7 @@ pub(crate) async fn provider_models(
         },
     };
     if request.endpoint.len() > MAX_ENDPOINT_BYTES
-        || crate::service::ai::providers::model_endpoint(&request.endpoint).is_err()
+        || crate::ai::providers::model_endpoint(&request.endpoint).is_err()
     {
         return Err(INVALID_ENDPOINT);
     }
@@ -1860,7 +1859,7 @@ pub(crate) async fn provider_models(
     {
         return Err(INVALID_CREDENTIAL);
     }
-    use crate::service::ai::providers::ModelListError;
+    use crate::ai::providers::ModelListError;
     let saved_headers = match request.profile_id.as_deref() {
         None => Vec::new(),
         Some(id) => {
@@ -1880,7 +1879,7 @@ pub(crate) async fn provider_models(
         }
     };
     let plan = plan_headers(database, request.headers, &saved_headers).await?;
-    let listed = crate::service::ai::providers::list_models(
+    let listed = crate::ai::providers::list_models(
         &request.endpoint,
         credential.as_deref(),
         match protocol {

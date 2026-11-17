@@ -141,7 +141,7 @@ impl DatabaseHandle {
                             DevelopmentUsageCheckpoint::default(),
                         ),
                         recorder: std::sync::Mutex::new(
-                            crate::service::ai::providers::RequestRecorder::default(),
+                            crate::ai::providers::RequestRecorder::default(),
                         ),
                     })
                 },
@@ -533,7 +533,7 @@ impl DatabaseHandle {
 
     pub(crate) async fn finalize_development_job(
         &self,
-        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        returned: crate::jobs::execution::runtime::DevelopmentExecutionReturn<'_>,
         expected_seq: u32,
         finalization: JobFinalization,
     ) -> Result<AppendedOutput, DatabaseError> {
@@ -574,7 +574,7 @@ impl DatabaseHandle {
 
     pub(crate) async fn finalize_development_decision(
         &self,
-        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        returned: crate::jobs::execution::runtime::DevelopmentExecutionReturn<'_>,
         expected_seq: u32,
         result: entities::DecisionResult,
     ) -> Result<AppendedOutput, DatabaseError> {
@@ -624,7 +624,7 @@ impl DatabaseHandle {
 
     pub(crate) async fn finalize_development_failure(
         &self,
-        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        returned: crate::jobs::execution::runtime::DevelopmentExecutionReturn<'_>,
         expected_seq: u32,
         finalization: JobFinalization,
         rejection: Option<(
@@ -715,7 +715,7 @@ impl DatabaseHandle {
 
     pub(crate) async fn record_development_uncertain(
         &self,
-        returned: crate::system::executor::execution_runtime::DevelopmentExecutionReturn<'_>,
+        returned: crate::jobs::execution::runtime::DevelopmentExecutionReturn<'_>,
         reason: entities::UncertaintyReason,
     ) -> Result<(), DatabaseError> {
         let handoff = returned.handoff();

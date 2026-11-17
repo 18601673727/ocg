@@ -1,6 +1,6 @@
 use super::contracts::envelope;
 use super::{DatabaseHandle, DatabaseStatus, Value};
-use crate::system::monitor::{database_disk_usage, process_memory};
+use crate::host::monitor::{database_disk_usage, process_memory};
 
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "ActiveSystemSettings")]

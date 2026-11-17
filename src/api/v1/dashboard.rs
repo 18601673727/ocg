@@ -790,7 +790,7 @@ impl LogQuery {
         let file = values.remove("file").map(str::to_owned);
         if file
             .as_ref()
-            .is_some_and(|file| !crate::system::logger::is_runtime_file_name(file.as_ref()))
+            .is_some_and(|file| !crate::host::logger::is_runtime_file_name(file.as_ref()))
         {
             return Err(INVALID_REQUEST);
         }
@@ -861,7 +861,7 @@ fn log_tail(directory: &std::path::Path, query: LogQuery) -> Result<Value, Refus
             return Err(unavailable);
         }
         let entry = entry.map_err(|_| unavailable.clone())?;
-        if crate::system::logger::is_runtime_file_name(&entry.file_name())
+        if crate::host::logger::is_runtime_file_name(&entry.file_name())
             && entry
                 .file_type()
                 .map_err(|_| unavailable.clone())?

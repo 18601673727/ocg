@@ -10,7 +10,7 @@ use crate::db::redb::schema::{
 };
 use crate::db::redb::schema::{DATABASE_FILE_NAME, FORMAT_VERSION};
 use crate::db::redb::{allocations, batch, indexes, recovery};
-use crate::system::data_directory::{current_boot_id, current_host_id};
+use crate::host::data_directory::{current_boot_id, current_host_id};
 use ::redb::{Database, ReadableTable};
 
 enum OfflineAccess<'a> {
@@ -65,7 +65,7 @@ pub(super) fn verification_copy(
         create.access_mode(GENERIC_READ | GENERIC_WRITE | DELETE);
         create.custom_flags(DELETE_ON_CLOSE);
     }
-    let copy = crate::system::data_directory::private_file(&mut create)
+    let copy = crate::host::data_directory::private_file(&mut create)
         .open(&scratch)
         .map_err(io_storage_error)?;
     #[cfg(not(windows))]
@@ -272,8 +272,7 @@ pub(crate) fn verify_publication(
     }
 
     let directory = std::fs::canonicalize(directory).map_err(io_storage_error)?;
-    let named_lock =
-        open_named(&directory.join(crate::system::data_directory::DATABASE_LOCK_FILE))?;
+    let named_lock = open_named(&directory.join(crate::host::data_directory::DATABASE_LOCK_FILE))?;
     if !same_file(
         &named_lock.metadata().map_err(io_storage_error)?,
         &exclusive_lock.metadata().map_err(io_storage_error)?,
@@ -643,7 +642,7 @@ fn inspect_held_in(
         }
         _ => "an index table is missing".to_owned(),
     };
-    let features: Vec<_> = crate::system::execution_features::EXECUTION_FEATURES
+    let features: Vec<_> = crate::host::execution_features::EXECUTION_FEATURES
         .into_iter()
         .map(|(name, enabled)| {
             json!({"feature": name, "state": if enabled { "Enabled" } else { "Disabled" }})

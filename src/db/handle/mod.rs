@@ -12,9 +12,9 @@ use crate::db::scheduler_wake::SchedulerWakeSubscription;
 use crate::db::shared::{Admission, Opened, ReadJob, ReadMessage, Shared, admitted};
 use crate::db::worker::{DatabaseHandle, run};
 use crate::db::{errors, redb};
-use crate::system::data_directory::DataDirectory;
-use crate::system::monitor::{ProtectionReason, ProtectionWatch};
-use crate::system::policy::SystemPolicy;
+use crate::host::data_directory::DataDirectory;
+use crate::host::monitor::{ProtectionReason, ProtectionWatch};
+use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
@@ -87,24 +87,24 @@ impl DatabaseHandle {
             .take()
     }
 
-    pub(crate) fn subscribe_catalog(&self) -> crate::system::notification::Subscription {
+    pub(crate) fn subscribe_catalog(&self) -> crate::support::notification::Subscription {
         self.shared.catalog_changes.subscribe()
     }
 
-    pub(crate) fn subscribe_observations(&self) -> crate::system::notification::Subscription {
+    pub(crate) fn subscribe_observations(&self) -> crate::support::notification::Subscription {
         self.shared.observation_changes.subscribe()
     }
 
-    pub(crate) fn observation_cursor(&self) -> crate::system::notification::JournalCursor {
+    pub(crate) fn observation_cursor(&self) -> crate::support::notification::JournalCursor {
         self.shared.observation_changes.cursor()
     }
 
     pub(crate) fn observation_changes(
         &self,
-        cursor: crate::system::notification::JournalCursor,
+        cursor: crate::support::notification::JournalCursor,
     ) -> Result<
         Vec<(
-            crate::system::notification::JournalCursor,
+            crate::support::notification::JournalCursor,
             ObservationChange,
         )>,
         (),
@@ -115,7 +115,7 @@ impl DatabaseHandle {
     pub(crate) fn subscribe_outputs(
         &self,
         job: JobId,
-    ) -> crate::system::notification::Subscription {
+    ) -> crate::support::notification::Subscription {
         self.shared.output_changes.subscribe(job.get())
     }
 
@@ -185,7 +185,7 @@ impl DatabaseHandle {
         {
             return Ok(None);
         }
-        if crate::system::executor::blocking::groups_tracked() {
+        if crate::workspace::process::groups_tracked() {
             return Ok(None);
         }
         self.shared.update_paused.store(true, Ordering::SeqCst);

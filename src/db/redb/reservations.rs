@@ -26,7 +26,7 @@ use crate::db::redb::schema::{
     SCHEDULED_EXTERNAL_BINDING, TOOL_CALLS,
 };
 use crate::db::redb::{allocations, reads, state};
-use crate::system::data_directory::{current_boot_id, current_host_id};
+use crate::host::data_directory::{current_boot_id, current_host_id};
 use ::redb::{Database, ReadableTable};
 
 static PROMOTION_CLOCK_BASE: OnceLock<(i64, Instant)> = OnceLock::new();
