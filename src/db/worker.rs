@@ -11,6 +11,10 @@ use crate::db::errors::{
     CompactionOutcome, CompactionReport, CompactionSkip, DatabaseError, MaintenanceError,
     OperationStatus, UnknownCause, operation_status,
 };
+use crate::db::protection::{
+    ProtectedArea, ProtectionCell, ProtectionLock, ProtectionReason, RecoveryError, RecoveryReport,
+    ReopenFailure, SpaceMeasurement, SpaceShortage,
+};
 use crate::db::redb::{
     BatchError, BatchFailure, Commit, CompactFailure, OpenedFile, Probe, StorageError,
     StorageErrorKind,
@@ -23,10 +27,7 @@ use crate::db::shared::{
 use crate::db::{entities, redb};
 use crate::host::data_directory::DataDirectory;
 use crate::host::monitor;
-use crate::host::monitor::{
-    FilesystemConfig, ProtectedArea, ProtectionCell, ProtectionLock, ProtectionReason,
-    RecoveryError, RecoveryReport, ReopenFailure, SpaceMeasurement, SpaceShortage,
-};
+use crate::host::monitor::FilesystemConfig;
 use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::path::PathBuf;

@@ -1,11 +1,10 @@
 use super::{COMMAND_QUEUE_CAPACITY, READ_QUEUE_CAPACITY};
 use crate::db::attachments::StoreError;
 use crate::db::entities::{OperationId, Violation};
+use crate::db::protection::{ProtectionLock, ProtectionReason, SpaceShortage};
 use crate::db::redb;
 use crate::db::redb::{Probe, StorageError};
-use crate::host::monitor::{
-    FilesystemConfigError, ProtectionLock, ProtectionReason, SpaceShortage,
-};
+use crate::host::monitor::FilesystemConfigError;
 use crate::host::policy::SystemPolicyError;
 use std::time::Duration;
 

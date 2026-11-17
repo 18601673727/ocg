@@ -1,11 +1,11 @@
 use super::TRANSACTION_ALLOWANCE_BYTES;
 use crate::db::entities::{Config, ConfigBody, OperationId, OperationKind, ProjectCommand};
 use crate::db::errors::{CompactionOutcome, DatabaseError, MaintenanceError};
+use crate::db::protection::ProtectionReason;
 use crate::db::redb;
 use crate::db::redb::{BatchError, Commit};
 use crate::db::shared::Shared;
 use crate::db::worker::{Executed, run};
-use crate::host::monitor::ProtectionReason;
 use ::redb::Database;
 use std::io::Write;
 use std::sync::Arc;

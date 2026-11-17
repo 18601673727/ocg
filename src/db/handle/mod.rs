@@ -6,6 +6,7 @@ use crate::db::errors::{
     CompactionOutcome, DatabaseError, DatabaseStatus, MaintenanceError, OperationStatus,
     UnknownCause,
 };
+use crate::db::protection::{ProtectionReason, ProtectionWatch};
 use crate::db::redb::QueueCounts;
 use crate::db::redb::StorageError;
 use crate::db::scheduler_wake::SchedulerWakeSubscription;
@@ -13,7 +14,6 @@ use crate::db::shared::{Admission, Opened, ReadJob, ReadMessage, Shared, admitte
 use crate::db::worker::{DatabaseHandle, run};
 use crate::db::{errors, redb};
 use crate::host::data_directory::DataDirectory;
-use crate::host::monitor::{ProtectionReason, ProtectionWatch};
 use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::sync::atomic::{AtomicBool, Ordering};
