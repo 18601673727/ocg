@@ -1065,7 +1065,7 @@ fn held_ownership(held: u64, unknown: u64) -> StorageError {
         kind: StorageErrorKind::Other,
         os_error: None,
         detail: format!(
-            "refusing to start: {held} Allocation(s) still hold capacity and {unknown} Job outcome(s) are Unknown; a restart does not prove the work stopped, and recovery is disabled. Inspect with `ocg inspect-held <data-directory>`"
+            "refusing to start: {held} Allocation(s) still hold capacity and {unknown} Job outcome(s) are Unknown. Inspect with `ocg inspect-held <data-directory>`. To plan offline release, run `ocg reconcile-held <data-directory> --dry-run`"
         ),
     }
 }

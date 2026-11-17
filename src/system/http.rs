@@ -18,29 +18,6 @@ use crate::service::ai::providers::ProviderExecutionError;
 
 static PROXY: OnceLock<Result<Option<Proxy>, String>> = OnceLock::new();
 
-pub(crate) fn direct_diagnostic_loopback(endpoint: &str) -> bool {
-    let Ok(uri) = endpoint.parse::<Uri>() else {
-        return false;
-    };
-    if uri.scheme_str() != Some("http")
-        || uri.host() != Some("127.0.0.1")
-        || uri
-            .authority()
-            .is_none_or(|authority| authority.as_str().contains('@'))
-        || uri.query().is_some()
-    {
-        return false;
-    }
-    let Some(port) = uri.port_u16().filter(|port| *port != 0) else {
-        return false;
-    };
-    match PROXY.get_or_init(load) {
-        Ok(None) => true,
-        Ok(Some(proxy)) => proxy.bypasses("127.0.0.1", port),
-        Err(_) => false,
-    }
-}
-
 const TUNNEL_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn authorization(credential: &str) -> Result<HeaderValue, ProviderExecutionError> {

@@ -297,7 +297,7 @@ impl NativeScheduler {
     fn halt(&self, reason: &str) {
         if !self.halted.replace(true) {
             log::error!(
-                "native scheduler stopped claiming: {reason}; run `ocg inspect-held` once the host has stopped; nothing is retried, reconciled or released"
+                "native scheduler stopped claiming: {reason}. Once the host has stopped, run `ocg inspect-held` to inspect ownership and `ocg reconcile-held` to release eligible Allocations"
             );
         }
     }
@@ -509,7 +509,7 @@ impl NativeScheduler {
             dispatched.log();
             if !dispatched.resolved() && !halted.replace(true) {
                 log::error!(
-                    "native scheduler stopped claiming: Job {} is not settled or Uncertain after its dispatch; run `ocg inspect-held` once the host has stopped; nothing is retried, reconciled or released",
+                    "native scheduler stopped claiming: Job {} is not settled or Uncertain after its dispatch. Once the host has stopped, run `ocg inspect-held` to inspect ownership and `ocg reconcile-held` to release eligible Allocations",
                     dispatched.job
                 );
             }

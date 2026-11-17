@@ -14,9 +14,8 @@ use crate::db::redb::recovery::offline::{
 use crate::db::redb::recovery::reserved::ReservedRefusal;
 use crate::db::redb::schema::FORMAT_VERSION;
 use crate::db::redb::schema::{
-    ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, APPROVALS, EXECUTORS, JOB_OUTPUTS, JOB_RUNTIME,
-    LIVE_CHILDREN, META, MUTABLE_READY, PENDING, POOL_ALLOCATIONS, POOLS, REQUEST_EVENTS,
-    SCHEDULED_EXTERNAL_BINDING, TOOL_CALLS,
+    ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, EXECUTORS, JOB_OUTPUTS, JOB_RUNTIME, META,
+    MUTABLE_READY, PENDING, POOL_ALLOCATIONS, POOLS, TOOL_CALLS,
 };
 use crate::db::redb::state::JobRuntime;
 use crate::db::redb::{allocations, reads, rows, state};
@@ -254,32 +253,24 @@ fn recovery_action_in(
     };
     if record.job.phase != MutableJobPhase::Executing
         || record.job.revision != allocation.job_revision
-        || record.job.summary_source.is_some()
     {
         ineligible!(
             "job_revision",
-            "the Job is not the ordinary executing revision named by the Allocation"
+            "the Job is not the executing revision named by the Allocation"
         );
     }
-    let Some(MutableFrozenConfiguration::Generative(frozen)) = record.job.frozen.as_ref() else {
-        ineligible!(
-            "not_loopback_generative",
-            "only a frozen Generative Job is eligible"
-        );
+    let expected_operation = match record.job.frozen.as_ref() {
+        Some(MutableFrozenConfiguration::Generative(frozen)) => Some((
+            ExecutionOperation::LlmRequest,
+            Some(frozen.llm.provider.transport),
+        )),
+        Some(MutableFrozenConfiguration::Decision(_)) => Some((ExecutionOperation::Decision, None)),
+        None => None,
     };
-    if frozen.single_request_refusal().is_some()
-        || !frozen
-            .llm
-            .provider
-            .endpoint
-            .as_deref()
-            .is_some_and(crate::system::http::direct_diagnostic_loopback)
-        || allocation.operation != ExecutionOperation::LlmRequest
-        || allocation.protocol != Some(frozen.llm.provider.transport)
-    {
+    if expected_operation != Some((allocation.operation, allocation.protocol)) {
         ineligible!(
-            "not_loopback_generative",
-            "the Job is not the strict single-request, tool-free literal-loopback shape"
+            "allocation_inconsistent",
+            "the Allocation operation or protocol disagrees with the frozen Job"
         );
     }
     let pool = tx
@@ -314,33 +305,6 @@ fn recovery_action_in(
             "the Pool or Executor binding no longer proves this Allocation"
         );
     }
-    if tx
-        .open_table(SCHEDULED_EXTERNAL_BINDING)
-        .map_err(StorageError::from)?
-        .get(job_id.get())
-        .map_err(StorageError::from)?
-        .is_some()
-    {
-        ineligible!(
-            "external_binding",
-            "scheduled external work is never eligible for loopback recovery"
-        );
-    }
-
-    for entry in tx
-        .open_table(REQUEST_EVENTS)
-        .map_err(StorageError::from)?
-        .range((job_id.get(), 0, 0)..=(job_id.get(), u32::MAX, u32::MAX))
-        .map_err(StorageError::from)?
-    {
-        let (key, _) = entry.map_err(StorageError::from)?;
-        if key.value().1 != 1 {
-            ineligible!(
-                "multiple_requests",
-                "more than the first request has durable evidence"
-            );
-        }
-    }
     for entry in tx
         .open_table(JOB_OUTPUTS)
         .map_err(StorageError::from)?
@@ -354,33 +318,6 @@ fn recovery_action_in(
                 "a final Result already exists and will not be replaced"
             );
         }
-    }
-    if tx
-        .open_table(TOOL_CALLS)
-        .map_err(StorageError::from)?
-        .range((job_id.get(), 0, 0)..=(job_id.get(), u32::MAX, u32::MAX))
-        .map_err(StorageError::from)?
-        .next()
-        .is_some()
-        || tx
-            .open_table(APPROVALS)
-            .map_err(StorageError::from)?
-            .range((job_id.get(), 0, 0)..=(job_id.get(), u32::MAX, u32::MAX))
-            .map_err(StorageError::from)?
-            .next()
-            .is_some()
-        || tx
-            .open_table(LIVE_CHILDREN)
-            .map_err(StorageError::from)?
-            .range((job_id.get(), 0)..=(job_id.get(), u128::MAX))
-            .map_err(StorageError::from)?
-            .next()
-            .is_some()
-    {
-        ineligible!(
-            "execution_evidence",
-            "tool, approval, or child evidence is outside this recovery's authority"
-        );
     }
     for entry in tx
         .open_table(MUTABLE_READY)
@@ -489,6 +426,29 @@ fn recovery_action_in(
             ));
         }
     };
+    if proof == StopProof::Proof {
+        for entry in tx
+            .open_table(TOOL_CALLS)
+            .map_err(StorageError::from)?
+            .range((job_id.get(), 0, 0)..=(job_id.get(), u32::MAX, u32::MAX))
+            .map_err(StorageError::from)?
+        {
+            let (key, row) = entry.map_err(StorageError::from)?;
+            let tool = rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, row.value())?;
+            if tool.admission().is_some()
+                && tool.reconciliation.is_none()
+                && tool
+                    .outcome
+                    .as_ref()
+                    .is_none_or(|outcome| !outcome.fact.is_definite())
+            {
+                ineligible!(
+                    "tool_effect_unproven",
+                    "an admitted tool effect is unconfirmed and a local process may still be running on this boot"
+                );
+            }
+        }
+    }
     Ok(Ok(RecoveryAction {
         token: allocation.token,
         phase: allocation.phase,

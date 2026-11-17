@@ -493,6 +493,11 @@ pub(super) fn decode_mutable_input_revision(
     Ok(input)
 }
 
+pub(super) enum TurnMembership {
+    Turn,
+    NonTurn,
+}
+
 impl Batch {
     pub(super) fn require_generative_predecessors(
         &mut self,
@@ -1356,6 +1361,7 @@ impl Batch {
         &mut self,
         job: &crate::db::entities::MutableJob,
         req_tag: u16,
+        membership: TurnMembership,
         planning_wait: bool,
         create_state: bool,
     ) -> Result<(), BatchError> {
@@ -1377,8 +1383,10 @@ impl Batch {
                 )?;
             }
             tx.open_table(PENDING)?.insert(job.id.get(), ())?;
-            tx.open_table(TURNS)?
-                .insert((job.parent_id.get(), job.id.get()), ())?;
+            if matches!(membership, TurnMembership::Turn) {
+                tx.open_table(TURNS)?
+                    .insert((job.parent_id.get(), job.id.get()), ())?;
+            }
             tx.open_table(CHILDREN)?
                 .insert((job.parent_id.get(), job.id.get()), ())?;
             state::set_pending(tx, job.id, Some((u32::from(planning_wait), 0)))?;
@@ -1491,7 +1499,7 @@ impl Batch {
         job.submitted_at = Some(submitted);
         let planning_wait = self.maybe_attach_planning_decision(&parent, &job, &frozen)?;
         let req_tag = mutable_configuration_requirement(&frozen);
-        self.enqueue_mutable_job(&job, req_tag, planning_wait, false)?;
+        self.enqueue_mutable_job(&job, req_tag, TurnMembership::Turn, planning_wait, false)?;
         self.step(|tx| {
             indexes::update_mutable_turn_search(tx, job.parent_id, id, None, &job.input)
         })?;
@@ -1627,7 +1635,7 @@ impl Batch {
             frozen: Some(storable),
         };
         let req_tag = mutable_configuration_requirement(&FrozenConfiguration::Decision(frozen));
-        self.enqueue_mutable_job(&job, req_tag, false, true)?;
+        self.enqueue_mutable_job(&job, req_tag, TurnMembership::Turn, false, true)?;
         self.step(|tx| {
             indexes::update_mutable_turn_search(tx, conversation_id, job_id, None, &input)
         })?;

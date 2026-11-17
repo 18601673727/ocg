@@ -390,8 +390,15 @@ impl Batch {
         } else {
             self.unsettled_turns(conversation)?
         };
-        if !chunk_group && matches!(cause, OutcomeCause::Closed) {
-            jobs.extend(self.unsettled_summary_producers(conversation)?);
+        if !chunk_group {
+            for id in self.unsettled_non_turn_jobs(conversation)? {
+                let Some(job) = self.mutable_job(id)? else {
+                    return self.corrupted("conversation child is not a native Job".into());
+                };
+                if matches!(cause, OutcomeCause::Closed) || job.summary_source.is_none() {
+                    jobs.push(id);
+                }
+            }
         }
         let mut running = Vec::new();
         let mut ended = Vec::new();
@@ -502,7 +509,7 @@ impl Batch {
         if self.require_job_state(conversation)?.outcome.is_some()
             || !self.unsettled_turns(conversation)?.is_empty()
             || !self.live_children(conversation)?.is_empty()
-            || !self.unsettled_summary_producers(conversation)?.is_empty()
+            || !self.unsettled_non_turn_jobs(conversation)?.is_empty()
         {
             return Ok(());
         }
@@ -589,7 +596,7 @@ impl Batch {
                 .is_some_and(|allocation| allocation.holds_capacity())
             || !self.unsettled_turns(spec.id)?.is_empty()
             || !self.live_children(spec.id)?.is_empty()
-            || !self.unsettled_summary_producers(spec.id)?.is_empty()
+            || !self.unsettled_non_turn_jobs(spec.id)?.is_empty()
         {
             return Ok(());
         }
@@ -617,10 +624,7 @@ impl Batch {
         })
     }
 
-    fn unsettled_summary_producers(
-        &mut self,
-        conversation: JobId,
-    ) -> Result<Vec<JobId>, BatchError> {
+    fn unsettled_non_turn_jobs(&mut self, conversation: JobId) -> Result<Vec<JobId>, BatchError> {
         self.step(|tx| {
             let Some(counts) = state::pending(tx, conversation)? else {
                 return Ok(Vec::new());
@@ -630,25 +634,20 @@ impl Batch {
             }
             let children = tx.open_table(CHILDREN)?;
             let jobs = tx.open_table(JOBS)?;
-            let mut producers = Vec::new();
+            let turns = tx.open_table(TURNS)?;
+            let mut unsettled = Vec::new();
             for entry in
                 children.range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
             {
                 let id = entry?.0.value().1;
-                if state::pending(tx, JobId::new(id))?.is_none() {
-                    continue;
-                }
-                let Some(row) = jobs.get(id)? else {
-                    continue;
-                };
-                if jobs::decode_mutable_job(id, row.value())?
-                    .summary_source
-                    .is_some()
+                if turns.get((conversation.get(), id))?.is_none()
+                    && jobs.get(id)?.is_some()
+                    && state::pending(tx, JobId::new(id))?.is_some()
                 {
-                    producers.push(JobId::new(id));
+                    unsettled.push(JobId::new(id));
                 }
             }
-            Ok(producers)
+            Ok(unsettled)
         })
     }
 
@@ -656,8 +655,17 @@ impl Batch {
         let spec = self.require_mutable_conversation(job.parent_id)?;
         if spec.is_chunk_group() {
             self.settle_chunk_group(&spec)?;
-        } else if job.summary_source.is_some() {
-            self.settle_closing(spec.id)?;
+        } else if !self.step(|tx| {
+            Ok(tx
+                .open_table(TURNS)?
+                .get((spec.id.get(), job.id.get()))?
+                .is_some())
+        })? {
+            if self.job_lifecycle(spec.id)?.closing.is_some() {
+                self.settle_closing(spec.id)?;
+            } else {
+                self.auto_close_if_done(spec.id)?;
+            }
         }
         Ok(())
     }
@@ -973,25 +981,45 @@ impl Batch {
         let lifecycle = self.job_lifecycle(conversation)?;
         if lifecycle.closing.is_some() {
             self.settle_closing(conversation)?;
-        } else if !spec.keep_open
-            && outcome.kind == OutcomeKind::Completed
-            && !lifecycle.user_input
-            && self.live_children(conversation)?.is_empty()
-            && self.unsettled_summary_producers(conversation)?.is_empty()
-            && !self.has_open_job_approvals(conversation)?
-        {
-            let mut lifecycle = lifecycle;
-            lifecycle.closing = Some(JobClosing {
-                at: self.now,
-                by: Actor::Auto,
-                running: false,
-            });
-            self.put_job_lifecycle(conversation, &lifecycle)?;
-            self.settle_closing(conversation)?;
+        } else {
+            self.auto_close_if_done(conversation)?;
         }
         self.end_impossible_dependents(parent, conversation)?;
         self.return_child_results(parent, conversation)?;
         Ok(true)
+    }
+
+    fn auto_close_if_done(&mut self, conversation: JobId) -> Result<(), BatchError> {
+        let spec = self.require_mutable_conversation(conversation)?;
+        let mut lifecycle = self.job_lifecycle(conversation)?;
+        if spec.parent_id.is_none()
+            || spec.is_chunk_group()
+            || spec.keep_open
+            || lifecycle.closing.is_some()
+            || lifecycle.user_input
+        {
+            return Ok(());
+        }
+        let Some(head) = self.group_head(conversation)? else {
+            return Ok(());
+        };
+        if !self
+            .require_job_state(head)?
+            .outcome
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+            || !self.live_children(conversation)?.is_empty()
+            || !self.unsettled_non_turn_jobs(conversation)?.is_empty()
+            || self.has_open_job_approvals(conversation)?
+        {
+            return Ok(());
+        }
+        lifecycle.closing = Some(JobClosing {
+            at: self.now,
+            by: Actor::Auto,
+            running: false,
+        });
+        self.put_job_lifecycle(conversation, &lifecycle)?;
+        self.settle_closing(conversation)
     }
 
     fn end_impossible_dependents(

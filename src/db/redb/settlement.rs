@@ -7,7 +7,7 @@ use crate::db::entities::{
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::codec::Code;
-use crate::db::redb::jobs::{decode_mutable_job, mutable_priority};
+use crate::db::redb::jobs::{TurnMembership, decode_mutable_job, mutable_priority};
 use crate::db::redb::reservations::mutable_configuration_requirement;
 use crate::db::redb::rows::decode_output;
 use crate::db::redb::schema::{
@@ -199,7 +199,13 @@ impl Batch {
                         frozen: Some(storable),
                     };
                     let req_tag = mutable_configuration_requirement(&wrapped);
-                    self.enqueue_mutable_job(&pred_job, req_tag, false, true)?;
+                    self.enqueue_mutable_job(
+                        &pred_job,
+                        req_tag,
+                        TurnMembership::NonTurn,
+                        false,
+                        true,
+                    )?;
                 }
             }
         }
@@ -505,7 +511,7 @@ impl Batch {
             frozen: Some(storable),
         };
         let req_tag = mutable_configuration_requirement(&wrapped);
-        self.enqueue_mutable_job(&dec_job, req_tag, false, true)?;
+        self.enqueue_mutable_job(&dec_job, req_tag, TurnMembership::Turn, false, true)?;
         self.step(|tx| {
             tx.open_table(DEPENDENCY_WAITERS)?.insert(
                 (dec_id.get(), job.id.get()),
