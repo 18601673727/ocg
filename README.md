@@ -120,6 +120,42 @@ Keep the OCG data directory separate from project workspaces. The [data layout](
 
 ## Performance
 
+### Backend comparison (2026-11-17)
+
+Compared the backend before and after the recent five-commit change: baseline [`3386cac`](https://github.com/18601673727/ocg/commit/3386cacc1f37dc4e674c74df2c1a5563f1963805) and current [`77dff6f`](https://github.com/18601673727/ocg/commit/77dff6ff166b924e214914cc1ad13d991cd84294). Both used the matching benchmark harness for their revision.
+
+**Machine:** Linux ARM64 Neoverse-N1, 2 vCPUs, 11 GiB RAM. Rust 1.99.1, optimized Cargo bench profile, and **tmpfs** benchmark storage. The production service was not used. Runtime workloads exercised the authenticated backend HTTP surface, real workspace tools, persistence, and a deterministic mock provider.
+
+The `all` run used reference mode, 3 trials, 1 warm-up, 1,000 jobs, 1,000 workspace files, 50 iterations, and client concurrency 1 and 8. Values below are medians of per-trial statistics.
+
+| Metric | Baseline → current | Change |
+| --- | --- | ---: |
+| Startup readiness p50 | 84.18 → 32.67 ms | **−61.2%** |
+| Admission p95 | C1: 2.72 → 2.86 ms; C8: 9.42 → 9.41 ms | C1 **+5.2%**; C8 −0.1% |
+| Throughput | C1: 11.57 → 11.62; C8: 23.06 → 23.01 jobs/s | C1 +0.5%; C8 −0.2% |
+| Streaming delivery p50 | C1: 11.94 → 11.32 ms; C8: 11.43 → 10.70 ms | −5.2%; −6.4% |
+| History read p95 | C1: 1.32 → 1.47 ms; C8: 6.63 → 6.23 ms | +11.6%; −6.0% |
+| Database after 1,000 completed jobs | C1: 40.7 → 36.2 MiB; C8: 72.3 → 54.2 MiB | **−11%; −25%** |
+| Database growth per completed job | C1: 40.64 → 36.03 KiB; C8: 72.99 → 54.48 KiB | **−11%; −25%** |
+| Loaded peak RSS (separate 100-job run) | C1: 32.96 → 32.43 MiB; C8: 34.81 → 34.17 MiB | −1.6%; −1.8% |
+| FTS build, 64 MiB corpus | 506.29 → 464.60 ms | −8.2% |
+| FTS full rebuild, 64 MiB corpus | 503.50 → 465.36 ms | −7.6% |
+| Mixed search latency, C8 p50 / p95 / p99 | 0.039 / 2.576 / 12.649 → 0.036 / 0.624 / 16.345 ms | −8.8% / −75.8% / **+29.2%** |
+
+The mixed-query p99 increase is a tail-latency regression to watch; its p99 varied between 12.6 and 16.6 ms across trials. Database file size also varied between trials. This was one baseline-then-current run on the same VM, so treat those tail and footprint changes as directional.
+
+The main `all` run produced 159 successful measurements per revision, with every section complete and no diagnostics. The `all` command omits the memory section; memory was run separately with 100 jobs and 3 trials for each concurrency. This backend benchmark does not measure browser rendering or interaction latency.
+
+To repeat the main profile on a comparable machine:
+
+```sh
+cargo bench --features benchmarks --bench backend -- \
+  all --mode reference --trials 3 --warmup 1 --iterations 50 \
+  --jobs 1000 --files 1000 --clients 1,8 --dir /tmp/ocg-benchmark
+```
+
+### Earlier ext4 reference (2026-11-07)
+
 Measured on **2026-11-07** (Singapore time) from the source in this commit, based on [`728aab5`](https://github.com/18601673727/ocg/commit/728aab570cbcc0a7096e652bd4a6badd0eb7a00f), using a native optimized Cargo benchmark build with Rust 1.99.1. All eight sections below used the same binary and source snapshot, including the 5 ms output flush and the `ntex-loopback-tcp-nodelay-v1` benchmark client.
 
 **Machine:** Debian Linux 6.12.113, ARM64 Neoverse-N1 (2 logical CPUs at 2.0 GHz), 11.66 GiB RAM, and **ext4** storage on `/dev/sda2`. The existing OCG service remained running and was not modified. The benchmark database was isolated on ext4, not tmpfs.
