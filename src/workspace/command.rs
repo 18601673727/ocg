@@ -6,24 +6,21 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
-use crate::db::entities::{BUILT_IN_COMMANDS, JobId, ProjectCommand, ToolCallRef, ToolEffect};
-use crate::jobs::execution::tools::registry::{
-    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, ToolStart,
-};
-use crate::jobs::execution::tools::tool_loop::ToolLoopLimits;
+use crate::db::entities::{BUILT_IN_COMMANDS, JobId, ProjectCommand, ToolCallRef};
+use crate::workspace::ExecutionFailure as CommandFailure;
 use crate::workspace::blocking::Kind;
 use crate::workspace::files::read::{self, Refusal as PathRefusal, Workspace};
-use crate::workspace::process::{self, FinishError, Finished, Process, StartingCall, StopSignal};
+use crate::workspace::process::{
+    self, FinishError, Finished, Process, StartingCall, StopSignal, ToolStart,
+};
 
 pub const TOOL_NAME: &str = "workspace_run_command";
-
-const HANDLER_VERSION: &str = "workspace_run_command-7";
 
 const MAX_EXTRA_ARGUMENTS: usize = 64;
 const MAX_EXTRA_ARGUMENT_BYTES: usize = 4096;
@@ -123,14 +120,17 @@ impl From<Uncertainty> for Failure {
     }
 }
 
-impl From<Failure> for ToolFailure {
+impl From<Failure> for CommandFailure {
     fn from(failure: Failure) -> Self {
         match failure {
-            Failure::Refused(refusal) => Self::not_applied(refusal.to_string()),
-            Failure::Uncertain(uncertainty) => Self::uncertain(uncertainty.to_string()),
+            Failure::Refused(refusal) => Self::Refused(refusal.to_string()),
+            Failure::Uncertain(uncertainty) => Self::Uncertain(uncertainty.to_string()),
         }
     }
 }
+
+pub(crate) type CommandFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Value, CommandFailure>> + 'a>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Selected {
@@ -888,7 +888,7 @@ fn reader(
         .ok()
 }
 
-struct RunCommand {
+pub(crate) struct RunCommand {
     workspace: Workspace,
     commands: Vec<ProjectCommand>,
     environment: CommandEnvironment,
@@ -916,19 +916,25 @@ impl RunCommand {
     }
 }
 
-impl ToolHandler for RunCommand {
-    fn version(&self) -> &str {
-        HANDLER_VERSION
+impl RunCommand {
+    pub(crate) fn new(
+        workspace: Workspace,
+        commands: &[ProjectCommand],
+        environment: CommandEnvironment,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            workspace,
+            commands: commands.to_vec(),
+            environment,
+            timeout,
+        }
     }
 
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::NonIdempotent
-    }
-
-    fn stop(
+    pub(crate) fn stop(
         &self,
         job: JobId,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ToolFailure>> + '_>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), CommandFailure>> + '_>> {
         let root = self.workspace.root().to_path_buf();
         Box::pin(async move {
             let commands = active()
@@ -955,18 +961,14 @@ impl ToolHandler for RunCommand {
             if proven {
                 Ok(())
             } else {
-                Err(ToolFailure::uncertain(
-                    "the command's process cleanup was not proven",
+                Err(CommandFailure::Uncertain(
+                    "the command's process cleanup was not proven".to_owned(),
                 ))
             }
         })
     }
 
-    fn spawns(&self) -> bool {
-        true
-    }
-
-    fn call(&self, arguments: Value) -> ToolFuture<'_> {
+    pub(crate) fn call(&self, arguments: Value) -> CommandFuture<'_> {
         self.invoke(
             CommandCall::Standalone(NEXT_ACTIVE.fetch_add(1, Ordering::Relaxed)),
             arguments,
@@ -974,22 +976,18 @@ impl ToolHandler for RunCommand {
         )
     }
 
-    fn call_for(&self, call: ToolCallRef, arguments: Value) -> ToolFuture<'_> {
-        self.invoke(CommandCall::Job(call), arguments, ToolStart::default())
-    }
-
-    fn call_with_start(
+    pub(crate) fn call_for(
         &self,
         call: ToolCallRef,
         arguments: Value,
         start: ToolStart,
-    ) -> ToolFuture<'_> {
+    ) -> CommandFuture<'_> {
         self.invoke(CommandCall::Job(call), arguments, start)
     }
 }
 
 impl RunCommand {
-    fn invoke(&self, call: CommandCall, arguments: Value, start: ToolStart) -> ToolFuture<'_> {
+    fn invoke(&self, call: CommandCall, arguments: Value, start: ToolStart) -> CommandFuture<'_> {
         Box::pin(async move {
             let selected = parse(&arguments, &self.commands).map_err(Failure::from)?;
             let mut invocation = self.prepare(&selected).map_err(Failure::from)?;
@@ -1054,20 +1052,20 @@ impl RunCommand {
                 start.wait().await;
                 ntex::time::sleep(start.remaining(self.timeout)).await;
             };
-            let (ended, timed_out) =
-                match ntex::util::select(reported.recv_async(), expires).await {
-                    ntex::util::Either::Left(Ok(ended)) => (ended, false),
-                    ntex::util::Either::Left(Err(_)) => {
-                        return Err(Failure::from(Uncertainty::NotObserved).into());
-                    }
-                    ntex::util::Either::Right(()) => {
-                        stop.request();
-                        let ended = reported.recv_async().await.map_err(|_| {
-                            ToolFailure::from(Failure::from(Uncertainty::NotObserved))
-                        })?;
-                        (ended, true)
-                    }
-                };
+            let (ended, timed_out) = match ntex::util::select(reported.recv_async(), expires).await
+            {
+                ntex::util::Either::Left(Ok(ended)) => (ended, false),
+                ntex::util::Either::Left(Err(_)) => {
+                    return Err(Failure::from(Uncertainty::NotObserved).into());
+                }
+                ntex::util::Either::Right(()) => {
+                    stop.request();
+                    let ended = reported.recv_async().await.map_err(|_| {
+                        CommandFailure::from(Failure::from(Uncertainty::NotObserved))
+                    })?;
+                    (ended, true)
+                }
+            };
             if ended.as_ref().err() != Some(&Failure::Uncertain(Uncertainty::NotObserved)) {
                 active()
                     .lock()
@@ -1083,7 +1081,7 @@ impl RunCommand {
     }
 }
 
-fn parameters(commands: &[ProjectCommand]) -> Value {
+pub(crate) fn parameters(commands: &[ProjectCommand]) -> Value {
     let names = Preset::ALL
         .map(Preset::name)
         .into_iter()
@@ -1146,33 +1144,4 @@ fn parameters(commands: &[ProjectCommand]) -> Value {
         "required": ["command"],
         "additionalProperties": false
     })
-}
-
-pub(crate) fn register(
-    registry: &ToolRegistry,
-    workspace: Workspace,
-    commands: &[ProjectCommand],
-    environment: CommandEnvironment,
-    timeout: Duration,
-) -> Result<(), ToolRegistryError> {
-    registry.register(
-        TOOL_NAME,
-        Some(
-            "Run one of the Project's commands in the authorized Workspace root, optionally appending literal entries from `arguments`, and return its argv, exit code, stdout, stderr, wall_ms, cpu_user_ms, cpu_system_ms and peak_rss_bytes. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. The command's executable, configured arguments, directory and environment cannot be replaced.",
-        ),
-        parameters(commands),
-        Arc::new(RunCommand {
-            workspace,
-            commands: commands.to_vec(),
-            environment,
-            timeout,
-        }),
-    )
-}
-
-pub(crate) fn coding_limits(timeout: Duration) -> ToolLoopLimits {
-    ToolLoopLimits {
-        handler_timeout: timeout.saturating_add(process::STOP_GRACE),
-        ..ToolLoopLimits::default()
-    }
 }

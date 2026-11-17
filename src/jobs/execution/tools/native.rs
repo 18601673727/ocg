@@ -122,7 +122,7 @@ async fn authorize_workspace(
     let root = root.to_path_buf();
     let directory = data_directory.clone();
     match blocking::run(blocking::Kind::File, move || {
-        let workspace = Workspace::authorize(&root, &directory)?;
+        let workspace = Workspace::authorize(&root, directory.root())?;
         let agents_md = read_agents_md(&workspace);
         Ok::<_, read::WorkspaceError>((workspace, agents_md))
     })
@@ -205,18 +205,18 @@ fn tools_of(
 ) -> Result<ToolExecution, ToolRegistryError> {
     let registry = ToolRegistry::default();
     let limits = if workspace.is_some() {
-        crate::workspace::command::coding_limits(crate::workspace::command::COMMAND_TIMEOUT)
+        super::workspace::command::coding_limits(crate::workspace::command::COMMAND_TIMEOUT)
     } else {
         ToolLoopLimits::default()
     };
     let mut names = Vec::new();
     let captured_workspace = workspace.as_ref().map(|(workspace, _)| workspace.clone());
     if let Some((workspace, commands)) = workspace {
-        read::register(&registry, workspace.clone())?;
-        crate::workspace::files::discovery::register(&registry, workspace.clone())?;
-        crate::workspace::search::fts::register(&registry, workspace.clone())?;
+        super::workspace::files::register_read(&registry, workspace.clone())?;
+        super::workspace::files::register_discovery(&registry, workspace.clone())?;
+        super::workspace::search::register_fts(&registry, workspace.clone())?;
         #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
-        crate::workspace::search::lsp::register(
+        super::workspace::search::register_lsp(
             &registry,
             workspace.clone(),
             limits.handler_timeout,
@@ -232,9 +232,9 @@ fn tools_of(
         names.push(crate::workspace::search::lsp::TOOL_NAME);
         super::web::register(&registry)?;
         names.extend(super::web::NAMES);
-        crate::workspace::files::write::register(&registry, workspace.clone())?;
+        super::workspace::files::register_write(&registry, workspace.clone())?;
         names.push(crate::workspace::files::write::TOOL_NAME);
-        crate::workspace::command::register(
+        super::workspace::command::register(
             &registry,
             workspace,
             commands,

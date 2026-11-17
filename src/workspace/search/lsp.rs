@@ -13,15 +13,12 @@ use tree_sitter::{
 };
 
 use super::fts::{self, BuildLimit, FileStamp, FtsLimits, Skipped, Stopped, WalkVisitor};
-use crate::db::entities::ToolEffect;
-use crate::jobs::execution::tools::registry::{
-    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
-};
+use crate::workspace::ExecutionFailure as AnalysisFailure;
 use crate::workspace::blocking::{self, Kind};
 use crate::workspace::files::read::{Refusal, Workspace, components};
 
 pub const TOOL_NAME: &str = "workspace_code";
-const HANDLER_VERSION: &str = "workspace_code-1";
+
 const MAX_PARSE_FILE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_FILES: usize = 50_000;
 const MAX_REF_FILES: usize = 500;
@@ -92,10 +89,10 @@ struct Grammars {
     python: Grammar,
 }
 impl Grammars {
-    fn new() -> Result<Self, ToolFailure> {
-        fn grammar(language: Language, tags: &str) -> Result<Grammar, ToolFailure> {
+    fn new() -> Result<Self, AnalysisFailure> {
+        fn grammar(language: Language, tags: &str) -> Result<Grammar, AnalysisFailure> {
             let tags = Query::new(&language, tags)
-                .map_err(|error| ToolFailure::not_applied(error.to_string()))?;
+                .map_err(|error| AnalysisFailure::not_applied(error.to_string()))?;
             Ok(Grammar { language, tags })
         }
         Ok(Self {
@@ -118,10 +115,10 @@ impl Grammars {
     }
 }
 
-fn grammars() -> Result<&'static Grammars, ToolFailure> {
+fn grammars() -> Result<&'static Grammars, AnalysisFailure> {
     static GRAMMARS: OnceLock<Result<Grammars, String>> = OnceLock::new();
     GRAMMARS
-        .get_or_init(|| Grammars::new().map_err(|error| error.message))
+        .get_or_init(|| Grammars::new().map_err(|error| error.to_string()))
         .as_ref()
         .map_err(refused)
 }
@@ -129,16 +126,16 @@ fn grammars() -> Result<&'static Grammars, ToolFailure> {
 #[derive(Clone, Copy)]
 struct Deadline(Instant);
 impl Deadline {
-    fn check(self) -> Result<(), ToolFailure> {
+    fn check(self) -> Result<(), AnalysisFailure> {
         if Instant::now() >= self.0 {
-            Err(ToolFailure::not_applied("analysis deadline reached"))
+            Err(AnalysisFailure::not_applied("analysis deadline reached"))
         } else {
             Ok(())
         }
     }
 }
 
-fn parse(source: &str, grammar: &Grammar, deadline: Deadline) -> Result<Tree, ToolFailure> {
+fn parse(source: &str, grammar: &Grammar, deadline: Deadline) -> Result<Tree, AnalysisFailure> {
     deadline.check()?;
     let mut on_progress = |_state: &tree_sitter::ParseState| {
         if Instant::now() >= deadline.0 {
@@ -151,14 +148,14 @@ fn parse(source: &str, grammar: &Grammar, deadline: Deadline) -> Result<Tree, To
     let mut parser = Parser::new();
     parser
         .set_language(&grammar.language)
-        .map_err(|error| ToolFailure::not_applied(error.to_string()))?;
+        .map_err(|error| AnalysisFailure::not_applied(error.to_string()))?;
     parser
         .parse_with_options(
             &mut |offset: usize, _point| &source.as_bytes()[offset.min(source.len())..],
             None,
             Some(options),
         )
-        .ok_or_else(|| ToolFailure::not_applied("parse deadline reached"))
+        .ok_or_else(|| AnalysisFailure::not_applied("parse deadline reached"))
 }
 
 #[derive(Clone)]
@@ -229,7 +226,7 @@ struct RegisteredIndex {
     shared: Arc<Shared>,
     registered: Instant,
 }
-fn shared(workspace: &Workspace) -> Result<Arc<Shared>, ToolFailure> {
+fn shared(workspace: &Workspace) -> Result<Arc<Shared>, AnalysisFailure> {
     static INDEXES: OnceLock<Mutex<BTreeMap<RootKey, RegisteredIndex>>> = OnceLock::new();
     let metadata = workspace
         .open_root()
@@ -275,8 +272,8 @@ fn shared(workspace: &Workspace) -> Result<Arc<Shared>, ToolFailure> {
     );
     Ok(shared)
 }
-fn refused(error: impl std::fmt::Display) -> ToolFailure {
-    ToolFailure::not_applied(error.to_string())
+fn refused(error: impl std::fmt::Display) -> AnalysisFailure {
+    AnalysisFailure::not_applied(error.to_string())
 }
 
 struct Scan {
@@ -334,7 +331,7 @@ impl WalkVisitor for Scan {
         Ok(())
     }
 }
-fn scan(workspace: &Workspace, deadline: Deadline) -> Result<Scan, ToolFailure> {
+fn scan(workspace: &Workspace, deadline: Deadline) -> Result<Scan, AnalysisFailure> {
     let root = workspace.open_root().map_err(refused)?;
     let device = root.metadata().map_err(refused)?.dev();
     let limits = FtsLimits {
@@ -378,7 +375,7 @@ fn visit(
     tree: &Tree,
     deadline: Deadline,
     mut action: impl FnMut(Node<'_>),
-) -> Result<(), ToolFailure> {
+) -> Result<(), AnalysisFailure> {
     let mut cursor = tree.walk();
     'visit: loop {
         deadline.check()?;
@@ -405,7 +402,7 @@ fn symbols(
     tree: &Tree,
     grammar: &Grammar,
     deadline: Deadline,
-) -> Result<Vec<Symbol>, ToolFailure> {
+) -> Result<Vec<Symbol>, AnalysisFailure> {
     let mut cursor = QueryCursor::new();
     let mut on_progress = |_state: &tree_sitter::QueryCursorState| {
         if Instant::now() >= deadline.0 {
@@ -542,7 +539,7 @@ fn read_parse(
     workspace: &Workspace,
     path: &str,
     deadline: Deadline,
-) -> Result<(String, Tree), ToolFailure> {
+) -> Result<(String, Tree), AnalysisFailure> {
     let bytes = workspace
         .read_binary(path, MAX_PARSE_FILE_BYTES)
         .map_err(refused)?;
@@ -591,7 +588,7 @@ struct Call {
     queries: Vec<Question>,
     max_bytes: Option<usize>,
 }
-fn call_of(arguments: Value) -> Result<Call, ToolFailure> {
+fn call_of(arguments: Value) -> Result<Call, AnalysisFailure> {
     let call: Call = serde_json::from_value(arguments).map_err(refused)?;
     if call.queries.is_empty() || call.queries.len() > 8 {
         return Err(refused("expected 1 to 8 queries"));
@@ -694,9 +691,9 @@ fn point_to_offset(
     point: Point,
     line_starts: &[usize],
     source_len: usize,
-) -> Result<usize, ToolFailure> {
+) -> Result<usize, AnalysisFailure> {
     if point.row >= line_starts.len() {
-        return Err(ToolFailure::not_applied("invalid tree-sitter position"));
+        return Err(AnalysisFailure::not_applied("invalid tree-sitter position"));
     }
 
     let offset = line_starts[point.row] + point.column;
@@ -708,7 +705,7 @@ fn point_to_offset(
     };
 
     if offset > line_end {
-        return Err(ToolFailure::not_applied("invalid tree-sitter position"));
+        return Err(AnalysisFailure::not_applied("invalid tree-sitter position"));
     }
 
     Ok(offset)
@@ -718,10 +715,10 @@ fn offsets_to_positions(
     source: &str,
     offsets: &[usize],
     deadline: Deadline,
-) -> Result<Vec<(u64, u64)>, ToolFailure> {
+) -> Result<Vec<(u64, u64)>, AnalysisFailure> {
     for &offset in offsets {
         if offset > source.len() || !source.is_char_boundary(offset) {
-            return Err(ToolFailure::not_applied("invalid tree-sitter position"));
+            return Err(AnalysisFailure::not_applied("invalid tree-sitter position"));
         }
     }
 
@@ -740,7 +737,7 @@ fn offsets_to_positions(
         let target = offsets[i];
         while byte < target {
             let Some((start, c)) = next else {
-                return Err(ToolFailure::not_applied("invalid tree-sitter position"));
+                return Err(AnalysisFailure::not_applied("invalid tree-sitter position"));
             };
             debug_assert_eq!(start, byte);
             if c == '\n' {
@@ -770,7 +767,7 @@ fn walk_tree<'tree>(
     errors: &mut Vec<RawError<'tree>>,
     line_starts: &[usize],
     deadline: Deadline,
-) -> Result<(), ToolFailure> {
+) -> Result<(), AnalysisFailure> {
     'visit: loop {
         deadline.check()?;
         let node = cursor.node();
@@ -1174,14 +1171,14 @@ fn answer(
         let grammars = match grammars() {
             Ok(grammars) => grammars,
             Err(error) => {
-                section.issues.push(error.message);
+                section.issues.push(error.to_string());
                 break;
             }
         };
         let (source, tree) = match read_parse(workspace, path, deadline) {
             Ok(parsed) => parsed,
             Err(error) => {
-                section.issues.push(format!("{path}: {}", error.message));
+                section.issues.push(format!("{path}: {error}"));
                 continue;
             }
         };
@@ -1216,7 +1213,7 @@ fn answer(
                         );
                     }
                 }
-                Err(error) => section.issues.push(error.message),
+                Err(error) => section.issues.push(error.to_string()),
             }
             continue;
         }
@@ -1224,7 +1221,7 @@ fn answer(
         let symbols = match symbols(&source, &tree, grammar, deadline) {
             Ok(symbols) => symbols,
             Err(error) => {
-                section.issues.push(error.message);
+                section.issues.push(error.to_string());
                 continue;
             }
         };
@@ -1305,7 +1302,7 @@ fn answer(
                     );
                 }
             }) {
-                section.issues.push(error.message);
+                section.issues.push(error.to_string());
             }
         }
     }
@@ -1450,137 +1447,139 @@ fn render(sections: &[Section], report: &str, budget: usize) -> (String, Vec<Val
 }
 
 #[derive(Clone)]
-struct WorkspaceCode {
+pub(crate) struct WorkspaceCode {
     workspace: Workspace,
     shared: Arc<Shared>,
     previous: Arc<Mutex<BTreeMap<Arc<str>, FileStamp>>>,
     timeout: Duration,
 }
-impl ToolHandler for WorkspaceCode {
-    fn version(&self) -> &str {
-        HANDLER_VERSION
+impl WorkspaceCode {
+    pub(crate) fn new(workspace: Workspace, timeout: Duration) -> Result<Self, AnalysisFailure> {
+        let shared = shared(&workspace)?;
+        Ok(Self {
+            workspace,
+            shared,
+            previous: Arc::new(Mutex::default()),
+            timeout,
+        })
     }
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-    fn call(&self, arguments: Value) -> ToolFuture<'_> {
-        Box::pin(async move {
-            let call = call_of(arguments)?;
-            let started = Instant::now();
-            let deadline = Deadline(started + self.timeout);
-            self.shared.available.recv_async().await.map_err(refused)?;
-            let lease = Arc::new(Lease(self.shared.clone()));
-            let workspace = self.workspace.clone();
-            let worker_lease = lease.clone();
-            let previous = self.previous.clone();
-            let (scan, changed, pending) = blocking::run(Kind::Cpu, move || {
-                let scan = scan(&workspace, deadline)?;
-                let mut index = worker_lease
-                    .0
-                    .index
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                let removed: Vec<Arc<str>> = index
-                    .files
-                    .keys()
-                    .filter(|path| !scan.files.contains_key(*path))
-                    .cloned()
-                    .collect();
-                for path in removed {
-                    index.remove(&path);
-                }
-                let previous = previous.lock().unwrap_or_else(PoisonError::into_inner);
-                let changed = scan
-                    .files
-                    .iter()
-                    .filter(|(path, stamp)| previous.get(*path) != Some(*stamp))
-                    .map(|(path, _)| path.clone())
-                    .collect::<BTreeSet<_>>();
-                let pending: Vec<_> = scan
-                    .files
-                    .iter()
-                    .filter(|(path, stamp)| {
-                        index
-                            .files
-                            .get(*path)
-                            .is_none_or(|file| file.stamp != **stamp || racy(file))
-                    })
-                    .map(|(path, stamp)| (path.clone(), *stamp))
-                    .collect();
-                for (path, _) in &pending {
-                    index.remove(path);
-                }
-                Ok::<_, ToolFailure>((scan, changed, pending))
-            })
-            .await
-            .map_err(ToolFailure::uncertain)??;
-            let midpoint = pending.len().div_ceil(2);
-            let batches = [pending[..midpoint].to_vec(), pending[midpoint..].to_vec()];
-            let workers = batches
-                .into_iter()
-                .filter(|batch| !batch.is_empty())
-                .map(|batch| {
-                    let workspace = self.workspace.clone();
-                    let lease = lease.clone();
-                    blocking::run(Kind::Cpu, move || {
-                        let mut parsed = 0;
-                        let mut skipped = Vec::new();
-                        for (path, stamp) in batch {
-                            if deadline.check().is_err() {
-                                skipped.push(format!("{path}: deadline"));
-                                continue;
-                            }
-                            let parsed_at = SystemTime::now();
-                            let extracted = read_parse(&workspace, &path, deadline).and_then(
-                                |(source, tree)| {
-                                    let grammar = grammars()?.get(
-                                        detect_language(&path)
-                                            .ok_or_else(|| refused("unsupported language"))?,
-                                    );
-                                    let symbols = symbols(&source, &tree, grammar, deadline)?;
-                                    let mut names = BTreeSet::new();
-                                    visit(&tree, deadline, |node| {
-                                        if identifier(node) {
-                                            names.insert(node_text(node, &source).to_owned());
-                                        }
-                                    })?;
-                                    Ok(FileIndex {
-                                        stamp,
-                                        parsed_at,
-                                        symbols,
-                                        names,
-                                    })
-                                },
-                            );
-                            match extracted {
-                                Ok(file) => {
-                                    lease
-                                        .0
-                                        .index
-                                        .lock()
-                                        .unwrap_or_else(PoisonError::into_inner)
-                                        .insert(path, file);
-                                    parsed += 1;
-                                }
-                                Err(error) => skipped.push(format!("{path}: {}", error.message)),
-                            }
-                        }
-                        (parsed, skipped)
-                    })
-                });
-            let refreshed = ntex::util::join_all(workers).await;
-            let mut reparsed = 0;
-            let mut failures = Vec::new();
-            for refreshed in refreshed {
-                let (count, skipped) = refreshed.map_err(ToolFailure::uncertain)?;
-                reparsed += count;
-                failures.extend(skipped);
+
+    pub(crate) async fn call(&self, arguments: Value) -> Result<Value, AnalysisFailure> {
+        let call = call_of(arguments)?;
+        let started = Instant::now();
+        let deadline = Deadline(started + self.timeout);
+        self.shared.available.recv_async().await.map_err(refused)?;
+        let lease = Arc::new(Lease(self.shared.clone()));
+        let workspace = self.workspace.clone();
+        let worker_lease = lease.clone();
+        let previous = self.previous.clone();
+        let (scan, changed, pending) = blocking::run(Kind::Cpu, move || {
+            let scan = scan(&workspace, deadline)?;
+            let mut index = worker_lease
+                .0
+                .index
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let removed: Vec<Arc<str>> = index
+                .files
+                .keys()
+                .filter(|path| !scan.files.contains_key(*path))
+                .cloned()
+                .collect();
+            for path in removed {
+                index.remove(&path);
             }
-            let workspace = self.workspace.clone();
-            let previous = self.previous.clone();
-            let max_result_bytes = 16 * 1024;
-            let budget = call.max_bytes.unwrap_or(6 * 1024).min(max_result_bytes);
-            blocking::run(Kind::Cpu, move || {
+            let previous = previous.lock().unwrap_or_else(PoisonError::into_inner);
+            let changed = scan
+                .files
+                .iter()
+                .filter(|(path, stamp)| previous.get(*path) != Some(*stamp))
+                .map(|(path, _)| path.clone())
+                .collect::<BTreeSet<_>>();
+            let pending: Vec<_> = scan
+                .files
+                .iter()
+                .filter(|(path, stamp)| {
+                    index
+                        .files
+                        .get(*path)
+                        .is_none_or(|file| file.stamp != **stamp || racy(file))
+                })
+                .map(|(path, stamp)| (path.clone(), *stamp))
+                .collect();
+            for (path, _) in &pending {
+                index.remove(path);
+            }
+            Ok::<_, AnalysisFailure>((scan, changed, pending))
+        })
+        .await
+        .map_err(AnalysisFailure::uncertain)??;
+        let midpoint = pending.len().div_ceil(2);
+        let batches = [pending[..midpoint].to_vec(), pending[midpoint..].to_vec()];
+        let workers = batches
+            .into_iter()
+            .filter(|batch| !batch.is_empty())
+            .map(|batch| {
+                let workspace = self.workspace.clone();
+                let lease = lease.clone();
+                blocking::run(Kind::Cpu, move || {
+                    let mut parsed = 0;
+                    let mut skipped = Vec::new();
+                    for (path, stamp) in batch {
+                        if deadline.check().is_err() {
+                            skipped.push(format!("{path}: deadline"));
+                            continue;
+                        }
+                        let parsed_at = SystemTime::now();
+                        let extracted =
+                            read_parse(&workspace, &path, deadline).and_then(|(source, tree)| {
+                                let grammar = grammars()?.get(
+                                    detect_language(&path)
+                                        .ok_or_else(|| refused("unsupported language"))?,
+                                );
+                                let symbols = symbols(&source, &tree, grammar, deadline)?;
+                                let mut names = BTreeSet::new();
+                                visit(&tree, deadline, |node| {
+                                    if identifier(node) {
+                                        names.insert(node_text(node, &source).to_owned());
+                                    }
+                                })?;
+                                Ok(FileIndex {
+                                    stamp,
+                                    parsed_at,
+                                    symbols,
+                                    names,
+                                })
+                            });
+                        match extracted {
+                            Ok(file) => {
+                                lease
+                                    .0
+                                    .index
+                                    .lock()
+                                    .unwrap_or_else(PoisonError::into_inner)
+                                    .insert(path, file);
+                                parsed += 1;
+                            }
+                            Err(error) => skipped.push(format!("{path}: {error}")),
+                        }
+                    }
+                    (parsed, skipped)
+                })
+            });
+        let refreshed = ntex::util::join_all(workers).await;
+        let mut reparsed = 0;
+        let mut failures = Vec::new();
+        for refreshed in refreshed {
+            let (count, skipped) = refreshed.map_err(AnalysisFailure::uncertain)?;
+            reparsed += count;
+            failures.extend(skipped);
+        }
+        let workspace = self.workspace.clone();
+        let previous = self.previous.clone();
+        let max_result_bytes = 16 * 1024;
+        let budget = call.max_bytes.unwrap_or(6 * 1024).min(max_result_bytes);
+        blocking::run(Kind::Cpu, move || {
                 workspace.open_root().map_err(refused)?;
                 let index = lease.0.index.lock().unwrap_or_else(PoisonError::into_inner);
                 let sections: Vec<_> = call.queries.iter().enumerate().map(|(number, question)| answer(&index, &workspace, question, number, &changed, budget, deadline)).collect();
@@ -1602,25 +1601,16 @@ impl ToolHandler for WorkspaceCode {
                     })
                     .collect();
                 Ok(result)
-            }).await.map_err(ToolFailure::uncertain)?
-        })
+            }).await.map_err(AnalysisFailure::uncertain)?
     }
 }
 
-pub(crate) fn register(
-    registry: &ToolRegistry,
-    workspace: Workspace,
-    timeout: Duration,
-) -> Result<(), ToolRegistryError> {
-    let shared =
-        shared(&workspace).map_err(|error| ToolRegistryError::Unregistered(error.message))?;
-    registry.register(TOOL_NAME, Some(
-        "Use workspace_code before reading files. Read symbols with body instead of whole files, and batch every question you already have into one call (up to 8 queries). find returns definitions/signatures by Name, Type::name or prefix*; refs returns identifier uses, optionally kind=call/type/import; body takes name or path+line, signature=true includes docs and signature; outline takes a file/folder (depth 2); errors takes path or path=changed since this Job's previous call. Every query supports a path prefix. Compact text shares max_bytes (default 6144, capped at the Job's 16 KiB result limit). Rust, TypeScript/TSX and Python only. Results are by name, not by type: macros, trait dispatch, aliases and runtime attributes may be unresolved, so confirm renames/deletions with cargo check or tests."
-    ), json!({"type":"object", "additionalProperties":false, "required":["queries"], "properties":{
+pub(crate) fn parameters() -> Value {
+    json!({"type":"object", "additionalProperties":false, "required":["queries"], "properties":{
         "queries":{"type":"array", "minItems":1, "maxItems":8, "items":{"type":"object", "additionalProperties":false, "required":["op"], "properties":{
             "op":{"type":"string", "enum":["find","refs","body","outline","errors"]},
             "name":{"type":"string", "minLength":1}, "path":{"type":"string", "minLength":1},
             "line":{"type":"integer", "minimum":1}, "kind":{"type":"string", "enum":["call","type","import"]}, "signature":{"type":"boolean"}
         }}}, "max_bytes":{"type":"integer", "minimum":1}
-    }}), Arc::new(WorkspaceCode { workspace, shared, previous: Arc::new(Mutex::default()), timeout }))
+    }})
 }

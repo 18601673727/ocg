@@ -7,11 +7,6 @@ use rustix::fs::{AtFlags, Dir, FileType};
 use serde_json::{Value, json};
 use std::os::unix::fs::MetadataExt;
 
-use crate::db::entities::ToolEffect;
-use crate::jobs::execution::tools::registry::{
-    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
-};
-use crate::workspace::blocking::{self, Kind};
 use crate::workspace::files::discovery::SKIPPED_DIRECTORY_NAMES;
 use crate::workspace::files::read::{
     MutationStamp, Refusal, Step, Workspace, check_component, mutation_stamp, open_within,
@@ -19,8 +14,6 @@ use crate::workspace::files::read::{
 };
 
 pub const TOOL_NAME: &str = "workspace_fts_search";
-
-const HANDLER_VERSION: &str = "workspace_fts_search-2";
 
 const MAX_QUERY_BYTES: usize = 256;
 const MAX_EXCERPT_BYTES: usize = 200;
@@ -1436,6 +1429,11 @@ impl WorkspaceFts {
         }
         slot.index = None;
     }
+
+    pub(crate) fn stop_query(&self, stop: &AtomicBool) {
+        let _slot = self.lock();
+        stop.store(true, Ordering::Relaxed);
+    }
 }
 
 struct BuildLease<'a> {
@@ -1493,7 +1491,7 @@ fn index_block(index: &Index, age: Duration) -> Value {
     })
 }
 
-fn parameters() -> Value {
+pub(crate) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -1519,17 +1517,13 @@ fn parameters() -> Value {
     })
 }
 
-struct FtsSearch {
-    fts: Arc<WorkspaceFts>,
-}
-
-struct Call {
+pub(crate) struct Call {
     query: String,
     results: usize,
     refresh: bool,
 }
 
-fn call_of(arguments: &Value) -> Result<Call, QueryRefusal> {
+pub(crate) fn call_of(arguments: &Value) -> Result<Call, QueryRefusal> {
     let only_fields = arguments.as_object().is_some_and(|object| {
         object
             .keys()
@@ -1562,7 +1556,11 @@ fn call_of(arguments: &Value) -> Result<Call, QueryRefusal> {
     })
 }
 
-fn run_call(fts: &WorkspaceFts, call: &Call, stop: &AtomicBool) -> Result<Value, SearchRefusal> {
+pub(crate) fn run_call(
+    fts: &WorkspaceFts,
+    call: &Call,
+    stop: &AtomicBool,
+) -> Result<Value, SearchRefusal> {
     let installed = fts.lock().index.is_some();
     if call.refresh || !installed {
         fts.build_with(stop, Instant::now() + fts.limits.time)?;
@@ -1572,73 +1570,5 @@ fn run_call(fts: &WorkspaceFts, call: &Call, stop: &AtomicBool) -> Result<Value,
         call.results,
         stop,
         Instant::now() + fts.limits.query_time,
-    )
-}
-
-impl ToolHandler for FtsSearch {
-    fn version(&self) -> &str {
-        HANDLER_VERSION
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-
-    fn call(&self, arguments: Value) -> ToolFuture<'_> {
-        Box::pin(async move {
-            let call = call_of(&arguments).map_err(refused)?;
-            let stop = Arc::new(AtomicBool::new(false));
-            let fts = self.fts.clone();
-            let worker_fts = fts.clone();
-            let worker_stop = stop.clone();
-            let stopping = StopOnDrop { stop, fts };
-            let found = blocking::run(Kind::Cpu, move || {
-                run_call(&worker_fts, &call, &worker_stop)
-            })
-            .await
-            .map_err(|_| ToolFailure::not_applied("the search ended without a result"))?;
-            drop(stopping);
-            found.map_err(refused)
-        })
-    }
-}
-
-struct StopOnDrop {
-    stop: Arc<AtomicBool>,
-    fts: Arc<WorkspaceFts>,
-}
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        {
-            let _slot = self.fts.lock();
-            self.stop.store(true, Ordering::Relaxed);
-        }
-    }
-}
-
-impl Drop for FtsSearch {
-    fn drop(&mut self) {
-        self.fts.dispose();
-    }
-}
-
-fn refused(refusal: impl std::fmt::Display) -> ToolFailure {
-    ToolFailure::not_applied(refusal.to_string())
-}
-
-pub(crate) fn register(
-    registry: &ToolRegistry,
-    workspace: Workspace,
-) -> Result<(), ToolRegistryError> {
-    registry.register(
-        TOOL_NAME,
-        Some(
-            "Opt-in: find files of the authorized Workspace with an in-memory full-text index built once and reused. All `query` words must match as whole words, case-insensitively (this is word search, not substring search), and a \"quoted phrase\" or one word of several parts, like JobScheduler, must appear as adjacent words. Results are ranked by BM25 with the matching line and an excerpt; offsets are UTF-8 byte columns, and excerpt_offset locates the excerpt within that line. AND applies across each file and phrases may cross lines. files_matched counts verified matching candidates examined, not an uncapped total. The index is a snapshot: its generation, age and coverage are in every result, and `refresh` rebuilds it after edits. Known OCG writes and commands mark snapshots dirty; external edits remain unverified even after refresh. Hidden, secret-bearing, symlinked, binary and over 1 MiB files are not indexed, nor `target` or `node_modules` directories; `index.complete` is false when a bound left part of the Workspace out of the snapshot.",
-        ),
-        parameters(),
-        Arc::new(FtsSearch {
-            fts: Arc::new(WorkspaceFts::new(workspace, FtsLimits::default())),
-        }),
     )
 }

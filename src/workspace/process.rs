@@ -3,7 +3,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,6 +18,49 @@ const COMMAND_WAIT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const STOP_GRACE: Duration = Duration::from_secs(5);
 const STARTUP_GRACE: Duration = Duration::from_millis(50);
 const POLL: Duration = Duration::from_millis(10);
+
+#[derive(Clone, Default)]
+pub(crate) struct ToolStart {
+    at: Arc<OnceLock<Instant>>,
+    ready: crate::support::cancellation::CancellationToken,
+    starting: Arc<Mutex<Option<StartingCall>>>,
+}
+
+impl ToolStart {
+    pub(crate) fn with_starting(starting: Option<StartingCall>) -> Self {
+        Self {
+            starting: Arc::new(Mutex::new(starting)),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn take_starting(&self) -> Option<StartingCall> {
+        self.starting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    pub(crate) fn mark_started(&self) {
+        if self.at.set(Instant::now()).is_ok() {
+            self.ready.cancel();
+        }
+    }
+
+    pub(crate) fn has_started(&self) -> bool {
+        self.at.get().is_some()
+    }
+
+    pub(crate) async fn wait(&self) {
+        self.ready.cancelled().await;
+    }
+
+    pub(crate) fn remaining(&self, limit: Duration) -> Duration {
+        self.at
+            .get()
+            .map_or(limit, |at| limit.saturating_sub(at.elapsed()))
+    }
+}
 
 pub(crate) struct Sentinel {
     read: OwnedFd,

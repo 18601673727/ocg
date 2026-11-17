@@ -1,9 +1,7 @@
 use std::fs::File;
-use std::future::Future;
 use std::io::Write as _;
-use std::pin::Pin;
+use std::sync::PoisonError;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rustix::fs::{AtFlags, FileType, Gid, Mode, OFlags, RenameFlags, Stat};
@@ -13,18 +11,14 @@ use serde_json::{Value, json};
 use super::read::{
     self, Refusal as PathRefusal, Step, Workspace, open_at, open_within, read_bytes, read_whole,
 };
-use crate::db::entities::{ContentDigest, JobId, ToolCallRef, ToolEffect};
-use crate::jobs::execution::tools::registry::{
-    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
-};
+use crate::db::entities::{ContentDigest, JobId};
+use crate::workspace::ExecutionFailure as WriteFailure;
 use crate::workspace::blocking::Kind;
 use crate::workspace::process::{StopSignal, WorkerTracker};
 
 pub const TOOL_NAME: &str = "workspace_write_file";
 
 const MAX_CONTENT_BYTES: usize = 8 * 1024;
-
-const HANDLER_VERSION: &str = "workspace_write_file-3";
 
 const MAX_DELETE_BYTES: usize = 64 * 1024;
 
@@ -106,11 +100,11 @@ impl From<Uncertainty> for Failure {
     }
 }
 
-impl From<Failure> for ToolFailure {
+impl From<Failure> for WriteFailure {
     fn from(failure: Failure) -> Self {
         match failure {
-            Failure::Refused(refusal) => Self::not_applied(refusal.to_string()),
-            Failure::Uncertain(uncertainty) => Self::uncertain(uncertainty.to_string()),
+            Failure::Refused(refusal) => Self::Refused(refusal.to_string()),
+            Failure::Uncertain(uncertainty) => Self::Uncertain(uncertainty.to_string()),
         }
     }
 }
@@ -592,7 +586,7 @@ fn staging_file(directory: &File) -> Result<(String, File), Refusal> {
     Err(Refusal::NotStaged)
 }
 
-fn parameters() -> Value {
+pub(crate) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -649,143 +643,110 @@ fn parameters() -> Value {
     })
 }
 
-struct WriteFile {
+pub(crate) struct WriteFile {
     workspace: Workspace,
     workers: WorkerTracker,
 }
 
-impl ToolHandler for WriteFile {
-    fn version(&self) -> &str {
-        HANDLER_VERSION
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::NonIdempotent
-    }
-
-    fn spawns(&self) -> bool {
-        true
-    }
-
-    fn call(&self, arguments: Value) -> ToolFuture<'_> {
-        self.write(None, arguments)
-    }
-
-    fn call_for(&self, call: ToolCallRef, arguments: Value) -> ToolFuture<'_> {
-        self.write(Some(call.job), arguments)
-    }
-
-    fn stop(&self, job: JobId) -> Pin<Box<dyn Future<Output = Result<(), ToolFailure>> + '_>> {
-        Box::pin(async move {
-            self.workers.stop_job(job).await;
-            Ok(())
-        })
-    }
-}
-
 impl WriteFile {
-    fn write(&self, job: Option<JobId>, arguments: Value) -> ToolFuture<'_> {
-        Box::pin(async move {
-            let (path, operation) = parse(&arguments)
-                .map_err(|refusal| ToolFailure::not_applied(refusal.to_string()))?;
-            let path = path.to_owned();
-            let workspace = self.workspace.clone();
-            let path_for_worker = path.clone();
-
-            let result = match operation {
-                Operation::Create { content } => {
-                    let content = content.to_owned();
-                    let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
-                    let bytes_written = content.len();
-                    self.workers
-                        .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
-                            let _mutation = read::WorkspaceMutation::begin();
-                            create(&workspace, &path_for_worker, &content, stop)
-                        })
-                        .await
-                        .map_err(ToolFailure::uncertain)?
-                        .map_err(ToolFailure::from)?;
-                    json!({
-                        "operation": "create",
-                        "path": path,
-                        "bytes_written": bytes_written,
-                        "after_sha256": after_sha256,
-                    })
-                }
-                Operation::Update { content, expected } => {
-                    let content = content.to_owned();
-                    let expected = expected.to_owned();
-                    let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
-                    let bytes_written = content.len();
-                    self.workers
-                        .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
-                            let _mutation = read::WorkspaceMutation::begin();
-                            update(&workspace, &path_for_worker, &expected, &content, stop)
-                        })
-                        .await
-                        .map_err(ToolFailure::uncertain)?
-                        .map_err(ToolFailure::from)?;
-                    json!({
-                        "operation": "update",
-                        "path": path,
-                        "bytes_written": bytes_written,
-                        "after_sha256": after_sha256,
-                    })
-                }
-                Operation::Replace { old, new } => {
-                    let old = old.to_owned();
-                    let new = new.to_owned();
-                    let (offset, before_sha256, after_sha256) = self
-                        .workers
-                        .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
-                            let _mutation = read::WorkspaceMutation::begin();
-                            replace(&workspace, &path_for_worker, &old, &new, stop)
-                        })
-                        .await
-                        .map_err(ToolFailure::uncertain)?
-                        .map_err(ToolFailure::from)?;
-                    json!({
-                        "operation": "replace",
-                        "path": path,
-                        "offset": offset,
-                        "before_sha256": before_sha256,
-                        "after_sha256": after_sha256,
-                    })
-                }
-                Operation::Delete { expected } => {
-                    let expected = expected.to_owned();
-                    self.workers
-                        .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
-                            let _mutation = read::WorkspaceMutation::begin();
-                            delete(&workspace, &path_for_worker, &expected, stop)
-                        })
-                        .await
-                        .map_err(ToolFailure::uncertain)?
-                        .map_err(ToolFailure::from)?;
-                    json!({
-                        "operation": "delete",
-                        "path": path,
-                    })
-                }
-            };
-            Ok(result)
-        })
-    }
-}
-
-pub(crate) fn register(
-    registry: &ToolRegistry,
-    workspace: Workspace,
-) -> Result<(), ToolRegistryError> {
-    registry.register(
-        TOOL_NAME,
-        Some(
-            "Create a new UTF-8 text file, replace the whole content of an existing one, replace exact text in a file, or delete a file in the authorized Workspace. Operations: `create` {path, content} fails if the file exists. `update` {path, content, expected_content} requires the whole file to match `expected_content`. `replace` {path, old, new} replaces `old` (must occur exactly once) with `new` (up to 8 KiB each, in files up to 1 MiB). `delete` {path, expected_content} deletes a file matching `expected_content` (up to 64 KiB). Directories are never created or deleted.",
-        ),
-        parameters(),
-        Arc::new(WriteFile {
+    pub(crate) fn new(workspace: Workspace) -> Self {
+        Self {
             workspace,
             workers: Default::default(),
-        }),
-    )
+        }
+    }
+
+    pub(crate) async fn stop(&self, job: JobId) {
+        self.workers.stop_job(job).await;
+    }
+
+    pub(crate) async fn write(
+        &self,
+        job: Option<JobId>,
+        arguments: Value,
+    ) -> Result<Value, WriteFailure> {
+        let (path, operation) =
+            parse(&arguments).map_err(|refusal| WriteFailure::Refused(refusal.to_string()))?;
+        let path = path.to_owned();
+        let workspace = self.workspace.clone();
+        let path_for_worker = path.clone();
+
+        let result = match operation {
+            Operation::Create { content } => {
+                let content = content.to_owned();
+                let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
+                let bytes_written = content.len();
+                self.workers
+                    .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
+                        let _mutation = read::WorkspaceMutation::begin();
+                        create(&workspace, &path_for_worker, &content, stop)
+                    })
+                    .await
+                    .map_err(|error| WriteFailure::Uncertain(error.to_string()))?
+                    .map_err(WriteFailure::from)?;
+                json!({
+                    "operation": "create",
+                    "path": path,
+                    "bytes_written": bytes_written,
+                    "after_sha256": after_sha256,
+                })
+            }
+            Operation::Update { content, expected } => {
+                let content = content.to_owned();
+                let expected = expected.to_owned();
+                let after_sha256 = ContentDigest::of(content.as_bytes()).to_string();
+                let bytes_written = content.len();
+                self.workers
+                    .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
+                        let _mutation = read::WorkspaceMutation::begin();
+                        update(&workspace, &path_for_worker, &expected, &content, stop)
+                    })
+                    .await
+                    .map_err(|error| WriteFailure::Uncertain(error.to_string()))?
+                    .map_err(WriteFailure::from)?;
+                json!({
+                    "operation": "update",
+                    "path": path,
+                    "bytes_written": bytes_written,
+                    "after_sha256": after_sha256,
+                })
+            }
+            Operation::Replace { old, new } => {
+                let old = old.to_owned();
+                let new = new.to_owned();
+                let (offset, before_sha256, after_sha256) = self
+                    .workers
+                    .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
+                        let _mutation = read::WorkspaceMutation::begin();
+                        replace(&workspace, &path_for_worker, &old, &new, stop)
+                    })
+                    .await
+                    .map_err(|error| WriteFailure::Uncertain(error.to_string()))?
+                    .map_err(WriteFailure::from)?;
+                json!({
+                    "operation": "replace",
+                    "path": path,
+                    "offset": offset,
+                    "before_sha256": before_sha256,
+                    "after_sha256": after_sha256,
+                })
+            }
+            Operation::Delete { expected } => {
+                let expected = expected.to_owned();
+                self.workers
+                    .run_tracked(job, Kind::File, StopSignal::new(), move |stop| {
+                        let _mutation = read::WorkspaceMutation::begin();
+                        delete(&workspace, &path_for_worker, &expected, stop)
+                    })
+                    .await
+                    .map_err(|error| WriteFailure::Uncertain(error.to_string()))?
+                    .map_err(WriteFailure::from)?;
+                json!({
+                    "operation": "delete",
+                    "path": path,
+                })
+            }
+        };
+        Ok(result)
+    }
 }

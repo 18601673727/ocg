@@ -195,7 +195,7 @@ async fn resolve_root(shared: &Shared, root: String) -> Result<String, Refusal> 
 
     let data_directory = shared.workspace_tools.data_directory().clone();
     let authorized = blocking::run(Kind::File, move || {
-        Workspace::authorize(std::path::Path::new(&root), &data_directory)
+        Workspace::authorize(std::path::Path::new(&root), data_directory.root())
             .map(|workspace| workspace.root().to_path_buf())
     })
     .await

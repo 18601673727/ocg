@@ -1,6 +1,5 @@
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
@@ -10,22 +9,14 @@ use rustix::io::Errno;
 use serde_json::{Value, json};
 
 use super::read::{Refusal, Step, Workspace, check_component, open_within, read_bytes};
-use crate::db::entities::ToolEffect;
-use crate::jobs::execution::tools::registry::{
-    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
-};
-use crate::workspace::blocking::{self, Kind as BlockingKind};
 
 pub const LIST_TOOL_NAME: &str = "workspace_list_directory";
 pub const SEARCH_TOOL_NAME: &str = "workspace_search";
 
-const LIST_HANDLER_VERSION: &str = "workspace_list_directory-1";
-const SEARCH_HANDLER_VERSION: &str = "workspace_search-2";
-
 pub const SKIPPED_DIRECTORY_NAMES: &[&str] = &["target", "node_modules"];
 
-const MAX_NAME_PATTERN_BYTES: usize = 128;
-const MAX_TEXT_BYTES: usize = 256;
+pub(crate) const MAX_NAME_PATTERN_BYTES: usize = 128;
+pub(crate) const MAX_TEXT_BYTES: usize = 256;
 
 const MAX_LINE_TEXT_BYTES: usize = 200;
 
@@ -127,7 +118,7 @@ impl Kind {
     }
 }
 
-fn directory_path(arguments: &Value) -> Result<&str, Refusal> {
+pub(crate) fn directory_path(arguments: &Value) -> Result<&str, Refusal> {
     if !only_fields(arguments, &["path"]) {
         return Err(Refusal::InvalidPath);
     }
@@ -137,7 +128,11 @@ fn directory_path(arguments: &Value) -> Result<&str, Refusal> {
     }
 }
 
-fn list(workspace: &Workspace, path: &str, limits: &DiscoveryLimits) -> Result<Value, Refusal> {
+pub(crate) fn list(
+    workspace: &Workspace,
+    path: &str,
+    limits: &DiscoveryLimits,
+) -> Result<Value, Refusal> {
     let directory = workspace.directory(path)?;
     let Names { names, partial } = names(&directory, limits.directory_entries)?;
     let result = |entries: Vec<Value>, truncated: bool| {
@@ -225,14 +220,14 @@ enum TextMatcher {
 }
 
 #[derive(Debug)]
-struct Query {
+pub(crate) struct Query {
     path: String,
     name: Option<NamePattern>,
     text: Option<TextMatcher>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-enum QueryRefusal {
+pub(crate) enum QueryRefusal {
     #[error(
         "a search needs a `name` of 1 to {MAX_NAME_PATTERN_BYTES} bytes without `/` or control characters, a `text` of 1 to {MAX_TEXT_BYTES} bytes on one line, or both"
     )]
@@ -249,7 +244,7 @@ fn only_fields(arguments: &Value, fields: &[&str]) -> bool {
         .is_some_and(|object| object.keys().all(|key| fields.contains(&key.as_str())))
 }
 
-fn query(arguments: &Value) -> Result<Query, QueryRefusal> {
+pub(crate) fn query(arguments: &Value) -> Result<Query, QueryRefusal> {
     if !only_fields(arguments, &["path", "name", "text", "regex"]) {
         return Err(QueryRefusal::Invalid);
     }
@@ -491,7 +486,7 @@ fn search_result(path: &str, files: Vec<Value>, limit: Option<Limit>, skipped: u
     })
 }
 
-fn search(
+pub(crate) fn search(
     workspace: &Workspace,
     query: &Query,
     limits: &DiscoveryLimits,
@@ -530,78 +525,7 @@ fn search(
     ))
 }
 
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Relaxed);
-    }
-}
-
-fn refused(refusal: impl std::fmt::Display) -> ToolFailure {
-    ToolFailure::not_applied(refusal.to_string())
-}
-
-struct ListDirectory {
-    workspace: Workspace,
-    limits: DiscoveryLimits,
-}
-
-impl ToolHandler for ListDirectory {
-    fn version(&self) -> &str {
-        LIST_HANDLER_VERSION
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-
-    fn call(&self, arguments: Value) -> ToolFuture<'_> {
-        Box::pin(async move {
-            let path = directory_path(&arguments).map_err(refused)?.to_owned();
-            let workspace = self.workspace.clone();
-            let limits = self.limits;
-            blocking::run(BlockingKind::File, move || list(&workspace, &path, &limits))
-                .await
-                .map_err(ToolFailure::uncertain)?
-                .map_err(refused)
-        })
-    }
-}
-
-struct Search {
-    workspace: Workspace,
-    limits: DiscoveryLimits,
-}
-
-impl ToolHandler for Search {
-    fn version(&self) -> &str {
-        SEARCH_HANDLER_VERSION
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-
-    fn call(&self, arguments: Value) -> ToolFuture<'_> {
-        Box::pin(async move {
-            let query = query(&arguments).map_err(refused)?;
-            let stop = Arc::new(AtomicBool::new(false));
-            let stopping = StopOnDrop(stop.clone());
-            let (workspace, limits) = (self.workspace.clone(), self.limits);
-
-            let found = blocking::run(BlockingKind::File, move || {
-                search(&workspace, &query, &limits, &stop)
-            })
-            .await
-            .map_err(|_| ToolFailure::not_applied("the search ended without a result"))?;
-            drop(stopping);
-            found.map_err(refused)
-        })
-    }
-}
-
-fn list_parameters() -> Value {
+pub(crate) fn list_parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -614,7 +538,7 @@ fn list_parameters() -> Value {
     })
 }
 
-fn search_parameters() -> Value {
+pub(crate) fn search_parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -641,34 +565,4 @@ fn search_parameters() -> Value {
         },
         "additionalProperties": false
     })
-}
-
-pub(crate) fn register(
-    registry: &ToolRegistry,
-    workspace: Workspace,
-) -> Result<(), ToolRegistryError> {
-    let limits = DiscoveryLimits::default();
-    registry.register(
-        LIST_TOOL_NAME,
-        Some(
-            "List one directory of the authorized Workspace: its entries sorted by name, each with its type (file, directory, symlink, other, inaccessible) and a file's size in bytes. Hidden and secret-bearing names are not shown, and symlinks are never followed. At most 200 entries; `truncated` says some were left out and `total_entries` counts them all.",
-        ),
-        list_parameters(),
-        Arc::new(ListDirectory {
-            workspace: workspace.clone(),
-            limits,
-        }),
-    )?;
-    registry.register(
-        SEARCH_TOOL_NAME,
-        Some(
-            "Find files below a directory of the authorized Workspace by name, by content, or both: give `name`, `text`, or both. Returns matching file paths with their sizes and, for `text`, the matching line numbers and lines (each cut to 200 bytes, at most 10 per file). Hidden, secret-bearing, symlinked, binary and over 1 MiB files are not searched, nor `target` or `node_modules` directories unless `path` names them. `complete` is false when a bound (results, entries, content_bytes, time) named by `limit` ended the search early; `skipped` counts entries that could not be searched.",
-        ),
-        search_parameters(),
-        Arc::new(Search {
-            workspace,
-            limits,
-
-        }),
-    )
 }

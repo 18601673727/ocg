@@ -2,8 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use jsonschema::Validator;
 use serde_json::Value;
@@ -19,48 +18,7 @@ use crate::db::entities::{
 
 pub(crate) type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, ToolFailure>> + 'a>>;
 
-#[derive(Clone, Default)]
-pub(crate) struct ToolStart {
-    at: Arc<OnceLock<Instant>>,
-    ready: crate::ai::providers::CancellationToken,
-    starting: Arc<Mutex<Option<crate::workspace::process::StartingCall>>>,
-}
-
-impl ToolStart {
-    pub(crate) fn with_starting(starting: Option<crate::workspace::process::StartingCall>) -> Self {
-        Self {
-            starting: Arc::new(Mutex::new(starting)),
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn take_starting(&self) -> Option<crate::workspace::process::StartingCall> {
-        self.starting
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
-    }
-
-    pub(crate) fn mark_started(&self) {
-        if self.at.set(Instant::now()).is_ok() {
-            self.ready.cancel();
-        }
-    }
-
-    pub(crate) fn has_started(&self) -> bool {
-        self.at.get().is_some()
-    }
-
-    pub(crate) async fn wait(&self) {
-        self.ready.cancelled().await;
-    }
-
-    pub(crate) fn remaining(&self, limit: Duration) -> Duration {
-        self.at
-            .get()
-            .map_or(limit, |at| limit.saturating_sub(at.elapsed()))
-    }
-}
+pub(crate) use crate::workspace::process::ToolStart;
 
 pub(crate) trait ToolHandler: Send + Sync {
     fn version(&self) -> &str;

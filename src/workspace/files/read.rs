@@ -2,18 +2,10 @@ use std::fs::File;
 use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 use serde_json::{Value, json};
-
-use crate::db::entities::ToolEffect;
-use crate::host::data_directory::DataDirectory;
-use crate::jobs::execution::tools::registry::{
-    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
-};
-use crate::workspace::blocking::{self, Kind};
 
 pub const TOOL_NAME: &str = "workspace_read_file";
 
@@ -22,8 +14,6 @@ pub const MAX_FILE_BYTES: usize = 32 * 1024;
 pub const MAX_RANGED_FILE_BYTES: usize = 16 * 1024 * 1024;
 
 pub const MAX_RANGE_LINES: u64 = 2_000;
-
-const HANDLER_VERSION: &str = "workspace_read_file-3";
 
 const MAX_PATH_BYTES: usize = 1024;
 const MAX_PATH_COMPONENTS: usize = 64;
@@ -133,13 +123,13 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    pub fn authorize(root: &Path, data_directory: &DataDirectory) -> Result<Self, WorkspaceError> {
-        Self::authorize_beside(root, data_directory, account_home())
+    pub fn authorize(root: &Path, data_root: &Path) -> Result<Self, WorkspaceError> {
+        Self::authorize_beside(root, data_root, account_home())
     }
 
     fn authorize_beside(
         root: &Path,
-        data_directory: &DataDirectory,
+        data_root: &Path,
         home: Result<PathBuf, HomeError>,
     ) -> Result<Self, WorkspaceError> {
         let home = home.map_err(WorkspaceError::HomeUnknown)?;
@@ -155,11 +145,10 @@ impl Workspace {
         if root.parent().is_none() || home.starts_with(&root) {
             return Err(WorkspaceError::TooBroad);
         }
-        let data = data_directory.root();
-        if data.starts_with(&root) || root.starts_with(data) {
+        if data_root.starts_with(&root) || root.starts_with(data_root) {
             return Err(WorkspaceError::OverlapsDataDirectory);
         }
-        let data_metadata = std::fs::metadata(data).map_err(WorkspaceError::Unresolved)?;
+        let data_metadata = std::fs::metadata(data_root).map_err(WorkspaceError::Unresolved)?;
         Ok(Self {
             root,
             identity: Identity::of(&metadata),
@@ -171,7 +160,7 @@ impl Workspace {
         &self.root
     }
 
-    fn read(&self, path: &str) -> Result<String, Refusal> {
+    pub(crate) fn read(&self, path: &str) -> Result<String, Refusal> {
         let (directory, name) = self.parent(path)?;
         let file = open_within(&directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(
             |refusal| match refusal {
@@ -191,7 +180,7 @@ impl Workspace {
         read_whole(&file)
     }
 
-    fn read_range(
+    pub(crate) fn read_range(
         &self,
         path: &str,
         start_line: u64,
@@ -513,7 +502,7 @@ fn unchanged(file: &File, before: &std::fs::Metadata, read: u64) -> Result<(), R
 }
 
 #[derive(Debug, PartialEq, Eq)]
-struct LineRange {
+pub(crate) struct LineRange {
     start_line: u64,
     end_line: Option<u64>,
     content: String,
@@ -527,7 +516,7 @@ impl LineRange {
         (last < self.total_lines).then_some(last + 1)
     }
 
-    fn to_json(&self, path: &str) -> Value {
+    pub(crate) fn to_json(&self, path: &str) -> Value {
         json!({
             "path": path,
             "start_line": self.start_line,
@@ -629,7 +618,7 @@ fn read_lines(file: &File, start_line: u64, line_count: u64) -> Result<LineRange
     })
 }
 
-fn parameters() -> Value {
+pub(crate) fn parameters() -> Value {
     json!({
         "type": "object",
         "properties": {
@@ -654,7 +643,7 @@ fn parameters() -> Value {
     })
 }
 
-fn requested_range(arguments: &Value) -> Result<Option<(u64, u64)>, Refusal> {
+pub(crate) fn requested_range(arguments: &Value) -> Result<Option<(u64, u64)>, Refusal> {
     let field = |name: &str| match arguments.get(name) {
         None => Ok(None),
         Some(value) => value.as_u64().map(Some).ok_or(Refusal::InvalidRange),
@@ -666,63 +655,4 @@ fn requested_range(arguments: &Value) -> Result<Option<(u64, u64)>, Refusal> {
             line_count.unwrap_or(MAX_RANGE_LINES),
         ))),
     }
-}
-
-struct ReadFile {
-    workspace: Workspace,
-}
-
-impl ToolHandler for ReadFile {
-    fn version(&self) -> &str {
-        HANDLER_VERSION
-    }
-
-    fn effect(&self) -> ToolEffect {
-        ToolEffect::ReadOnly
-    }
-
-    fn call(&self, arguments: Value) -> ToolFuture<'_> {
-        Box::pin(async move {
-            let refused = |refusal: Refusal| ToolFailure::not_applied(refusal.to_string());
-            let Some(path) = arguments.get("path").and_then(Value::as_str) else {
-                return Err(refused(Refusal::InvalidPath));
-            };
-            match requested_range(&arguments).map_err(refused)? {
-                None => {
-                    let owned_path = path.to_owned();
-                    let workspace = self.workspace.clone();
-                    let content = blocking::run(Kind::File, move || workspace.read(&owned_path))
-                        .await
-                        .map_err(ToolFailure::uncertain)?
-                        .map_err(refused)?;
-                    Ok(json!({"path": path, "content": content}))
-                }
-                Some((start_line, line_count)) => {
-                    let owned_path = path.to_owned();
-                    let workspace = self.workspace.clone();
-                    let range = blocking::run(Kind::File, move || {
-                        workspace.read_range(&owned_path, start_line, line_count)
-                    })
-                    .await
-                    .map_err(ToolFailure::uncertain)?
-                    .map_err(refused)?;
-                    Ok(range.to_json(path))
-                }
-            }
-        })
-    }
-}
-
-pub(crate) fn register(
-    registry: &ToolRegistry,
-    workspace: Workspace,
-) -> Result<(), ToolRegistryError> {
-    registry.register(
-        TOOL_NAME,
-        Some(
-            "Read one UTF-8 text file from the authorized Workspace. With only `path`, return its complete contents; a file over 32 KiB fails the call, so read larger files in ranges. With `start_line` or `line_count`, return whole lines from `start_line` (from 1) of a file of up to 16 MiB, at most `line_count` (up to 2000) and about 32 KiB of them, exactly as the file holds them, with `end_line` (null when the file ends before `start_line`), `total_lines`, and `next_start_line` to continue from (null at the end of the file); `line_truncated` says the one line returned is cut because it alone is longer than the limit.",
-        ),
-        parameters(),
-        Arc::new(ReadFile { workspace }),
-    )
 }
