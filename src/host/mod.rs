@@ -1,5 +1,6 @@
 pub mod data_directory;
 pub(crate) mod execution_features;
+pub(crate) mod identity;
 pub mod job_runtime;
 pub mod logger;
 pub mod monitor;

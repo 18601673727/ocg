@@ -10,7 +10,7 @@ use crate::db::redb::schema::{
 };
 use crate::db::redb::schema::{DATABASE_FILE_NAME, FORMAT_VERSION};
 use crate::db::redb::{allocations, batch, indexes, recovery};
-use crate::host::data_directory::{current_boot_id, current_host_id};
+use crate::host::identity::{current_boot_id, current_host_id};
 use ::redb::{Database, ReadableTable};
 
 enum OfflineAccess<'a> {

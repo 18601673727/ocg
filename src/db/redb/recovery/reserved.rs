@@ -18,7 +18,7 @@ use crate::db::redb::schema::{
 };
 use crate::db::redb::state::JobRuntime;
 use crate::db::redb::{StorageError, StorageErrorKind, allocations, reads};
-use crate::host::data_directory::{current_boot_id, current_host_id};
+use crate::host::identity::{current_boot_id, current_host_id};
 use ::redb::ReadableDatabase;
 
 #[derive(Debug)]
