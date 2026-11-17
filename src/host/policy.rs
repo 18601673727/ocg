@@ -4,9 +4,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::db::database_file;
+use crate::db::protection::ProtectionReason;
 use crate::host::data_directory::DataDirectory;
+use crate::host::disk::{self, FilesystemConfig, FilesystemConfigError};
 use crate::host::logger::{LoggerConfig, LoggerConfigError};
-use crate::host::monitor::{self, FilesystemConfig, FilesystemConfigError, ProtectionReason};
 
 pub const SYSTEM_POLICY_FILE_NAME: &str = "ocg.conf";
 
@@ -75,10 +76,10 @@ impl SystemPolicy {
             Err(source) => return Err(io_error(&path, "read policy", source)),
         };
         policy.validate(&path)?;
-        let reasons = monitor::protected_paths(data_directory)
+        let reasons = disk::protected_paths(data_directory)
             .iter()
             .filter_map(|(area, protected_path)| {
-                monitor::check_space(
+                disk::check_space(
                     *area,
                     protected_path,
                     0,

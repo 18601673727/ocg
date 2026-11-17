@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 
+use crate::db::protection::{ProtectedArea, ProtectionReason};
 use crate::db::{DatabaseHandle, DatabaseStatus};
 use crate::support::notification::{Notifications, Subscription};
 
@@ -438,8 +439,8 @@ impl Worker {
 
     fn record_failure(&mut self, path: PathBuf, operation: &'static str, error: &io::Error) {
         if error.kind() == io::ErrorKind::StorageFull {
-            let reason = super::monitor::ProtectionReason::FilesystemWriteFailed {
-                area: super::monitor::ProtectedArea::Logs,
+            let reason = ProtectionReason::FilesystemWriteFailed {
+                area: ProtectedArea::Logs,
                 path: path.clone(),
                 kind: error.kind(),
                 os_error: error.raw_os_error(),
@@ -628,8 +629,8 @@ fn cleanup_expired(database: &DatabaseHandle, logs: &LogStore) {
                 Ok(()) => deleted += 1,
                 Err(error) if error.kind() == std::io::ErrorKind::StorageFull => {
                     database.activate_filesystem_protection(
-                        super::monitor::ProtectionReason::FilesystemWriteFailed {
-                            area: super::monitor::ProtectedArea::Logs,
+                        ProtectionReason::FilesystemWriteFailed {
+                            area: ProtectedArea::Logs,
                             path,
                             kind: error.kind(),
                             os_error: error.raw_os_error(),

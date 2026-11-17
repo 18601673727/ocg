@@ -26,8 +26,7 @@ use crate::db::shared::{
 };
 use crate::db::{entities, redb};
 use crate::host::data_directory::DataDirectory;
-use crate::host::monitor;
-use crate::host::monitor::FilesystemConfig;
+use crate::host::disk::{self, FilesystemConfig};
 use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::path::PathBuf;
@@ -178,7 +177,7 @@ impl DatabaseWorker {
         let attachment_directory = data_directory.attachments_path();
         let directory = data_directory.database_path().to_path_buf();
         let data_directory = data_directory.clone();
-        let paths = monitor::protected_paths(&data_directory);
+        let paths = disk::protected_paths(&data_directory);
         let (sender, receiver) = flume::bounded(COMMAND_QUEUE_CAPACITY);
         let (maintenance_sender, maintenance) = flume::bounded(MAINTENANCE_QUEUE_CAPACITY);
         let (ready_sender, ready_receiver) = flume::bounded(1);
@@ -447,7 +446,7 @@ pub(super) fn space_shortfalls(
 ) -> Vec<ProtectionReason> {
     paths
         .iter()
-        .filter_map(|(area, path)| monitor::check_space(*area, path, 0, threshold_bytes).err())
+        .filter_map(|(area, path)| disk::check_space(*area, path, 0, threshold_bytes).err())
         .collect()
 }
 
@@ -581,7 +580,7 @@ impl WriteWorker {
         &mut self,
         expected_write_bytes: u64,
     ) -> Result<(), SpaceRefusal> {
-        match monitor::check_space(
+        match disk::check_space(
             ProtectedArea::Database,
             &self.directory,
             expected_write_bytes,
@@ -969,7 +968,7 @@ impl WriteWorker {
         let mut available = Vec::with_capacity(self.paths.len());
         let mut shortages = Vec::new();
         for (area, path) in &self.paths {
-            match monitor::check_space(*area, path, 0, threshold) {
+            match disk::check_space(*area, path, 0, threshold) {
                 Ok(available_bytes) => available.push(SpaceMeasurement {
                     area: *area,
                     path: path.clone(),

@@ -4,7 +4,7 @@ use crate::db::entities::{OperationId, Violation};
 use crate::db::protection::{ProtectionLock, ProtectionReason, SpaceShortage};
 use crate::db::redb;
 use crate::db::redb::{Probe, StorageError};
-use crate::host::monitor::FilesystemConfigError;
+use crate::host::disk::FilesystemConfigError;
 use crate::host::policy::SystemPolicyError;
 use std::time::Duration;
 

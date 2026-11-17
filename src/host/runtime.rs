@@ -6,8 +6,8 @@ use crate::db::{DatabaseHandle, DatabaseWorker};
 use crate::host::data_directory::DataDirectory;
 use crate::host::job_runtime::ExecutionRuntime;
 use crate::host::logger::{LogStore, RuntimeLogger};
-use crate::host::monitor::report_protection;
 use crate::host::policy::SystemPolicy;
+use crate::host::protection_notice::report_protection;
 use crate::jobs::execution::stops::NativeStops;
 
 const REMOVED_WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";

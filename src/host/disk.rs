@@ -1,11 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-pub use crate::db::protection::{
-    DiskProtectionStatus, ProtectedArea, ProtectionLock, ProtectionReason, ProtectionWatch,
-    RecoveryError, RecoveryReport, ReopenFailure, SpaceMeasurement, SpaceQueryFailure,
-    SpaceShortage,
-};
+use crate::db::protection::{ProtectedArea, ProtectionReason, SpaceQueryFailure, SpaceShortage};
 use crate::host::data_directory::DataDirectory;
 
 pub const DEFAULT_DISK_LOCK_THRESHOLD_BYTES: u64 = 1024 * 1024 * 1024;
@@ -100,7 +96,7 @@ pub(crate) fn protected_paths(data_directory: &DataDirectory) -> [(ProtectedArea
     ]
 }
 
-fn measure(area: ProtectedArea, path: &Path) -> Result<u64, SpaceQueryFailure> {
+pub(crate) fn measure(area: ProtectedArea, path: &Path) -> Result<u64, SpaceQueryFailure> {
     fs4::available_space(path).map_err(|error| SpaceQueryFailure {
         area,
         path: path.to_path_buf(),
@@ -108,56 +104,6 @@ fn measure(area: ProtectedArea, path: &Path) -> Result<u64, SpaceQueryFailure> {
         os_error: error.raw_os_error(),
         detail: error.to_string(),
     })
-}
-
-pub(crate) fn database_disk_usage(directory: &Path) -> (Option<u64>, Option<u64>) {
-    let database_bytes = std::fs::metadata(crate::db::database_file(directory))
-        .ok()
-        .map(|metadata| metadata.len());
-    let available_bytes = measure(ProtectedArea::Database, directory).ok();
-    (database_bytes, available_bytes)
-}
-
-pub(crate) fn process_memory() -> (Option<u64>, Option<u64>) {
-    #[cfg(unix)]
-    let peak = {
-        let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
-        (unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut rusage) } == 0).then(|| {
-            let rss = rusage.ru_maxrss.max(0) as u64;
-            if cfg!(target_os = "macos") {
-                rss
-            } else {
-                rss.saturating_mul(1024)
-            }
-        })
-    };
-    #[cfg(not(unix))]
-    let peak = None;
-
-    #[cfg(target_os = "linux")]
-    if let Ok(status) = std::fs::read_to_string("/proc/self/status") {
-        let mut current = None;
-        let mut peak = peak;
-        for line in status.lines() {
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-            let metric = match name {
-                "VmRSS" => &mut current,
-                "VmHWM" => &mut peak,
-                _ => continue,
-            };
-            if let Some(kb) = value
-                .split_whitespace()
-                .next()
-                .and_then(|text| text.parse::<u64>().ok())
-            {
-                *metric = Some(kb.saturating_mul(1024));
-            }
-        }
-        return (current, peak);
-    }
-    (None, peak)
 }
 
 pub(crate) fn leaves_threshold(
@@ -187,33 +133,5 @@ pub(crate) fn check_space(
             expected_write_bytes,
             threshold_bytes,
         }))
-    }
-}
-
-pub(crate) async fn report_protection(watch: ProtectionWatch) {
-    let mut lock = watch.status().lock;
-    if let Some(notice) = protection_notice(None, lock.as_ref()) {
-        eprintln!("{notice}");
-    }
-    while let Some(status) = watch.changed().await {
-        if let Some(notice) = protection_notice(lock.as_ref(), status.lock.as_ref()) {
-            eprintln!("{notice}");
-        }
-        lock = status.lock;
-    }
-}
-
-fn protection_notice(
-    before: Option<&ProtectionLock>,
-    after: Option<&ProtectionLock>,
-) -> Option<String> {
-    match (before, after) {
-        (None, Some(lock)) => Some(format!(
-            "OCG storage protection is active; commands are refused and the file log is paused: {lock}"
-        )),
-        (Some(_), None) => {
-            Some("OCG storage protection was lifted; commands are accepted again".to_owned())
-        }
-        _ => None,
     }
 }

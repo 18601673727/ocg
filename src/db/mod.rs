@@ -51,7 +51,7 @@ const MAINTENANCE_QUEUE_CAPACITY: usize = 2;
 const TRANSACTION_ALLOWANCE_BYTES: u64 = 1024 * 1024;
 
 mod commands;
-pub(crate) mod protection;
+pub mod protection;
 pub(crate) use commands::serialized_len;
 mod errors;
 mod handle;

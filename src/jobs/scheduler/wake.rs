@@ -4,8 +4,8 @@ use ntex::util::{Either, select};
 
 use super::allocation::Allocator;
 use crate::ai::providers::CancellationToken;
+use crate::db::protection::ProtectionWatch;
 use crate::db::{DatabaseHandle, SchedulerWakeSubscription};
-use crate::host::monitor::ProtectionWatch;
 
 const BATCH_FLOOR: Duration = Duration::from_millis(5);
 const RECONCILE: Duration = Duration::from_secs(30);
