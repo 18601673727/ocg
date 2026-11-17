@@ -14,7 +14,6 @@ use crate::db::shared::{Admission, Opened, ReadJob, ReadMessage, Shared, admitte
 use crate::db::worker::{DatabaseHandle, run};
 use crate::db::{errors, redb};
 use crate::host::data_directory::DataDirectory;
-use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
@@ -147,10 +146,6 @@ impl DatabaseHandle {
             log::debug!("failed to enqueue filesystem protection maintenance notice: {error}");
         }
         true
-    }
-
-    pub fn active_system_policy(&self) -> SystemPolicy {
-        self.shared.active_policy
     }
 
     pub(crate) fn pause_for_update(&self) -> Result<Option<UpdatePause>, DatabaseError> {

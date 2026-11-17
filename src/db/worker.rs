@@ -27,7 +27,6 @@ use crate::db::shared::{
 use crate::db::{entities, redb};
 use crate::host::data_directory::DataDirectory;
 use crate::host::disk::{self, FilesystemConfig};
-use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -157,23 +156,6 @@ impl DatabaseWorker {
         config: FilesystemConfig,
     ) -> Result<Self, DatabaseError> {
         config.validate().map_err(DatabaseError::Configuration)?;
-        Self::start_with_policy(
-            data_directory,
-            SystemPolicy {
-                filesystem_config: config,
-                ..SystemPolicy::default()
-            },
-        )
-    }
-
-    pub fn start_with_policy(
-        data_directory: &DataDirectory,
-        policy: SystemPolicy,
-    ) -> Result<Self, DatabaseError> {
-        policy
-            .validate(&SystemPolicy::path(data_directory))
-            .map_err(DatabaseError::StartupPolicy)?;
-        let config = policy.filesystem_config;
         let attachment_directory = data_directory.attachments_path();
         let directory = data_directory.database_path().to_path_buf();
         let data_directory = data_directory.clone();
@@ -265,7 +247,6 @@ impl DatabaseWorker {
                     output_changes: Default::default(),
                     scheduler_wake,
                     scheduler_subscription: std::sync::Mutex::new(Some(scheduler_subscription)),
-                    active_policy: policy,
                     database_directory: directory.to_path_buf(),
                     admission: RwLock::new(Admission::Open),
                     update_paused: AtomicBool::new(false),

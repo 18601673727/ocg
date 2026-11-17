@@ -1,12 +1,23 @@
 use super::contracts::envelope;
 use super::{DatabaseHandle, DatabaseStatus, Value};
+use crate::host::data_directory::DataDirectory;
 use crate::host::metrics::{database_disk_usage, process_memory};
+use crate::host::policy::SystemPolicy;
 
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "ActiveSystemSettings")]
 pub(crate) struct ActiveSystemSettingsView {
-    pub(super) path: String,
-    pub(super) content: String,
+    path: String,
+    content: String,
+}
+
+impl ActiveSystemSettingsView {
+    pub(crate) fn new(data_directory: &DataDirectory, policy: &SystemPolicy) -> Self {
+        Self {
+            path: SystemPolicy::path(data_directory).display().to_string(),
+            content: policy.to_conf(),
+        }
+    }
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]

@@ -1,14 +1,12 @@
 use std::future::Future;
-use std::sync::Arc;
 
-use crate::api::v1::{ApiServer, ServerConfig};
+use crate::api::v1::{ActiveSystemSettingsView, ApiServer, ServerConfig};
 use crate::db::{DatabaseHandle, DatabaseWorker};
 use crate::host::data_directory::DataDirectory;
 use crate::host::job_runtime::ExecutionRuntime;
 use crate::host::logger::{LogStore, RuntimeLogger};
 use crate::host::policy::SystemPolicy;
 use crate::host::protection_notice::report_protection;
-use crate::jobs::execution::stops::NativeStops;
 
 const REMOVED_WORKSPACE_ROOT_VARIABLE: &str = "OCG_WORKSPACE_ROOT";
 
@@ -146,7 +144,8 @@ where
             return report;
         }
     };
-    let database = match DatabaseWorker::start_with_policy(data_directory, policy) {
+    let filesystem_config = policy.filesystem_config;
+    let database = match DatabaseWorker::start_with_config(data_directory, filesystem_config) {
         Ok(database) => database,
         Err(error) => {
             report.fail(Phase::Startup, error);
@@ -160,6 +159,8 @@ where
         .signals(signals)
         .build(ntex::rt::DefaultRuntime)
         .block_on(serve(
+            data_directory.clone(),
+            policy,
             database.handle(),
             scope,
             server_config,
@@ -172,6 +173,8 @@ where
 }
 
 async fn serve<F>(
+    data_directory: DataDirectory,
+    policy: SystemPolicy,
     handle: DatabaseHandle,
     scope: crate::host::job_runtime::ClaimScope,
     server_config: Option<ServerConfig>,
@@ -190,8 +193,8 @@ where
         }
     };
     ntex::rt::spawn(report_protection(handle.watch_disk_protection()));
-    let logs = LogStore::new(handle.data_directory().logs_path());
-    let logger = match RuntimeLogger::start(handle.clone(), logs.clone()) {
+    let logs = LogStore::new(data_directory.logs_path());
+    let logger = match RuntimeLogger::start(handle.clone(), logs.clone(), policy.logger_config) {
         Ok(logger) => logger,
         Err(error) => {
             report.fail(Phase::Logger, error);
@@ -227,7 +230,15 @@ where
     }
 
     crate::network::http::log_configuration();
-    let cleanup = match crate::host::logger::start_retention(&handle, logs.clone()) {
+    let cleanup = match crate::host::logger::start_retention(
+        &handle,
+        logs.clone(),
+        policy.logger_config.retention_days,
+        policy
+            .filesystem_config
+            .cleanup_config
+            .max_log_files_per_run,
+    ) {
         Ok(cleanup) => Some(cleanup),
         Err(error) => {
             log::error!("log retention did not start: {error}");
@@ -235,16 +246,25 @@ where
             None
         }
     };
-    serve_api(
-        &mut report,
-        handle,
-        execution.native_stops(),
-        logs,
-        server_config,
-        workspace_tools,
-        until_stopped,
-    )
-    .await;
+    let listener = server_config
+        .map(|config| {
+            ApiServer::start(
+                config,
+                handle.clone(),
+                ActiveSystemSettingsView::new(&data_directory, &policy),
+                logs,
+                execution.native_stops(),
+                workspace_tools,
+            )
+        })
+        .transpose();
+    match listener {
+        Ok(listener) => serve_api(&mut report, handle, listener, until_stopped).await,
+        Err(error) => {
+            log::error!("{error}");
+            report.fail(Phase::ApiServer, error);
+        }
+    }
 
     report.record(Phase::ExecutionRuntime, execution.shutdown().await);
     if let Some(cleanup) = cleanup
@@ -267,27 +287,11 @@ where
 async fn serve_api<F>(
     report: &mut HostReport,
     handle: DatabaseHandle,
-    native_stops: NativeStops,
-    logs: Arc<LogStore>,
-    server_config: Option<ServerConfig>,
-    workspace_tools: crate::jobs::execution::runtime::WorkspaceTools,
+    listener: Option<ApiServer>,
     until_stopped: impl FnOnce(DatabaseHandle) -> F,
 ) where
     F: Future<Output = ()>,
 {
-    let listener = match server_config {
-        None => None,
-        Some(config) => {
-            match ApiServer::start(config, handle.clone(), logs, native_stops, workspace_tools) {
-                Ok(listener) => Some(listener),
-                Err(error) => {
-                    log::error!("{error}");
-                    report.fail(Phase::ApiServer, error);
-                    return;
-                }
-            }
-        }
-    };
     if let Some(address) = listener.as_ref().map(ApiServer::address) {
         log::info!("API server listening on http://{address}");
         eprintln!("OCG API server listening on http://{address}");

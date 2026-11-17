@@ -297,11 +297,11 @@ impl RuntimeLogger {
     pub(crate) fn start(
         database: DatabaseHandle,
         logs: Arc<LogStore>,
+        config: LoggerConfig,
     ) -> Result<Self, LoggerError> {
         if database.status() != DatabaseStatus::Open {
             return Err(LoggerError::DatabaseNotOpen);
         }
-        let config = database.active_system_policy().logger_config;
         config.validate().map_err(LoggerError::Configuration)?;
         let shared = Arc::new(Shared {
             database,
@@ -555,6 +555,8 @@ pub struct CoreLogCleanup {
 pub(crate) fn start_retention(
     database: &DatabaseHandle,
     logs: Arc<LogStore>,
+    retention_days: u32,
+    max_log_files_per_run: u32,
 ) -> Result<CoreLogCleanup, CleanupError> {
     let database = database.clone();
     let (stop_tx, stop_rx) = flume::bounded(1);
@@ -562,7 +564,7 @@ pub(crate) fn start_retention(
         .name("ocg-log-cleanup".to_owned())
         .spawn(move || {
             loop {
-                cleanup_expired(&database, &logs);
+                cleanup_expired(&database, &logs, retention_days, max_log_files_per_run);
                 match stop_rx.recv_timeout(RETENTION_CHECK_INTERVAL) {
                     Ok(()) | Err(flume::RecvTimeoutError::Disconnected) => break,
                     Err(flume::RecvTimeoutError::Timeout) => {}
@@ -595,23 +597,23 @@ impl Drop for CoreLogCleanup {
     }
 }
 
-fn cleanup_expired(database: &DatabaseHandle, logs: &LogStore) {
-    let policy = database.active_system_policy();
-    let Some(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(
-        u64::from(policy.logger_config.retention_days) * 86400,
-    )) else {
+fn cleanup_expired(
+    database: &DatabaseHandle,
+    logs: &LogStore,
+    retention_days: u32,
+    max_log_files_per_run: u32,
+) {
+    let Some(cutoff) =
+        SystemTime::now().checked_sub(Duration::from_secs(u64::from(retention_days) * 86400))
+    else {
         return;
     };
-    let limit = policy
-        .filesystem_config
-        .cleanup_config
-        .max_log_files_per_run;
     let Ok(entries) = fs::read_dir(logs.directory()) else {
         return;
     };
     let mut deleted = 0u32;
     for entry in entries.flatten() {
-        if deleted >= limit {
+        if deleted >= max_log_files_per_run {
             break;
         }
         if !is_runtime_file_name(&entry.file_name()) {

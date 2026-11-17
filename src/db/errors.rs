@@ -5,13 +5,10 @@ use crate::db::protection::{ProtectionLock, ProtectionReason, SpaceShortage};
 use crate::db::redb;
 use crate::db::redb::{Probe, StorageError};
 use crate::host::disk::FilesystemConfigError;
-use crate::host::policy::SystemPolicyError;
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatabaseError {
-    #[error("invalid startup policy: {0}")]
-    StartupPolicy(#[source] SystemPolicyError),
     #[error("the maintenance queue is full; the space check was not accepted")]
     MaintenanceQueueFull,
     #[error(

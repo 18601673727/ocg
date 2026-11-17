@@ -689,12 +689,7 @@ pub(super) async fn respond(
             profiles::import_models(database, &body).await
         }
         Route::ActiveSystemSettings => Ok(Reply::ok(envelope(serde_json::json!(
-            super::system::ActiveSystemSettingsView {
-                path: crate::host::policy::SystemPolicy::path(&database.data_directory())
-                    .display()
-                    .to_string(),
-                content: database.active_system_policy().to_conf(),
-            }
+            shared.active_system_settings
         )))),
         Route::GlobalCompactionSettings => {
             profiles::global_compaction_settings(database, None).await

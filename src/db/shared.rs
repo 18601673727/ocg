@@ -8,7 +8,6 @@ use crate::db::redb;
 use crate::db::redb::{Probe, StorageError};
 use crate::db::scheduler_wake::{SchedulerWake, SchedulerWakeSubscription};
 use crate::host::data_directory::DataDirectory;
-use crate::host::policy::SystemPolicy;
 use ::redb::Database;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -71,7 +70,6 @@ pub(super) struct Shared {
     pub(super) observation_changes: crate::support::notification::Journal<ObservationChange>,
     pub(super) scheduler_wake: SchedulerWake,
     pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
-    pub(super) active_policy: SystemPolicy,
     pub(super) database_directory: PathBuf,
     pub(super) admission: RwLock<Admission>,
     pub(super) update_paused: AtomicBool,

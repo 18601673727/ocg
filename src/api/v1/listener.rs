@@ -1,7 +1,8 @@
 use super::{
-    App, Arc, AtomicBool, AtomicUsize, DatabaseHandle, HttpServer, HttpServiceConfig, IoConfig,
-    Ipv4Addr, MAX_HEADERS, NativeStops, Ordering, Seconds, Server, ServerConfig, Shared, SharedCfg,
-    SocketAddr, TcpListener, UI_VARIABLE, answer, assets, browser, submissions, web,
+    ActiveSystemSettingsView, App, Arc, AtomicBool, AtomicUsize, DatabaseHandle, HttpServer,
+    HttpServiceConfig, IoConfig, Ipv4Addr, MAX_HEADERS, NativeStops, Ordering, Seconds, Server,
+    ServerConfig, Shared, SharedCfg, SocketAddr, TcpListener, UI_VARIABLE, answer, assets, browser,
+    submissions, web,
 };
 use crate::host::logger::LogStore;
 
@@ -43,6 +44,7 @@ impl ApiServer {
     pub(crate) fn start(
         config: ServerConfig,
         database: DatabaseHandle,
+        active_system_settings: ActiveSystemSettingsView,
         logs: Arc<LogStore>,
         native_stops: NativeStops,
         workspace_tools: crate::jobs::execution::runtime::WorkspaceTools,
@@ -61,6 +63,7 @@ impl ApiServer {
         };
         let shared = Arc::new(Shared {
             database,
+            active_system_settings,
             logs,
             native_stops,
             submissions: submissions::Registry::default(),

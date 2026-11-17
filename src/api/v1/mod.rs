@@ -94,6 +94,7 @@ use wire::{
 
 struct Shared {
     database: DatabaseHandle,
+    active_system_settings: ActiveSystemSettingsView,
     logs: Arc<crate::host::logger::LogStore>,
     native_stops: NativeStops,
     submissions: submissions::Registry,

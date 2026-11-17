@@ -796,8 +796,7 @@ fn not_admitted(error: &DatabaseError) -> Refusal {
         | DatabaseError::ReadInterrupted
         | DatabaseError::ReadPoolStopped
         | DatabaseError::Read(_) => DATABASE_UNAVAILABLE,
-        DatabaseError::StartupPolicy(_)
-        | DatabaseError::MaintenanceQueueFull
+        DatabaseError::MaintenanceQueueFull
         | DatabaseError::StorageUnavailable(_)
         | DatabaseError::OutcomeUnknown { .. }
         | DatabaseError::UnknownOperation(_)

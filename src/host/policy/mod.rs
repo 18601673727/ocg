@@ -99,7 +99,7 @@ impl SystemPolicy {
         Ok(policy)
     }
 
-    pub(crate) fn validate(&self, path: &Path) -> Result<(), SystemPolicyError> {
+    fn validate(&self, path: &Path) -> Result<(), SystemPolicyError> {
         self.filesystem_config
             .validate()
             .map_err(|source| SystemPolicyError::Configuration {
