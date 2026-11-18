@@ -200,7 +200,7 @@ pub const STOPPED_BEFORE_SEND: &str = "a stop was requested before the request w
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeStopRequest {
-    EndedBeforeStart,
+    EndedBeforeStart(Option<AllocationToken>),
     Requested(AllocationToken),
     AlreadyRequested(AllocationToken),
 }

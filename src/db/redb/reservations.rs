@@ -1090,7 +1090,7 @@ impl Batch {
                 &row,
                 OutcomeCause::Text(STOPPED_BEFORE_START_SUMMARY.to_owned()),
             )?;
-            return Ok(NativeStopRequest::EndedBeforeStart);
+            return Ok(NativeStopRequest::EndedBeforeStart(None));
         }
         let Some(allocation) = allocation else {
             return self.reject(Violation::InvalidValue(
@@ -1126,7 +1126,7 @@ impl Batch {
                     },
                 )?;
                 self.settle_summary_membership(&job)?;
-                Ok(NativeStopRequest::EndedBeforeStart)
+                Ok(NativeStopRequest::EndedBeforeStart(Some(token)))
             }
             AllocationPhase::Running => {
                 self.transition_pool_allocation(token, AllocationPhase::StopRequested, None)?;

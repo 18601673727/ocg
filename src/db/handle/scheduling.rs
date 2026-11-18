@@ -111,7 +111,7 @@ impl DatabaseHandle {
                             let result = batch.request_native_stop(job)?;
                             Ok(match result {
                                 entities::NativeStopRequest::AlreadyRequested(_) => Break(result),
-                                entities::NativeStopRequest::EndedBeforeStart
+                                entities::NativeStopRequest::EndedBeforeStart(_)
                                 | entities::NativeStopRequest::Requested(_) => Continue(result),
                             })
                         });

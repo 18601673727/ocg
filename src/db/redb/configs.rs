@@ -981,6 +981,7 @@ impl Batch {
         }
 
         let mut emptied = BTreeSet::new();
+        let mut edited = BTreeSet::new();
         // Update Decision targets before validating policies that refer to them.
         for mut row in decision_agents {
             let ConfigBody::DecisionAgent(agent) = &mut row.body else {
@@ -1002,17 +1003,18 @@ impl Batch {
                     agent.default_model,
                     &agent.models,
                 )?);
+                edited.insert(row.id);
             }
             self.update_config(row.id, row.name, row.body)?;
         }
 
         // The stored policies were structurally validated by their decoders.
-        // Validate each surviving configuration reference against the revised catalog.
+        // Validate surviving summaries and affected predictors against the revised catalog.
         for model in refs.summaries {
             self.require_config_kind(model, ConfigKind::Model)?;
         }
         let mut replacements = BTreeMap::new();
-        for agent in refs.predictions {
+        for &agent in refs.rebind.union(&edited) {
             let frozen = self.check_prediction_agent(agent)?;
             if refs.rebind.contains(&agent) {
                 replacements.insert(

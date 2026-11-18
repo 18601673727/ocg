@@ -388,8 +388,8 @@ pub(super) async fn respond(
                 .await
                 .map_err(stop_refusal)?;
             let (token, request, status, stopped, phase) = match stop {
-                NativeStopRequest::EndedBeforeStart => (
-                    None,
+                NativeStopRequest::EndedBeforeStart(token) => (
+                    token,
                     "ended_before_start",
                     StatusCode::OK,
                     true,
@@ -412,7 +412,10 @@ pub(super) async fn respond(
             };
             if let Some(token) = token {
                 stops.cancel(token);
-            } else if let Err(error) = database.settle_child_turns(vec![id]).await {
+            }
+            if matches!(stop, NativeStopRequest::EndedBeforeStart(_))
+                && let Err(error) = database.settle_child_turns(vec![id]).await
+            {
                 log::warn!(
                     "stopped Job {id}: could not report the outcome to its parent ({error})"
                 );
