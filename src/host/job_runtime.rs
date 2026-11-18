@@ -1,7 +1,7 @@
 use crate::ai::providers::CancellationToken;
 use crate::db::DatabaseHandle;
+use crate::db::NativeStops;
 use crate::jobs::execution::runtime::{ExecutionRuntimeError, WorkspaceTools};
-use crate::jobs::execution::stops::NativeStops;
 use crate::jobs::scheduler::allocation;
 use crate::support::cancellation::CancellationReason;
 
@@ -19,15 +19,15 @@ pub enum ClaimScope {
 
 impl ExecutionRuntime {
     pub fn start(
-        _database: DatabaseHandle,
+        database: DatabaseHandle,
         _scope: ClaimScope,
     ) -> Result<Self, ExecutionRuntimeError> {
-        Ok(Self::idle())
+        Ok(Self::idle(&database))
     }
 
-    fn idle() -> Self {
+    fn idle(database: &DatabaseHandle) -> Self {
         Self {
-            native_stops: NativeStops::default(),
+            native_stops: database.native_stops(),
             shutdown: CancellationToken::default(),
             finished: None,
         }
@@ -38,7 +38,7 @@ impl ExecutionRuntime {
         scope: ClaimScope,
         workspace_tools: &WorkspaceTools,
     ) -> Result<Self, ExecutionRuntimeError> {
-        let mut runtime = Self::idle();
+        let mut runtime = Self::idle(&database);
         if scope == ClaimScope::Stored {
             let wake = database
                 .take_scheduler_wake()
@@ -54,7 +54,7 @@ impl ExecutionRuntime {
         Ok(runtime)
     }
 
-    pub(crate) fn is_autonomous(&self) -> bool {
+    pub(crate) fn scheduler_task_running(&self) -> bool {
         !self.shutdown.is_cancelled()
             && self
                 .finished

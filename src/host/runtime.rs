@@ -211,7 +211,7 @@ where
                 let state = if enabled { "available" } else { "unavailable" };
                 log::info!("compiled execution capability {name}: {state}");
             }
-            let scheduler = if execution.is_autonomous() {
+            let scheduler = if execution.scheduler_task_running() {
                 "active"
             } else {
                 "inactive"

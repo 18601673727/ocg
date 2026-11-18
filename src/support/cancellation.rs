@@ -32,7 +32,12 @@ impl CancellationToken {
     }
 
     pub(crate) fn cancel_for(&self, reason: CancellationReason) {
-        let reason = if self.deadline_expired() {
+        let deadline = self
+            .0
+            .deadline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let reason = if deadline.is_some_and(|limit| limit <= Instant::now()) {
             CancellationReason::Deadline
         } else {
             reason
@@ -45,6 +50,7 @@ impl CancellationToken {
         {
             return;
         }
+        drop(deadline);
         let waiters = std::mem::take(
             &mut *self
                 .0
@@ -97,24 +103,29 @@ impl CancellationToken {
         *deadline = Some(deadline.map_or(limit, |current| current.min(limit)));
     }
 
-    fn deadline_expired(&self) -> bool {
-        self.0
-            .deadline
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_some_and(|deadline| deadline <= Instant::now())
-    }
-
     pub(crate) fn reason(&self) -> Option<CancellationReason> {
         use CancellationReason::{
             Deadline, EvidenceUnavailable, HostShutdown, Unspecified, UserStop,
         };
-        match self.0.reason.load(Ordering::Acquire) {
+        let mut reason = self.0.reason.load(Ordering::Acquire);
+        if reason == 0 {
+            let deadline = self
+                .0
+                .deadline
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            reason = self.0.reason.load(Ordering::Acquire);
+            if reason == 0 {
+                return deadline
+                    .is_some_and(|limit| limit <= Instant::now())
+                    .then_some(Deadline);
+            }
+        }
+        match reason {
             value if value == UserStop as u8 => Some(UserStop),
             value if value == HostShutdown as u8 => Some(HostShutdown),
             value if value == Deadline as u8 => Some(Deadline),
             value if value == EvidenceUnavailable as u8 => Some(EvidenceUnavailable),
-            0 => self.deadline_expired().then_some(Deadline),
             _ => Some(Unspecified),
         }
     }

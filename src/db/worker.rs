@@ -253,6 +253,7 @@ impl DatabaseWorker {
                     observation_changes: Default::default(),
                     output_changes: Default::default(),
                     scheduler_wake,
+                    native_stops: Default::default(),
                     scheduler_subscription: std::sync::Mutex::new(Some(scheduler_subscription)),
                     database_directory: directory.to_path_buf(),
                     admission: RwLock::new(Admission::Open),

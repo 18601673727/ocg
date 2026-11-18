@@ -376,6 +376,12 @@ pub(crate) fn map_mutation_error(error: DatabaseError) -> Refusal {
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
         DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
         DatabaseError::Rejected(Violation::ProfileChanged) => PROFILE_CHANGED,
+        DatabaseError::Rejected(Violation::ProfileArchiveRefused(reason)) => Refusal::new(
+            StatusCode::CONFLICT,
+            "model_archive_refused",
+            "A configuration that depends on these profiles prevents archiving them.",
+        )
+        .with_reason(reason),
         DatabaseError::Rejected(Violation::DuplicateReference(_)) => INVALID_LLM_TARGET,
         DatabaseError::QueueFull | DatabaseError::ReadQueueFull => DATABASE_BUSY,
         DatabaseError::ShuttingDown | DatabaseError::ReadsClosed => SHUTTING_DOWN,
@@ -1753,12 +1759,7 @@ pub(crate) async fn delete_model(
     database
         .archive_model(id.into())
         .await
-        .map_err(|error| match error {
-            DatabaseError::Rejected(Violation::InvalidValue("archive", reason)) => {
-                Refusal::new(StatusCode::CONFLICT, "model_archive_refused", reason)
-            }
-            error => map_mutation_error(error),
-        })?;
+        .map_err(map_mutation_error)?;
     Ok(Reply::ok(
         build_profiles_snapshot(database, Some(id)).await?,
     ))

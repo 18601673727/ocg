@@ -187,64 +187,100 @@ pub(crate) fn confirmed_answer(
     }))
 }
 
-pub(super) fn settlement_failure(
-    error: BatchError,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum SettlementTarget {
+    ConfirmedAnswer(JobId),
+    ClosingGroup(JobId),
+}
+
+pub(super) enum StartupSettlementError {
+    Storage(StorageError),
+    Rejected(SettlementTarget, crate::db::entities::Violation),
+}
+
+fn classify_settlement_error(
+    batch: &Batch,
+    target: SettlementTarget,
     operation: &str,
-    job: Option<JobId>,
-    group: Option<JobId>,
-) -> StorageError {
-    let job = job.map_or_else(|| "unidentified".to_owned(), |id| id.to_string());
-    let group = group.map_or_else(|| "unidentified".to_owned(), |id| id.to_string());
-    let context = format!("recovery {operation} (Job {job}, Group {group})");
-    match error.0 {
+    error: BatchError,
+) -> StartupSettlementError {
+    // Prefer any latched storage failure over the returned business rejection.
+    let failure = batch
+        .check_failure()
+        .err()
+        .filter(|error| matches!(&error.0, Failure::Storage(_)))
+        .unwrap_or(error);
+    match failure.0 {
         Failure::Storage(mut error) => {
-            error.detail = format!("{context}: {}", error.detail);
-            error
+            error.detail = format!(
+                "startup settlement {operation} for {target:?}: {}",
+                error.detail
+            );
+            StartupSettlementError::Storage(error)
         }
-        Failure::Rejected(violation) => StorageError {
-            kind: super::StorageErrorKind::Other,
-            os_error: None,
-            detail: format!(
-                "{context}: business rejection; recovery cannot safely continue: {violation}"
-            ),
-        },
+        Failure::Rejected(reason) => StartupSettlementError::Rejected(target, reason),
     }
 }
 
-pub(crate) fn settle_confirmed_answers(batch: &mut Batch) -> Result<(), StorageError> {
+pub(super) fn settle_startup(
+    batch: &mut Batch,
+    excluded: &std::collections::BTreeSet<SettlementTarget>,
+) -> Result<(), StartupSettlementError> {
+    settle_confirmed_answers(batch, excluded)?;
+    finish_closing_groups(batch, excluded)?;
+    batch.check_failure().map_err(|error| match error.0 {
+        Failure::Storage(error) => StartupSettlementError::Storage(error),
+        Failure::Rejected(reason) => StartupSettlementError::Storage(StorageError::corrupted(
+            format!("startup settlement latched a rejection without an owning object: {reason}"),
+        )),
+    })
+}
+
+fn settle_confirmed_answers(
+    batch: &mut Batch,
+    excluded: &std::collections::BTreeSet<SettlementTarget>,
+) -> Result<(), StartupSettlementError> {
     let candidates = batch
         .step(|tx| {
             let mut found = Vec::new();
             for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
                 let (key, value) = entry?;
-                let allocation = allocations::decode_pool_allocation(key.value(), value.value())
-                    .map_err(|error| {
-                        settlement_failure(
-                            BatchError(Failure::Storage(error)),
-                            "decode confirmed answer Allocation",
-                            Some(JobId::new(key.value())),
-                            None,
-                        )
-                    })?;
-                let result = confirmed_answer(tx, &allocation).map_err(|error| {
-                    settlement_failure(
-                        BatchError(Failure::Storage(error)),
-                        "verify confirmed answer",
-                        Some(allocation.token.job),
-                        None,
-                    )
-                })?;
-                if let Some(result) = result {
+                let allocation = allocations::decode_pool_allocation(key.value(), value.value())?;
+                if excluded.contains(&SettlementTarget::ConfirmedAnswer(allocation.token.job)) {
+                    continue;
+                }
+                if let Some(result) = confirmed_answer(tx, &allocation)? {
                     found.push((allocation, result));
                 }
             }
             Ok(found)
         })
-        .map_err(|error| settlement_failure(error, "scan confirmed answers", None, None))?;
+        .map_err(|error| startup_read_error("scan confirmed answers", error))?;
     for (allocation, result) in candidates {
-        batch.settle_confirmed_answer(allocation, result)?;
+        let target = SettlementTarget::ConfirmedAnswer(allocation.token.job);
+        if let Err(error) = batch.settle_confirmed_answer(allocation, result) {
+            return Err(classify_settlement_error(
+                batch,
+                target,
+                "settle confirmed answer",
+                error,
+            ));
+        }
     }
     Ok(())
+}
+
+fn startup_read_error(operation: &str, error: BatchError) -> StartupSettlementError {
+    let error = match error.0 {
+        Failure::Storage(mut error) => {
+            error.detail = format!("startup settlement {operation}: {}", error.detail);
+            error
+        }
+        Failure::Rejected(reason) => StorageError::corrupted(format!(
+            "startup settlement {operation} unexpectedly rejected a read: {reason}"
+        )),
+    };
+    StartupSettlementError::Storage(error)
 }
 
 impl Batch {
@@ -252,37 +288,27 @@ impl Batch {
         &mut self,
         allocation: crate::db::entities::PoolAllocation,
         mut result: crate::db::entities::FinalResult,
-    ) -> Result<(), StorageError> {
+    ) -> Result<(), BatchError> {
         let job_id = allocation.token.job;
-        let Some(job) = self.mutable_job(job_id).map_err(|error| {
-            settlement_failure(error, "load confirmed answer Job", Some(job_id), None)
-        })?
-        else {
-            return Err(StorageError::corrupted(format!(
-                "confirmed answer Job {job_id} is missing"
-            )));
+        let Some(job) = self.mutable_job(job_id)? else {
+            return self.corrupted(format!("confirmed answer Job {job_id} is missing"));
         };
-        let failure = |error, operation| {
-            settlement_failure(error, operation, Some(job_id), Some(job.parent_id))
-        };
-        self.normalize_summary_output(&job, &mut result)
-            .map_err(|error| failure(error, "normalize confirmed summary"))?;
-        self.settle_mutable_outcome(allocation.token, &job, OutcomeKind::Completed, result)
-            .map_err(|error| failure(error, "settle confirmed outcome"))?;
+        self.normalize_summary_output(&job, &mut result)?;
+        self.settle_mutable_outcome(allocation.token, &job, OutcomeKind::Completed, result)?;
         let mut released = allocation.clone();
         released.phase = crate::db::entities::AllocationPhase::Released;
-        self.put_pool_allocation(&released, Some(&allocation))
-            .map_err(|error| failure(error, "release confirmed Allocation"))?;
-        self.settle_summary_membership(&job)
-            .map_err(|error| failure(error, "settle confirmed summary membership"))?;
-        self.settle_standalone_decision(&job)
-            .map_err(|error| failure(error, "settle confirmed standalone Decision"))?;
+        self.put_pool_allocation(&released, Some(&allocation))?;
+        self.settle_summary_membership(&job)?;
+        self.settle_standalone_decision(&job)?;
         self.freed_capacity = true;
         Ok(())
     }
 }
 
-pub(crate) fn finish_closing_groups(batch: &mut Batch) -> Result<(), StorageError> {
+fn finish_closing_groups(
+    batch: &mut Batch,
+    excluded: &std::collections::BTreeSet<SettlementTarget>,
+) -> Result<(), StartupSettlementError> {
     use std::ops::Bound::{Excluded, Unbounded};
     let mut after = None;
     loop {
@@ -295,28 +321,34 @@ pub(crate) fn finish_closing_groups(batch: &mut Batch) -> Result<(), StorageErro
                     .transpose()?;
                 Ok(entry.map(|(key, _)| key.value()))
             })
-            .map_err(|error| {
-                settlement_failure(
-                    error,
-                    "scan closing Groups",
-                    None,
-                    after.map(|key: (u128, u128)| JobId::new(key.1)),
-                )
-            })?;
+            .map_err(|error| startup_read_error("scan closing Groups", error))?;
         let Some(key) = next else {
             return Ok(());
         };
         after = Some(key);
         let group = JobId::new(key.1);
-        let spec = batch.job(group).map_err(|error| {
-            settlement_failure(error, "load closing Group", None, Some(group))
-        })?.ok_or_else(|| StorageError::corrupted(format!(
-            "recovery load closing Group {group}: LIVE_CHILDREN of Group {} references a missing Group", JobId::new(key.0)
-        )))?;
-        if spec.is_chunk_group() {
-            batch.recover_chunk_group(&spec).map_err(|error| {
-                settlement_failure(error, "recover closing Chunk Group", None, Some(group))
+        let target = SettlementTarget::ClosingGroup(group);
+        if excluded.contains(&target) {
+            continue;
+        }
+        let spec = batch
+            .job(group)
+            .map_err(|error| startup_read_error("load closing Group", error))?
+            .ok_or_else(|| {
+                StartupSettlementError::Storage(StorageError::corrupted(format!(
+                    "LIVE_CHILDREN of Group {} references missing Group {group}",
+                    JobId::new(key.0)
+                )))
             })?;
+        if spec.is_chunk_group()
+            && let Err(error) = batch.recover_chunk_group(&spec)
+        {
+            return Err(classify_settlement_error(
+                batch,
+                target,
+                "recover closing Chunk Group",
+                error,
+            ));
         }
     }
 }

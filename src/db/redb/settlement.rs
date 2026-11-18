@@ -1,4 +1,4 @@
-use super::StorageError;
+use super::{StorageError, TxRead};
 use crate::db::entities::{
     AppendedOutput, DependencyCondition, DependencyState, ExecutionEventKind, FrozenConfiguration,
     FrozenExecutionConfig, JobId, JobSpec, MutableJobPhase, Origin, OutcomeCause, OutcomeKind,
@@ -10,6 +10,7 @@ use crate::db::redb::codec::Code;
 use crate::db::redb::jobs::{
     TurnMembership, decode_mutable_job, is_predictive_helper, mutable_priority,
 };
+use crate::db::redb::reads::execution_context::NativeSourceError;
 use crate::db::redb::reservations::mutable_configuration_requirement;
 use crate::db::redb::rows::decode_output;
 use crate::db::redb::schema::{
@@ -20,6 +21,23 @@ use crate::db::redb::{reads, state};
 use ::redb::ReadableTable;
 
 impl Batch {
+    pub(super) fn read_summary_source<T>(
+        &mut self,
+        read: impl FnOnce(&::redb::WriteTransaction) -> Result<T, NativeSourceError>,
+    ) -> Result<T, BatchError> {
+        self.step(|tx| match read(tx) {
+            Ok(value) => Ok(Ok(value)),
+            Err(NativeSourceError::Storage(error)) => Err(error),
+            Err(NativeSourceError::Corrupt { job, detail }) => {
+                Ok(Err(Violation::SummarySourceCorrupt { job, detail }))
+            }
+            Err(NativeSourceError::Unavailable(reason)) => {
+                Ok(Err(Violation::InvalidValue("summary_source", reason)))
+            }
+        })?
+        .map_err(|violation| BatchError(Failure::Rejected(violation)))
+    }
+
     pub(super) fn automatic_compaction(
         &mut self,
         body: impl FnOnce(&mut Self) -> Result<(), BatchError>,
@@ -30,6 +48,10 @@ impl Batch {
         self.probe = probe;
         self.check_failure()?;
         match result {
+            Err(BatchError(Failure::Rejected(Violation::SummarySourceCorrupt { job, detail }))) => {
+                log::error!("automatic compaction skipped for corrupt source {job}: {detail}");
+                Ok(())
+            }
             Err(BatchError(Failure::Rejected(reason))) => {
                 log::debug!("automatic compaction declined before writes: {reason}");
                 Ok(())
@@ -62,12 +84,12 @@ impl Batch {
             return Ok(());
         };
         let summarizer = policy.summarization_model.unwrap_or(frozen.llm.model.id);
-        let total_tokens = self.step(|tx| {
+        let total_tokens = self.read_summary_source(|tx| {
             let Some(tip) = reads::jobs::turn_head(tx, conversation)? else {
                 return Ok(0usize);
             };
-            let jobs = tx.open_table(JOBS)?;
-            let outputs = tx.open_table(JOB_OUTPUTS)?;
+            let jobs = tx.table(JOBS)?;
+            let outputs = tx.table(JOB_OUTPUTS)?;
             let mut cursor = Some(tip);
             let mut total_tokens = 0usize;
             let mut steps = 0usize;
@@ -76,16 +98,22 @@ impl Batch {
                 if steps > 4096 {
                     break;
                 }
-                let Some(row) = jobs.get(turn_id.get())? else {
-                    break;
-                };
-                let turn_job = decode_mutable_job(turn_id.get(), row.value())?;
+                let row = jobs.get(turn_id.get())?.ok_or_else(|| {
+                    NativeSourceError::malformed(turn_id, "source Job is missing")
+                })?;
+                let turn_job = NativeSourceError::decoded(
+                    turn_id,
+                    decode_mutable_job(turn_id.get(), row.value()),
+                )?;
                 let mut bytes = 16usize
                     .saturating_add(turn_job.input.text().len())
                     .saturating_add(turn_job.input.attachments().len().saturating_mul(4800));
                 for entry in outputs.range((turn_id.get(), 0)..=(turn_id.get(), u32::MAX))? {
                     let (key, value) = entry?;
-                    let out = decode_output(key.value(), value.value())?;
+                    let out = NativeSourceError::decoded(
+                        turn_id,
+                        decode_output(key.value(), value.value()),
+                    )?;
                     if out.kind == OutputKind::Result {
                         bytes = bytes
                             .saturating_add(out.display_text().as_ref().map_or(0, String::len));
@@ -101,10 +129,10 @@ impl Batch {
             i64::from(p.minimum_interval_seconds).saturating_mul(1_000_000)
         });
         let now_micros = self.now.as_unix_micros();
-        let (summary_blocked, pred_blocked, pred_count) = self.step(|tx| {
-            let children = tx.open_table(CHILDREN)?;
-            let jobs = tx.open_table(JOBS)?;
-            let states = tx.open_table(JOB_RUNTIME)?;
+        let (summary_blocked, pred_blocked, pred_count) = self.read_summary_source(|tx| {
+            let children = tx.table(CHILDREN)?;
+            let jobs = tx.table(JOBS)?;
+            let states = tx.table(JOB_RUNTIME)?;
             let mut summary_blocked = false;
             let mut pred_blocked = false;
             let mut pred_count = 0u32;
@@ -116,10 +144,14 @@ impl Batch {
                 let Some(row) = jobs.get(child_id)? else {
                     continue;
                 };
-                let child_job = decode_mutable_job(child_id, row.value())?;
+                let child = JobId::new(child_id);
+                let child_job =
+                    NativeSourceError::decoded(child, decode_mutable_job(child_id, row.value()))?;
                 let outcome = states
                     .get(child_id)?
-                    .map(|s| state::decode_state(child_id, s.value()))
+                    .map(|s| {
+                        NativeSourceError::decoded(child, state::decode_state(child_id, s.value()))
+                    })
                     .transpose()?
                     .and_then(|s| s.outcome);
                 if child_job.summary_source.is_some() {

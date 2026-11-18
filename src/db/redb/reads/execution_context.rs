@@ -17,7 +17,7 @@ use crate::db::redb::schema::{
     ATTACHMENTS, CHILD_GROUPS, CHILDREN, DEPENDENCY_WAITERS, EXECUTORS, JOB_OUTPUTS, JOB_RUNTIME,
     JOBS, MESSAGES, META, POOL_ALLOCATIONS, POOLS, PROJECTS, TOOL_CALLS,
 };
-use crate::db::redb::{StorageError, allocations, state};
+use crate::db::redb::{StorageError, allocations, jobs, state};
 use ::redb::{Database, ReadTransaction, ReadableTable};
 use std::collections::BTreeSet;
 
@@ -123,7 +123,27 @@ const SUMMARY_MAX_RECORD_BYTES: usize = 8 * 1024 * 1024;
 
 pub(crate) enum NativeSourceError {
     Unavailable(&'static str),
+    Corrupt { job: JobId, detail: String },
     Storage(StorageError),
+}
+
+impl NativeSourceError {
+    pub(crate) fn malformed(job: JobId, detail: impl Into<String>) -> Self {
+        Self::Corrupt {
+            job,
+            detail: detail.into(),
+        }
+    }
+
+    pub(crate) fn decoded<T>(job: JobId, decoded: Result<T, StorageError>) -> Result<T, Self> {
+        decoded.map_err(|error| {
+            if error.kind == crate::db::redb::StorageErrorKind::Corrupted {
+                Self::malformed(job, error.detail)
+            } else {
+                Self::Storage(error)
+            }
+        })
+    }
 }
 
 impl From<StorageError> for NativeSourceError {
@@ -134,6 +154,12 @@ impl From<StorageError> for NativeSourceError {
 
 impl From<::redb::StorageError> for NativeSourceError {
     fn from(error: ::redb::StorageError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+impl From<::redb::TableError> for NativeSourceError {
+    fn from(error: ::redb::TableError) -> Self {
         Self::Storage(error.into())
     }
 }
@@ -192,17 +218,23 @@ fn native_summary_owner(
     allocation: &crate::db::entities::PoolAllocation,
     budget: &mut SummaryBudget,
 ) -> Result<(), NativeSourceError> {
+    let job = allocation.token.job;
     let pool = pools
         .get(allocation.token.pool.get())?
-        .ok_or_else(|| StorageError::corrupted("summary allocation Pool missing"))?;
+        .ok_or_else(|| NativeSourceError::malformed(job, "Allocation Pool is missing"))?;
     let executor = executors
         .get(allocation.token.executor.get())?
-        .ok_or_else(|| StorageError::corrupted("summary allocation Executor missing"))?;
+        .ok_or_else(|| NativeSourceError::malformed(job, "Allocation Executor is missing"))?;
     budget.bytes(pool.value().len())?;
     budget.bytes(executor.value().len())?;
-    let pool = allocations::decode_allocation_pool(allocation.token.pool.get(), pool.value())?;
-    let executor =
-        allocations::decode_allocation_executor(allocation.token.executor.get(), executor.value())?;
+    let pool = NativeSourceError::decoded(
+        job,
+        allocations::decode_allocation_pool(allocation.token.pool.get(), pool.value()),
+    )?;
+    let executor = NativeSourceError::decoded(
+        job,
+        allocations::decode_allocation_executor(allocation.token.executor.get(), executor.value()),
+    )?;
     if executor.pool != pool.id
         || pool.revision < allocation.pool_revision
         || executor.revision < allocation.executor_revision
@@ -254,17 +286,14 @@ where
     let tools = &tables.tools;
     let job_bytes = jobs
         .get(id.get())?
-        .ok_or_else(|| StorageError::corrupted("summary source Job missing"))?;
+        .ok_or_else(|| NativeSourceError::malformed(id, "source Job is missing"))?;
     let state_bytes = states
         .get(id.get())?
-        .ok_or_else(|| StorageError::corrupted("summary source state missing"))?;
-    let allocation_bytes = allocations
-        .get(id.get())?
-        .ok_or_else(|| StorageError::corrupted("summary source allocation missing"))?;
+        .ok_or_else(|| NativeSourceError::malformed(id, "source runtime is missing"))?;
     budget.bytes(job_bytes.value().len())?;
     budget.bytes(state_bytes.value().len())?;
-    budget.bytes(allocation_bytes.value().len())?;
-    let job = crate::db::redb::jobs::decode_mutable_job(id.get(), job_bytes.value())?;
+    let job =
+        NativeSourceError::decoded(id, jobs::decode_mutable_job(id.get(), job_bytes.value()))?;
     if matches!(
         job.input.content,
         crate::db::entities::MutableJobContent::Decision { .. }
@@ -273,10 +302,21 @@ where
             "Decision Jobs cannot be summary sources",
         ));
     }
-    let state = state::decode_state(id.get(), state_bytes.value())?;
-    let allocation = allocations::decode_pool_allocation(id.get(), allocation_bytes.value())?;
+    let state = NativeSourceError::decoded(id, state::decode_state(id.get(), state_bytes.value()))?;
+    if job.phase != MutableJobPhase::Executing {
+        return Err(NativeSourceError::Unavailable(
+            "summary source Job never started",
+        ));
+    }
+    let allocation_bytes = allocations
+        .get(id.get())?
+        .ok_or_else(|| NativeSourceError::malformed(id, "source Allocation is missing"))?;
+    budget.bytes(allocation_bytes.value().len())?;
+    let allocation = NativeSourceError::decoded(
+        id,
+        allocations::decode_pool_allocation(id.get(), allocation_bytes.value()),
+    )?;
     if job.parent_id != conversation
-        || job.phase != MutableJobPhase::Executing
         || job.summary_source.is_some()
         || job.context_selection != crate::db::entities::MutableContextSelection::FullHistory
         || !state.outcome.as_ref().is_some_and(|o| {
@@ -322,12 +362,16 @@ where
     native_summary_frame(&mut hash, budget, job_bytes.value())?;
     native_summary_frame(&mut hash, budget, state_bytes.value())?;
     native_summary_frame(&mut hash, budget, allocation_bytes.value())?;
-    for id in job.input.attachments() {
-        let bytes = attachments
-            .get(id.get())?
-            .ok_or_else(|| StorageError::corrupted("summary source attachment missing"))?;
+    for attachment_id in job.input.attachments() {
+        let bytes = attachments.get(attachment_id.get())?.ok_or_else(|| {
+            NativeSourceError::malformed(
+                id,
+                format!("source attachment {attachment_id} is missing"),
+            )
+        })?;
         native_summary_frame(&mut hash, budget, bytes.value())?;
-        let attachment = decode_attachment(id.get(), bytes.value())?;
+        let attachment =
+            NativeSourceError::decoded(id, decode_attachment(attachment_id.get(), bytes.value()))?;
         if !attachment.is_available() {
             return Err(NativeSourceError::Unavailable(
                 "summary source attachment unavailable",
@@ -347,10 +391,13 @@ where
                     "summary source output overflow",
                 ))?
         {
-            return Err(StorageError::corrupted("summary source output sequence has a gap").into());
+            return Err(NativeSourceError::malformed(
+                id,
+                "source output sequence has a gap",
+            ));
         }
         native_summary_frame(&mut hash, budget, bytes.value())?;
-        let output = decode_output(key.value(), bytes.value())?;
+        let output = NativeSourceError::decoded(id, decode_output(key.value(), bytes.value()))?;
         if output.created_at < allocation.claimed_at
             || state
                 .outcome
@@ -362,15 +409,19 @@ where
             ));
         }
         if final_result {
-            return Err(
-                StorageError::corrupted("summary source output follows its final result").into(),
-            );
+            return Err(NativeSourceError::malformed(
+                id,
+                "source output follows its final result",
+            ));
         }
         final_result = output.kind == OutputKind::Result;
         through = seq;
     }
     if through == 0 || !final_result {
-        return Err(StorageError::corrupted("summary source final output missing").into());
+        return Err(NativeSourceError::malformed(
+            id,
+            "source final output is missing",
+        ));
     }
     let digest: [u8; 32] = hash
         .finish()

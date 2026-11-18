@@ -1075,7 +1075,7 @@ impl Batch {
         &mut self,
         job: JobId,
     ) -> Result<crate::db::entities::NativeStopRequest, BatchError> {
-        use crate::db::entities::{AllocationPhase, NativeStopRequest};
+        use crate::db::entities::{AllocationPhase, NativeStopRequest, UnstartedCause};
         self.require_allocation_durability()?;
         let Some(row) = self.mutable_job(job)? else {
             return self.reject(Violation::NotFound(RecordRef::Job(job)));
@@ -1090,7 +1090,10 @@ impl Batch {
                 &row,
                 OutcomeCause::Text(STOPPED_BEFORE_START_SUMMARY.to_owned()),
             )?;
-            return Ok(NativeStopRequest::EndedBeforeStart(None));
+            return Ok(NativeStopRequest::EndedBeforeStart {
+                token: None,
+                outcome: OutcomeKind::Cancelled,
+            });
         }
         let Some(allocation) = allocation else {
             return self.reject(Violation::InvalidValue(
@@ -1115,18 +1118,35 @@ impl Batch {
         let token = allocation.token;
         match allocation.phase {
             AllocationPhase::Reserved => {
+                let expired = self
+                    .native_stops
+                    .as_ref()
+                    .is_some_and(|stops| stops.deadline_has_precedence(token));
+                let (outcome, summary, code) = if expired {
+                    let deadline = UnstartedCause::DeadlineExceeded;
+                    (deadline.outcome(), deadline.summary(), deadline.code())
+                } else {
+                    (
+                        OutcomeKind::Cancelled,
+                        STOPPED_BEFORE_START_SUMMARY,
+                        STOPPED_BEFORE_START_CODE,
+                    )
+                };
                 let (job, _) = self.end_untouched_reservation(
                     token,
-                    OutcomeKind::Cancelled,
+                    outcome,
                     crate::db::entities::FinalResult {
-                        summary: Some(STOPPED_BEFORE_START_SUMMARY.to_owned()),
-                        code: Some(STOPPED_BEFORE_START_CODE.to_owned()),
+                        summary: Some(summary.to_owned()),
+                        code: Some(code.to_owned()),
                         goal_reached: Some(false),
                         value: None,
                     },
                 )?;
                 self.settle_summary_membership(&job)?;
-                Ok(NativeStopRequest::EndedBeforeStart(Some(token)))
+                Ok(NativeStopRequest::EndedBeforeStart {
+                    token: Some(token),
+                    outcome,
+                })
             }
             AllocationPhase::Running => {
                 self.transition_pool_allocation(token, AllocationPhase::StopRequested, None)?;

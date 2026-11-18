@@ -421,7 +421,7 @@ impl Batch {
                 AllocationPhase::Reserved
                 | AllocationPhase::Running
                 | AllocationPhase::StopRequested => match self.request_native_stop(turn)? {
-                    NativeStopRequest::EndedBeforeStart(token) => {
+                    NativeStopRequest::EndedBeforeStart { token, .. } => {
                         running.extend(token);
                         ended.push(turn);
                     }

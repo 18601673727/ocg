@@ -717,9 +717,7 @@ fn inspect_held_in(
     };
     let features: Vec<_> = crate::host::execution_features::COMPILED_EXECUTION_FEATURES
         .into_iter()
-        .map(|(name, enabled)| {
-            json!({"feature": name, "state": if enabled { "Enabled" } else { "Disabled" }})
-        })
+        .map(|(name, compiled)| json!({"feature": name, "compiled": compiled}))
         .collect();
     Ok(json!({
         "database": {

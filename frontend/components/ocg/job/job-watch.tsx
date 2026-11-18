@@ -33,7 +33,7 @@ import {
   type ExecutionPhase,
   type Job,
   type JobDetails,
-  type NativeStopRequest,
+  type NativeStop,
   type Output,
   type ProviderResponse,
   type ToolCall,
@@ -228,7 +228,7 @@ function JobWatchBody({
   const refreshRef = useRef<() => void>(() => {});
   const stopRequest = useRef<AbortController | null>(null);
   const [stopState, setStopState] = useState<StopState>("idle");
-  const [stopOutcome, setStopOutcome] = useState<NativeStopRequest | null>(null);
+  const [stopOutcome, setStopOutcome] = useState<NativeStop | null>(null);
   const [stopNotice, setStopNotice] = useState<StopNotice | null>(null);
   const statusReads = useRef(0);
   const [readCount, setReadCount] = useState(0);
@@ -629,7 +629,7 @@ function JobWatchBody({
     try {
       const stop = await client.stopNativeJob(context, jobId, controller.signal);
       if (controller.signal.aborted) return;
-      setStopOutcome(stop.request);
+      setStopOutcome(stop);
       setStopState("locked");
     } catch (cause) {
       if (controller.signal.aborted) return;
@@ -648,21 +648,24 @@ function JobWatchBody({
     if (!stopOutcome) return null;
     if (phase === "completed")
       return { message: t("job.stop.completedFirst"), tone: "warning" as const };
-    if (phase === "failed") return { message: t("job.stop.failedFirst"), tone: "warning" as const };
+    if (phase === "failed" || stopOutcome.execution_phase === "failed")
+      return { message: t("job.stop.failedFirst"), tone: "warning" as const };
     if (phase === "unknown")
       return { message: t("job.stop.outcomeUnknown"), tone: "warning" as const };
     if (phase === "cancelled")
       return {
         message:
-          stopOutcome === "ended_before_start"
+          stopOutcome.request === "ended_before_start"
             ? t("job.stop.endedBeforeStart")
             : t("job.stop.cancelledOutcome"),
         tone: "status" as const,
       };
-    if (stopOutcome === "ended_before_start")
+    if (stopOutcome.request === "ended_before_start")
       return { message: t("job.stop.endedBeforeStart"), tone: "status" as const };
     return {
-      message: t(stopOutcome === "requested" ? "job.stop.requested" : "job.stop.alreadyRequested"),
+      message: t(
+        stopOutcome.request === "requested" ? "job.stop.requested" : "job.stop.alreadyRequested",
+      ),
       tone: "warning" as const,
     };
   })();

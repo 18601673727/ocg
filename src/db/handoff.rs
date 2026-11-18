@@ -1,10 +1,12 @@
 use crate::db::entities;
-use crate::db::entities::{AttachmentId, Violation};
+use crate::db::entities::{AllocationToken, AttachmentId, JobId, Violation};
 use crate::db::errors::{DatabaseError, OperationStatus};
 use crate::db::redb::StorageErrorKind;
 use crate::db::shared::Shared;
-use std::sync::Arc;
+use crate::support::cancellation::{CancellationReason, CancellationToken};
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 pub(crate) struct PreparedDevelopmentHandoff {
     pub(super) candidate: crate::db::entities::DevelopmentCandidate,
@@ -389,5 +391,73 @@ pub(crate) fn classify_unstarted(error: DatabaseError) -> DevelopmentHandoffErro
             detail: error.to_string(),
         },
         None => DevelopmentHandoffError::Database(Box::new(error)),
+    }
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct NativeStops(Arc<Mutex<BTreeMap<JobId, (AllocationToken, CancellationToken)>>>);
+
+impl std::fmt::Debug for NativeStops {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("NativeStops")
+    }
+}
+
+impl NativeStops {
+    pub(crate) fn register(
+        &self,
+        token: AllocationToken,
+        cancellation: CancellationToken,
+    ) -> NativeStopRegistration {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(token.job, (token, cancellation));
+        NativeStopRegistration {
+            stops: self.clone(),
+            token,
+        }
+    }
+
+    pub(super) fn deadline_has_precedence(&self, token: AllocationToken) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&token.job)
+            .is_some_and(|(registered, cancellation)| {
+                *registered == token && cancellation.reason() == Some(CancellationReason::Deadline)
+            })
+    }
+
+    pub(crate) fn cancel(&self, token: AllocationToken) -> bool {
+        match self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&token.job)
+        {
+            Some((registered, cancellation)) if *registered == token => {
+                cancellation.cancel_for(CancellationReason::UserStop);
+                true
+            }
+            Some(_) | None => false,
+        }
+    }
+}
+
+pub(crate) struct NativeStopRegistration {
+    stops: NativeStops,
+    token: AllocationToken,
+}
+
+impl Drop for NativeStopRegistration {
+    fn drop(&mut self) {
+        let mut stops = self.stops.0.lock().unwrap_or_else(PoisonError::into_inner);
+        if stops
+            .get(&self.token.job)
+            .is_some_and(|(registered, _)| *registered == self.token)
+        {
+            stops.remove(&self.token.job);
+        }
     }
 }

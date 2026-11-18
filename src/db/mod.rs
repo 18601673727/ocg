@@ -57,7 +57,8 @@ mod errors;
 mod handle;
 mod handoff;
 pub(crate) use handoff::{
-    DevelopmentHandoff, DevelopmentHandoffError, PreparedDevelopmentHandoff, classify_unstarted,
+    DevelopmentHandoff, DevelopmentHandoffError, NativeStops, PreparedDevelopmentHandoff,
+    classify_unstarted,
 };
 mod scheduler_wake;
 mod shared;

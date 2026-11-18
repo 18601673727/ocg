@@ -69,6 +69,7 @@ pub(super) struct Shared {
     pub(super) catalog_changes: crate::support::notification::Notifications,
     pub(super) observation_changes: crate::support::notification::Journal<ObservationChange>,
     pub(super) scheduler_wake: SchedulerWake,
+    pub(super) native_stops: crate::db::NativeStops,
     pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
     pub(super) database_directory: PathBuf,
     pub(super) admission: RwLock<Admission>,

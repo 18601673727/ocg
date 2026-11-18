@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use crate::ai::providers::{CancellationToken, ProviderExecutionConfig};
+use crate::db::NativeStops;
 use crate::db::entities::{
     AllocationPhase, AllocationToken, ExecutionOperation, JobId, OutcomeKind, PoolAllocation,
     UnstartedCause,
@@ -11,7 +12,6 @@ use crate::jobs::execution::runtime::{
     EndpointPolicy, WorkspaceTools, supervise_development_decision,
     supervise_development_generative,
 };
-use crate::jobs::execution::stops::NativeStops;
 use crate::jobs::execution::tools::native::NativeTooling;
 use crate::support::cancellation::CancellationReason;
 

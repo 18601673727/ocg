@@ -45,7 +45,7 @@ pub(crate) struct ToolExecution {
     pub(crate) decider: bool,
     pub(crate) offer: ToolOffer,
     pub(crate) limits: ToolLoopLimits,
-    pub(crate) stops: crate::jobs::execution::stops::NativeStops,
+    pub(crate) stops: crate::db::NativeStops,
     pub(crate) workspace: Option<crate::workspace::files::read::Workspace>,
 }
 

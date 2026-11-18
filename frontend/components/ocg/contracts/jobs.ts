@@ -81,7 +81,7 @@ export type NativeStop = {
   job: string;
   request: NativeStopRequest;
   stopped: boolean;
-  execution_phase: "cancelled" | "stop_requested";
+  execution_phase: "cancelled" | "failed" | "stop_requested";
 };
 
 const JOB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -99,17 +99,31 @@ export function projectNativeStop(status: number, input: unknown): NativeStop {
   const stop = body?.stop;
   if (body?.api_version !== 1 || !stop || typeof stop.job !== "string" || !JOB_ID.test(stop.job))
     throw new ContractError("stop", "a valid native stop answer");
-  if (stop.request === "ended_before_start") {
-    if (status !== 200 || stop.stopped !== true || stop.execution_phase !== "cancelled")
-      throw new ContractError("stop", "a confirmed stop");
-  } else if (stop.request === "requested" || stop.request === "already_requested") {
-    if (status !== 202 || stop.stopped !== false || stop.execution_phase !== "stop_requested")
-      throw new ContractError("stop", "a requested stop");
-  } else throw new ContractError("stop.request", "a native stop request outcome");
-  return {
-    job: stop.job,
-    request: stop.request,
-    stopped: stop.stopped,
-    execution_phase: stop.execution_phase,
-  };
+  if (
+    stop.request === "ended_before_start" &&
+    status === 200 &&
+    ((stop.stopped === true && stop.execution_phase === "cancelled") ||
+      (stop.stopped === false && stop.execution_phase === "failed"))
+  ) {
+    return {
+      job: stop.job,
+      request: stop.request,
+      stopped: stop.stopped,
+      execution_phase: stop.execution_phase,
+    };
+  }
+  if (
+    (stop.request === "requested" || stop.request === "already_requested") &&
+    status === 202 &&
+    stop.stopped === false &&
+    stop.execution_phase === "stop_requested"
+  ) {
+    return {
+      job: stop.job,
+      request: stop.request,
+      stopped: false,
+      execution_phase: "stop_requested",
+    };
+  }
+  throw new ContractError("stop", "a consistent native stop outcome");
 }

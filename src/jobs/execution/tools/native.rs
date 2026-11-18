@@ -13,7 +13,7 @@ const MAX_AGENTS_MD_BYTES: usize = 32 * 1024;
 
 pub(crate) struct NativeTooling<'a> {
     data_directory: &'a crate::host::data_directory::DataDirectory,
-    stops: crate::jobs::execution::stops::NativeStops,
+    stops: crate::db::NativeStops,
     built: Option<ToolExecution>,
     cancellation: CancellationToken,
 }
@@ -21,7 +21,7 @@ pub(crate) struct NativeTooling<'a> {
 impl<'a> NativeTooling<'a> {
     pub(crate) fn new(
         data_directory: &'a crate::host::data_directory::DataDirectory,
-        stops: crate::jobs::execution::stops::NativeStops,
+        stops: crate::db::NativeStops,
         cancellation: CancellationToken,
     ) -> Self {
         Self {
@@ -146,7 +146,7 @@ async fn build(
     data_directory: &crate::host::data_directory::DataDirectory,
     project: Option<&ProjectRecord>,
     wiring: Wiring,
-    stops: crate::jobs::execution::stops::NativeStops,
+    stops: crate::db::NativeStops,
 ) -> Result<(ToolExecution, DevelopmentToolOffer), &'static str> {
     let mut agents_md = None;
     let workspace = match project {
@@ -185,7 +185,7 @@ async fn build(
     _data_directory: &crate::host::data_directory::DataDirectory,
     _project: Option<&ProjectRecord>,
     _wiring: Wiring,
-    _stops: crate::jobs::execution::stops::NativeStops,
+    _stops: crate::db::NativeStops,
 ) -> Result<(ToolExecution, DevelopmentToolOffer), &'static str> {
     Err("workspace_unsupported")
 }
@@ -202,7 +202,7 @@ struct Wiring {
 fn tools_of(
     workspace: Option<(Workspace, &[crate::db::entities::ProjectCommand])>,
     wiring: Wiring,
-    stops: crate::jobs::execution::stops::NativeStops,
+    stops: crate::db::NativeStops,
 ) -> Result<ToolExecution, ToolRegistryError> {
     let registry = ToolRegistry::default();
     let limits = if workspace.is_some() {

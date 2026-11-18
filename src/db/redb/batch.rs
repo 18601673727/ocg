@@ -90,6 +90,7 @@ pub(crate) struct Batch {
     pub(super) probe: Option<Probe>,
     pub(super) resource_deltas: Vec<NativeResourceDelta>,
     pub(super) execution_transaction: Option<u64>,
+    pub(crate) native_stops: Option<crate::db::NativeStops>,
     failure: Option<Failure>,
 }
 
@@ -258,6 +259,7 @@ impl Batch {
             probe: None,
             resource_deltas: Vec::new(),
             execution_transaction: None,
+            native_stops: None,
             failure: None,
         }
     }

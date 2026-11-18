@@ -228,11 +228,14 @@ fn startup_checks(
 ) -> Result<Verification, StorageError> {
     let tx = database.begin_read()?;
     let clean = startup_metadata(&tx)?;
-    if clean && !force_full && allocations_are_quiet(&tx)? && !indexes::verify_compaction_refs(&tx)?
-    {
-        return Ok(Verification::Quick);
+    if clean && !force_full && allocations_are_quiet(&tx)? {
+        if !indexes::verify_compaction_refs(&tx)? {
+            return Ok(Verification::Quick);
+        }
+        check_records_after_compaction_refs(&tx)?;
+    } else {
+        check_records(&tx)?;
     }
-    check_records(&tx)?;
     refuse_unresolved_ownership(&tx)?;
     Ok(Verification::Full)
 }
@@ -386,11 +389,15 @@ pub(crate) fn verify_reserved_residual(
 }
 
 fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
+    indexes::verify_compaction_refs(tx)?;
+    check_records_after_compaction_refs(tx)
+}
+
+fn check_records_after_compaction_refs(tx: &ReadTransaction) -> Result<(), StorageError> {
     check_record_headers(tx)?;
     check_record_payloads(tx)?;
     check_native_invariants(tx)?;
     indexes::verify_job_indexes(tx)?;
-    indexes::verify_compaction_refs(tx)?;
     check_execution_history(tx)
 }
 
@@ -1419,9 +1426,34 @@ fn preflight(
 }
 
 fn initialize(database: &Database, fresh: bool) -> Result<u64, StorageError> {
+    reservations::init_promotion_clock(Timestamp::now().as_unix_micros());
+    let mut excluded = std::collections::BTreeSet::new();
+    let batch = loop {
+        let mut batch = initialize_batch(database, fresh)?;
+        match settle::settle_startup(&mut batch, &excluded) {
+            Ok(()) => break batch,
+            Err(settle::StartupSettlementError::Storage(error)) => return Err(error),
+            Err(settle::StartupSettlementError::Rejected(target, reason)) => {
+                // A settlement can reject after writing. Retry from the committed
+                // snapshot so the excluded object keeps its facts and ownership.
+                batch.tx.abort()?;
+                if !excluded.insert(target) {
+                    return Err(StorageError::corrupted(format!(
+                        "startup settlement attempted excluded object {target:?}"
+                    )));
+                }
+                eprintln!("OCG startup settlement deferred {target:?}: {reason}");
+            }
+        }
+    };
+    let epoch = batch.epoch;
+    batch.tx.commit()?;
+    Ok(epoch)
+}
+
+fn initialize_batch(database: &Database, fresh: bool) -> Result<Batch, StorageError> {
     let mut tx = database.begin_write()?;
     tx.set_durability(Durability::Immediate)?;
-    reservations::init_promotion_clock(Timestamp::now().as_unix_micros());
 
     if fresh {
         create_tables(&tx)?;
@@ -1493,13 +1525,7 @@ fn initialize(database: &Database, fresh: bool) -> Result<u64, StorageError> {
 
     let mut batch = Batch::new(tx, epoch);
     batch.commit_mode = Some(Commit::Durable);
-    settle_confirmed_answers(&mut batch)?;
-    finish_closing_groups(&mut batch)?;
-    batch
-        .check_failure()
-        .map_err(|error| settlement_failure(error, "commit initialization", None, None))?;
-    batch.tx.commit()?;
-    Ok(epoch)
+    Ok(batch)
 }
 
 pub(super) fn allocate(tx: &WriteTransaction) -> Result<u128, StorageError> {

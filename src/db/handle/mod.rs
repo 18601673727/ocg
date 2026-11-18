@@ -241,8 +241,7 @@ impl DatabaseHandle {
         args: A,
         f: impl FnOnce(&mut redb::Batch, A) -> Result<T, redb::BatchError> + Send + 'static,
     ) -> Result<T, DatabaseError> {
-        self.submit(|reply| Command::new(args, reply, |_| bytes, kind, move |a, b| f(b, a)))
-            .await
+        self.write_sized(args, |_| bytes, kind, f).await
     }
 
     async fn write_sized<A: Send + 'static, T: Send + 'static>(
@@ -252,8 +251,14 @@ impl DatabaseHandle {
         kind: OperationKind,
         f: impl FnOnce(&mut redb::Batch, A) -> Result<T, redb::BatchError> + Send + 'static,
     ) -> Result<T, DatabaseError> {
-        self.submit(|reply| Command::new(args, reply, size, kind, move |a, b| f(b, a)))
-            .await
+        let stops = self.native_stops();
+        self.submit(|reply| {
+            Command::new(args, reply, size, kind, move |args, batch| {
+                batch.native_stops = Some(stops);
+                f(batch, args)
+            })
+        })
+        .await
     }
 
     async fn write_output<A: Send + 'static, T: Send + 'static>(
@@ -264,9 +269,13 @@ impl DatabaseHandle {
         kind: OperationKind,
         f: impl FnOnce(&mut redb::Batch, A) -> Result<T, redb::BatchError> + Send + 'static,
     ) -> Result<T, DatabaseError> {
+        let stops = self.native_stops();
         self.submit(|reply| {
             Command::custom(args, reply, size, move |args, reply, db, op, commit| {
-                let mut outcome = run(db, op, commit, kind, reply, |batch| f(batch, args));
+                let mut outcome = run(db, op, commit, kind, reply, |batch| {
+                    batch.native_stops = Some(stops);
+                    f(batch, args)
+                });
                 if outcome.committed {
                     outcome.output_changed = Some(job);
                 }

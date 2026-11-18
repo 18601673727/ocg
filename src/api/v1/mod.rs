@@ -16,13 +16,13 @@ use ntex::time::Seconds;
 use ntex::web::{self, App, HttpRequest, HttpResponse, HttpServer};
 use serde_json::{Value, json};
 
+use crate::db::NativeStops;
 use crate::db::entities::{
     AttachmentId, ExecutionPoolId, JobId, JobOutputRecord, NotInvokedReason, OutputKind, ProfileId,
     ProjectId, RequestNumber, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind,
     UncertainCause, WithheldReason,
 };
 use crate::db::{DatabaseError, DatabaseHandle, DatabaseStatus};
-use crate::jobs::execution::stops::NativeStops;
 
 mod assets;
 mod attachments;

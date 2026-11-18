@@ -122,6 +122,10 @@ pub enum Violation {
     InvalidValue(&'static str, &'static str),
     #[error("the Profile changed while it was being validated; reload and retry")]
     ProfileChanged,
+    #[error("{0}")]
+    ProfileArchiveRefused(String),
+    #[error("summary source for {job} is corrupt: {detail}")]
+    SummarySourceCorrupt { job: JobId, detail: String },
     #[error("{0} cannot be its own parent")]
     SelfParent(JobId),
     #[error("the parent of {0} was fixed when it was submitted")]

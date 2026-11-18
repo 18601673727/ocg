@@ -912,6 +912,20 @@ impl Batch {
     }
 
     fn archive_models(&mut self, rows: Vec<ConfigRow>) -> Result<(), BatchError> {
+        self.apply_model_archive(rows)
+            .map_err(|error| match error.0 {
+                Failure::Rejected(reason) => {
+                    let detail = match reason {
+                        Violation::InvalidValue("archive", detail) => detail.to_owned(),
+                        other => other.to_string(),
+                    };
+                    BatchError(Failure::Rejected(Violation::ProfileArchiveRefused(detail)))
+                }
+                Failure::Storage(_) => error,
+            })
+    }
+
+    fn apply_model_archive(&mut self, rows: Vec<ConfigRow>) -> Result<(), BatchError> {
         if rows.is_empty() {
             return self.purge_unused_credentials();
         }

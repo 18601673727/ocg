@@ -1,4 +1,5 @@
-use super::{StorageError, jobs};
+use super::reads::execution_context::NativeSourceError;
+use super::{StorageError, TxRead, jobs};
 use crate::db::entities::ToolCallRef;
 use crate::db::entities::{
     AttachmentId, AttachmentRecord, ConfigId, ContentDigest, DependencyCondition,
@@ -22,6 +23,16 @@ use crate::db::redb::schema::{
 use crate::db::redb::{allocations, indexes, reads, reservations, rows, state};
 use ::redb::ReadableTable;
 use ::redb::ReadableTableMetadata;
+
+fn summary_source_job(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    job: JobId,
+) -> Result<crate::db::entities::MutableJob, NativeSourceError> {
+    let row = jobs
+        .get(job.get())?
+        .ok_or_else(|| NativeSourceError::malformed(job, "source Job is missing"))?;
+    NativeSourceError::decoded(job, jobs::decode_mutable_job(job.get(), row.value()))
+}
 
 impl Batch {
     pub(crate) fn request_compaction(
@@ -172,12 +183,18 @@ impl Batch {
             });
         };
         loop {
-            let Some(candidate) = self.mutable_job(through)? else {
-                return Ok(crate::db::entities::CompactionRequest::Noop {
-                    reason: "no settled source",
-                });
-            };
-            let state = self.require_job_state(through)?;
+            let (candidate, state) = self.read_summary_source(|tx| {
+                let candidate = summary_source_job(&tx.table(JOBS)?, through)?;
+                let states = tx.table(JOB_RUNTIME)?;
+                let row = states.get(through.get())?.ok_or_else(|| {
+                    NativeSourceError::malformed(through, "source runtime is missing")
+                })?;
+                let state = NativeSourceError::decoded(
+                    through,
+                    state::decode_state(through.get(), row.value()),
+                )?;
+                Ok((candidate, state))
+            })?;
             if candidate.summary_source.is_none()
                 && state
                     .outcome
@@ -195,7 +212,9 @@ impl Batch {
         }
         if let Some(recipe) = &automatic {
             for _ in 0..recipe.preserve_recent_turns {
-                let Some(prev) = self.mutable_job(through)?.and_then(|job| job.previous) else {
+                let job =
+                    self.read_summary_source(|tx| summary_source_job(&tx.table(JOBS)?, through))?;
+                let Some(prev) = job.previous else {
                     return Ok(crate::db::entities::CompactionRequest::Noop {
                         reason: "recent turns are protected",
                     });
@@ -203,16 +222,16 @@ impl Batch {
                 through = prev;
             }
         }
-        let sealed = self.step(|tx| {
+        let sealed = self.read_summary_source(|tx| {
             let tables = reads::execution_context::NativeSummaryTables {
-                jobs: tx.open_table(JOBS)?,
-                states: tx.open_table(JOB_RUNTIME)?,
-                allocations: tx.open_table(POOL_ALLOCATIONS)?,
-                outputs: tx.open_table(JOB_OUTPUTS)?,
-                attachments: tx.open_table(ATTACHMENTS)?,
-                tools: tx.open_table(TOOL_CALLS)?,
-                pools: tx.open_table(POOLS)?,
-                executors: tx.open_table(EXECUTORS)?,
+                jobs: tx.table(JOBS)?,
+                states: tx.table(JOB_RUNTIME)?,
+                allocations: tx.table(POOL_ALLOCATIONS)?,
+                outputs: tx.table(JOB_OUTPUTS)?,
+                attachments: tx.table(ATTACHMENTS)?,
+                tools: tx.table(TOOL_CALLS)?,
+                pools: tx.table(POOLS)?,
+                executors: tx.table(EXECUTORS)?,
             };
             let mut summary_budget = reads::execution_context::SummaryBudget {
                 bytes: 0,
@@ -228,11 +247,13 @@ impl Batch {
                     &mut summary_budget,
                 ) {
                     Ok(pair) => pair,
-                    Err(reads::execution_context::NativeSourceError::Unavailable(reason)) => {
+                    Err(NativeSourceError::Unavailable(reason)) => {
                         log::debug!("compaction source {id} unavailable: {reason}");
                         return Ok(None);
                     }
-                    Err(reads::execution_context::NativeSourceError::Storage(error)) => {
+                    Err(
+                        error @ (NativeSourceError::Corrupt { .. } | NativeSourceError::Storage(_)),
+                    ) => {
                         return Err(error);
                     }
                 };
@@ -246,17 +267,17 @@ impl Batch {
             let mut text = String::new();
             let mut context_tokens = 0usize;
             for boundary in &boundaries {
-                let Some(bytes) = tables.jobs.get(boundary.job.get())? else {
-                    return Ok(None);
-                };
-                let job = jobs::decode_mutable_job(boundary.job.get(), bytes.value())?;
+                let job = summary_source_job(&tables.jobs, boundary.job)?;
                 let mut turn_text = format!("User: {}\n", job.input.text());
                 for entry in tables
                     .outputs
                     .range((boundary.job.get(), 0)..=(boundary.job.get(), u32::MAX))?
                 {
                     let (key, val) = entry?;
-                    let out = crate::db::redb::rows::decode_output(key.value(), val.value())?;
+                    let out = NativeSourceError::decoded(
+                        boundary.job,
+                        crate::db::redb::rows::decode_output(key.value(), val.value()),
+                    )?;
                     if let Some(t) = out.display_text() {
                         turn_text.push_str("Assistant: ");
                         turn_text.push_str(&t);
@@ -292,11 +313,11 @@ impl Batch {
         })?)
         .map_err(|e| BatchError(Failure::Storage(StorageError::corrupted(e.to_string()))))?;
         let source_digest = manifest_body.digest();
-        let existing = self.step(|tx| {
-            let children = tx.open_table(CHILDREN)?;
-            let jobs = tx.open_table(JOBS)?;
-            let states = tx.open_table(JOB_RUNTIME)?;
-            let allocations = tx.open_table(POOL_ALLOCATIONS)?;
+        let existing = self.read_summary_source(|tx| {
+            let children = tx.table(CHILDREN)?;
+            let jobs = tx.table(JOBS)?;
+            let states = tx.table(JOB_RUNTIME)?;
+            let allocations = tx.table(POOL_ALLOCATIONS)?;
             for entry in children
                 .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
                 .rev()
@@ -305,23 +326,31 @@ impl Batch {
                 let Some(bytes) = jobs.get(child_id.get())? else {
                     continue;
                 };
-                let job = jobs::decode_mutable_job(child_id.get(), bytes.value())?;
+                let job = NativeSourceError::decoded(
+                    child_id,
+                    jobs::decode_mutable_job(child_id.get(), bytes.value()),
+                )?;
                 if job.summary_source != Some(source_digest) {
                     continue;
                 }
-                let state = states
-                    .get(child_id.get())?
-                    .map(|b| state::decode_state(child_id.get(), b.value()))
-                    .transpose()?;
-                let Some(state) = state else {
-                    continue;
-                };
+                let row = states.get(child_id.get())?.ok_or_else(|| {
+                    NativeSourceError::malformed(child_id, "summary producer runtime is missing")
+                })?;
+                let state = NativeSourceError::decoded(
+                    child_id,
+                    state::decode_state(child_id.get(), row.value()),
+                )?;
                 match state.outcome.as_ref().map(|o| o.kind) {
                     None => return Ok(Some(child_id)),
                     Some(OutcomeKind::Completed) => {
                         let released = allocations
                             .get(child_id.get())?
-                            .map(|b| allocations::decode_pool_allocation(child_id.get(), b.value()))
+                            .map(|b| {
+                                NativeSourceError::decoded(
+                                    child_id,
+                                    allocations::decode_pool_allocation(child_id.get(), b.value()),
+                                )
+                            })
                             .transpose()?
                             .is_some_and(|a| a.phase == AllocationPhase::Released);
                         if released {

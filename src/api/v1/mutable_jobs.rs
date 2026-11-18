@@ -208,10 +208,7 @@ fn refusal(error: DatabaseError) -> Refusal {
 }
 pub(super) fn phase(record: &MutableJobRecord) -> &'static str {
     match record.outcome.as_ref().map(|outcome| outcome.kind) {
-        Some(OutcomeKind::Completed) => "completed",
-        Some(OutcomeKind::Failed) => "failed",
-        Some(OutcomeKind::Cancelled) => "cancelled",
-        Some(OutcomeKind::Unknown) => "unknown",
+        Some(kind) => outcome_kind(kind),
         None => match record.job.phase {
             MutableJobPhase::Unsubmitted => "unsubmitted",
             MutableJobPhase::Queued => "queued",
@@ -219,6 +216,15 @@ pub(super) fn phase(record: &MutableJobRecord) -> &'static str {
         },
     }
 }
+fn outcome_kind(kind: OutcomeKind) -> &'static str {
+    match kind {
+        OutcomeKind::Completed => "completed",
+        OutcomeKind::Failed => "failed",
+        OutcomeKind::Cancelled => "cancelled",
+        OutcomeKind::Unknown => "unknown",
+    }
+}
+
 fn input_view(job: &crate::db::entities::MutableJob) -> Value {
     let priority = match job.input.priority {
         JobQueuePriority::Foreground => "foreground",
@@ -289,7 +295,7 @@ pub(super) async fn respond(
     request: &HttpRequest,
     payload: web::types::Payload,
     database: &DatabaseHandle,
-    stops: &crate::jobs::execution::stops::NativeStops,
+    stops: &crate::db::NativeStops,
 ) -> Result<Reply, Refusal> {
     let context = context(request)?;
     match action {
@@ -388,12 +394,12 @@ pub(super) async fn respond(
                 .await
                 .map_err(stop_refusal)?;
             let (token, request, status, stopped, phase) = match stop {
-                NativeStopRequest::EndedBeforeStart(token) => (
+                NativeStopRequest::EndedBeforeStart { token, outcome } => (
                     token,
                     "ended_before_start",
                     StatusCode::OK,
-                    true,
-                    "cancelled",
+                    outcome == OutcomeKind::Cancelled,
+                    outcome_kind(outcome),
                 ),
                 NativeStopRequest::Requested(token) => (
                     Some(token),
@@ -413,7 +419,7 @@ pub(super) async fn respond(
             if let Some(token) = token {
                 stops.cancel(token);
             }
-            if matches!(stop, NativeStopRequest::EndedBeforeStart(_))
+            if matches!(stop, NativeStopRequest::EndedBeforeStart { .. })
                 && let Err(error) = database.settle_child_turns(vec![id]).await
             {
                 log::warn!(

@@ -191,6 +191,7 @@ struct CompletionRecord {
     path: PathBuf,
     reference: EvidenceRef,
     evidence: CompletionEvidence,
+    owner: (u32, u32),
 }
 
 #[derive(Default)]
@@ -415,6 +416,14 @@ fn read_record<T: for<'de> Deserialize<'de>>(
             format!("{} changed while it was read", path.display()),
         ));
     }
+    let named =
+        std::fs::symlink_metadata(path).map_err(|error| io("recheck audit evidence", error))?;
+    if !named.is_file() || named.nlink() != 1 || identity(&named) != actual {
+        return Err(refused(
+            "audit_evidence",
+            format!("{} changed while it was read", path.display()),
+        ));
+    }
     let digest = digest_bytes(&bytes);
     let record = serde_json::from_slice(&bytes)
         .map_err(|error| refused("audit_evidence", format!("{}: {error}", path.display())))?;
@@ -490,7 +499,8 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
                 evidence,
             });
         } else {
-            let (evidence, reference, _): (CompletionEvidence, _, _) = read_audit_record(&path)?;
+            let (evidence, reference, actual): (CompletionEvidence, _, _) =
+                read_audit_record(&path)?;
             if evidence.schema != COMPLETION_SCHEMA
                 || evidence.sequence == 0
                 || !valid_digest(&evidence.prepared.sha256)
@@ -506,6 +516,7 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
                 path,
                 reference,
                 evidence,
+                owner: (actual.uid, actual.gid),
             });
         }
     }
@@ -516,13 +527,16 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
         .completed
         .sort_by_key(|record| record.evidence.sequence);
 
+    let prepared_by_reference: BTreeMap<_, _> = chain
+        .prepared
+        .iter()
+        .map(|record| (&record.reference, record))
+        .collect();
     let mut completion_by_prepared = BTreeMap::new();
     let mut finalized_sequences = BTreeSet::new();
     for (index, completion) in chain.completed.iter().enumerate() {
-        let matching = chain
-            .prepared
-            .iter()
-            .position(|prepared| prepared.reference == completion.evidence.prepared)
+        let prepared = prepared_by_reference
+            .get(&completion.evidence.prepared)
             .ok_or_else(|| {
                 refused_in_state(
                     "orphaned_completion",
@@ -530,7 +544,6 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
                     format!("{} has no exact prepared record", completion.path.display()),
                 )
             })?;
-        let prepared = &chain.prepared[matching];
         if completion.evidence.sequence != prepared.evidence.sequence
             || !finalized_sequences.insert(completion.evidence.sequence)
             || completion.evidence.published != prepared.evidence.replacement
@@ -549,8 +562,7 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
                 ),
             ));
         }
-        let owner = read_audit_record::<Value>(&completion.path)?.2;
-        if (owner.uid, owner.gid) != (prepared.evidence.source.uid, prepared.evidence.source.gid) {
+        if completion.owner != (prepared.evidence.source.uid, prepared.evidence.source.gid) {
             return Err(refused_in_state(
                 "audit_permissions",
                 INCONSISTENT,
@@ -571,7 +583,7 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
 
     let mut previous: Option<EvidenceRef> = None;
     let mut superseded = BTreeSet::new();
-    for (index, prepared) in chain.prepared.iter().enumerate() {
+    for prepared in &chain.prepared {
         if prepared.evidence.previous_finalized != previous {
             return Err(refused_in_state(
                 "audit_chain",
@@ -588,19 +600,15 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
             chain.latest_finalized = Some(completion_index);
         }
         if let Some(supersedes) = &prepared.evidence.supersedes_prepared {
-            let old = chain
-                .prepared
-                .iter()
-                .position(|candidate| &candidate.reference == supersedes)
-                .ok_or_else(|| {
-                    refused_in_state(
-                        "audit_chain",
-                        INCONSISTENT,
-                        "a prepared record supersedes missing evidence",
-                    )
-                })?;
-            if chain.prepared[old].evidence.sequence >= prepared.evidence.sequence
-                || chain.prepared[old].evidence.source.sha256 != prepared.evidence.source.sha256
+            let old = prepared_by_reference.get(supersedes).ok_or_else(|| {
+                refused_in_state(
+                    "audit_chain",
+                    INCONSISTENT,
+                    "a prepared record supersedes missing evidence",
+                )
+            })?;
+            if old.evidence.sequence >= prepared.evidence.sequence
+                || old.evidence.source.sha256 != prepared.evidence.source.sha256
                 || completion_by_prepared.contains_key(supersedes)
                 || !superseded.insert(supersedes.clone())
             {
@@ -611,35 +619,18 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
                 ));
             }
         }
-        if !completion_by_prepared.contains_key(&prepared.reference) {
-            chain.active = Some(index);
-        }
     }
-    if let Some(active) = chain.active
-        && superseded.contains(&chain.prepared[active].reference)
-    {
-        chain.active = None;
-    }
-    let unresolved = chain
-        .prepared
-        .iter()
-        .filter(|record| {
-            !completion_by_prepared.contains_key(&record.reference)
-                && !superseded.contains(&record.reference)
-        })
-        .count();
-    if unresolved > 1 {
+    let mut unresolved = chain.prepared.iter().enumerate().filter(|(_, record)| {
+        !completion_by_prepared.contains_key(&record.reference)
+            && !superseded.contains(&record.reference)
+    });
+    chain.active = unresolved.next().map(|(index, _)| index);
+    if unresolved.next().is_some() {
         return Err(refused_in_state(
             "audit_chain_ambiguous",
             INCONSISTENT,
             "multiple prepared records are unresolved candidates",
         ));
-    }
-    if chain.active.is_none() {
-        chain.active = chain.prepared.iter().position(|record| {
-            !completion_by_prepared.contains_key(&record.reference)
-                && !superseded.contains(&record.reference)
-        });
     }
     Ok(chain)
 }

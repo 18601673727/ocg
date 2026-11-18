@@ -5,6 +5,7 @@ use std::time::Duration;
 use super::dispatch::dispatch;
 use super::wake::Scheduler;
 use crate::ai::providers::CancellationToken;
+use crate::db::NativeStops;
 use crate::db::entities::{
     DevelopmentFreshReservation, DevelopmentReadyCursor, DevelopmentReservation,
     ExecutionOperation, ExecutionPoolId, ExecutorId, LlmTransport, PoolAllocation,
@@ -13,7 +14,6 @@ use crate::db::{
     DatabaseError, DatabaseHandle, DevelopmentReservationError, SchedulerWakeSubscription,
 };
 use crate::jobs::execution::runtime::WorkspaceTools;
-use crate::jobs::execution::stops::NativeStops;
 
 const EXECUTOR_PAGE: usize = 100;
 const MAX_EXECUTOR_PAGES: usize = 16;
@@ -34,12 +34,13 @@ pub(crate) struct EndpointEligibility {
     endpoint_class: Option<&'static str>,
 }
 
-const NOT_ASSESSED: [&str; 6] = [
+const NOT_ASSESSED: [&str; 7] = [
     "agent_and_live_conversation_start_context",
     "live_attachment_availability",
     "executor_capacity",
     "host_scheduler_running",
     "optional_allocation_policy_binding",
+    "live_execution_authorization",
     "reservation_and_writer_admission",
 ];
 
@@ -104,7 +105,7 @@ pub(crate) fn endpoint_eligibility(
     }
 }
 
-fn can_schedule(
+fn configuration_is_eligible(
     configuration: &crate::db::entities::FrozenConfiguration,
     summary_work: bool,
 ) -> bool {
@@ -373,7 +374,7 @@ impl Allocator {
             let fresh = DevelopmentFreshReservation::new(pool, executor, after);
             let passed = self
                 .database
-                .reserve_scheduled_job(fresh, can_schedule)
+                .reserve_scheduled_job(fresh, configuration_is_eligible)
                 .await;
             match passed {
                 Ok(DevelopmentReservation::Reserved(allocation)) => {

@@ -379,9 +379,9 @@ fn policy_json(record: &ScheduledExternalPolicyRecord) -> serde_json::Value {
 
 fn feature_json() -> serde_json::Value {
     serde_json::json!({
-        "name": SCHEDULED_EXTERNAL.0,
-        "enabled": SCHEDULED_EXTERNAL.1,
-        "note": "a stored policy never enables the feature; every dispatch needs both",
+        "name": SCHEDULED_EXTERNAL,
+        "compiled": true,
+        "authorization": "requires a live policy bound to the Allocation for scheduled external execution",
     })
 }
 

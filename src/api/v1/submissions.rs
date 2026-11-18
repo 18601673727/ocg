@@ -963,6 +963,12 @@ pub(super) async fn action(
 }
 fn action_error(error: DatabaseError) -> Refusal {
     match error {
+        DatabaseError::Rejected(reason @ Violation::SummarySourceCorrupt { .. }) => Refusal::new(
+            StatusCode::CONFLICT,
+            "summary_source_corrupt",
+            "The stored source cannot be used for a summary.",
+        )
+        .with_reason(reason.to_string()),
         DatabaseError::Rejected(Violation::NotFound(
             crate::db::entities::RecordRef::Attachment(_),
         )) => ATTACHMENT_NOT_FOUND,

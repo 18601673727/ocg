@@ -10,6 +10,10 @@ use crate::db::{DevelopmentReservationError, entities, redb};
 use std::ops::ControlFlow::{Break, Continue};
 
 impl DatabaseHandle {
+    pub(crate) fn native_stops(&self) -> crate::db::NativeStops {
+        self.shared.native_stops.clone()
+    }
+
     pub async fn uncertain_allocations(&self) -> Result<Vec<UncertainAllocation>, DatabaseError> {
         self.read(redb::read_uncertain_allocations).await
     }
@@ -99,19 +103,21 @@ impl DatabaseHandle {
         context: entities::ComposerContextId,
         job: entities::JobId,
     ) -> Result<entities::NativeStopRequest, DatabaseError> {
+        let stops = self.native_stops();
         self.submit(|reply| {
             Command::custom(
                 (context, job),
                 reply,
                 |_| 8192,
-                |(context, job), reply, database, operation, commit| {
+                move |(context, job), reply, database, operation, commit| {
                     let (outcome, declined) =
                         redb::run_batch_declinable(database, operation.epoch, commit, |batch| {
+                            batch.native_stops = Some(stops);
                             batch.require_mutable_job_context(context, job)?;
                             let result = batch.request_native_stop(job)?;
                             Ok(match result {
                                 entities::NativeStopRequest::AlreadyRequested(_) => Break(result),
-                                entities::NativeStopRequest::EndedBeforeStart(_)
+                                entities::NativeStopRequest::EndedBeforeStart { .. }
                                 | entities::NativeStopRequest::Requested(_) => Continue(result),
                             })
                         });

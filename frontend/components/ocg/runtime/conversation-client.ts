@@ -1493,11 +1493,13 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         const turn = this.turns.get(job);
         if (turn) {
           turn.error =
-            stop.request === "ended_before_start"
-              ? "Stopped before it started; the Job is Cancelled and nothing was sent to the Provider."
-              : stop.request === "already_requested"
-                ? "A stop was already requested; the execution is not confirmed stopped."
-                : "Stop requested; the execution is not confirmed stopped.";
+            stop.execution_phase === "failed"
+              ? "The dispatch deadline expired before the Job started. Nothing was sent to the Provider."
+              : stop.request === "ended_before_start"
+                ? "Stopped before it started; the Job is Cancelled and nothing was sent to the Provider."
+                : stop.request === "already_requested"
+                  ? "A stop was already requested; the execution is not confirmed stopped."
+                  : "Stop requested; the execution is not confirmed stopped.";
           this.publish(sessionId);
         }
       } finally {
