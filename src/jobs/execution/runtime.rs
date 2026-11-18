@@ -978,7 +978,7 @@ struct DevelopmentLoopbackSink<'a> {
     sent: bool,
     evidence_incomplete: bool,
     persisted_usage: bool,
-    secret_stream: SecretStream<'a>,
+    secret_stream: SecretStream<'a, IntermediateOutputKind>,
 }
 
 impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
@@ -1056,7 +1056,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
         Box::pin(async move {
-            if self.secret_stream.push(text.as_bytes()) {
+            if self.secret_stream.push(kind, text.as_bytes()) {
                 return Err(OutputSinkError {
                     message: "output contains credential material".into(),
                 });

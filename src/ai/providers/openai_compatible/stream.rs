@@ -8,15 +8,16 @@ use crate::db::entities::{
 
 use super::request::{MAX_TOOL_ARGUMENTS_BYTES, MAX_TOOL_CALLS};
 
-pub(crate) fn parse_finish_reason(raw: &str) -> ChatFinishReason {
-    match raw {
+pub(crate) fn parse_finish_reason(raw: &str) -> Option<ChatFinishReason> {
+    Some(match raw {
+        "" => return None,
         "stop" => ChatFinishReason::Stop,
         "length" => ChatFinishReason::Length,
         "tool_calls" => ChatFinishReason::ToolCalls,
         "content_filter" => ChatFinishReason::ContentFilter,
         "error" => ChatFinishReason::Error,
         _ => ChatFinishReason::Other,
-    }
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

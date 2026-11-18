@@ -4,6 +4,8 @@ use crate::host::data_directory::DataDirectory;
 mod llm_target;
 #[cfg(unix)]
 mod reconcile_reserved;
+#[cfg(unix)]
+pub(crate) use reconcile_reserved::check_offline_publication;
 mod scheduled_external_policy;
 pub mod typescript;
 #[cfg(unix)]

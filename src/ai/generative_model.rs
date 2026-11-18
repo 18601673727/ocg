@@ -845,9 +845,11 @@ fn consume_event(
             deltas.push((IntermediateOutputKind::Progress, value.to_owned()));
         }
     }
-    if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str) {
+    if let Some(raw) = choice.get("finish_reason").and_then(Value::as_str)
+        && let Some(reason) = openai_compatible::stream::parse_finish_reason(raw)
+    {
         response.raw_finish_reason = Some(raw.to_owned());
-        response.finish_reason = Some(openai_compatible::stream::parse_finish_reason(raw));
+        response.finish_reason = Some(reason);
     }
     Ok(deltas)
 }

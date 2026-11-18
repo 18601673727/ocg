@@ -72,7 +72,7 @@ impl Spellings {
         self.0.iter().any(|form| text.contains(form.as_str()))
     }
 
-    pub(crate) fn stream(&self) -> SecretStream<'_> {
+    pub(crate) fn stream<Kind: Copy + Eq>(&self) -> SecretStream<'_, Kind> {
         SecretStream {
             patterns: self.iter().map(SecretPrefix::new).collect(),
             found: false,
@@ -88,26 +88,39 @@ impl Spellings {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct SecretStream<'a> {
-    patterns: Vec<SecretPrefix<'a>>,
+pub(crate) struct SecretStream<'a, Kind> {
+    patterns: Vec<SecretPrefix<'a, Kind>>,
     found: bool,
 }
 
-impl SecretStream<'_> {
-    pub(crate) fn push(&mut self, bytes: &[u8]) -> bool {
-        self.found = self.found || self.patterns.iter_mut().any(|pattern| pattern.find(bytes));
+impl<Kind> Default for SecretStream<'_, Kind> {
+    fn default() -> Self {
+        Self {
+            patterns: Vec::new(),
+            found: false,
+        }
+    }
+}
+
+impl<Kind: Copy + Eq> SecretStream<'_, Kind> {
+    pub(crate) fn push(&mut self, kind: Kind, bytes: &[u8]) -> bool {
+        self.found = self.found
+            || self
+                .patterns
+                .iter_mut()
+                .any(|pattern| pattern.find(kind, bytes));
         self.found
     }
 }
 
-struct SecretPrefix<'a> {
+struct SecretPrefix<'a, Kind> {
     spelling: &'a [u8],
     fallback: Vec<usize>,
     matched: usize,
+    by_kind: Vec<(Kind, usize)>,
 }
 
-impl<'a> SecretPrefix<'a> {
+impl<'a, Kind: Copy + Eq> SecretPrefix<'a, Kind> {
     fn new(spelling: &'a str) -> Self {
         let spelling = spelling.as_bytes();
         // KMP stores the longest proper prefix that is also a suffix at each offset.
@@ -121,6 +134,7 @@ impl<'a> SecretPrefix<'a> {
             spelling,
             fallback,
             matched: 0,
+            by_kind: Vec::new(),
         }
     }
 
@@ -131,23 +145,51 @@ impl<'a> SecretPrefix<'a> {
         matched + usize::from(spelling[matched] == byte)
     }
 
-    fn find(&mut self, mut bytes: &[u8]) -> bool {
+    fn find(&mut self, kind: Kind, bytes: &[u8]) -> bool {
+        let spelling = self.spelling;
+        let fallback = &self.fallback;
+        self.matched = Self::match_bytes(spelling, fallback, self.matched, bytes);
+        if self.matched == spelling.len() {
+            return true;
+        }
+        // Consumers can also concatenate chunks of one output kind.
+        let previous = self.by_kind.iter_mut().find(|(state, _)| *state == kind);
+        let matched = match previous {
+            Some((_, matched)) => {
+                *matched = Self::match_bytes(spelling, fallback, *matched, bytes);
+                *matched
+            }
+            None => {
+                let matched = Self::match_bytes(spelling, fallback, 0, bytes);
+                self.by_kind.push((kind, matched));
+                matched
+            }
+        };
+        matched == spelling.len()
+    }
+
+    fn match_bytes(
+        spelling: &[u8],
+        fallback: &[usize],
+        mut matched: usize,
+        mut bytes: &[u8],
+    ) -> usize {
         while let Some((&byte, rest)) = bytes.split_first() {
-            if self.matched == 0 {
-                let Some(start) = memchr::memchr(self.spelling[0], bytes) else {
+            if matched == 0 {
+                let Some(start) = memchr::memchr(spelling[0], bytes) else {
                     break;
                 };
-                self.matched = 1;
+                matched = 1;
                 bytes = &bytes[start + 1..];
             } else {
-                self.matched = Self::advance(self.spelling, &self.fallback, self.matched, byte);
+                matched = Self::advance(spelling, fallback, matched, byte);
                 bytes = rest;
             }
-            if self.matched == self.spelling.len() {
-                return true;
+            if matched == spelling.len() {
+                break;
             }
         }
-        false
+        matched
     }
 }
 

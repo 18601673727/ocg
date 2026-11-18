@@ -219,7 +219,8 @@ fn startup_checks(
 ) -> Result<Verification, StorageError> {
     let tx = database.begin_read()?;
     let clean = startup_metadata(&tx)?;
-    if clean && !force_full && allocations_are_quiet(&tx)? && !unknown_outcomes_exist(&tx)? {
+    if clean && !force_full && allocations_are_quiet(&tx)? && !indexes::verify_compaction_refs(&tx)?
+    {
         return Ok(Verification::Quick);
     }
     check_records(&tx)?;

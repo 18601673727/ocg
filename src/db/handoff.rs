@@ -190,7 +190,9 @@ impl DevelopmentHandoff {
             .is_some_and(|spellings| spellings.found_in(value))
     }
 
-    pub(crate) fn secret_stream(&self) -> crate::support::secrets::SecretStream<'_> {
+    pub(crate) fn secret_stream(
+        &self,
+    ) -> crate::support::secrets::SecretStream<'_, entities::IntermediateOutputKind> {
         self.prepared
             .credentials
             .spellings

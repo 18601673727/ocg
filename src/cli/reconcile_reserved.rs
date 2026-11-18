@@ -649,6 +649,22 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
     Ok(chain)
 }
 
+pub(crate) fn check_offline_publication(directory: &Path) -> std::io::Result<()> {
+    let chain = load_audit_chain(directory).map_err(|error| {
+        std::io::Error::other(format!(
+            "offline publication audit {}: {}",
+            error.code, error.detail
+        ))
+    })?;
+    if let Some(active) = chain.active {
+        let operation = &chain.prepared[active].evidence.operation;
+        return Err(std::io::Error::other(format!(
+            "offline publication is pending ({operation}); finalize it with the original offline command, or retry the operation if the original database is still in place"
+        )));
+    }
+    Ok(())
+}
+
 fn validate_prepared(evidence: &PreparedEvidence, actual: &Identity) -> Result<(), Refused> {
     let (database_format, record_version) = storage_format_versions();
     let versions = (evidence.database_format, evidence.record_version);

@@ -39,6 +39,10 @@ impl CompactionReference {
         }
     }
 
+    pub(super) fn matches(self, policy: &CompactionPolicy, config: ConfigId) -> bool {
+        self.config(Some(policy)) == Some(config)
+    }
+
     fn key(self, config: ConfigId, owner: JobId) -> (u8, u128, u128) {
         (self as u8, config.get(), owner.get())
     }
@@ -105,13 +109,18 @@ pub(super) fn update_compaction_refs(
 fn visit_compaction_refs(
     tx: &impl TxRead,
     mut visit: impl FnMut((u8, u128, u128)) -> Result<(), StorageError>,
-) -> Result<u64, StorageError> {
+) -> Result<(u64, bool), StorageError> {
     let conversations = tx.table(CONVERSATIONS)?;
     let mut count = 0;
+    let mut has_unknown = false;
     for entry in tx.table(JOB_RUNTIME)?.iter()? {
         let (key, bytes) = entry?;
         let job = JobId::new(key.value());
         let runtime = state::JobRuntime::decode_at(job.get(), bytes.value())?;
+        has_unknown |= runtime
+            .state
+            .outcome
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown);
         let policy = runtime.lifecycle.compaction_policy.as_ref();
         if policy.is_some() && conversations.get(job.get())?.is_none() {
             return Err(StorageError::corrupted(format!(
@@ -125,7 +134,7 @@ fn visit_compaction_refs(
             }
         }
     }
-    Ok(count)
+    Ok((count, has_unknown))
 }
 
 #[cfg(unix)]
@@ -138,9 +147,9 @@ pub(super) fn rebuild_compaction_refs(tx: &WriteTransaction) -> Result<(), Stora
     Ok(())
 }
 
-pub(super) fn verify_compaction_refs(tx: &ReadTransaction) -> Result<(), StorageError> {
+pub(super) fn verify_compaction_refs(tx: &ReadTransaction) -> Result<bool, StorageError> {
     let index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
-    let expected = visit_compaction_refs(tx, |key| {
+    let (expected, has_unknown) = visit_compaction_refs(tx, |key| {
         if index.get(key)?.is_none() {
             return Err(StorageError::corrupted(
                 "missing conversation configuration reference",
@@ -153,7 +162,7 @@ pub(super) fn verify_compaction_refs(tx: &ReadTransaction) -> Result<(), Storage
             "extra conversation configuration references",
         ));
     }
-    Ok(())
+    Ok(has_unknown)
 }
 
 pub(super) fn search_gram(chars: &[char]) -> u64 {

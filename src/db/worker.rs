@@ -181,6 +181,12 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
+                // Opening redb changes the digest needed to finalize an offline publication.
+                #[cfg(unix)]
+                if let Err(error) = crate::cli::check_offline_publication(&directory) {
+                    ready_sender.send(Err(DatabaseError::Startup(error))).ok();
+                    return Ok(());
+                }
                 let OpenedFile { database, epoch } = match redb::open(&directory) {
                     Ok(opened) => opened,
                     Err(error) => {

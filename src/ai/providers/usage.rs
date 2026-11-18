@@ -63,11 +63,11 @@ impl UsageCapture {
             if choices.len() > 1 && !seen.insert(index) {
                 self.ambiguous_choices = true;
             }
-            // The provider parser accepts unknown finish reasons as Other.
             let finished = choice
                 .get("finish_reason")
                 .and_then(Value::as_str)
-                .is_some_and(|reason| !reason.is_empty());
+                .and_then(super::openai_compatible::stream::parse_finish_reason)
+                .is_some();
             let before = self.choices.insert(index, finished);
             self.open_choices -= usize::from(before == Some(false));
             self.open_choices += usize::from(!finished);

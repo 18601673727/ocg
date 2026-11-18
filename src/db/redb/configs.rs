@@ -960,6 +960,7 @@ impl Batch {
                         .into_iter()
                         .filter(|config| !ids.contains(config)),
                 );
+                let mut candidates = BTreeMap::<JobId, Vec<(CompactionReference, ConfigId)>>::new();
                 // Removing a model from a predictor's target list can require
                 // a new default even when no conversation pins that model.
                 for predictor in ids
@@ -967,16 +968,17 @@ impl Batch {
                     .copied()
                     .chain(decision_agents.iter().map(|row| row.id))
                 {
-                    if index
+                    if let Some((key, _)) = index
                         .range(CompactionReference::Predictor.range(predictor))?
                         .next()
                         .transpose()?
-                        .is_some()
                     {
-                        refs.predictions.insert(predictor);
+                        candidates
+                            .entry(JobId::new(key.value().2))
+                            .or_default()
+                            .push((CompactionReference::Predictor, predictor));
                     }
                 }
-                let mut affected = BTreeSet::new();
                 for &config in &ids {
                     for role in [
                         CompactionReference::Summary,
@@ -984,22 +986,31 @@ impl Batch {
                     ] {
                         for entry in index.range(role.range(config))? {
                             let (key, _) = entry?;
-                            affected.insert(JobId::new(key.value().2));
+                            candidates
+                                .entry(JobId::new(key.value().2))
+                                .or_default()
+                                .push((role, config));
                         }
                     }
                 }
                 let mut conversations = Vec::new();
-                for job in affected {
+                for (job, references) in candidates {
                     let policy = state::require(tx, job)?
                         .lifecycle
                         .compaction_policy
-                        .filter(|policy| refs.record(policy, &ids))
+                        .filter(|policy| {
+                            references
+                                .iter()
+                                .all(|(role, config)| role.matches(policy, *config))
+                        })
                         .ok_or_else(|| {
                             StorageError::corrupted(format!(
                                 "{job} has a stale conversation configuration reference"
                             ))
                         })?;
-                    conversations.push((job, policy));
+                    if refs.record(&policy, &ids) {
+                        conversations.push((job, policy));
+                    }
                 }
                 let settings = reads::catalog::global_compaction_settings(&tx.open_table(META)?)?;
                 let settings_changed = refs.record(&settings.policy, &ids);
