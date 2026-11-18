@@ -63,12 +63,11 @@ impl UsageCapture {
             if choices.len() > 1 && !seen.insert(index) {
                 self.ambiguous_choices = true;
             }
-            let finished = matches!(
-                choice.get("finish_reason").and_then(Value::as_str),
-                Some(
-                    "stop" | "length" | "tool_calls" | "function_call" | "content_filter" | "error"
-                )
-            );
+            // The provider parser accepts unknown finish reasons as Other.
+            let finished = choice
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| !reason.is_empty());
             let before = self.choices.insert(index, finished);
             self.open_choices -= usize::from(before == Some(false));
             self.open_choices += usize::from(!finished);

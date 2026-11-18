@@ -1753,7 +1753,12 @@ pub(crate) async fn delete_model(
     database
         .archive_model(id.into())
         .await
-        .map_err(map_mutation_error)?;
+        .map_err(|error| match error {
+            DatabaseError::Rejected(Violation::InvalidValue("archive", reason)) => {
+                Refusal::new(StatusCode::CONFLICT, "model_archive_refused", reason)
+            }
+            error => map_mutation_error(error),
+        })?;
     Ok(Reply::ok(
         build_profiles_snapshot(database, Some(id)).await?,
     ))
