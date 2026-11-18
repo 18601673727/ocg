@@ -1,10 +1,13 @@
 pub(crate) const SCHEDULED_EXTERNAL: (&str, bool) = ("scheduled_external_transport", true);
 
-pub(crate) const EXECUTION_FEATURES: [(&str, bool); 11] = [
+pub(crate) const AUTONOMOUS_SCHEDULING: &str = "autonomous_scheduling";
+
+// Compiled capabilities. The host reports scheduler activation separately.
+pub(crate) const COMPILED_EXECUTION_FEATURES: [(&str, bool); 11] = [
     ("manual_loopback_execution", true),
     ("manual_external_trial", false),
     ("manual_external_execution", false),
-    ("autonomous_scheduling", true),
+    (AUTONOMOUS_SCHEDULING, true),
     SCHEDULED_EXTERNAL,
     ("external_provider_transport", true),
     ("provider_discovery", true),

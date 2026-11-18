@@ -1076,12 +1076,34 @@ impl Batch {
         if self.require_job_state(job)?.outcome.is_some() {
             return self.reject(ended);
         }
-        let Some(allocation) = self.pool_allocation(job)? else {
+        let allocation = self.pool_allocation(job)?;
+        if allocation.is_none() && row.phase == MutableJobPhase::Queued {
+            self.end_queued_native_job(
+                &row,
+                OutcomeCause::Text(STOPPED_BEFORE_START_SUMMARY.to_owned()),
+            )?;
+            return Ok(NativeStopRequest::EndedBeforeStart);
+        }
+        let Some(allocation) = allocation else {
             return self.reject(Violation::InvalidValue(
                 "stop",
                 crate::db::entities::STOP_JOB_NOT_RUNNING,
             ));
         };
+        if allocation.job_revision != row.revision {
+            return self.corrupted(format!(
+                "Job {job} and its Allocation disagree on the revision"
+            ));
+        }
+        if matches!(
+            allocation.phase,
+            AllocationPhase::Running | AllocationPhase::StopRequested
+        ) && row.phase != MutableJobPhase::Executing
+        {
+            return self.corrupted(format!(
+                "Job {job} is not executing with its active Allocation"
+            ));
+        }
         let token = allocation.token;
         match allocation.phase {
             AllocationPhase::Reserved => {
@@ -1096,7 +1118,7 @@ impl Batch {
                     },
                 )?;
                 self.settle_summary_membership(&job)?;
-                Ok(NativeStopRequest::EndedBeforeStart(token))
+                Ok(NativeStopRequest::EndedBeforeStart)
             }
             AllocationPhase::Running => {
                 self.transition_pool_allocation(token, AllocationPhase::StopRequested, None)?;
@@ -1106,13 +1128,6 @@ impl Batch {
                 Ok(NativeStopRequest::Requested(token))
             }
             AllocationPhase::StopRequested => Ok(NativeStopRequest::AlreadyRequested(token)),
-            AllocationPhase::Released if row.phase == MutableJobPhase::Queued => {
-                self.end_queued_native_job(
-                    &row,
-                    OutcomeCause::Text(STOPPED_BEFORE_START_SUMMARY.to_owned()),
-                )?;
-                Ok(NativeStopRequest::EndedBeforeStart(token))
-            }
             AllocationPhase::Uncertain | AllocationPhase::Released => self.reject(ended),
         }
     }
@@ -1121,7 +1136,7 @@ impl Batch {
         &mut self,
         token: crate::db::entities::AllocationToken,
         next: crate::db::entities::AllocationPhase,
-        uncertainty: Option<crate::db::entities::UncertaintyReason>,
+        uncertainty: Option<OutcomeCause>,
     ) -> Result<(), BatchError> {
         use crate::db::entities::AllocationPhase;
         self.require_allocation_durability()?;
@@ -1165,7 +1180,7 @@ impl Batch {
             state.outcome = Some(OutcomeRecord {
                 kind: OutcomeKind::Unknown,
                 at: self.now,
-                cause: Some(OutcomeCause::Uncertain(reason)),
+                cause: Some(reason),
             });
             self.put_job_state(token.job, &state)?;
         }

@@ -479,6 +479,9 @@ fn inspect_held_in(
                             reason.as_str()
                         ));
                     }
+                    Some(crate::db::entities::OutcomeCause::Text(detail)) => {
+                        established.push(detail.clone());
+                    }
                     _ => unknown.push(
                         "Why the outcome is uncertain: this Unknown outcome stores no typed reason."
                             .to_owned(),
@@ -642,7 +645,7 @@ fn inspect_held_in(
         }
         _ => "an index table is missing".to_owned(),
     };
-    let features: Vec<_> = crate::host::execution_features::EXECUTION_FEATURES
+    let features: Vec<_> = crate::host::execution_features::COMPILED_EXECUTION_FEATURES
         .into_iter()
         .map(|(name, enabled)| {
             json!({"feature": name, "state": if enabled { "Enabled" } else { "Disabled" }})

@@ -10,10 +10,12 @@ use crate::db::redb::reads::jobs::{
     unstarted_settlement_in,
 };
 use crate::db::redb::reads::read;
-use crate::db::redb::rows::{decode_attachment, decode_output, decode_project};
+use crate::db::redb::rows::{
+    decode_attachment, decode_output, decode_project, decode_tool_evidence, tool_call_ref,
+};
 use crate::db::redb::schema::{
     ATTACHMENTS, CHILD_GROUPS, CHILDREN, DEPENDENCY_WAITERS, EXECUTORS, JOB_OUTPUTS, JOB_RUNTIME,
-    JOBS, MESSAGES, META, POOL_ALLOCATIONS, POOLS, PROJECTS,
+    JOBS, MESSAGES, META, POOL_ALLOCATIONS, POOLS, PROJECTS, TOOL_CALLS,
 };
 use crate::db::redb::{StorageError, allocations, state};
 use ::redb::{Database, ReadTransaction, ReadableTable};
@@ -24,6 +26,73 @@ fn context_unavailable(detail: &str) -> StorageError {
         kind: super::StorageErrorKind::Other,
         os_error: None,
         detail: detail.to_owned(),
+    }
+}
+
+fn read_awaiting_batch(
+    rx: &ReadTransaction,
+    job: JobId,
+    output: Option<&crate::db::entities::JobOutputRecord>,
+    selected_bytes: &mut usize,
+) -> Result<Vec<crate::db::entities::ToolEvidenceRecord>, StorageError> {
+    use crate::db::entities::{AWAITING_TOOL_DECISION, ToolDecision};
+    let Some(output) = output else {
+        return Ok(Vec::new());
+    };
+    let paused = output.code.as_deref() == Some(AWAITING_TOOL_DECISION);
+    let legacy = output.code.is_none()
+        && output
+            .value
+            .as_ref()
+            .and_then(|value| value.get("finish_reason"))
+            .and_then(serde_json::Value::as_str)
+            == Some("tool_calls");
+    if !paused && !legacy {
+        return Ok(Vec::new());
+    }
+
+    let table = rx.open_table(TOOL_CALLS)?;
+    let id = job.get();
+    let Some((last, _)) = table
+        .range((id, 0, 0)..=(id, u32::MAX, u32::MAX))?
+        .next_back()
+        .transpose()?
+    else {
+        if paused {
+            return Err(StorageError::corrupted(format!(
+                "paused Job {job} has no tool calls"
+            )));
+        }
+        return Ok(Vec::new());
+    };
+    let (_, request, _) = last.value();
+    let mut batch = Vec::new();
+    for entry in table.range((id, request, 0)..=(id, request, u32::MAX))? {
+        let (key, value) = entry?;
+        *selected_bytes = selected_bytes.saturating_add(value.value().len());
+        if *selected_bytes > 8 * 1024 * 1024 || batch.len() == 128 {
+            return Err(context_unavailable(
+                "paused tool batch exceeds execution context limit",
+            ));
+        }
+        batch.push(decode_tool_evidence(
+            tool_call_ref(key.value())?,
+            value.value(),
+        )?);
+    }
+    if batch.iter().any(|call| {
+        matches!(
+            call.decision.fact,
+            ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_)
+        )
+    }) {
+        Ok(batch)
+    } else if paused {
+        Err(StorageError::corrupted(format!(
+            "paused Job {job} has no awaiting tool call"
+        )))
+    } else {
+        Ok(Vec::new())
     }
 }
 
@@ -790,11 +859,14 @@ fn development_candidate_in(
                 "settled predecessor has no final output",
             ));
         }
+        let awaiting_batch =
+            read_awaiting_batch(rx, id, prior_outputs.last(), &mut selected_bytes)?;
         previous = prior.job.previous;
         history.push(DevelopmentContextTurn {
             record: prior,
             attachments: prior_attachments,
             outputs: prior_outputs,
+            awaiting_batch,
         });
     }
     covered_inputs.reverse();

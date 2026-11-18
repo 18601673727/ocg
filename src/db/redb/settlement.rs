@@ -853,11 +853,7 @@ impl Batch {
     ) -> Result<AppendedOutput, BatchError> {
         let (job, output) = self.end_untouched_reservation(
             token,
-            if cause == crate::db::entities::UnstartedCause::Cancelled {
-                OutcomeKind::Cancelled
-            } else {
-                OutcomeKind::Failed
-            },
+            cause.outcome(),
             crate::db::entities::FinalResult {
                 summary: Some(cause.summary().to_owned()),
                 code: Some(cause.code().to_owned()),

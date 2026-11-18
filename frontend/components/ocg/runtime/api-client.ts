@@ -2177,31 +2177,6 @@ export function createApiClient(options: ApiClientOptions) {
       return result;
     },
 
-    async amendQueuedMessage(
-      conversation: string,
-      amendment:
-        | {
-            action: "edit";
-            turn: string;
-            message: number;
-            text: string;
-            attachments: string[];
-          }
-        | { action: "withdraw"; turn: string; message: number },
-      signal?: AbortSignal,
-    ) {
-      jobIdentity(conversation);
-      jobIdentity(amendment.turn);
-      sequence(amendment.message);
-      const result = (
-        await send("POST", `/api/v1/conversations/${conversation}/queue`, {
-          body: amendment,
-          sign: true,
-          signal,
-        })
-      ).input as Api.Envelope<Api.Append>;
-      return result;
-    },
     async retryConversation(conversation: string, turn: string, signal?: AbortSignal) {
       jobIdentity(conversation);
       jobIdentity(turn);

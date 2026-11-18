@@ -403,7 +403,10 @@ fn recovery_action_in(
                                 | UncertaintyReason::ResponseIncompleteOrInvalid
                                 | UncertaintyReason::StopRequestedWithoutConfirmedTermination
                         )
-                    )
+                    ) || matches!(cause, OutcomeCause::Text(detail) if matches!(
+                        detail.as_str(),
+                        crate::db::entities::UNCERTAIN_HOST_SHUTDOWN | crate::db::entities::UNCERTAIN_DEADLINE
+                    ))
                 });
                 if !returned {
                     ineligible!(

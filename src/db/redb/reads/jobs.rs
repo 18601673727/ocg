@@ -1044,6 +1044,7 @@ pub(crate) fn mutable_job_details_in(
                 Some(crate::db::entities::OutcomeCause::Uncertain(reason)) => {
                     format!(" {}", reason.description())
                 }
+                Some(crate::db::entities::OutcomeCause::Text(detail)) => format!(" {detail}"),
                 Some(_) | None => String::new(),
             };
             format!(

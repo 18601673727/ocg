@@ -19,6 +19,7 @@ use crate::db::entities::{
     WithheldReason,
 };
 use crate::db::{DatabaseError, DatabaseHandle, DevelopmentHandoff};
+use crate::support::cancellation::CancellationReason;
 
 const DEFAULT_MAX_PROVIDER_REQUESTS: u32 = 2048;
 
@@ -71,7 +72,10 @@ pub(crate) enum ToolLoopStop {
     TimedOut {
         index: u32,
     },
-    Cancelled,
+    Interrupted {
+        reason: CancellationReason,
+        effect_unknown: bool,
+    },
     EvidenceNotRecorded {
         index: u32,
         outcome: Option<ToolOutcomeKind>,
@@ -83,9 +87,9 @@ impl ToolLoopStop {
     pub(crate) fn is_unknown(&self) -> bool {
         match self {
             Self::TimedOut { .. }
-            | Self::Cancelled
             | Self::HandlerUncertain { .. }
             | Self::EvidenceNotRecorded { .. } => true,
+            Self::Interrupted { effect_unknown, .. } => *effect_unknown,
             Self::RequestLimit { .. }
             | Self::Refused(_)
             | Self::AdmissionRefused { .. }
@@ -117,7 +121,9 @@ impl std::fmt::Display for ToolLoopStop {
                 "the assistant response could not be recorded: {message}"
             ),
             Self::TimedOut { index } => write!(formatter, "tool call {index} timed out"),
-            Self::Cancelled => formatter.write_str("the tool loop was cancelled"),
+            Self::Interrupted { reason, .. } => {
+                formatter.write_str(super::super::runtime::cancellation_output(*reason).1)
+            }
             Self::EvidenceNotRecorded { index, .. } => write!(
                 formatter,
                 "the evidence of tool call {index} could not be recorded"
@@ -197,8 +203,11 @@ pub(crate) async fn answer_calls(
     refused: &[InvalidToolCall],
     cancellation: &CancellationToken,
 ) -> Result<CallAnswers, ToolLoopStop> {
-    if cancellation.is_cancelled() {
-        return Err(ToolLoopStop::Cancelled);
+    if let Some(reason) = cancellation.reason() {
+        return Err(ToolLoopStop::Interrupted {
+            reason,
+            effect_unknown: false,
+        });
     }
     let earlier = conversation
         .messages
@@ -237,12 +246,23 @@ pub(crate) async fn answer_calls(
         }
     }
 
+    // A paused Turn cannot send another request to durably retain read-only results.
+    let retain_results = tools.decider
+        && calls.iter().any(|call| {
+            needs_decision(&call.name).is_some()
+                && !refused
+                    .iter()
+                    .any(|refusal| refusal.index == Some(call.index))
+        });
     let limits = &tools.limits;
     let mut answers = Vec::with_capacity(calls.len());
     let mut awaiting = Vec::new();
     for call in calls {
-        if cancellation.is_cancelled() {
-            return Err(ToolLoopStop::Cancelled);
+        if let Some(reason) = cancellation.reason() {
+            return Err(ToolLoopStop::Interrupted {
+                reason,
+                effect_unknown: false,
+            });
         }
         if let Some(refusal) = refused
             .iter()
@@ -271,7 +291,6 @@ pub(crate) async fn answer_calls(
             if tools.decider {
                 record_decision(site, call, awaiting_decision(decided)).await?;
                 awaiting.push(index);
-                answers.push(String::new());
             } else {
                 record_decision(
                     site,
@@ -292,7 +311,6 @@ pub(crate) async fn answer_calls(
             starting.admission_pending();
         }
         let admission = ToolEvidence {
-            approval: None,
             call: reference,
             tool_call_id: call.id.clone(),
             name: call.name.clone(),
@@ -318,8 +336,8 @@ pub(crate) async fn answer_calls(
                 });
             }
         }
-        if cancellation.is_cancelled() {
-            return Err(cancelled_before_invocation(site, reference).await);
+        if let Some(reason) = cancellation.reason() {
+            return Err(cancelled_before_invocation(site, reference, reason).await);
         }
         let dispatch = match tools.offer.resolve(call) {
             Ok(dispatch) => dispatch,
@@ -351,7 +369,7 @@ pub(crate) async fn answer_calls(
             };
             match site
                 .database
-                .apply_development_job_tool(site.handoff, reference, job_call)
+                .apply_development_job_tool(site.handoff, reference, job_call, retain_results)
                 .await
             {
                 Ok(applied) => {
@@ -430,14 +448,28 @@ pub(crate) async fn answer_calls(
                 ToolOutcome::NotApplied {
                     message: "cancelled before the handler started".into(),
                 },
-                ToolLoopStop::Cancelled,
+                ToolLoopStop::Interrupted {
+                    reason: cancellation
+                        .reason()
+                        .unwrap_or(CancellationReason::Unspecified),
+                    effect_unknown: false,
+                },
             ),
             Either::Left(()) => (
                 ToolOutcome::Uncertain {
-                    cause: UncertainCause::Cancelled,
+                    cause: if cancellation.reason() == Some(CancellationReason::Deadline) {
+                        UncertainCause::TimedOut
+                    } else {
+                        UncertainCause::Cancelled
+                    },
                     message: None,
                 },
-                ToolLoopStop::Cancelled,
+                ToolLoopStop::Interrupted {
+                    reason: cancellation
+                        .reason()
+                        .unwrap_or(CancellationReason::Unspecified),
+                    effect_unknown: true,
+                },
             ),
             Either::Right(Err(())) => {
                 let outcome = ToolOutcome::Uncertain {
@@ -513,7 +545,7 @@ pub(crate) async fn answer_calls(
                     ToolLoopStop::ResultUnserializable { index },
                 ),
                 Ok(content) => {
-                    let outcome = if read_only {
+                    let outcome = if read_only && !retain_results {
                         ToolOutcome::CompletedElided {
                             bytes: content.len() as u64,
                             digest: ContentDigest::of(content.as_bytes()),
@@ -555,7 +587,6 @@ async fn record_decision(
     decision: ToolDecision,
 ) -> Result<(), ToolLoopStop> {
     let evidence = ToolEvidence {
-        approval: None,
         call: site.call(call),
         tool_call_id: call.id.clone(),
         name: call.name.clone(),
@@ -624,7 +655,6 @@ async fn record_refusal(
         .record_development_tool_decision(
             site.handoff,
             ToolEvidence {
-                approval: None,
                 call: site.call(call),
                 tool_call_id: call.id.clone(),
                 name: call.name.clone(),
@@ -636,11 +666,24 @@ async fn record_refusal(
         .map_err(|_| ToolLoopStop::Refused(refusal.clone()))
 }
 
-async fn cancelled_before_invocation(site: &CallSite<'_>, call: ToolCallRef) -> ToolLoopStop {
+async fn cancelled_before_invocation(
+    site: &CallSite<'_>,
+    call: ToolCallRef,
+    reason: CancellationReason,
+) -> ToolLoopStop {
     let outcome = ToolOutcome::NotInvoked {
         reason: NotInvokedReason::Cancelled,
     };
-    conclude(site, call, outcome, ToolLoopStop::Cancelled).await
+    conclude(
+        site,
+        call,
+        outcome,
+        ToolLoopStop::Interrupted {
+            reason,
+            effect_unknown: false,
+        },
+    )
+    .await
 }
 
 async fn conclude(

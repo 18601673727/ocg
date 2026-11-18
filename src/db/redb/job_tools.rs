@@ -58,6 +58,7 @@ impl Batch {
         proof: &crate::db::handoff::DevelopmentWriteProof,
         call: ToolCallRef,
         tool: JobToolCall,
+        retain_read_only_result: bool,
     ) -> Result<JobToolApplied, BatchError> {
         self.require_development_call(proof, call)?;
         let Some(evidence) = self.tool_evidence(call)? else {
@@ -153,7 +154,7 @@ impl Batch {
             }
         };
         let text = applied.value.to_string();
-        let outcome = if effect == ToolEffect::ReadOnly {
+        let outcome = if effect == ToolEffect::ReadOnly && !retain_read_only_result {
             ToolOutcome::CompletedElided {
                 bytes: text.len() as u64,
                 digest: ContentDigest::of(text.as_bytes()),

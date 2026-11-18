@@ -1,15 +1,13 @@
-use super::rows::encode_request_event;
-use super::{StorageError, jobs, observations};
+use super::{StorageError, jobs};
+use crate::db::entities::ToolCallRef;
 use crate::db::entities::{
     AttachmentId, AttachmentRecord, ConfigId, ContentDigest, DependencyCondition,
     FrozenExecutionConfig, JobId, JobLifecycle, JobSpec, JobState, Origin, ProjectId,
-    ProjectRecord, RecordRef, RequestNumber, SubmissionKey, SubmissionRecord, Timestamp,
-    ToolEvidenceRecord,
+    ProjectRecord, RecordRef, RequestNumber, SubmissionKey, SubmissionRecord, ToolEvidenceRecord,
 };
 use crate::db::entities::{
     ConfigBody, ConfigKind, ExecutionConfiguration, OutcomeKind, Submission, Violation,
 };
-use crate::db::entities::{RequestEventRecord, RequestPayload, ToolCallRef};
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::codec::Code;
 use crate::db::redb::rows::{
@@ -17,9 +15,9 @@ use crate::db::redb::rows::{
     decode_tool_evidence, encode_attachment, encode_project, encode_tool_evidence, tool_call_key,
 };
 use crate::db::redb::schema::{
-    ATTACHMENTS, CHILDREN, CONVERSATIONS, DEPENDENCY_WAITERS, EXECUTORS, JOB_OBSERVATIONS,
-    JOB_OUTPUTS, JOB_RUNTIME, JOBS, LIVE_CHILDREN, MESSAGES, META, MUTABLE_READY, P_MAX, PENDING,
-    POOL_ALLOCATIONS, POOLS, PROJECTS, REQUEST_EVENTS, REQUEST_TIMELINE, SUBMISSIONS, TOOL_CALLS,
+    ATTACHMENTS, CHILDREN, CONVERSATIONS, DEPENDENCY_WAITERS, EXECUTORS, JOB_OUTPUTS, JOB_RUNTIME,
+    JOBS, LIVE_CHILDREN, MESSAGES, META, MUTABLE_READY, P_MAX, PENDING, POOL_ALLOCATIONS, POOLS,
+    PROJECTS, REQUEST_EVENTS, SUBMISSIONS, TOOL_CALLS,
 };
 use crate::db::redb::{allocations, indexes, reads, reservations, rows, state};
 use ::redb::ReadableTable;
@@ -764,60 +762,6 @@ impl Batch {
                 .is_some();
             Ok(observed)
         })
-    }
-
-    pub(crate) fn insert_request_event(
-        &mut self,
-        job: JobId,
-        request: RequestNumber,
-        observed_at: Timestamp,
-        payload: RequestPayload,
-    ) -> Result<RequestEventRecord, BatchError> {
-        let identity = self.development_usage_identity(job)?;
-        let seq = self.step(|tx| {
-            let events = tx.open_table(REQUEST_EVENTS)?;
-            let last = events
-                .range((job.get(), request.get(), 0)..=(job.get(), request.get(), u32::MAX))?
-                .next_back()
-                .transpose()?
-                .map_or(0, |(key, _)| key.value().2);
-            Ok(last)
-        })?;
-        let Some(seq) = seq.checked_add(1) else {
-            return self.reject(Violation::ValueOutOfRange("seq"));
-        };
-        let event = RequestEventRecord {
-            id: crate::db::entities::RequestEventId::new(self.next_id()?),
-            job_id: job,
-            request,
-            seq,
-            observed_at,
-            recorded_at: self.now,
-            payload,
-        };
-        let timeline = indexes::request_timeline_key(Some(&identity), &event);
-        let usage_model = indexes::usage_model_key(Some(&identity), &event);
-        self.step(|tx| {
-            tx.open_table(REQUEST_EVENTS)?.insert(
-                (job.get(), request.get(), seq),
-                encode_request_event(&event).as_slice(),
-            )?;
-            if let Some(kind) =
-                observations::observation_kind(&tx.open_table(REQUEST_EVENTS)?, &event)?
-            {
-                tx.open_table(JOB_OBSERVATIONS)?
-                    .insert((job.get(), kind, event.id.get()), (request.get(), seq))?;
-            }
-            if let Some(key) = timeline {
-                tx.open_table(REQUEST_TIMELINE)?.insert(key, ())?;
-            }
-            if let Some(key) = usage_model {
-                indexes::record_usage_model(tx, key, job)?;
-            }
-            Ok(())
-        })?;
-        self.record_request_reference(job, request, seq)?;
-        Ok(event)
     }
 }
 

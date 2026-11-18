@@ -2,7 +2,7 @@ use crate::db::entities::identity::{
     ExecutionPoolId, ExecutorId, JobId, ReservationRequestId, ScheduledExternalPolicyId,
 };
 use crate::db::entities::{
-    ExecutionOperation, FrozenExecutionConfig, LlmTransport, StopProof, Timestamp,
+    ExecutionOperation, FrozenExecutionConfig, LlmTransport, OutcomeKind, StopProof, Timestamp,
     valid_credential_ref,
 };
 use crate::network::http::LoopbackProxy;
@@ -82,10 +82,25 @@ pub enum UnstartedCause {
     StartRefused,
     ExecutorUnavailable,
     Cancelled,
+    HostShutdown,
+    DeadlineExceeded,
     OfflineReconciled,
 }
 
 impl UnstartedCause {
+    pub(crate) fn outcome(self) -> OutcomeKind {
+        match self {
+            Self::Cancelled => OutcomeKind::Cancelled,
+            Self::FrozenSecretUnavailable
+            | Self::InputUnavailable
+            | Self::StartRefused
+            | Self::ExecutorUnavailable
+            | Self::HostShutdown
+            | Self::DeadlineExceeded
+            | Self::OfflineReconciled => OutcomeKind::Failed,
+        }
+    }
+
     pub fn code(self) -> &'static str {
         match self {
             Self::FrozenSecretUnavailable => "frozen_secret_unavailable",
@@ -93,6 +108,8 @@ impl UnstartedCause {
             Self::StartRefused => "start_refused",
             Self::ExecutorUnavailable => "executor_unavailable_before_start",
             Self::Cancelled => "cancelled_before_start",
+            Self::HostShutdown => "host_shutdown_before_start",
+            Self::DeadlineExceeded => "deadline_exceeded_before_start",
             Self::OfflineReconciled => "reconciled_unstarted_reservation",
         }
     }
@@ -113,6 +130,12 @@ impl UnstartedCause {
             }
             Self::Cancelled => {
                 "This execution was cancelled before it started. Nothing was sent to the Provider."
+            }
+            Self::HostShutdown => {
+                "The host shut down before this Job started. Nothing was sent to the Provider."
+            }
+            Self::DeadlineExceeded => {
+                "The dispatch deadline expired before this Job started. Nothing was sent to the Provider."
             }
             Self::OfflineReconciled => {
                 "OCG stopped after reserving capacity for this Job and before it started; an offline reconciliation ended it. Nothing was sent to the Provider."
@@ -177,7 +200,7 @@ pub const STOPPED_BEFORE_SEND: &str = "a stop was requested before the request w
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NativeStopRequest {
-    EndedBeforeStart(AllocationToken),
+    EndedBeforeStart,
     Requested(AllocationToken),
     AlreadyRequested(AllocationToken),
 }

@@ -609,7 +609,7 @@ function JobWatchBody({
     ? t(EXECUTION_PHASE_KEYS[phase])
     : t(failure ? "job.state.unavailable" : "job.state.loading");
   const badgeClass = phase ? PHASE_BADGE[phase] : TONE.loading;
-  const stopPhase = phase === "reserved" || phase === "running";
+  const stopPhase = phase === "queued" || phase === "reserved" || phase === "running";
   const stopAvailable = Boolean(details?.context);
   const stopRetry =
     stopState === "locked" &&

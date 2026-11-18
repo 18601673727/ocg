@@ -330,7 +330,7 @@ pub(crate) fn prepare_development_handoff(
                 ));
             }
             for turn in &snapshot.history {
-                let answer = if turn
+                let mut answer = if turn
                     .record
                     .outcome
                     .as_ref()
@@ -343,6 +343,14 @@ pub(crate) fn prepare_development_handoff(
                         .last()
                         .and_then(entities::JobOutputRecord::display_text)
                 };
+                if !turn.awaiting_batch.is_empty() {
+                    let context = paused_tool_context(&turn.awaiting_batch);
+                    let answer = answer.get_or_insert_with(String::new);
+                    if !answer.is_empty() {
+                        answer.push_str("\n\n");
+                    }
+                    answer.push_str(&context);
+                }
                 prior.push((
                     Some(turn.record.job.input.text().to_owned()),
                     images_for(&turn.attachments)?,
@@ -423,4 +431,34 @@ pub(crate) fn prepare_development_handoff(
             ))
         }
     }
+}
+
+fn paused_tool_context(batch: &[entities::ToolEvidenceRecord]) -> String {
+    use entities::{ToolDecision, ToolOutcome};
+    use serde_json::json;
+
+    // A later Turn gets a transcript. It must not present prior calls as new
+    // invocations or manufacture a tool reply for a call that is still awaiting.
+    let calls = batch.iter().map(|call| {
+        let data = match (&call.decision.fact, call.outcome.as_ref().map(|outcome| &outcome.fact)) {
+            (ToolDecision::AwaitingApproval(_), _) => json!({"state": "awaited_approval"}),
+            (ToolDecision::AwaitingAnswer(_), _) => json!({"state": "awaited_answer"}),
+            (ToolDecision::Refused(reason), _) => json!({"state": "refused", "reason": reason.as_str()}),
+            (ToolDecision::Admitted(_), Some(outcome)) => match outcome {
+                ToolOutcome::Completed { result } => json!({"state": "completed", "result": result.as_str()}),
+                ToolOutcome::NotApplied { message } => json!({"state": "not_applied", "reason": message}),
+                ToolOutcome::NotInvoked { .. } => json!({"state": "not_invoked"}),
+                ToolOutcome::CompletedElided { .. } | ToolOutcome::CompletedWithheld { .. } => {
+                    json!({"state": "completed", "result_unavailable": true})
+                }
+                ToolOutcome::Uncertain { .. } => json!({"state": "uncertain"}),
+            },
+            (ToolDecision::Admitted(_), None) => json!({"state": "outcome_unavailable"}),
+        };
+        json!({"call_id": call.tool_call_id, "tool": call.name, "request": call.call.request.get(), "index": call.call.index, "evidence": data})
+    }).collect::<Vec<_>>();
+    format!(
+        "Recorded tool calls from the previous Turn. Use completed results as history. Calls that awaited a decision did not run here. Follow only decisions supplied by the user.\n{}",
+        json!(calls)
+    )
 }

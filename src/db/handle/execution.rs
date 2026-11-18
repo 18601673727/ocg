@@ -646,15 +646,15 @@ impl DatabaseHandle {
     pub(crate) async fn record_development_uncertain(
         &self,
         handoff: &DevelopmentHandoff,
-        reason: entities::UncertaintyReason,
+        cause: entities::OutcomeCause,
     ) -> Result<(), DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self
             .write(
                 0,
                 OperationKind::FinalizeJob,
-                (proof, reason),
-                |batch, (proof, reason)| batch.record_development_uncertain(&proof, reason),
+                (proof, cause),
+                |batch, (proof, cause)| batch.record_development_uncertain(&proof, cause),
             )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));
@@ -677,12 +677,13 @@ impl DatabaseHandle {
         handoff: &DevelopmentHandoff,
         call: ToolCallRef,
         tool: entities::JobToolCall,
+        retain_read_only_result: bool,
     ) -> Result<redb::JobToolApplied, DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self
             .write_sized(
-                (proof, call, tool),
-                |(_, _, tool)| {
+                (proof, call, tool, retain_read_only_result),
+                |(_, _, tool, _)| {
                     use entities::JobToolCall;
                     let search = match tool {
                         JobToolCall::JobPlan { steps, .. } => steps
@@ -726,7 +727,9 @@ impl DatabaseHandle {
                         })
                 },
                 OperationKind::ApplyJobTool,
-                |batch, (proof, call, tool)| batch.apply_job_tool(&proof, call, tool),
+                |batch, (proof, call, tool, retain)| {
+                    batch.apply_job_tool(&proof, call, tool, retain)
+                },
             )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));

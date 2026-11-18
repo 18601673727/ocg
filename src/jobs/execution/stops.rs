@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::db::entities::{AllocationToken, JobId};
-use crate::support::cancellation::CancellationToken;
+use crate::support::cancellation::{CancellationReason, CancellationToken};
 
 #[derive(Clone, Default)]
 pub(crate) struct NativeStops(Arc<Mutex<BTreeMap<JobId, (AllocationToken, CancellationToken)>>>);
@@ -37,7 +37,7 @@ impl NativeStops {
             .get(&token.job)
         {
             Some((registered, cancellation)) if *registered == token => {
-                cancellation.cancel();
+                cancellation.cancel_for(CancellationReason::UserStop);
                 true
             }
             Some(_) | None => false,

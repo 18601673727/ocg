@@ -1,22 +1,43 @@
 use std::sync::{
     Arc, Mutex, PoisonError, Weak,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicU8, Ordering},
 };
 use std::task::{Poll, Waker};
 
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken(Arc<Cancellation>);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum CancellationReason {
+    Unspecified = 1,
+    UserStop,
+    HostShutdown,
+    Deadline,
+    EvidenceUnavailable,
+}
+
 #[derive(Debug, Default)]
 struct Cancellation {
-    cancelled: AtomicBool,
+    reason: AtomicU8,
     waiters: Mutex<Vec<Waker>>,
     children: Mutex<Vec<Weak<Cancellation>>>,
 }
 
 impl CancellationToken {
     pub fn cancel(&self) {
-        self.0.cancelled.store(true, Ordering::Release);
+        self.cancel_for(CancellationReason::Unspecified);
+    }
+
+    pub(crate) fn cancel_for(&self, reason: CancellationReason) {
+        if self
+            .0
+            .reason
+            .compare_exchange(0, reason as u8, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let waiters = std::mem::take(
             &mut *self
                 .0
@@ -35,7 +56,7 @@ impl CancellationToken {
                 .unwrap_or_else(PoisonError::into_inner),
         );
         for child in children.iter().filter_map(Weak::upgrade) {
-            Self(child).cancel();
+            Self(child).cancel_for(reason);
         }
     }
 
@@ -46,9 +67,9 @@ impl CancellationToken {
             .children
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if self.is_cancelled() {
+        if let Some(reason) = self.reason() {
             drop(children);
-            child.cancel();
+            child.cancel_for(reason);
             return child;
         }
         children.retain(|registered| registered.strong_count() > 0);
@@ -57,7 +78,21 @@ impl CancellationToken {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.cancelled.load(Ordering::Acquire)
+        self.reason().is_some()
+    }
+
+    pub(crate) fn reason(&self) -> Option<CancellationReason> {
+        use CancellationReason::{
+            Deadline, EvidenceUnavailable, HostShutdown, Unspecified, UserStop,
+        };
+        match self.0.reason.load(Ordering::Acquire) {
+            value if value == UserStop as u8 => Some(UserStop),
+            value if value == HostShutdown as u8 => Some(HostShutdown),
+            value if value == Deadline as u8 => Some(Deadline),
+            value if value == EvidenceUnavailable as u8 => Some(EvidenceUnavailable),
+            0 => None,
+            _ => Some(Unspecified),
+        }
     }
 
     pub async fn cancelled(&self) {

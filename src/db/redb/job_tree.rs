@@ -12,7 +12,7 @@ use crate::db::entities::{
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::schema::{
     CHILD_GROUPS, CHILDREN, CONVERSATIONS, JOB_OUTPUTS, JOBS, LIVE_CHILDREN, RECURRENCES,
-    RETRY_JOBS, TURNS,
+    RETRY_JOBS, TOOL_CALLS, TURNS,
 };
 use crate::db::redb::{rows, state};
 use ::redb::ReadableTable;
@@ -421,8 +421,8 @@ impl Batch {
                 AllocationPhase::Reserved
                 | AllocationPhase::Running
                 | AllocationPhase::StopRequested => match self.request_native_stop(turn)? {
-                    NativeStopRequest::EndedBeforeStart(token)
-                    | NativeStopRequest::Requested(token)
+                    NativeStopRequest::EndedBeforeStart => ended.push(turn),
+                    NativeStopRequest::Requested(token)
                     | NativeStopRequest::AlreadyRequested(token) => running.push(token),
                 },
                 AllocationPhase::Uncertain | AllocationPhase::Released => {}
@@ -848,6 +848,34 @@ impl Batch {
             return self.reject(Violation::InvalidValue(
                 "turn",
                 "the original Job still holds execution capacity",
+            ));
+        }
+        let may_have_applied_tool = self.step(|tx| {
+            use crate::db::entities::{ToolEffect, ToolOutcome};
+            let calls = tx.open_table(TOOL_CALLS)?;
+            for entry in calls.range((turn.get(), 0, 0)..=(turn.get(), u32::MAX, u32::MAX))? {
+                let (key, value) = entry?;
+                let call =
+                    rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, value.value())?;
+                if call
+                    .admission()
+                    .is_some_and(|admission| admission.effect != ToolEffect::ReadOnly)
+                    && !call.outcome.as_ref().is_some_and(|outcome| {
+                        matches!(
+                            outcome.fact,
+                            ToolOutcome::NotApplied { .. } | ToolOutcome::NotInvoked { .. }
+                        )
+                    })
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        })?;
+        if may_have_applied_tool {
+            return self.reject(Violation::InvalidValue(
+                "retry",
+                "this turn may have applied a tool effect; continue the conversation using its recorded evidence",
             ));
         }
         if !self.unsettled_turns(conversation)?.is_empty() {

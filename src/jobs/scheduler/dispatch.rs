@@ -13,6 +13,7 @@ use crate::jobs::execution::runtime::{
 };
 use crate::jobs::execution::stops::NativeStops;
 use crate::jobs::execution::tools::native::NativeTooling;
+use crate::support::cancellation::CancellationReason;
 
 const DISPATCH_TIMEOUT: Duration = SCHEDULED_EXTERNAL_MAX_TIMEOUT;
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
@@ -120,6 +121,10 @@ async fn within_deadline<F: std::future::Future>(
     timeout: Duration,
     exchange: F,
 ) -> F::Output {
+    if timeout.is_zero() {
+        cancellation.cancel_for(CancellationReason::Deadline);
+        return exchange.await;
+    }
     let deadline = Instant::now() + timeout;
     let done = CancellationToken::default();
     let timer = ntex::rt::spawn({
@@ -138,7 +143,7 @@ async fn within_deadline<F: std::future::Future>(
                 }
             };
             if let Either::Right(()) = select(done.cancelled(), wait_for_deadline).await {
-                cancellation.cancel();
+                cancellation.cancel_for(CancellationReason::Deadline);
             }
         }
     });
@@ -183,58 +188,132 @@ pub(super) async fn dispatch(
     workspace_tools: &WorkspaceTools,
     stops: &NativeStops,
 ) -> Dispatched {
-    let token = allocation.token;
-    let admitted = if cancellation.is_cancelled() {
-        Err((
-            UnstartedCause::Cancelled,
-            "cancelled before the start".to_owned(),
-        ))
-    } else {
-        match ScheduledExternalGrant::load(database, token.job).await {
-            Ok(Some(_)) if allocation.operation == ExecutionOperation::Decision => Err((
-                UnstartedCause::StartRefused,
-                "Decision execution is not permitted under a scheduled external grant".to_owned(),
-            )),
-            Ok(grant) => Ok(grant),
-            Err(error) => Err((
-                UnstartedCause::StartRefused,
-                format!(
-                    "the scheduled external authorization was refused before the start ({error})"
-                ),
-            )),
-        }
-    };
-    let detail = match admitted {
-        Ok(grant) => {
-            let config = grant.as_ref().map_or_else(
-                || ProviderExecutionConfig {
-                    timeout: DISPATCH_TIMEOUT,
-                    first_delta_timeout: Some(DISPATCH_TIMEOUT),
-                    max_output_bytes: MAX_RESPONSE_BYTES,
-                    cancellation: cancellation.clone(),
-                    ..ProviderExecutionConfig::default()
-                },
-                |grant| grant.provider_config(cancellation.clone()),
-            );
-            start_and_exchange(
+    if let Some(cause) = cancellation_before_start(cancellation) {
+        return end_dispatch(
+            database,
+            allocation.token,
+            cause,
+            cause.summary().to_owned(),
+        )
+        .await;
+    }
+    let started = Instant::now();
+    let grant = match ScheduledExternalGrant::load(database, allocation.token.job).await {
+        Ok(grant) => grant,
+        Err(error) => {
+            return end_dispatch(
                 database,
-                token,
-                allocation.operation,
-                config,
-                grant.as_ref(),
-                workspace_tools.data_directory(),
-                stops,
+                allocation.token,
+                UnstartedCause::StartRefused,
+                format!("scheduled external authorization was refused before start ({error})"),
             )
-            .await
+            .await;
         }
-        Err((cause, prefix)) => match database
-            .fail_unstarted_development_reservation(token, cause)
-            .await
-        {
-            Ok(_) => format!("{prefix}; the reservation was ended and nothing was sent"),
-            Err(settle) => format!("{prefix}; the reservation was not ended here ({settle})"),
-        },
     };
+    let limit = grant
+        .as_ref()
+        .map_or(DISPATCH_TIMEOUT, |grant| grant.limits().timeout)
+        .saturating_sub(started.elapsed());
+    within_deadline(
+        cancellation,
+        limit,
+        dispatch_admitted(
+            database,
+            allocation,
+            cancellation,
+            workspace_tools,
+            stops,
+            grant.as_ref(),
+        ),
+    )
+    .await
+}
+
+async fn end_dispatch(
+    database: &DatabaseHandle,
+    token: AllocationToken,
+    cause: UnstartedCause,
+    detail: String,
+) -> Dispatched {
+    let detail = settle_unstarted(database, token, cause, detail).await;
+    finish_dispatch(database, token, detail).await
+}
+
+async fn settle_unstarted(
+    database: &DatabaseHandle,
+    token: AllocationToken,
+    cause: UnstartedCause,
+    detail: String,
+) -> String {
+    match database
+        .fail_unstarted_development_reservation(token, cause)
+        .await
+    {
+        Ok(_) => format!("{detail}; the reservation was ended and nothing was sent"),
+        Err(error) => format!("{detail}; the reservation was not ended here ({error})"),
+    }
+}
+
+fn cancellation_before_start(cancellation: &CancellationToken) -> Option<UnstartedCause> {
+    match cancellation.reason()? {
+        CancellationReason::UserStop => Some(UnstartedCause::Cancelled),
+        CancellationReason::HostShutdown => Some(UnstartedCause::HostShutdown),
+        CancellationReason::Deadline => Some(UnstartedCause::DeadlineExceeded),
+        CancellationReason::EvidenceUnavailable | CancellationReason::Unspecified => {
+            Some(UnstartedCause::StartRefused)
+        }
+    }
+}
+
+async fn dispatch_admitted(
+    database: &DatabaseHandle,
+    allocation: PoolAllocation,
+    cancellation: &CancellationToken,
+    workspace_tools: &WorkspaceTools,
+    stops: &NativeStops,
+    grant: Option<&ScheduledExternalGrant>,
+) -> Dispatched {
+    let token = allocation.token;
+    if let Some(cause) = cancellation_before_start(cancellation) {
+        return end_dispatch(database, token, cause, cause.summary().to_owned()).await;
+    }
+    if grant.is_some() && allocation.operation == ExecutionOperation::Decision {
+        return end_dispatch(
+            database,
+            token,
+            UnstartedCause::StartRefused,
+            "Decision execution is not permitted under a scheduled external grant".to_owned(),
+        )
+        .await;
+    }
+    let config = grant.map_or_else(
+        || ProviderExecutionConfig {
+            timeout: DISPATCH_TIMEOUT,
+            first_delta_timeout: Some(DISPATCH_TIMEOUT),
+            max_output_bytes: MAX_RESPONSE_BYTES,
+            cancellation: cancellation.clone(),
+            ..ProviderExecutionConfig::default()
+        },
+        |grant| grant.provider_config(cancellation.clone()),
+    );
+    let detail = start_and_exchange(
+        database,
+        token,
+        allocation.operation,
+        config,
+        grant,
+        workspace_tools.data_directory(),
+        stops,
+    )
+    .await;
+    finish_dispatch(database, token, detail).await
+}
+
+async fn finish_dispatch(
+    database: &DatabaseHandle,
+    token: AllocationToken,
+    detail: String,
+) -> Dispatched {
     let dispatched = reported(database, token, detail).await;
     if dispatched
         .outcome
@@ -261,6 +340,9 @@ async fn start_and_exchange(
     let cancellation = &config.cancellation;
     let mut tooling = NativeTooling::new(data_directory, stops.clone(), cancellation.clone());
     let handoff = loop {
+        if let Some(cause) = cancellation_before_start(cancellation) {
+            return settle_unstarted(database, token, cause, cause.summary().to_owned()).await;
+        }
         let result = async {
             use crate::ai::development::{
                 DevelopmentResolvedCandidate, prepare_development_handoff,
@@ -295,7 +377,17 @@ async fn start_and_exchange(
                         },
                     )
                     .await
-                    .map_err(invalid)?
+                    .map_err(|reason| {
+                        if reason == "preparation_cancelled"
+                            && let Some(cause) = cancellation_before_start(cancellation)
+                        {
+                            return DevelopmentHandoffError::NotStarted {
+                                cause,
+                                detail: cause.summary().to_owned(),
+                            };
+                        }
+                        invalid(reason)
+                    })?
             } else {
                 None
             };
@@ -322,6 +414,12 @@ async fn start_and_exchange(
                     }),
             }
             .map_err(invalid)?;
+            if let Some(cause) = cancellation_before_start(cancellation) {
+                return Err(DevelopmentHandoffError::NotStarted {
+                    cause,
+                    detail: cause.summary().to_owned(),
+                });
+            }
             let handoff = database
                 .start_development_handoff(prepared.evidence)
                 .await?;
@@ -342,28 +440,19 @@ async fn start_and_exchange(
     match handoff {
         Ok((handoff, policy)) => {
             let tools = tooling.into_execution();
-            let exchange = within_deadline(cancellation, DISPATCH_TIMEOUT, async {
-                if operation == ExecutionOperation::Decision
-                    || handoff.handoff.decision_inputs().is_some()
-                {
-                    supervise_development_decision(database, handoff, &config, policy).await
-                } else {
-                    supervise_development_generative(database, handoff, &config, policy, tools)
-                        .await
-                }
-            })
-            .await;
+            let exchange = if operation == ExecutionOperation::Decision
+                || handoff.handoff.decision_inputs().is_some()
+            {
+                supervise_development_decision(database, handoff, &config, policy).await
+            } else {
+                supervise_development_generative(database, handoff, &config, policy, tools).await
+            };
             match exchange {
                 Ok(_) => "the exchange returned and was recorded".to_owned(),
                 Err(error) => error.to_string(),
             }
         }
         Err(DevelopmentHandoffError::NotStarted { cause, detail }) => {
-            let cause = if cancellation.is_cancelled() {
-                UnstartedCause::Cancelled
-            } else {
-                cause
-            };
             let settled = loop {
                 match database
                     .fail_unstarted_development_reservation(token, cause)

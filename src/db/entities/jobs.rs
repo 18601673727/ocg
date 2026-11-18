@@ -542,6 +542,10 @@ pub enum UncertaintyReason {
     Unclassified,
 }
 
+pub(crate) const UNCERTAIN_HOST_SHUTDOWN: &str =
+    "The host shut down after external work may have started. Termination was not confirmed.";
+pub(crate) const UNCERTAIN_DEADLINE: &str = "The dispatch deadline expired after external work may have started. Termination was not confirmed.";
+
 impl UncertaintyReason {
     pub const fn code(self) -> u8 {
         match self {

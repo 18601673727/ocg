@@ -17,8 +17,6 @@ export abstract class RuntimeClientBase implements OcgRuntimeClient {
   abstract deleteSession(sessionId: string): Promise<void>;
   abstract retryMessage(sessionId: string, messageId: string): Promise<void>;
   abstract cancel(sessionId: string): Promise<void>;
-  abstract removeQueuedMessage(sessionId: string, id: string): Promise<void>;
-  abstract editQueuedMessage(sessionId: string, id: string, content: string): Promise<void>;
 
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void {
     this.listeners.add(listener);

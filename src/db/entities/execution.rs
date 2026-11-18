@@ -199,7 +199,10 @@ pub(crate) struct DevelopmentContextTurn {
     pub record: MutableJobRecord,
     pub attachments: Vec<AttachmentRecord>,
     pub outputs: Vec<JobOutputRecord>,
+    pub awaiting_batch: Vec<crate::db::entities::ToolEvidenceRecord>,
 }
+
+pub(crate) const AWAITING_TOOL_DECISION: &str = "awaiting_tool_decision";
 
 #[derive(Clone, Debug)]
 pub(crate) struct VerifiedNativeSummary {

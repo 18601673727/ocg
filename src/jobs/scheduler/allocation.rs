@@ -39,8 +39,8 @@ const NOT_ASSESSED: [&str; 7] = [
     "predecessor_settlement",
     "attachment_availability",
     "executor_capacity",
-    "autonomous_scheduling_enabled",
-    "host_armed_activation",
+    "host_scheduler_running",
+    "scheduled_external_authorization",
     "reservation_and_writer_admission",
 ];
 
@@ -96,7 +96,7 @@ pub(crate) fn endpoint_eligibility(
     };
     EndpointEligibility {
         code: "eligible",
-        detail: "the Job can use the configured Provider endpoint",
+        detail: "the frozen Provider configuration passes the endpoint check",
         endpoint_class: Some(if uri.scheme_str() == Some("https") {
             "external"
         } else {

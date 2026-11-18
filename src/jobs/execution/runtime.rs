@@ -20,6 +20,7 @@ use crate::db::entities::{
 };
 use crate::db::{DatabaseError, DatabaseHandle};
 use crate::jobs::authorization::scheduled::ScheduledExternalGrant;
+use crate::support::cancellation::CancellationReason;
 
 #[derive(Clone, Copy)]
 pub(crate) enum EndpointPolicy<'a> {
@@ -92,7 +93,7 @@ pub(crate) async fn supervise_development_generative(
             handoff,
             RequestNumber::FIRST,
             1,
-            config,
+            None,
             NOT_SENT,
             message,
         )
@@ -197,7 +198,7 @@ pub(crate) async fn supervise_development_generative(
             Ok(CallAnswers::Awaiting(awaiting)) => {
                 let finalization = JobFinalization::Completed(FinalResult {
                     summary: Some(awaiting_summary(&result, &awaiting)),
-                    code: None,
+                    code: Some(crate::db::entities::AWAITING_TOOL_DECISION.to_owned()),
                     goal_reached: None,
                     value: Some(providers::result_value(&result)),
                 });
@@ -560,11 +561,15 @@ async fn settle_tool_stop(
     last: Option<&ProviderExecutionResult>,
     stop: ToolLoopStop,
 ) -> Result<AppendedOutput, DatabaseError> {
+    let cancellation = match &stop {
+        ToolLoopStop::Interrupted { reason, .. } => Some(*reason),
+        _ => None,
+    };
     if stop.is_unknown() {
         database
             .record_development_uncertain(
                 handoff,
-                crate::db::entities::UncertaintyReason::StopRequestedWithoutConfirmedTermination,
+                cancellation_uncertainty(cancellation, crate::db::entities::UncertaintyReason::StopRequestedWithoutConfirmedTermination),
             )
             .await?;
         return Err(DatabaseError::Rejected(Violation::InvalidValue(
@@ -574,12 +579,25 @@ async fn settle_tool_stop(
     }
     let result = FinalResult {
         summary: Some(stop.to_string()),
-        code: Some(TOOL_LOOP_STOPPED.to_owned()),
+        code: Some(
+            cancellation
+                .map_or(TOOL_LOOP_STOPPED, |reason| cancellation_output(reason).0)
+                .to_owned(),
+        ),
         goal_reached: Some(false),
         value: last.map(providers::result_value),
     };
     database
-        .finalize_development_failure(handoff, expected_seq, JobFinalization::Failed(result), None)
+        .finalize_development_failure(
+            handoff,
+            expected_seq,
+            if cancellation == Some(CancellationReason::UserStop) {
+                JobFinalization::Cancelled(result)
+            } else {
+                JobFinalization::Failed(result)
+            },
+            None,
+        )
         .await
 }
 
@@ -608,9 +626,6 @@ pub(crate) async fn supervise_development_decision(
     let local_rejection = match endpoint {
         None => Some("explicit endpoint required"),
         Some(endpoint) if !policy.permits(endpoint, config) => Some(policy.refusal()),
-        Some(_) if config.cancellation.is_cancelled() => {
-            Some("Execution was cancelled before the provider request.")
-        }
         Some(_) => None,
     };
     if let Some(message) = local_rejection {
@@ -619,7 +634,7 @@ pub(crate) async fn supervise_development_decision(
             handoff,
             RequestNumber::FIRST,
             1,
-            config,
+            None,
             NOT_SENT,
             message,
         )
@@ -809,7 +824,11 @@ async fn settle_development_error(
                 handoff,
                 request,
                 expected_seq,
-                config,
+                if code == NOT_DELIVERED {
+                    config.cancellation.reason()
+                } else {
+                    None
+                },
                 code,
                 &message,
             )
@@ -842,12 +861,31 @@ async fn settle_development_error(
                 .await
         }
         DevelopmentSettlement::Held(reason) => {
+            let cancellation = config.cancellation.reason();
             database
-                .record_development_uncertain(handoff, reason)
+                .record_development_uncertain(
+                    handoff,
+                    cancellation_uncertainty(cancellation, reason),
+                )
                 .await?;
             Err(DatabaseError::Rejected(Violation::InvalidValue(
                 "execution",
-                "provider exchange did not return a supported result; ownership remains held as Uncertain",
+                match cancellation {
+                    Some(CancellationReason::HostShutdown) => {
+                        "host shut down after the request may have been sent; ownership remains held as Uncertain"
+                    }
+                    Some(CancellationReason::Deadline) => {
+                        "dispatch deadline expired after the request may have been sent; ownership remains held as Uncertain"
+                    }
+                    Some(
+                        CancellationReason::UserStop
+                        | CancellationReason::Unspecified
+                        | CancellationReason::EvidenceUnavailable,
+                    )
+                    | None => {
+                        "provider exchange did not return a supported result; ownership remains held as Uncertain"
+                    }
+                },
             )))
         }
     }
@@ -858,23 +896,27 @@ async fn settle_development_unsent(
     handoff: &crate::db::DevelopmentHandoff,
     request: RequestNumber,
     expected_seq: u32,
-    config: &ProviderExecutionConfig,
+    cancellation: Option<CancellationReason>,
     code: &'static str,
     message: &str,
 ) -> Result<AppendedOutput, DatabaseError> {
-    let cancelled = config.cancellation.is_cancelled();
-    if cancelled && request != RequestNumber::FIRST {
+    if cancellation.is_some() && request != RequestNumber::FIRST {
+        use crate::db::entities::UncertaintyReason;
         database
             .record_development_uncertain(
                 handoff,
-                crate::db::entities::UncertaintyReason::StopRequestedWithoutConfirmedTermination,
+                cancellation_uncertainty(cancellation, UncertaintyReason::RequestPossiblySent),
             )
             .await?;
         return Err(DatabaseError::Rejected(Violation::InvalidValue(
             "execution",
-            "the tool loop was cancelled after a request; ownership remains held as Uncertain",
+            "the tool loop was interrupted after a request; ownership remains held as Uncertain",
         )));
     }
+    let (code, message) = match cancellation {
+        Some(reason) => cancellation_output(reason),
+        None => (code, message),
+    };
     let summary = if handoff.contains_secret(message) {
         "Execution could not start the provider request.".to_owned()
     } else {
@@ -890,7 +932,7 @@ async fn settle_development_unsent(
         .finalize_development_failure(
             handoff,
             expected_seq,
-            if cancelled {
+            if cancellation == Some(CancellationReason::UserStop) {
                 JobFinalization::Cancelled(result)
             } else {
                 JobFinalization::Failed(result)
@@ -898,6 +940,44 @@ async fn settle_development_unsent(
             None,
         )
         .await
+}
+
+pub(super) fn cancellation_output(reason: CancellationReason) -> (&'static str, &'static str) {
+    match reason {
+        CancellationReason::UserStop => ("user_stop", "Execution stopped at the user's request."),
+        CancellationReason::HostShutdown => (
+            "host_shutdown",
+            "The host shut down before execution finished.",
+        ),
+        CancellationReason::Deadline => ("deadline_exceeded", "The dispatch deadline expired."),
+        CancellationReason::EvidenceUnavailable => (
+            "evidence_unavailable",
+            "Execution evidence was unavailable.",
+        ),
+        CancellationReason::Unspecified => ("interrupted", "Execution was interrupted."),
+    }
+}
+
+fn cancellation_uncertainty(
+    reason: Option<CancellationReason>,
+    fallback: crate::db::entities::UncertaintyReason,
+) -> crate::db::entities::OutcomeCause {
+    use crate::db::entities::{
+        OutcomeCause, UNCERTAIN_DEADLINE, UNCERTAIN_HOST_SHUTDOWN, UncertaintyReason,
+    };
+    match reason {
+        Some(CancellationReason::UserStop) => {
+            OutcomeCause::Uncertain(UncertaintyReason::StopRequestedWithoutConfirmedTermination)
+        }
+        Some(CancellationReason::HostShutdown) => {
+            OutcomeCause::Text(UNCERTAIN_HOST_SHUTDOWN.to_owned())
+        }
+        Some(CancellationReason::Deadline) => OutcomeCause::Text(UNCERTAIN_DEADLINE.to_owned()),
+        Some(CancellationReason::EvidenceUnavailable) => {
+            OutcomeCause::Uncertain(UncertaintyReason::WorkerAckPendingOrAmbiguous)
+        }
+        Some(CancellationReason::Unspecified) | None => OutcomeCause::Uncertain(fallback),
+    }
 }
 
 struct DevelopmentLoopbackSink<'a> {
@@ -933,12 +1013,14 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                 Err(DatabaseError::Rejected(Violation::InvalidValue("execution", reason)))
                     if reason == crate::db::entities::STOPPED_BEFORE_SEND =>
                 {
-                    self.cancellation.cancel();
+                    self.cancellation.cancel_for(CancellationReason::UserStop);
                     return Err(OutputSinkError {
                         message: "a stop was requested before the request was sent".into(),
                     });
                 }
-                Err(_) => {
+                Err(error) => {
+                    self.evidence_incomplete =
+                        matches!(error, DatabaseError::OutcomeUnknown { .. });
                     return Err(OutputSinkError {
                         message: "request evidence unavailable".into(),
                     });
@@ -1014,7 +1096,8 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                 .is_err()
             {
                 self.evidence_incomplete = true;
-                self.cancellation.cancel();
+                self.cancellation
+                    .cancel_for(CancellationReason::EvidenceUnavailable);
                 return;
             }
             self.persisted_usage = true;

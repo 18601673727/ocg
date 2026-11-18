@@ -1432,42 +1432,6 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     if (record.settlement.state === "unsettled") this.watch(job);
   }
 
-  override async removeQueuedMessage(sessionId: string, id: string): Promise<void> {
-    await this.amendQueue(sessionId, id);
-  }
-  override async editQueuedMessage(sessionId: string, id: string, content: string): Promise<void> {
-    await this.amendQueue(sessionId, id, content);
-  }
-  private async amendQueue(sessionId: string, id: string, content?: string) {
-    const turn = [...this.turns.values()].find(
-      (turn) => turn.sessionId === sessionId && id.startsWith(`${turn.job.id}:entry:`),
-    );
-    const entry = turn
-      ? materializeUserEntries(turn.entries ?? []).find(
-          (entry) => `${turn.job.id}:entry:${entry.seq}` === id && !entry.withdrawn,
-        )
-      : undefined;
-    if (!turn?.job.conversation || !entry)
-      throw new Error("Queued message is no longer available.");
-    try {
-      await this.api.amendQueuedMessage(
-        turn.job.conversation,
-        content === undefined
-          ? { action: "withdraw", turn: turn.job.id, message: entry.seq }
-          : {
-              action: "edit",
-              turn: turn.job.id,
-              message: entry.seq,
-              text: content,
-              attachments: entry.attachments,
-            },
-        this.lifetime.signal,
-      );
-    } finally {
-      await this.trackTurn(sessionId, turn.job.id);
-    }
-  }
-
   override async retryMessage(sessionId: string, messageId: string): Promise<void> {
     const message = this.getSnapshot().messagesBySession[sessionId]?.find(
       (message) => message.id === messageId,

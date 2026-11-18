@@ -34,7 +34,5 @@ export interface OcgRuntimeClient {
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;
   getSnapshot(): RuntimeSnapshot;
   cancel?(sessionId: string): Promise<void>;
-  removeQueuedMessage?(sessionId: string, id: string): void | Promise<void>;
-  editQueuedMessage?(sessionId: string, id: string, content: string): Promise<void>;
   dispose?(): void;
 }

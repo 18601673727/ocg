@@ -3,6 +3,7 @@ use crate::db::DatabaseHandle;
 use crate::jobs::execution::runtime::{ExecutionRuntimeError, WorkspaceTools};
 use crate::jobs::execution::stops::NativeStops;
 use crate::jobs::scheduler::allocation;
+use crate::support::cancellation::CancellationReason;
 
 pub struct ExecutionRuntime {
     native_stops: NativeStops,
@@ -62,7 +63,7 @@ impl ExecutionRuntime {
     }
 
     pub async fn shutdown(mut self) -> Result<(), ExecutionRuntimeError> {
-        self.shutdown.cancel();
+        self.shutdown.cancel_for(CancellationReason::HostShutdown);
         if let Some(finished) = self.finished.take() {
             finished
                 .await
@@ -74,6 +75,6 @@ impl ExecutionRuntime {
 
 impl Drop for ExecutionRuntime {
     fn drop(&mut self) {
-        self.shutdown.cancel();
+        self.shutdown.cancel_for(CancellationReason::HostShutdown);
     }
 }

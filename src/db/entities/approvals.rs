@@ -142,7 +142,6 @@ impl ToolAdmission {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolEvidence {
     pub call: ToolCallRef,
-    pub approval: Option<ToolCallRef>,
     pub tool_call_id: String,
     pub name: String,
     pub decision: ToolDecision,

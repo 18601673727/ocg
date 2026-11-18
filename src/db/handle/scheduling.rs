@@ -109,16 +109,11 @@ impl DatabaseHandle {
                         redb::run_batch_declinable(database, operation.epoch, commit, |batch| {
                             batch.require_mutable_job_context(context, job)?;
                             let result = batch.request_native_stop(job)?;
-                            Ok(
-                                if matches!(
-                                    result,
-                                    entities::NativeStopRequest::AlreadyRequested(_)
-                                ) {
-                                    Break(result)
-                                } else {
-                                    Continue(result)
-                                },
-                            )
+                            Ok(match result {
+                                entities::NativeStopRequest::AlreadyRequested(_) => Break(result),
+                                entities::NativeStopRequest::EndedBeforeStart
+                                | entities::NativeStopRequest::Requested(_) => Continue(result),
+                            })
                         });
                     settle(
                         operation,

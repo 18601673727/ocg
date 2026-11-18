@@ -142,7 +142,7 @@ pub(super) async fn send(
         .if_some(authorization, |authorization, request| {
             request.set_header("authorization", authorization)
         });
-    if stream && config.cancellation.is_cancelled() {
+    if config.cancellation.is_cancelled() {
         return Err(cancelled());
     }
     if let Some(sink) = sink {
