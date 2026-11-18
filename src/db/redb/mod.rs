@@ -58,8 +58,6 @@ pub(crate) use reads::usage::{
 pub(crate) use recovery::held::{
     reconcile_held_apply, reconcile_held_preflight, verify_held_publication_delta,
 };
-#[cfg(unix)]
-pub(crate) use recovery::migration::{migrate_format1_apply, verify_migration_publication_delta};
 pub(crate) use recovery::offline::{
     inspect_held_allocations_offline, verify_offline, verify_publication,
 };

@@ -6,7 +6,9 @@ use std::collections::BTreeSet;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const FORMAT_VERSION: u64 = 2;
+pub(super) const FORMAT_VERSION: u64 = 1;
+pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
+pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-format-1";
 
 pub(super) const fn record_version_byte() -> u8 {
     const { assert!(FORMAT_VERSION <= u8::MAX as u64) };
@@ -23,88 +25,24 @@ pub(crate) type UsageTotalKey = (i64, u128, u128, [u8; 32]);
 pub(crate) type UsageTotalValue = (u64, u64, u64, u64, u64, u64, u64);
 pub(super) type RequestTimelineKey = (i64, u128, u32, u32);
 
-#[cfg(unix)]
-const FORMAT1_APPROVAL_LINKS: TableDefinition<(u128, u32, u32), (u128, u32, u32)> =
-    TableDefinition::new("approval_call");
-
 // One inventory owns definitions, fresh-store creation and layout checks.
 // Normal writes maintain indexes in the same transaction as their source facts;
 // opening an existing store never creates missing tables or rebuilds indexes.
 macro_rules! tables {
-    (added {
-        $($added:ident: $added_key:ty = $added_name:literal;)*
-    }
-    $($group:ident {
+    ($($group:ident {
         $($name:ident: $key:ty => $value:ty = $table:literal $(tags [$($tag:literal),+])?;)*
     })*) => {
         $($(pub(super) const $name: TableDefinition<$key, $value> =
             TableDefinition::new($table);)*)*
-        $(pub(super) const $added: TableDefinition<$added_key, ()> =
-            TableDefinition::new($added_name);)*
 
         pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
             $($(tx.open_table($name)?;)*)*
-            $(tx.open_table($added)?;)*
             Ok(())
         }
 
         pub(super) fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
-            check_layout(tx, &[$($($table,)*)* $($added_name,)*])?;
+            check_layout(tx, &[$($($table,)*)*])?;
             $($(tx.open_table($name)?;)*)*
-            $(tx.open_table($added)?;)*
-            Ok(())
-        }
-
-        #[cfg(unix)]
-        pub(super) fn check_format1_layout(tx: &ReadTransaction) -> Result<(), StorageError> {
-            use ::redb::{ReadableTableMetadata, TableHandle};
-            check_layout(tx, &[$($($table,)*)* FORMAT1_APPROVAL_LINKS.name()])?;
-            $($(tx.open_table($name)?;)*)*
-            if !tx.open_table(FORMAT1_APPROVAL_LINKS)?.is_empty()? {
-                return Err(StorageError::corrupted(
-                    "Format 1 has populated legacy approval links; removal would lose history",
-                ));
-            }
-            for entry in tx.open_table(OPEN_APPROVALS)?.iter()? {
-                if entry?.1.value() != 0 {
-                    return Err(StorageError::corrupted(
-                        "Format 1 has legacy decided calls in its open approval index",
-                    ));
-                }
-            }
-            Ok(())
-        }
-
-        #[cfg(unix)]
-        pub(super) fn rewrite_format1_records(
-            source: &ReadTransaction,
-            tx: &WriteTransaction,
-        ) -> Result<(), StorageError> {
-            $($($(
-                recovery::migration::rewrite_tagged(source, tx, $name, &[$($tag),+])?;
-            )?)*)*
-            if !tx.delete_table(FORMAT1_APPROVAL_LINKS)? {
-                return Err(StorageError::corrupted("Format 1 approval link table missing"));
-            }
-            Ok(())
-        }
-
-        #[cfg(unix)]
-        pub(super) fn verify_format1_records(
-            source: &ReadTransaction,
-            result: &ReadTransaction,
-        ) -> Result<(), recovery::reserved::ReservedRefusal> {
-            // Every pre-existing table must have precisely its authorized delta.
-            macro_rules! verify {
-                (META) => { recovery::migration::verify_metadata(source, result)? };
-                ($definition:ident, $tags:expr) => {
-                    recovery::migration::verify_tagged(source, result, $definition, $tags)?
-                };
-                ($definition:ident) => {
-                    recovery::audit::verify_identical_table(source, result, $definition)?
-                };
-            }
-            $($(verify!($name $(, &[$($tag),+])?);)*)*
             Ok(())
         }
 
@@ -138,9 +76,6 @@ fn check_layout(tx: &ReadTransaction, expected: &[&str]) -> Result<(), StorageEr
 }
 
 tables! {
-    added {
-        CONVERSATION_CONFIG_REFS: (u8, u128, u128) = "conversation_config_ref";
-    }
     facts {
         CONFIGS: u128 => &[u8] = "config" tags [1];
         POOLS: u128 => &[u8] = "pool" tags [40];
@@ -191,6 +126,7 @@ tables! {
         LIVE_CHILDREN: (u128, u128) => () = "live_child";
         SUCCESSORS: u128 => () = "successor";
         RETRY_JOBS: (u128, u128) => () = "job_retry";
+        CONVERSATION_CONFIG_REFS: (u8, u128, u128) => () = "conversation_config_ref";
         CONVERSATION_SEARCH: ConversationSearchKey => () = "conversation_search";
         TOOL_CALL_IDS: (u128, &str) => (u32, u32) = "tool_call_id";
         OPEN_APPROVALS: (u128, u128, u32, u32) => u8 = "open_approval";

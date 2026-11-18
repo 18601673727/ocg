@@ -13,8 +13,9 @@ use crate::db::redb::schema::{
     DATABASE_FORMAT_KEY, DEPENDENCY_WAITERS, EXECUTION_COMMITS, EXECUTORS, FORMAT_VERSION,
     JOB_EVENTS, JOB_INPUTS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, LIVE_CHILDREN, MAX_PAGE, META,
     POOL_ALLOCATIONS, POOL_EXECUTORS, POOLS, PROJECTS, RECURRENCES, REQUEST_EVENTS,
-    REQUEST_TIMELINE, RETRY_JOBS, SCHEDULED_EXTERNAL_BINDING, SCHEDULED_EXTERNAL_POLICY, SEQUENCES,
-    SUBMISSIONS, TOOL_CALLS, TURNS, check_record_headers, check_required_tables, create_tables,
+    REQUEST_TIMELINE, RETRY_JOBS, SCHEDULED_EXTERNAL_BINDING, SCHEDULED_EXTERNAL_POLICY,
+    SCHEMA_FINGERPRINT, SCHEMA_FINGERPRINT_KEY, SEQUENCES, SUBMISSIONS, TOOL_CALLS, TURNS,
+    check_record_headers, check_required_tables, create_tables,
 };
 use crate::db::redb::state::JobRuntime;
 use crate::db::redb::{allocations, codec, indexes, job_tree, reads, reservations, rows, state};
@@ -26,8 +27,6 @@ use std::path::{Path, PathBuf};
 
 pub(super) mod audit;
 pub(super) mod held;
-#[cfg(unix)]
-pub(super) mod migration;
 pub(super) mod offline;
 pub(super) mod reserved;
 mod settle;
@@ -155,8 +154,18 @@ pub(super) fn check_identity(
     };
     if found != FORMAT_VERSION {
         return Err(unsupported_format(&format!(
-            "database format {found} is not supported; this build opens only format {FORMAT_VERSION}; see ocg help for offline migration"
+            "database format {found} is not supported; this build opens only format {FORMAT_VERSION}"
         )));
+    }
+    if meta
+        .get(SCHEMA_FINGERPRINT_KEY)?
+        .as_ref()
+        .map(|value| value.value())
+        != Some(SCHEMA_FINGERPRINT)
+    {
+        return Err(unsupported_format(
+            "database layout is incompatible with this build",
+        ));
     }
     Ok(())
 }
@@ -1423,6 +1432,7 @@ fn initialize(database: &Database, fresh: bool) -> Result<u64, StorageError> {
         encoded.compaction_policy(&settings.policy);
         let mut meta = tx.open_table(META)?;
         meta.insert(DATABASE_FORMAT_KEY, FORMAT_VERSION.to_le_bytes().as_slice())?;
+        meta.insert(SCHEMA_FINGERPRINT_KEY, SCHEMA_FINGERPRINT)?;
         meta.insert("compaction_settings", encoded.0.as_slice())?;
         meta.insert("open_epoch", 0u64.to_le_bytes().as_slice())?;
         meta.insert("clean_shutdown", [1u8].as_slice())?;

@@ -137,16 +137,6 @@ fn visit_compaction_refs(
     Ok((count, has_unknown))
 }
 
-#[cfg(unix)]
-pub(super) fn rebuild_compaction_refs(tx: &WriteTransaction) -> Result<(), StorageError> {
-    let mut index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
-    visit_compaction_refs(tx, |key| {
-        index.insert(key, ())?;
-        Ok(())
-    })?;
-    Ok(())
-}
-
 pub(super) fn verify_compaction_refs(tx: &ReadTransaction) -> Result<bool, StorageError> {
     let index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
     let (expected, has_unknown) = visit_compaction_refs(tx, |key| {

@@ -1,17 +1,21 @@
 use super::io_storage_error;
-use crate::db::entities::RequestNumber;
+use crate::db::entities::{ContentDigest, RequestNumber};
 use crate::db::redb::StorageError;
 use crate::db::redb::batch::{Batch, BatchError};
 use crate::db::redb::reads::jobs::{mutable_job_details_in, mutable_job_record_in};
 use crate::db::redb::recovery::reserved::ReservedRefusal;
 use crate::db::redb::schema::{
-    ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, MAX_OBSERVATION_SCAN, META, POOL_ALLOCATIONS, POOLS,
-    REQUEST_EVENTS,
+    ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, CREDENTIAL_KEY_FILE_NAME, CREDENTIALS,
+    MAX_OBSERVATION_SCAN, MESSAGES, META, POOL_ALLOCATIONS, POOLS, REQUEST_EVENTS,
 };
 use crate::db::redb::schema::{DATABASE_FILE_NAME, FORMAT_VERSION};
-use crate::db::redb::{allocations, batch, indexes, recovery};
+use crate::db::redb::{allocations, batch, indexes, reads, recovery, rows};
 use crate::host::identity::{current_boot_id, current_host_id};
-use ::redb::{Database, ReadableTable};
+use ::redb::{Database, ReadTransaction, ReadableDatabase, ReadableTable, ReadableTableMetadata};
+use serde_json::Value as Json;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::path::Path;
 
 enum OfflineAccess<'a> {
     InPlace(&'a ::redb::ReadOnlyDatabase),
@@ -185,7 +189,7 @@ pub(crate) fn verify_offline(
     let ((mut report, passed), bytes) = with_offline_database(directory, pages, |access| {
         match access {
             OfflineAccess::InPlace(database) => {
-                let (logical, logical_passed) = residual_logical_report(database);
+                let (logical, logical_passed) = residual_logical_report(directory, database);
                 Ok((
                     json!({
                         "access": "read-only; the database file was not copied",
@@ -196,7 +200,7 @@ pub(crate) fn verify_offline(
                 ))
             }
             OfflineAccess::Copy(database) => {
-                let (logical, logical_passed) = residual_logical_report(&*database);
+                let (logical, logical_passed) = residual_logical_report(directory, &*database);
                 let intact = database.check_integrity()?;
                 Ok((
                     json!({
@@ -218,8 +222,12 @@ pub(crate) fn verify_offline(
     Ok(OfflineVerification { report, passed })
 }
 
-fn residual_logical_report(database: &impl ::redb::ReadableDatabase) -> (serde_json::Value, bool) {
-    match recovery::verify_reserved_residual(database) {
+fn residual_logical_report(directory: &Path, database: &impl ReadableDatabase) -> (Json, bool) {
+    let verification = recovery::verify_reserved_residual(database).and_then(|result| {
+        verify_payloads(&database.begin_read()?, directory)?;
+        Ok(result)
+    });
+    match verification {
         Ok(residual) => (
             serde_json::json!({
                 "passed": true,
@@ -239,6 +247,53 @@ fn residual_logical_report(database: &impl ::redb::ReadableDatabase) -> (serde_j
             false,
         ),
     }
+}
+
+fn verify_payloads(tx: &ReadTransaction, directory: &Path) -> Result<(), StorageError> {
+    reads::catalog::global_outbound_headers(&tx.open_table(META)?)?;
+    for entry in tx.open_table(MESSAGES)?.iter()? {
+        let (key, bytes) = entry?;
+        if ContentDigest::of(bytes.value()).as_bytes().as_slice() != key.value()
+            || serde_json::from_slice::<Json>(bytes.value()).is_err()
+        {
+            return Err(StorageError::corrupted("invalid content-addressed message"));
+        }
+    }
+    let credentials = tx.open_table(CREDENTIALS)?;
+    if !credentials.is_empty()? {
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let file = options
+            .open(directory.join(CREDENTIAL_KEY_FILE_NAME))
+            .map_err(io_storage_error)?;
+        if !file.metadata().map_err(io_storage_error)?.is_file() {
+            return Err(StorageError::corrupted(
+                "credential key is not a regular file",
+            ));
+        }
+        let mut raw = Vec::with_capacity(33);
+        let key = file
+            .take(33)
+            .read_to_end(&mut raw)
+            .map_err(io_storage_error)
+            .and_then(|_| rows::CredentialKey::from_bytes(&raw));
+        crate::support::secrets::wipe_vec(&mut raw);
+        let key = key?;
+        for entry in credentials.iter()? {
+            let (name, bytes) = entry?;
+            if key.decrypt(name.value(), bytes.value())?.is_none() {
+                return Err(StorageError::corrupted(
+                    "cannot authenticate a stored credential with ocg.key",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn logical_report(result: Result<recovery::Verification, StorageError>) -> serde_json::Value {
@@ -331,7 +386,7 @@ pub(crate) fn verify_publication(
         let logical = if recovered {
             logical_report(recovery::verify_recovered(&database))
         } else {
-            residual_logical_report(&database).0
+            residual_logical_report(&directory, &database).0
         };
         let intact = database.check_integrity()?;
         Ok::<_, StorageError>((logical, intact))

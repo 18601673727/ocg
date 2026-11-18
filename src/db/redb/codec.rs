@@ -283,11 +283,6 @@ impl<'a> Dec<'a> {
             ))),
         }
     }
-    #[cfg(unix)]
-    pub(super) fn position(&self) -> usize {
-        self.at
-    }
-
     pub(super) fn take(&mut self, n: usize) -> DecodeResult<&'a [u8]> {
         let slice = self
             .bytes
