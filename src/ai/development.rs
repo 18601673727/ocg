@@ -441,8 +441,7 @@ fn paused_tool_context(batch: &[entities::ToolEvidenceRecord]) -> String {
     use entities::{ToolDecision, ToolOutcome};
     use serde_json::json;
 
-    // A later Turn gets a transcript. It must not present prior calls as new
-    // invocations or manufacture a tool reply for a call that is still awaiting.
+    // Render prior calls as transcript text so a later Turn sees their recorded state.
     let calls = batch.iter().map(|call| {
         let data = match (&call.decision.fact, call.outcome.as_ref().map(|outcome| &outcome.fact)) {
             (ToolDecision::AwaitingApproval(_), _) => json!({"state": "awaited_approval"}),

@@ -992,8 +992,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                     message: "prepared request mismatch".into(),
                 });
             }
-            // A durable binding is optional, but a bound Allocation must use
-            // its approved route on every request, including the first one.
+            // A bound Allocation must use its approved route for every request.
             use ntex::util::{Either, select};
             let grant = match select(
                 self.cancellation.cancelled(),

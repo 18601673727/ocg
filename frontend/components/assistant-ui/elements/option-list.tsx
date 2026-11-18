@@ -17,31 +17,17 @@ export interface OptionListOption {
 export interface OptionListProps
   extends Omit<ComponentPropsWithoutRef<"div">, "children" | "defaultValue" | "onChange"> {
   options: readonly OptionListOption[];
-  /** One option answers the question, or several do. */
   selectionMode?: "single" | "multiple" | undefined;
-  /**
-   * Options the list starts selected: checked in a multiple selection, and
-   * marked as the current answer in a single one.
-   */
   defaultValue?: readonly string[] | undefined;
-  /** A multiple selection whose draft is managed by a containing form. */
+  /** Draft selection controlled by the parent form. */
   selected?: readonly string[];
   onSelectionChange?: (ids: string[]) => void;
-  /** The fewest options a multiple selection confirms with. */
   minSelections?: number | undefined;
-  /** The most options a multiple selection may hold. */
   maxSelections?: number | undefined;
-  /**
-   * Commits the answer: a single selection commits on pick, a multiple one on
-   * the confirm button. Without it the list only displays its options. A
-   * rejected promise reopens the list, because the answer never landed.
-   */
+  /** Commits on pick in single mode and on confirm in multiple mode. Rejection re-enables input. */
   onConfirm?: ((ids: string[]) => void | Promise<void>) | undefined;
   confirmLabel?: string | undefined;
-  /**
-   * The committed answer. Once set, the list is a receipt of just these
-   * options and takes no further input.
-   */
+  /** Committed IDs render as a read-only receipt, even when the array is empty. */
   choice?: readonly string[] | undefined;
 }
 

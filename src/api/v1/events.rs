@@ -227,7 +227,7 @@ struct Body<F, N> {
     feed: Option<F>,
     advance: fn(F) -> N,
     next: Option<Pin<Box<N>>>,
-    rest: Option<(Bytes, F)>,
+    rest: Option<(Bytes, F)>, // Finish emitting this frame before polling the feed again.
     polled: Rc<Cell<Instant>>,
     _watched: Option<flume::Sender<()>>,
 }

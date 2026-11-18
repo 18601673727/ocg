@@ -24,8 +24,7 @@ export function useAttachmentState() {
     }
   });
 
-  // An attachment on a submission is still being prepared, whether or not the
-  // adapter reports progress while it uploads.
+  // A pending submission can upload attachments without adapter progress.
   const uploadState = useAuiState((s) =>
     s.attachment.status.type === "incomplete" && s.attachment.status.reason === "error"
       ? "error"

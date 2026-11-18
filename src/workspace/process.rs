@@ -239,7 +239,7 @@ struct UnprovenGroup {
 
 static UNPROVEN_GROUPS: Mutex<Vec<UnprovenGroup>> = Mutex::new(Vec::new());
 
-static NEXT_UNPROVEN_ID: AtomicU64 = AtomicU64::new(0);
+static NEXT_UNPROVEN_ID: AtomicU64 = AtomicU64::new(0); // The OS can reuse a reaped leader's PID.
 
 fn record_unproven_group(job: Option<JobId>, group: Pid, handles: GroupHandles) {
     UNPROVEN_GROUPS
@@ -281,6 +281,7 @@ pub(crate) fn stop_settled(job: JobId) {
         .remove(&job);
 }
 
+// Take the handles and permit out of the shared registry while probing. Drop returns them on failure.
 struct Probe {
     id: u64,
     job: Option<JobId>,

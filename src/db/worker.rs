@@ -195,6 +195,7 @@ impl DatabaseWorker {
                     }
                 };
                 let next_operation = 1;
+                // Hold the database lock before removing staging files from earlier runs.
                 let attachments = match AttachmentStore::open(&attachment_directory)
                     .and_then(|store| store.remove_staging_files().map(|_| store))
                 {
@@ -601,6 +602,7 @@ impl WriteWorker {
             Commit::Durable
         };
         let shared = self.shared.clone();
+        // Keep staged writes hidden until they are durable or the database is released.
         let staging = (commit == Commit::Staged).then(|| StagingBarrier::raise(&shared));
 
         let mut executed = Vec::with_capacity(group.len());

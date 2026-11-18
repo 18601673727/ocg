@@ -699,7 +699,7 @@ fn point_to_offset(
     let offset = line_starts[point.row] + point.column;
 
     let line_end = if point.row + 1 < line_starts.len() {
-        line_starts[point.row + 1] - 1
+        line_starts[point.row + 1] - 1 // Exclude the newline byte.
     } else {
         source_len
     };
@@ -723,11 +723,11 @@ fn offsets_to_positions(
     }
 
     let mut order: Vec<usize> = (0..offsets.len()).collect();
-    order.sort_unstable_by_key(|&i| offsets[i]);
+    order.sort_unstable_by_key(|&i| offsets[i]); // Scan once and report in caller order.
 
     let mut positions = vec![(0u64, 0u64); offsets.len()];
     let mut line = 0u64;
-    let mut column = 0u64;
+    let mut column = 0u64; // UTF-16 code units from the current line start.
     let mut byte = 0usize;
     let mut chars = source.char_indices();
     let mut next = chars.next();
@@ -1507,6 +1507,7 @@ impl WorkspaceCode {
                 })
                 .map(|(path, stamp)| (path.clone(), *stamp))
                 .collect();
+            // Evict old definitions before refreshing in case a changed file cannot be reindexed.
             for (path, _) in &pending {
                 index.remove(path);
             }

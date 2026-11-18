@@ -1,5 +1,6 @@
 export type SseFrame = { event: string; data: string; id: string | null } | { comment: string };
 
+// Each connection needs its own parser so partial frames are discarded at EOF.
 export class SseParser {
   private line = "";
   private carriageReturn = false;

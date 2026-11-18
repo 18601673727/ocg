@@ -320,8 +320,7 @@ impl Allocator {
             }
             match self.reserve_for(pool, executor, scan).await {
                 ExecutorPass::Reserved(allocation) => {
-                    // Transfer each committed claim to its dispatch owner before
-                    // awaiting the next reservation in this bounded sweep.
+                    // Transfer the committed claim before awaiting another reservation.
                     self.spawn(*allocation);
                     dispatched += 1;
                 }
@@ -336,8 +335,7 @@ impl Allocator {
             }
         }
         let reached = if capacity_reached {
-            // Continue after the last candidate actually examined, not after
-            // the prefetched page. This also advances beyond a busy first page.
+            // Resume after the last inspected candidate to keep unvisited entries eligible.
             last_examined
         } else {
             reached

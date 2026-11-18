@@ -4,6 +4,7 @@ export const JOB_WATCH_RESIDENT_OUTPUTS = 200;
 
 export const JOB_WATCH_WINDOW_STEP = 200;
 
+// Earlier-page reads can overlap outputs delivered by the live stream.
 export function mergeOutputWindow(
   current: readonly Output[],
   incoming: readonly Output[],

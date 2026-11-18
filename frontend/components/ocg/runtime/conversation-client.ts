@@ -342,6 +342,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       const current = this.getSnapshot().sessions.find((session) => session.id === id);
       const known = this.tips.get(id);
       const local = known ? this.turns.get(known) : undefined;
+      // A stale list can arrive after the client has accepted a newer tip.
       if (
         known &&
         known !== item.tip_job &&

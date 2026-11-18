@@ -1169,7 +1169,7 @@ fn scan_document<'query>(
                     position,
                 });
             }
-            position += 1;
+            position += 1; // Unmatched tokens still separate phrase terms.
         },
         &mut || !stop.load(Ordering::Relaxed) && Instant::now() < deadline,
     );

@@ -12,8 +12,7 @@ const COMMANDS: usize = 1;
 const CPU: usize = 2;
 const FILES: usize = 4;
 const MAX_WAITERS: usize = 64;
-/// The waiter list is full: the call was refused before it queued, so it did
-/// no work and may be retried.
+/// The queue was full before any work ran. The call can be retried.
 pub(crate) const QUEUE_FULL: &str = "the blocking work queue is full";
 
 #[derive(Clone, Copy)]
@@ -236,6 +235,7 @@ pub(crate) fn signal_stop(stopped: &AtomicBool) {
     }
 }
 
+// Cancellation and worker startup race to take the queued work and its permit.
 pub(crate) struct Queued<T>(Arc<Mutex<Option<T>>>);
 
 impl<T> Queued<T> {

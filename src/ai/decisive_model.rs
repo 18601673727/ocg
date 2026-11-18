@@ -158,8 +158,7 @@ fn decode_decision(
         raw,
         availability: AvailabilityObservation {
             status_code: Some(status),
-            // The validated answer completes the request. System One supplies no finish reason.
-            finish_reason: Some(ChatFinishReason::Stop),
+            finish_reason: Some(ChatFinishReason::Stop), // Derive completion from System One's validated answer.
             raw_finish_reason: None,
             failure: None,
         },

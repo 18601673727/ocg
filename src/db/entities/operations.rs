@@ -9,7 +9,7 @@ use std::fmt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OperationId {
-    pub(crate) epoch: u64,
+    pub(crate) epoch: u64, // Persisted on open so sequence numbers can restart safely.
     pub(crate) seq: u64,
 }
 

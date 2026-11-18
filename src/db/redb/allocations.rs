@@ -540,8 +540,7 @@ impl Batch {
                             "invalid Executor configuration",
                         ));
                     }
-                    // A settings edit may round-trip stored capabilities. Only admit new ones
-                    // the runtime can execute.
+                    // Allow stored capabilities to round-trip. New ones must be executable.
                     if let Some(reason) =
                         capabilities
                             .difference(&executor.capabilities)

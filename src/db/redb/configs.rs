@@ -961,8 +961,7 @@ impl Batch {
                         .filter(|config| !ids.contains(config)),
                 );
                 let mut candidates = BTreeMap::<JobId, Vec<(CompactionReference, ConfigId)>>::new();
-                // Removing a model from a predictor's target list can require
-                // a new default even when no conversation pins that model.
+                // Removing an unpinned model can still invalidate a predictor's default.
                 for predictor in ids
                     .iter()
                     .copied()
@@ -1058,8 +1057,7 @@ impl Batch {
             self.update_config(row.id, row.name, row.body)?;
         }
 
-        // The stored policies were structurally validated by their decoders.
-        // Validate surviving summaries and affected predictors against the revised catalog.
+        // Decoding checks policy structure. Check surviving references against the revised catalog.
         for model in refs.summaries {
             self.require_config_kind(model, ConfigKind::Model)?;
         }

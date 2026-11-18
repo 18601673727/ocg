@@ -152,9 +152,7 @@ pub(super) async fn send(
                 message: error.message,
             })?;
     }
-    // The send record may have awaited a protected or busy database worker.
-    // Do not poll the network send after cancellation at that boundary. The
-    // persisted send evidence remains conservative until settlement.
+    // Cancellation during the send-record write can leave evidence even before network I/O.
     if config.cancellation.is_cancelled() {
         return Err(ProviderExecutionError::Interrupted {
             message: format!("{operation} execution was cancelled at the send boundary"),

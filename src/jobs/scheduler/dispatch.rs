@@ -153,8 +153,7 @@ async fn within_deadline<F: std::future::Future>(
     output
 }
 
-// Only read-only preparation may be discarded on cancellation. Accepted
-// ownership and evidence writes must always be awaited and reconciled.
+// Race cancellation against read-only preparation. Await and reconcile accepted writes.
 async fn prepare_or_cancel<F: std::future::Future>(
     cancellation: &CancellationToken,
     preparation: F,
@@ -211,8 +210,7 @@ pub(super) async fn dispatch(
         .await;
     }
     let started = Instant::now();
-    // Authorization and execution spend the same budget. Once the bound policy
-    // is known it may shorten, but never restart, this absolute deadline.
+    // Authorization and execution share a deadline that the bound policy can only shorten.
     let grant = within_deadline(
         cancellation,
         started + DISPATCH_TIMEOUT,
@@ -481,8 +479,7 @@ async fn start_and_exchange(
         .await;
         let result = match preparation {
             Some(Ok((prepared, policy))) => {
-                // Do not drop this future if cancellation arrives during the
-                // claim. Its committed ownership determines safe settlement.
+                // Await the claim through cancellation so settlement knows who owns it.
                 database
                     .start_development_handoff(prepared.evidence, cancellation)
                     .await

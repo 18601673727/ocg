@@ -632,8 +632,7 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
                 && allocations.get(id)?.is_none()
             {
                 pending.insert(id);
-                // Execution history verifies the dependency count itself. Admission policy,
-                // ancestor holds and predecessor readiness do not change this queue index.
+                // This queue indexes dependency readiness. Dispatch checks other eligibility.
                 if runtime.pending == Some((0, 0)) {
                     let submitted_at = job.submitted_at.ok_or_else(|| {
                         StorageError::corrupted("queued Job has no submission time")

@@ -552,6 +552,7 @@ enum Reconciled {
 }
 
 async fn reconcile(shared: &Shared, key: SubmissionKey, generation: u64, epoch: u64) -> Reconciled {
+    // A newer epoch rules out a late commit by the worker that received this submission.
     let reading_in = shared.database.epoch();
     match shared.database.submission(key).await {
         Ok(Some(record)) => {

@@ -216,7 +216,6 @@
   --sidebar-ring: var(--ring);
 }
 
-/* Restrained, predefined accents. Appearance preferences never accept CSS. */
 :root[data-accent="slate"] {
   --primary: var(--accent-slate);
   --primary-foreground: oklch(0.98 0.004 250);
@@ -272,10 +271,7 @@
   &:where([data-state="closed"], [data-closed]:not([data-closed="false"]))
 );
 
-/*
- * highlight.js ships one theme per colour scheme, so the dark rules are
- * scoped to our `.dark` root and layered over the light ones.
- */
+/* Scope highlight.js dark colors to override the light theme under .dark. */
 .dark .hljs {
   color: var(--hljs-fg, #c9d1d9);
   background: transparent;
@@ -346,9 +342,6 @@
   font-weight: 600;
 }
 
-/*
- * Chat scrollbars: narrow, subdued, and only shown when content overflows.
- */
 .ocg-subtle-scrollbar,
 [data-slot="aui_thread-viewport"],
 [data-message-bounds="bounded"] {

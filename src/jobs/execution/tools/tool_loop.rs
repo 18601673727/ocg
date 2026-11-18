@@ -246,7 +246,7 @@ pub(crate) async fn answer_calls(
         }
     }
 
-    // A paused Turn cannot send another request to durably retain read-only results.
+    // Keep read-only results when a user decision may pause the Turn before the next request.
     let retain_results = tools.decider
         && calls.iter().any(|call| {
             needs_decision(&call.name).is_some()

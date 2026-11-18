@@ -109,7 +109,7 @@ impl UsageCapture {
             usage,
             usage_only,
         };
-        // Some providers emit an empty object as a placeholder for usage.
+        // Empty usage objects are placeholders.
         if !report.usage.has_counts() {
             if !latest.has_counts() {
                 *latest = report.usage.clone();
@@ -130,8 +130,7 @@ impl UsageCapture {
             return;
         }
 
-        // Keep a possible final report until the stream ends. Another choice may
-        // still be open, or the provider may send an authoritative usage-only tail.
+        // More choices or a usage-only tail can supersede a candidate before EOF.
         if let Some(previous) = self.pending_final.take()
             && previous.usage != report.usage
         {
@@ -147,8 +146,7 @@ impl UsageCapture {
     }
 
     pub(crate) async fn checkpoint(&mut self, sink: &mut dyn ProviderOutputSink) {
-        // The next chunk may contain a newer report or a finish marker.
-        // Persist the available counters before waiting, without promoting them.
+        // Persist provisional counters before waiting for the next chunk.
         if let Some(report) = self
             .pending_final
             .as_ref()

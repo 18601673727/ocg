@@ -235,7 +235,7 @@ function JobWatchBody({
   const [stopLockedAt, setStopLockedAt] = useState<number | null>(null);
   const watchRef = useRef({
     evidenceRevision: 0,
-    processed: 0,
+    processed: 0, // Shared replay cursor for stored pages and the stream.
     historyComplete: false,
     completed: false,
     reconciled: false,
@@ -611,6 +611,7 @@ function JobWatchBody({
   const badgeClass = phase ? PHASE_BADGE[phase] : TONE.loading;
   const stopPhase = phase === "queued" || phase === "reserved" || phase === "running";
   const stopAvailable = Boolean(details?.context);
+  // An unconfirmed stop can be retried only after a fresh Job read.
   const stopRetry =
     stopState === "locked" &&
     stopOutcome === null &&

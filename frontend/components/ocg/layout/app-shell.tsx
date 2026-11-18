@@ -166,7 +166,7 @@ function AppShellContent({
   const observedStatus = useRef<RuntimeStatus | null>(null);
   const activeConversation = useRef(conversationKey);
   const currentLocationRef = useRef({ location, sessionId });
-  const listedConversations = useRef(new Set<string>());
+  const listedConversations = useRef(new Set<string>()); // Listed IDs already identify conversations.
   useEffect(() => {
     currentLocationRef.current = { location, sessionId };
   });

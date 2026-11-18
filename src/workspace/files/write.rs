@@ -328,7 +328,7 @@ fn replace(
         if let Some(hit) = finder.find(&current_bytes[search_start..]) {
             count += 1;
             offset = search_start + hit;
-            search_start = offset + 1;
+            search_start = offset + 1; // Count overlapping matches before enforcing uniqueness.
         } else {
             break;
         }
@@ -525,7 +525,7 @@ impl<'a> Staged<'a> {
 
         self.directory
             .sync_all()
-            .map_err(|_| Uncertainty::NotDurable.into())
+            .map_err(|_| Uncertainty::NotDurable.into()) // The rename may already be visible.
     }
 
     fn is_in_place(&self) -> bool {

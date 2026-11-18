@@ -41,6 +41,7 @@ pub(crate) struct MutationStamp {
     active: usize,
 }
 
+// Commands can write outside their workspace, so all FTS snapshots share one mutation stamp.
 static MUTATIONS: std::sync::Mutex<MutationStamp> = std::sync::Mutex::new(MutationStamp {
     revision: 0,
     active: 0,
@@ -529,6 +530,7 @@ impl LineRange {
     }
 }
 
+// Charge the JSON-escaped byte length against the output budget.
 fn escaped_len(byte: u8) -> usize {
     match byte {
         b'"' | b'\\' | b'\n' | b'\r' | b'\t' | 0x08 | 0x0c => 2,
@@ -592,6 +594,7 @@ fn read_lines(file: &File, start_line: u64, line_count: u64) -> Result<LineRange
         last = buffer[count - 1];
     }
     unchanged(file, &before, read)?;
+    // A budget cut can leave a partial UTF-8 character at the end.
     if cut
         && let Err(error) = std::str::from_utf8(&content)
         && error.error_len().is_none()

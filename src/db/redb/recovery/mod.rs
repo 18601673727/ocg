@@ -694,7 +694,7 @@ fn check_execution_history(tx: &ReadTransaction) -> Result<(), StorageError> {
                         "Job has an invalid or duplicate reservation event",
                     ));
                 }
-                // check_record_payloads already decoded these rows in this read transaction.
+                // The payload pass already decoded these rows in this snapshot.
                 jobs.get(key.0)?.ok_or_else(|| {
                     StorageError::corrupted("reservation references a missing Job")
                 })?;

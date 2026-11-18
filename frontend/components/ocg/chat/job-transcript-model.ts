@@ -34,6 +34,7 @@ export function outputDisplayText(output: OutputView | null | undefined): string
     .join("\n");
 }
 
+// Rebuildable projection of stored outputs, maintained incrementally during streaming.
 export class TranscriptAccumulator {
   progress = "";
   reasoning = "";

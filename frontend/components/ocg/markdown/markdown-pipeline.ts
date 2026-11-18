@@ -44,7 +44,7 @@ function mathInline(state: StateInline, silent: boolean): boolean {
     if (source[close] === DOLLAR && !isEscaped(source, close)) break;
     close += 1;
   }
-  if (close >= state.posMax) return false;
+  if (close >= state.posMax) return false; // Keep an unfinished inline equation as text.
   if (!isMathDelimiter(source, open, close)) return false;
 
   if (!silent) {
@@ -115,7 +115,7 @@ const SAFE_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
 
 export const KATEX_OPTIONS = {
   throwOnError: true,
-  trust: false,
+  trust: false, // Disable links and external resources in equations.
   strict: "error",
   output: "htmlAndMathml",
 } as const;

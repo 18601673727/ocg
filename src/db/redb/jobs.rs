@@ -461,8 +461,7 @@ pub(super) fn is_predictive_helper(
     {
         return Ok(false);
     }
-    // Public Decisions are Turns (including the first Turn). Only the system
-    // enqueues this kind of non-Turn child of a root conversation.
+    // System Decisions can be non-Turn children. Public Decisions always become Turns.
     let key = (job.parent_id.get(), job.id.get());
     if tx.table(TURNS)?.get(key)?.is_some() || tx.table(CHILDREN)?.get(key)?.is_none() {
         return Ok(false);

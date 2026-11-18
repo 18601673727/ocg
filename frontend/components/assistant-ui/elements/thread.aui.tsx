@@ -392,7 +392,7 @@ const ThreadLoadEarlier: FC = () => {
     focusedRef.current = null;
     const active = document.activeElement;
     if (active && active !== document.body) return;
-    nextFocusable(slot)?.focus();
+    nextFocusable(slot)?.focus(); // Keep tab order when the final page removes the button.
   }, [visible]);
 
   return (

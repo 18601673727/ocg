@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const FORMAT_VERSION: u64 = 1;
+pub(super) const FORMAT_VERSION: u64 = 1; // Shared by database metadata and record headers.
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
 pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-format-1";
 
@@ -25,9 +25,8 @@ pub(crate) type UsageTotalKey = (i64, u128, u128, [u8; 32]);
 pub(crate) type UsageTotalValue = (u64, u64, u64, u64, u64, u64, u64);
 pub(super) type RequestTimelineKey = (i64, u128, u32, u32);
 
-// One inventory owns definitions, fresh-store creation and layout checks.
-// Normal writes maintain indexes in the same transaction as their source facts;
-// opening an existing store never creates missing tables or rebuilds indexes.
+// A single inventory defines, creates and verifies the tables.
+// Startup verifies the layout. Writes maintain indexes alongside their source rows.
 macro_rules! tables {
     ($($group:ident {
         $($name:ident: $key:ty => $value:ty = $table:literal $(tags [$($tag:literal),+])?;)*

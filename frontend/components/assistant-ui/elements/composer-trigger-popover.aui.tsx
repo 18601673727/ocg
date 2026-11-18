@@ -13,18 +13,17 @@ import { cn } from "@/lib/utils";
 type IconComponent = FC<{ className?: string }>;
 
 type DirectiveBehaviorProps = {
-  /** Formatter used to serialize the selected item into composer text. */
+  /** Serializes the inserted directive. */
   formatter?: DirectiveFormatter | undefined;
-  /** Called after the directive text has been inserted into the composer. */
+  /** Runs after the composer inserts the directive. */
   onInserted?: ((item: TriggerItem) => void) | undefined;
 };
 
 type ActionBehaviorProps = {
-  /** Formatter used to serialize the audit-trail chip (when `removeOnExecute` is false). */
+  /** Serializes the chip retained when `removeOnExecute` is false. */
   formatter?: DirectiveFormatter | undefined;
-  /** Invoked with the selected item at the moment of selection. */
   onExecute: (item: TriggerItem) => void;
-  /** If `true`, strip the trigger text from the composer after executing. @default false */
+  /** Removes the trigger text after the action runs. */
   removeOnExecute?: boolean | undefined;
 };
 
@@ -32,32 +31,22 @@ type ComposerTriggerPopoverBaseProps = Omit<
   ComponentPropsWithoutRef<typeof ComposerPrimitive.TriggerPopover>,
   "children"
 > & {
-  /**
-   * Maps icon keys to components. Items look up via `item.metadata?.icon`
-   * (string); categories look up via their `id`.
-   */
+  /** Items use `metadata.icon` as the key. Categories use their ID. */
   iconMap?: Record<string, IconComponent>;
-  /** Fallback icon when no entry in `iconMap` matches. */
   fallbackIcon?: IconComponent;
-  /** Label shown on the back button. @default "Back" */
   backLabel?: string;
-  /** Label shown when no categories are available. @default "No items available" */
   emptyCategoriesLabel?: string;
-  /** Label shown when no items match. @default "No matching items" */
   emptyItemsLabel?: string;
-  /** Label shown while an async adapter is resolving items. @default "Loading…" */
   loadingLabel?: string;
 };
 
 type ComposerTriggerPopoverProps = ComposerTriggerPopoverBaseProps &
   (
     | {
-        /** Insert-directive behavior. */
         directive: DirectiveBehaviorProps;
         action?: never;
       }
     | {
-        /** Action behavior. */
         action: ActionBehaviorProps;
         directive?: never;
       }
@@ -168,10 +157,6 @@ const Items: FC<ItemsProps> = ({
   );
 };
 
-/**
- * Pre-built popover UI for a trigger-driven picker (mentions, slash commands, etc).
- * Pass exactly one of `directive` (inserts a chip) or `action` (fires a handler).
- */
 const ComposerTriggerPopoverImpl: FC<ComposerTriggerPopoverProps> = ({
   iconMap,
   fallbackIcon = SparklesIcon,
