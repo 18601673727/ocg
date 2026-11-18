@@ -34,13 +34,12 @@ pub(crate) struct EndpointEligibility {
     endpoint_class: Option<&'static str>,
 }
 
-const NOT_ASSESSED: [&str; 7] = [
-    "conversation_start_context",
-    "predecessor_settlement",
-    "attachment_availability",
+const NOT_ASSESSED: [&str; 6] = [
+    "agent_and_live_conversation_start_context",
+    "live_attachment_availability",
     "executor_capacity",
     "host_scheduler_running",
-    "scheduled_external_authorization",
+    "optional_allocation_policy_binding",
     "reservation_and_writer_admission",
 ];
 
@@ -51,7 +50,7 @@ impl EndpointEligibility {
             "code": self.code,
             "detail": self.detail,
             "endpoint_class": self.endpoint_class,
-            "scope": "autonomous_loopback_dispatch_policy",
+            "scope": "frozen_provider_configuration",
             "not_assessed": NOT_ASSESSED,
         })
     }
@@ -69,10 +68,10 @@ pub(crate) fn endpoint_eligibility(
     };
     let endpoint = match frozen {
         Some(MutableFrozenConfiguration::Generative(frozen)) => {
-            if frozen.native_execution_refusal().is_some() {
+            if frozen.provider_refusal().is_some() {
                 return rejected(
                     "unsupported_configuration",
-                    "the frozen configuration cannot run as a native Generative execution",
+                    "the frozen Provider configuration is not supported for native execution",
                 );
             }
             frozen.llm.provider.endpoint.as_deref()
@@ -96,7 +95,7 @@ pub(crate) fn endpoint_eligibility(
     };
     EndpointEligibility {
         code: "eligible",
-        detail: "the frozen Provider configuration passes the endpoint check",
+        detail: "the frozen Provider configuration is supported; execution still requires live authorization",
         endpoint_class: Some(if uri.scheme_str() == Some("https") {
             "external"
         } else {

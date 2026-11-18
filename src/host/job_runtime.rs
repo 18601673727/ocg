@@ -55,7 +55,11 @@ impl ExecutionRuntime {
     }
 
     pub(crate) fn is_autonomous(&self) -> bool {
-        self.finished.is_some()
+        !self.shutdown.is_cancelled()
+            && self
+                .finished
+                .as_ref()
+                .is_some_and(|task| !task.is_finished())
     }
 
     pub(crate) fn native_stops(&self) -> NativeStops {

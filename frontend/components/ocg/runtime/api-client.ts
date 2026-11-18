@@ -245,7 +245,7 @@ export type AutonomousLoopbackEligibility = {
   code: string;
   detail: string;
   endpoint_class: string | null;
-  scope: "autonomous_loopback_dispatch_policy";
+  scope: "frozen_provider_configuration";
   not_assessed?: string[];
 };
 
@@ -258,7 +258,7 @@ function autonomousLoopbackEligibility(value: unknown): AutonomousLoopbackEligib
     typeof eligibility.code !== "string" ||
     typeof eligibility.detail !== "string" ||
     !(eligibility.endpoint_class === null || typeof eligibility.endpoint_class === "string") ||
-    eligibility.scope !== "autonomous_loopback_dispatch_policy" ||
+    eligibility.scope !== "frozen_provider_configuration" ||
     !(
       eligibility.not_assessed === undefined ||
       (Array.isArray(eligibility.not_assessed) &&

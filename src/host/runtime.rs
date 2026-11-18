@@ -208,14 +208,17 @@ where
             log::set_max_level(log_handle.active_config().level.filter());
             log::info!("OCG foundation initialized; storage is ready");
             for (name, enabled) in crate::host::execution_features::COMPILED_EXECUTION_FEATURES {
-                let enabled = if name == crate::host::execution_features::AUTONOMOUS_SCHEDULING {
-                    execution.is_autonomous()
-                } else {
-                    enabled
-                };
-                let state = if enabled { "Enabled" } else { "Disabled" };
-                log::info!("execution feature {name}: {state}");
+                let state = if enabled { "available" } else { "unavailable" };
+                log::info!("compiled execution capability {name}: {state}");
             }
+            let scheduler = if execution.is_autonomous() {
+                "active"
+            } else {
+                "inactive"
+            };
+            log::info!(
+                "host scheduler task: {scheduler}; Allocation authorization is checked separately"
+            );
             handle.log_open_warnings();
             if std::env::var_os(REMOVED_WORKSPACE_ROOT_VARIABLE).is_some() {
                 log::warn!(

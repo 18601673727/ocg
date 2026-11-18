@@ -174,6 +174,10 @@ pub(crate) struct DevelopmentHandoff {
 }
 
 impl DevelopmentHandoff {
+    pub(crate) fn token(&self) -> entities::AllocationToken {
+        self.prepared.candidate.allocation().token
+    }
+
     pub(crate) fn job(&self) -> entities::JobId {
         self.started.id
     }

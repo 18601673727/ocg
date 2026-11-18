@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use crate::ai::providers::{CancellationToken, ProviderExecutionConfig};
 use crate::db::entities::{
     AllocationPhase, AllocationToken, ExecutionOperation, JobId, OutcomeKind, PoolAllocation,
-    SCHEDULED_EXTERNAL_MAX_TIMEOUT, UnstartedCause,
+    UnstartedCause,
 };
 use crate::db::{DatabaseError, DatabaseHandle, DevelopmentHandoffError};
 use crate::jobs::authorization::scheduled::ScheduledExternalGrant;
@@ -15,7 +15,7 @@ use crate::jobs::execution::stops::NativeStops;
 use crate::jobs::execution::tools::native::NativeTooling;
 use crate::support::cancellation::CancellationReason;
 
-const DISPATCH_TIMEOUT: Duration = SCHEDULED_EXTERNAL_MAX_TIMEOUT;
+const DISPATCH_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
 #[derive(Debug)]
@@ -118,14 +118,13 @@ fn prepared_native_policy(
 
 async fn within_deadline<F: std::future::Future>(
     cancellation: &CancellationToken,
-    timeout: Duration,
+    deadline: Instant,
     exchange: F,
 ) -> F::Output {
-    if timeout.is_zero() {
+    if deadline <= Instant::now() {
         cancellation.cancel_for(CancellationReason::Deadline);
         return exchange.await;
     }
-    let deadline = Instant::now() + timeout;
     let done = CancellationToken::default();
     let timer = ntex::rt::spawn({
         let cancellation = cancellation.clone();
@@ -151,6 +150,19 @@ async fn within_deadline<F: std::future::Future>(
     done.cancel();
     drop(timer);
     output
+}
+
+// Only read-only preparation may be discarded on cancellation. Accepted
+// ownership and evidence writes must always be awaited and reconciled.
+async fn prepare_or_cancel<F: std::future::Future>(
+    cancellation: &CancellationToken,
+    preparation: F,
+) -> Option<F::Output> {
+    use ntex::util::{Either, select};
+    match select(cancellation.cancelled(), preparation).await {
+        Either::Left(()) => None,
+        Either::Right(result) => Some(result),
+    }
 }
 
 fn protection_refused(error: &DatabaseError) -> bool {
@@ -198,9 +210,29 @@ pub(super) async fn dispatch(
         .await;
     }
     let started = Instant::now();
-    let grant = match ScheduledExternalGrant::load(database, allocation.token.job).await {
-        Ok(grant) => grant,
-        Err(error) => {
+    // Authorization and execution spend the same budget. Once the bound policy
+    // is known it may shorten, but never restart, this absolute deadline.
+    let grant = within_deadline(
+        cancellation,
+        started + DISPATCH_TIMEOUT,
+        prepare_or_cancel(
+            cancellation,
+            ScheduledExternalGrant::load(database, allocation.token),
+        ),
+    )
+    .await;
+    if let Some(cause) = cancellation_before_start(cancellation) {
+        return end_dispatch(
+            database,
+            allocation.token,
+            cause,
+            cause.summary().to_owned(),
+        )
+        .await;
+    }
+    let grant = match grant {
+        Some(Ok(grant)) => grant,
+        Some(Err(error)) => {
             return end_dispatch(
                 database,
                 allocation.token,
@@ -209,14 +241,25 @@ pub(super) async fn dispatch(
             )
             .await;
         }
+        None => {
+            let cause =
+                cancellation_before_start(cancellation).unwrap_or(UnstartedCause::StartRefused);
+            return end_dispatch(
+                database,
+                allocation.token,
+                cause,
+                cause.summary().to_owned(),
+            )
+            .await;
+        }
     };
-    let limit = grant
-        .as_ref()
-        .map_or(DISPATCH_TIMEOUT, |grant| grant.limits().timeout)
-        .saturating_sub(started.elapsed());
+    let deadline = started
+        + grant
+            .as_ref()
+            .map_or(DISPATCH_TIMEOUT, |grant| grant.limits().timeout);
     within_deadline(
         cancellation,
-        limit,
+        deadline,
         dispatch_admitted(
             database,
             allocation,
@@ -343,7 +386,7 @@ async fn start_and_exchange(
         if let Some(cause) = cancellation_before_start(cancellation) {
             return settle_unstarted(database, token, cause, cause.summary().to_owned()).await;
         }
-        let result = async {
+        let preparation = prepare_or_cancel(cancellation, async {
             use crate::ai::development::{
                 DevelopmentResolvedCandidate, prepare_development_handoff,
                 resolve_development_candidate,
@@ -357,11 +400,20 @@ async fn start_and_exchange(
                     "handoff", reason,
                 )))
             };
+            let check_cancelled = || match cancellation_before_start(cancellation) {
+                Some(cause) => Err(DevelopmentHandoffError::NotStarted {
+                    cause,
+                    detail: cause.summary().to_owned(),
+                }),
+                None => Ok(()),
+            };
             let snapshot = database
                 .development_execution_context(token, &crate::ai::compact::DevelopmentContextBudget)
                 .await
                 .map_err(classify_unstarted)?;
+            check_cancelled()?;
             let resolved = resolve_development_candidate(database, snapshot).await?;
+            check_cancelled()?;
             let offer = if let DevelopmentResolvedCandidate::Generative(context) = &resolved
                 && !context.snapshot.is_summary_work()
             {
@@ -391,13 +443,16 @@ async fn start_and_exchange(
             } else {
                 None
             };
+            check_cancelled()?;
             authorize_development_candidate(&resolved, offer.as_ref())
                 .map_err(classify_unstarted)?;
             let mut prepared = prepare_development_handoff(resolved, offer.as_ref())
                 .map_err(classify_unstarted)?;
+            check_cancelled()?;
             database
                 .load_handoff_credentials(&mut prepared.evidence)
                 .await?;
+            check_cancelled()?;
             let policy = match grant {
                 None => prepared_native_policy(&prepared.evidence),
                 Some(grant) => grant
@@ -420,14 +475,36 @@ async fn start_and_exchange(
                     detail: cause.summary().to_owned(),
                 });
             }
-            let handoff = database
-                .start_development_handoff(prepared.evidence)
-                .await?;
-            let handoff =
-                crate::ai::development::DevelopmentExecution::new(handoff, prepared.conversation);
-            Ok((handoff, policy))
-        }
+            Ok((prepared, policy))
+        })
         .await;
+        let result = match preparation {
+            Some(Ok((prepared, policy))) => {
+                // Do not drop this future if cancellation arrives during the
+                // claim. Its committed ownership determines safe settlement.
+                database
+                    .start_development_handoff(prepared.evidence)
+                    .await
+                    .map(|handoff| {
+                        (
+                            crate::ai::development::DevelopmentExecution::new(
+                                handoff,
+                                prepared.conversation,
+                            ),
+                            policy,
+                        )
+                    })
+            }
+            Some(Err(error)) => Err(error),
+            None => {
+                let cause =
+                    cancellation_before_start(cancellation).unwrap_or(UnstartedCause::StartRefused);
+                Err(DevelopmentHandoffError::NotStarted {
+                    cause,
+                    detail: cause.summary().to_owned(),
+                })
+            }
+        };
         match result {
             Err(DevelopmentHandoffError::Database(error)) if protection_refused(&error) => {
                 if !wait_for_protection_recovery(database, cancellation).await {
@@ -490,12 +567,23 @@ async fn reported(database: &DatabaseHandle, token: AllocationToken, detail: Str
             {
                 crate::workspace::process::stop_settled(token.job);
             }
+            let cancelled_before_start = allocation.phase == AllocationPhase::Released
+                && allocation.job_revision == record.job.revision
+                && allocation.started_at.is_none()
+                && record
+                    .outcome
+                    .as_ref()
+                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Cancelled);
             Dispatched {
                 job: token.job,
                 allocation_phase: Some(allocation.phase),
                 started: allocation.started_at.is_some(),
                 outcome: record.outcome.as_ref().map(|outcome| outcome.kind),
-                detail,
+                detail: if cancelled_before_start {
+                    "the reservation was cancelled before start; nothing was sent".to_owned()
+                } else {
+                    detail
+                },
             }
         }
         Ok(_) => Dispatched {

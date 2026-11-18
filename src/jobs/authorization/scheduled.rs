@@ -1,6 +1,6 @@
 use crate::ai::providers::{CancellationToken, DestinationPolicy, ProviderExecutionConfig};
 use crate::db::entities::{
-    FrozenExecutionConfig, JobId, LlmTransport, ScheduledExternalLimits,
+    AllocationToken, FrozenExecutionConfig, LlmTransport, ScheduledExternalLimits,
     ScheduledExternalPolicyConfig, ScheduledExternalRefusal, Violation,
 };
 use crate::db::{DatabaseError, DatabaseHandle, PreparedDevelopmentHandoff};
@@ -14,9 +14,9 @@ pub(crate) struct ScheduledExternalGrant {
 impl ScheduledExternalGrant {
     pub(crate) async fn load(
         database: &DatabaseHandle,
-        job: JobId,
+        token: AllocationToken,
     ) -> Result<Option<Self>, DatabaseError> {
-        let Some(record) = database.scheduled_external_bound_policy(job).await? else {
+        let Some(record) = database.scheduled_external_bound_policy(token).await? else {
             return Ok(None);
         };
         let policy =

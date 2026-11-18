@@ -305,14 +305,25 @@ impl DatabaseHandle {
 
     pub(crate) async fn scheduled_external_bound_policy(
         &self,
-        job: entities::JobId,
+        token: entities::AllocationToken,
     ) -> Result<Option<entities::ScheduledExternalPolicyRecord>, DatabaseError> {
         let pair = self
-            .read(move |database| redb::read_scheduled_external_binding_with_policy(database, job))
+            .read(move |database| {
+                redb::read_scheduled_external_binding_with_policy(database, token.job)
+            })
             .await?;
         let Some((binding, policy)) = pair else {
             return Ok(None);
         };
+        if binding.job != token.job
+            || binding.allocation_epoch != token.epoch
+            || binding.allocation_generation != token.generation
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "scheduled_external_policy",
+                "the binding does not name this Allocation",
+            )));
+        }
         if policy.revision != binding.policy_revision {
             return Err(DatabaseError::Rejected(Violation::InvalidValue(
                 "scheduled_external_policy",

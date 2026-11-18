@@ -115,6 +115,7 @@ pub(crate) async fn supervise_development_generative(
             request,
             prepared: &body,
             cancellation: &config.cancellation,
+            destination: &config.destination,
             output_seq,
             sent: false,
             evidence_incomplete: false,
@@ -255,7 +256,7 @@ pub(crate) async fn supervise_development_generative(
             }
         };
         if matches!(policy, EndpointPolicy::ScheduledExternal(_)) {
-            let recheck = match ScheduledExternalGrant::load(database, token.job).await {
+            let recheck = match ScheduledExternalGrant::load(database, token).await {
                 Ok(Some(live_grant)) => {
                     let body_bytes =
                         serde_json::to_vec(&body).map_or(usize::MAX, |bytes| bytes.len());
@@ -635,6 +636,7 @@ pub(crate) async fn supervise_development_decision(
         request: RequestNumber::FIRST,
         prepared: body,
         cancellation: &config.cancellation,
+        destination: &config.destination,
         output_seq: 1,
         sent: false,
         evidence_incomplete: false,
@@ -975,6 +977,7 @@ struct DevelopmentLoopbackSink<'a> {
     request: RequestNumber,
     prepared: &'a serde_json::Value,
     cancellation: &'a CancellationToken,
+    destination: &'a DestinationPolicy,
     output_seq: u32,
     sent: bool,
     evidence_incomplete: bool,
@@ -991,6 +994,38 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
             if self.sent || body != self.prepared {
                 return Err(OutputSinkError {
                     message: "prepared request mismatch".into(),
+                });
+            }
+            // A durable binding is optional, but a bound Allocation must use
+            // its approved route on every request, including the first one.
+            use ntex::util::{Either, select};
+            let grant = match select(
+                self.cancellation.cancelled(),
+                ScheduledExternalGrant::load(self.database, self.execution.handoff.token()),
+            )
+            .await
+            {
+                Either::Left(()) => {
+                    return Err(OutputSinkError {
+                        message: "provider execution was cancelled during authorization".into(),
+                    });
+                }
+                Either::Right(result) => result.map_err(|_| OutputSinkError {
+                    message: "scheduled external authorization is unavailable or changed".into(),
+                })?,
+            };
+            let destination_permitted = match grant {
+                Some(grant) => grant.permits_destination(self.destination),
+                None => *self.destination == DestinationPolicy::Standard,
+            };
+            if !destination_permitted {
+                return Err(OutputSinkError {
+                    message: "the request destination does not match the Allocation binding".into(),
+                });
+            }
+            if self.cancellation.is_cancelled() {
+                return Err(OutputSinkError {
+                    message: "provider execution was cancelled before recording the request".into(),
                 });
             }
             match self
