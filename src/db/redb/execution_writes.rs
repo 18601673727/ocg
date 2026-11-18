@@ -865,7 +865,7 @@ impl Batch {
     pub(crate) fn record_development_uncertain(
         &mut self,
         proof: &crate::db::handoff::DevelopmentWriteProof,
-        cause: crate::db::entities::OutcomeCause,
+        cause: crate::db::entities::UncertaintyReason,
     ) -> Result<(), BatchError> {
         self.require_development_write_for(proof, None)?;
         self.transition_pool_allocation(

@@ -540,11 +540,9 @@ pub enum UncertaintyReason {
     WorkerAckPendingOrAmbiguous,
     StopRequestedWithoutConfirmedTermination,
     Unclassified,
+    HostShutdown,
+    DeadlineExceeded,
 }
-
-pub(crate) const UNCERTAIN_HOST_SHUTDOWN: &str =
-    "The host shut down after external work may have started. Termination was not confirmed.";
-pub(crate) const UNCERTAIN_DEADLINE: &str = "The dispatch deadline expired after external work may have started. Termination was not confirmed.";
 
 impl UncertaintyReason {
     pub const fn code(self) -> u8 {
@@ -556,6 +554,8 @@ impl UncertaintyReason {
             Self::WorkerAckPendingOrAmbiguous => 5,
             Self::StopRequestedWithoutConfirmedTermination => 6,
             Self::Unclassified => 7,
+            Self::HostShutdown => 8,
+            Self::DeadlineExceeded => 9,
         }
     }
 
@@ -568,6 +568,8 @@ impl UncertaintyReason {
             5 => Some(Self::WorkerAckPendingOrAmbiguous),
             6 => Some(Self::StopRequestedWithoutConfirmedTermination),
             7 => Some(Self::Unclassified),
+            8 => Some(Self::HostShutdown),
+            9 => Some(Self::DeadlineExceeded),
             _ => None,
         }
     }
@@ -593,6 +595,12 @@ impl UncertaintyReason {
                 "A stop was requested locally but termination was never confirmed."
             }
             Self::Unclassified => "The reason the outcome is uncertain could not be established.",
+            Self::HostShutdown => {
+                "The host shut down after external work may have started. Termination was not confirmed."
+            }
+            Self::DeadlineExceeded => {
+                "The dispatch deadline expired after external work may have started. Termination was not confirmed."
+            }
         }
     }
 
@@ -607,6 +615,8 @@ impl UncertaintyReason {
                 "stop_requested_without_confirmed_termination"
             }
             Self::Unclassified => "unclassified",
+            Self::HostShutdown => "host_shutdown",
+            Self::DeadlineExceeded => "deadline_exceeded",
         }
     }
 }

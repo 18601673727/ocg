@@ -1,18 +1,160 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::{StorageError, jobs};
+use super::{StorageError, TxRead, jobs};
 use crate::db::entities::{
-    AttachmentRecord, ContentDigest, JobId, JobOutputRecord, JobSpec, MutableJobInput, Origin,
-    OutcomeKind, OutputKind,
+    AttachmentRecord, CompactionPolicy, ConfigId, ContentDigest, JobId, JobOutputRecord, JobSpec,
+    MutableJobInput, Origin, OutcomeKind, OutputKind,
 };
 use crate::db::entities::{RequestEventRecord, RequestPayload};
 use crate::db::redb::schema::{
-    ATTACHMENTS, CHILD_GROUPS, CHILDREN, CONTENT_RECLAIM, CONTENT_REFERENCES, CONVERSATION_SEARCH,
-    CONVERSATIONS, DRAFT_CONTEXTS, JOB_OUTPUTS, JOBS, LIVE_CHILDREN, MUTABLE_READY, PENDING,
-    POOL_ALLOCATIONS, SUCCESSORS, USAGE_MODEL,
+    ATTACHMENTS, CHILD_GROUPS, CHILDREN, CONTENT_RECLAIM, CONTENT_REFERENCES,
+    CONVERSATION_CONFIG_REFS, CONVERSATION_SEARCH, CONVERSATIONS, DRAFT_CONTEXTS, JOB_OUTPUTS,
+    JOB_RUNTIME, JOBS, LIVE_CHILDREN, MUTABLE_READY, PENDING, POOL_ALLOCATIONS, SUCCESSORS,
+    USAGE_MODEL,
 };
 use crate::db::redb::{allocations, reads, reservations, rows, schema, state};
-use ::redb::{ReadTransaction, ReadableTable, WriteTransaction};
+use ::redb::{ReadTransaction, ReadableTable, ReadableTableMetadata, WriteTransaction};
+
+#[derive(Clone, Copy)]
+pub(super) enum CompactionReference {
+    Summary = 1,
+    Predictor = 2,
+    Acceptance = 3,
+}
+
+impl CompactionReference {
+    const ALL: [Self; 3] = [Self::Summary, Self::Predictor, Self::Acceptance];
+
+    fn config(self, policy: Option<&CompactionPolicy>) -> Option<ConfigId> {
+        let policy = policy?;
+        match self {
+            Self::Summary => policy.summarization_model,
+            Self::Predictor => policy.predictive.as_ref().map(|p| p.decision_agent),
+            Self::Acceptance => policy
+                .predictive
+                .as_ref()?
+                .acceptance
+                .as_ref()
+                .map(|p| p.model.id),
+        }
+    }
+
+    fn key(self, config: ConfigId, owner: JobId) -> (u8, u128, u128) {
+        (self as u8, config.get(), owner.get())
+    }
+
+    pub(super) fn range(self, config: ConfigId) -> std::ops::RangeInclusive<(u8, u128, u128)> {
+        (self as u8, config.get(), 0)..=(self as u8, config.get(), u128::MAX)
+    }
+
+    pub(super) fn configs(
+        self,
+        index: &impl ReadableTable<(u8, u128, u128), ()>,
+    ) -> Result<BTreeSet<ConfigId>, StorageError> {
+        let role = self as u8;
+        let mut configs = BTreeSet::new();
+        let mut first = 0;
+        // Seek to the next ConfigId without visiting every owner of this one.
+        while let Some((key, _)) = index
+            .range((role, first, 0)..=(role, u128::MAX, u128::MAX))?
+            .next()
+            .transpose()?
+        {
+            let (_, config, _) = key.value();
+            configs.insert(ConfigId::new(config));
+            let Some(next) = config.checked_add(1) else {
+                break;
+            };
+            first = next;
+        }
+        Ok(configs)
+    }
+}
+
+pub(super) fn update_compaction_refs(
+    tx: &WriteTransaction,
+    owner: JobId,
+    previous: Option<&CompactionPolicy>,
+    next: Option<&CompactionPolicy>,
+) -> Result<(), StorageError> {
+    for role in CompactionReference::ALL {
+        let old = role.config(previous);
+        let new = role.config(next);
+        if old == new {
+            continue;
+        }
+        let mut index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
+        if let Some(config) = old
+            && index.remove(role.key(config, owner))?.is_none()
+        {
+            return Err(StorageError::corrupted(
+                "missing conversation configuration reference",
+            ));
+        }
+        if let Some(config) = new
+            && index.insert(role.key(config, owner), ())?.is_some()
+        {
+            return Err(StorageError::corrupted(
+                "duplicate conversation configuration reference",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn visit_compaction_refs(
+    tx: &impl TxRead,
+    mut visit: impl FnMut((u8, u128, u128)) -> Result<(), StorageError>,
+) -> Result<u64, StorageError> {
+    let conversations = tx.table(CONVERSATIONS)?;
+    let mut count = 0;
+    for entry in tx.table(JOB_RUNTIME)?.iter()? {
+        let (key, bytes) = entry?;
+        let job = JobId::new(key.value());
+        let runtime = state::JobRuntime::decode_at(job.get(), bytes.value())?;
+        let policy = runtime.lifecycle.compaction_policy.as_ref();
+        if policy.is_some() && conversations.get(job.get())?.is_none() {
+            return Err(StorageError::corrupted(format!(
+                "{job} has a policy but is not a conversation"
+            )));
+        }
+        for role in CompactionReference::ALL {
+            if let Some(config) = role.config(policy) {
+                visit(role.key(config, job))?;
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+#[cfg(unix)]
+pub(super) fn rebuild_compaction_refs(tx: &WriteTransaction) -> Result<(), StorageError> {
+    let mut index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
+    visit_compaction_refs(tx, |key| {
+        index.insert(key, ())?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+pub(super) fn verify_compaction_refs(tx: &ReadTransaction) -> Result<(), StorageError> {
+    let index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
+    let expected = visit_compaction_refs(tx, |key| {
+        if index.get(key)?.is_none() {
+            return Err(StorageError::corrupted(
+                "missing conversation configuration reference",
+            ));
+        }
+        Ok(())
+    })?;
+    if index.len()? != expected {
+        return Err(StorageError::corrupted(
+            "extra conversation configuration references",
+        ));
+    }
+    Ok(())
+}
 
 pub(super) fn search_gram(chars: &[char]) -> u64 {
     chars

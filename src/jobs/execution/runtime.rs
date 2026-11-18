@@ -952,22 +952,18 @@ pub(super) fn cancellation_output(reason: CancellationReason) -> (&'static str, 
 fn cancellation_uncertainty(
     reason: Option<CancellationReason>,
     fallback: crate::db::entities::UncertaintyReason,
-) -> crate::db::entities::OutcomeCause {
-    use crate::db::entities::{
-        OutcomeCause, UNCERTAIN_DEADLINE, UNCERTAIN_HOST_SHUTDOWN, UncertaintyReason,
-    };
+) -> crate::db::entities::UncertaintyReason {
+    use crate::db::entities::UncertaintyReason;
     match reason {
         Some(CancellationReason::UserStop) => {
-            OutcomeCause::Uncertain(UncertaintyReason::StopRequestedWithoutConfirmedTermination)
+            UncertaintyReason::StopRequestedWithoutConfirmedTermination
         }
-        Some(CancellationReason::HostShutdown) => {
-            OutcomeCause::Text(UNCERTAIN_HOST_SHUTDOWN.to_owned())
-        }
-        Some(CancellationReason::Deadline) => OutcomeCause::Text(UNCERTAIN_DEADLINE.to_owned()),
+        Some(CancellationReason::HostShutdown) => UncertaintyReason::HostShutdown,
+        Some(CancellationReason::Deadline) => UncertaintyReason::DeadlineExceeded,
         Some(CancellationReason::EvidenceUnavailable) => {
-            OutcomeCause::Uncertain(UncertaintyReason::WorkerAckPendingOrAmbiguous)
+            UncertaintyReason::WorkerAckPendingOrAmbiguous
         }
-        Some(CancellationReason::Unspecified) | None => OutcomeCause::Uncertain(fallback),
+        Some(CancellationReason::Unspecified) | None => fallback,
     }
 }
 

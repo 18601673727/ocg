@@ -93,18 +93,6 @@ impl JobRuntime {
     }
 
     pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
-        Self::decode::<true>(key, bytes)
-    }
-
-    pub(super) fn decode_compaction_policy(
-        bytes: &[u8],
-    ) -> DecodeResult<Option<crate::db::entities::CompactionPolicy>> {
-        // Validate the whole row using the same decoder without allocating
-        // unrelated outcome text, titles or dependency lists.
-        Ok(Self::decode::<false>(0, bytes)?.lifecycle.compaction_policy)
-    }
-
-    fn decode<const FULL: bool>(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_JOB_RUNTIME)?;
         let outcome = d.opt(|d| {
             let kind = d.code_with(OutcomeKind::from_code, |_| {
@@ -113,14 +101,7 @@ impl JobRuntime {
             let at = d.ts()?;
             let cause = d.opt(|d| match d.u8()? {
                 1 => Ok(OutcomeCause::Code(d.u8()?)),
-                2 => {
-                    let text = d.str_ref()?;
-                    Ok(OutcomeCause::Text(if FULL {
-                        text.to_owned()
-                    } else {
-                        String::new()
-                    }))
-                }
+                2 => Ok(OutcomeCause::Text(d.str()?)),
                 3 => Ok(OutcomeCause::Abandoned),
                 4 => Ok(OutcomeCause::DependencyImpossible),
                 5 => Ok(OutcomeCause::Stopped { record: d.u32()? }),
@@ -138,9 +119,8 @@ impl JobRuntime {
             job_id: JobId::new(key),
             outcome,
         };
-        let title = d.opt(Dec::str_ref)?;
         let lifecycle = JobLifecycle {
-            title: title.filter(|_| FULL).map(str::to_owned),
+            title: d.ostr()?,
             hidden_at: d.ots()?,
             on_hold: d.ou32()?,
             loop_count: d.u8()?,
@@ -169,9 +149,7 @@ impl JobRuntime {
                         2 => DependencyCondition::Settled,
                         _ => return Err(StorageError::corrupted("invalid dependency condition")),
                     };
-                    if FULL {
-                        items.push((job, condition));
-                    }
+                    items.push((job, condition));
                 }
                 items
             },

@@ -1854,8 +1854,18 @@ impl Batch {
                 },
             )?;
         }
-        runtime.lifecycle = row.clone();
-        self.step(|tx| state::write(tx, &runtime))?;
+        let previous = std::mem::replace(&mut runtime.lifecycle, row.clone());
+        self.step(|tx| {
+            if previous.compaction_policy != row.compaction_policy {
+                super::indexes::update_compaction_refs(
+                    tx,
+                    root,
+                    previous.compaction_policy.as_ref(),
+                    row.compaction_policy.as_ref(),
+                )?;
+            }
+            state::write(tx, &runtime)
+        })?;
         if (row.closing.is_some() || row.hidden_at.is_some())
             && let Some(mut rec) = self.get(RECURRENCES, root.get(), Recurrence::decode)?
             && !matches!(rec.phase, RecurrencePhase::Halted { .. })

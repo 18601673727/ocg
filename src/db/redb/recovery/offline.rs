@@ -94,8 +94,24 @@ pub(super) fn with_reconciliation_copy<T>(
     file: std::fs::File,
     body: impl FnOnce(&mut Database) -> Result<T, ReservedRefusal>,
 ) -> Result<T, ReservedRefusal> {
+    with_database_copy(file, &Database::builder(), body)
+}
+
+pub(super) fn with_database_copy<T>(
+    file: std::fs::File,
+    builder: &::redb::Builder,
+    body: impl FnOnce(&mut Database) -> Result<T, ReservedRefusal>,
+) -> Result<T, ReservedRefusal> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut database = Database::builder().create_file(file)?;
+        let mut database = match builder.create_file(file) {
+            Err(::redb::DatabaseError::RepairAborted) => {
+                return Err(ReservedRefusal::new(
+                    "page_integrity",
+                    "the offline copy requires redb repair",
+                ));
+            }
+            result => result?,
+        };
         body(&mut database)
     }))
     .unwrap_or_else(|_| {

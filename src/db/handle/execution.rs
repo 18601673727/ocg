@@ -646,7 +646,7 @@ impl DatabaseHandle {
     pub(crate) async fn record_development_uncertain(
         &self,
         handoff: &DevelopmentHandoff,
-        cause: entities::OutcomeCause,
+        cause: entities::UncertaintyReason,
     ) -> Result<(), DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         let result = self

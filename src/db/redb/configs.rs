@@ -9,11 +9,11 @@ use crate::db::entities::{
 use crate::db::redb::StorageError;
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::codec::{Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS};
-use crate::db::redb::reads;
+use crate::db::redb::indexes::CompactionReference;
 use crate::db::redb::reads::catalog::live_credential_refs;
 use crate::db::redb::rows::{ConfigRow, decode_project};
-use crate::db::redb::schema::{CONFIGS, CREDENTIALS, JOB_RUNTIME, META, PROJECTS};
-use crate::db::redb::state::JobRuntime;
+use crate::db::redb::schema::{CONFIGS, CONVERSATION_CONFIG_REFS, CREDENTIALS, META, PROJECTS};
+use crate::db::redb::{reads, state};
 use ::redb::ReadableTable;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -953,14 +953,53 @@ impl Batch {
                         | ConfigBody::DecisionModel(_) => {}
                     }
                 }
-                let mut conversations = Vec::new();
-                for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
-                    let (key, bytes) = entry?;
-                    if let Some(policy) = JobRuntime::decode_compaction_policy(bytes.value())?
-                        && refs.record(&policy, &ids)
+                let index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
+                refs.summaries.extend(
+                    CompactionReference::Summary
+                        .configs(&index)?
+                        .into_iter()
+                        .filter(|config| !ids.contains(config)),
+                );
+                // Removing a model from a predictor's target list can require
+                // a new default even when no conversation pins that model.
+                for predictor in ids
+                    .iter()
+                    .copied()
+                    .chain(decision_agents.iter().map(|row| row.id))
+                {
+                    if index
+                        .range(CompactionReference::Predictor.range(predictor))?
+                        .next()
+                        .transpose()?
+                        .is_some()
                     {
-                        conversations.push((JobId::new(key.value()), policy));
+                        refs.predictions.insert(predictor);
                     }
+                }
+                let mut affected = BTreeSet::new();
+                for &config in &ids {
+                    for role in [
+                        CompactionReference::Summary,
+                        CompactionReference::Acceptance,
+                    ] {
+                        for entry in index.range(role.range(config))? {
+                            let (key, _) = entry?;
+                            affected.insert(JobId::new(key.value().2));
+                        }
+                    }
+                }
+                let mut conversations = Vec::new();
+                for job in affected {
+                    let policy = state::require(tx, job)?
+                        .lifecycle
+                        .compaction_policy
+                        .filter(|policy| refs.record(policy, &ids))
+                        .ok_or_else(|| {
+                            StorageError::corrupted(format!(
+                                "{job} has a stale conversation configuration reference"
+                            ))
+                        })?;
+                    conversations.push((job, policy));
                 }
                 let settings = reads::catalog::global_compaction_settings(&tx.open_table(META)?)?;
                 let settings_changed = refs.record(&settings.policy, &ids);

@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const FORMAT_VERSION: u64 = 1;
+pub(super) const FORMAT_VERSION: u64 = 2;
 
 pub(super) const fn record_version_byte() -> u8 {
     const { assert!(FORMAT_VERSION <= u8::MAX as u64) };
@@ -27,32 +27,64 @@ pub(super) type RequestTimelineKey = (i64, u128, u32, u32);
 // Normal writes maintain indexes in the same transaction as their source facts;
 // opening an existing store never creates missing tables or rebuilds indexes.
 macro_rules! tables {
-    ($($group:ident {
+    (added {
+        $($added:ident: $added_key:ty = $added_name:literal;)*
+    }
+    $($group:ident {
         $($name:ident: $key:ty => $value:ty = $table:literal $(tags [$($tag:literal),+])?;)*
     })*) => {
         $($(pub(super) const $name: TableDefinition<$key, $value> =
             TableDefinition::new($table);)*)*
+        $(pub(super) const $added: TableDefinition<$added_key, ()> =
+            TableDefinition::new($added_name);)*
 
         pub(super) fn create_tables(tx: &WriteTransaction) -> Result<(), StorageError> {
             $($(tx.open_table($name)?;)*)*
+            $(tx.open_table($added)?;)*
             Ok(())
         }
 
         pub(super) fn check_required_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
-            use ::redb::TableHandle;
-            let expected: &[&str] = &[$($($table,)*)*];
-            let present = tx.list_tables()?
-                .map(|table| table.name().to_owned())
-                .collect::<BTreeSet<_>>();
-            if present.len() != expected.len()
-                || expected.iter().any(|name| !present.contains(*name))
-                || tx.list_multimap_tables()?.next().is_some()
-            {
-                return Err(StorageError::corrupted(
-                    "database tables do not match the current storage layout",
-                ));
-            }
+            check_layout(tx, &[$($($table,)*)* $($added_name,)*])?;
             $($(tx.open_table($name)?;)*)*
+            $(tx.open_table($added)?;)*
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        pub(super) fn check_format1_layout(tx: &ReadTransaction) -> Result<(), StorageError> {
+            check_layout(tx, &[$($($table,)*)*])?;
+            $($(tx.open_table($name)?;)*)*
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        pub(super) fn rewrite_format1_records(
+            source: &ReadTransaction,
+            tx: &WriteTransaction,
+        ) -> Result<(), StorageError> {
+            $($($(
+                recovery::migration::rewrite_tagged(source, tx, $name, &[$($tag),+])?;
+            )?)*)*
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        pub(super) fn verify_format1_records(
+            source: &ReadTransaction,
+            result: &ReadTransaction,
+        ) -> Result<(), recovery::reserved::ReservedRefusal> {
+            // Every pre-existing table must have precisely its authorized delta.
+            macro_rules! verify {
+                (META) => { recovery::migration::verify_metadata(source, result)? };
+                ($definition:ident, $tags:expr) => {
+                    recovery::migration::verify_tagged(source, result, $definition, $tags)?
+                };
+                ($definition:ident) => {
+                    recovery::audit::verify_identical_table(source, result, $definition)?
+                };
+            }
+            $($(verify!($name $(, &[$($tag),+])?);)*)*
             Ok(())
         }
 
@@ -67,7 +99,28 @@ macro_rules! tables {
     };
 }
 
+fn check_layout(tx: &ReadTransaction, expected: &[&str]) -> Result<(), StorageError> {
+    use ::redb::TableHandle;
+
+    let present = tx
+        .list_tables()?
+        .map(|table| table.name().to_owned())
+        .collect::<BTreeSet<_>>();
+    if present.len() != expected.len()
+        || expected.iter().any(|name| !present.contains(*name))
+        || tx.list_multimap_tables()?.next().is_some()
+    {
+        return Err(StorageError::corrupted(
+            "database tables do not match the declared storage format",
+        ));
+    }
+    Ok(())
+}
+
 tables! {
+    added {
+        CONVERSATION_CONFIG_REFS: (u8, u128, u128) = "conversation_config_ref";
+    }
     facts {
         CONFIGS: u128 => &[u8] = "config" tags [1];
         POOLS: u128 => &[u8] = "pool" tags [40];

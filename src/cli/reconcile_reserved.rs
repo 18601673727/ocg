@@ -15,6 +15,7 @@ use crate::host::data_directory::{DATABASE_LOCK_FILE, private_file};
 const USAGE: &str = "usage: ocg reconcile-reserved <data-directory> <job-id> --confirm-no-start | ocg reconcile-reserved <data-directory> --finalize";
 const HELD_USAGE: &str =
     "usage: ocg reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize";
+const MIGRATION_USAGE: &str = "usage: ocg migrate <data-directory> --apply | --finalize";
 const STALE_PREFIX: &str = ".ocg-reconcile-";
 const PREPARED_SCHEMA: &str = "ocg-publication-prepared-v1";
 const COMPLETION_SCHEMA: &str = "ocg-publication-finalized-v1";
@@ -30,6 +31,7 @@ type Failure = Box<dyn std::error::Error>;
 enum RecoveryKind {
     Reserved,
     Held,
+    Migration,
 }
 
 impl RecoveryKind {
@@ -37,6 +39,7 @@ impl RecoveryKind {
         match self {
             Self::Reserved => "reserved",
             Self::Held => "held",
+            Self::Migration => "format-1-to-2",
         }
     }
 }
@@ -44,6 +47,7 @@ impl RecoveryKind {
 enum Operation {
     Reserved(JobId),
     Held { expected_digest: Option<String> },
+    Migration,
 }
 
 impl Operation {
@@ -51,6 +55,7 @@ impl Operation {
         match self {
             Self::Reserved(_) => RecoveryKind::Reserved,
             Self::Held { .. } => RecoveryKind::Held,
+            Self::Migration => RecoveryKind::Migration,
         }
     }
 }
@@ -646,11 +651,16 @@ fn load_audit_chain(directory: &Path) -> Result<AuditChain, Refused> {
 
 fn validate_prepared(evidence: &PreparedEvidence, actual: &Identity) -> Result<(), Refused> {
     let (database_format, record_version) = storage_format_versions();
+    let versions = (evidence.database_format, evidence.record_version);
+    let known_operation = match evidence.operation.as_str() {
+        // Offline audit records from Format 1 remain part of the publication chain.
+        "reserved" | "held" => versions == (1, 1) || versions == (database_format, record_version),
+        "format-1-to-2" => versions == (2, 2),
+        _ => false,
+    };
     if evidence.schema != PREPARED_SCHEMA
         || evidence.sequence == 0
-        || !matches!(evidence.operation.as_str(), "reserved" | "held")
-        || evidence.database_format != database_format
-        || evidence.record_version != record_version
+        || !known_operation
         || !valid_digest(&evidence.source.sha256)
         || !valid_digest(&evidence.replacement.sha256)
         || !valid_digest(&evidence.rollback_artifact.sha256)
@@ -841,6 +851,18 @@ pub fn run_held(arguments: Vec<String>) -> Result<(), Failure> {
     ))
 }
 
+pub fn run_migration(arguments: Vec<String>) -> Result<(), Failure> {
+    match arguments.as_slice() {
+        [directory, flag] if flag == "--apply" => {
+            finish(reconcile(Path::new(directory), Operation::Migration))
+        }
+        [directory, flag] if flag == "--finalize" => {
+            finish(finalize(Path::new(directory), RecoveryKind::Migration))
+        }
+        _ => Err(MIGRATION_USAGE.into()),
+    }
+}
+
 fn finish(result: Result<Value, Refused>) -> Result<(), Failure> {
     match result {
         Ok(report) => {
@@ -926,12 +948,13 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
         None => None,
     };
 
-    let private = private_copy(&mut original, &source_sha256)?;
     match &operation {
         Operation::Reserved(job) => {
+            let private = private_copy(&mut original, &source_sha256)?;
             crate::db::reconcile_reserved_preflight(private, *job)?;
         }
         Operation::Held { expected_digest } => {
+            let private = private_copy(&mut original, &source_sha256)?;
             let plan = crate::db::reconcile_held_preflight(private, &source_sha256)?;
             if expected_digest
                 .as_ref()
@@ -955,6 +978,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 }));
             }
         }
+        Operation::Migration => {}
     }
 
     let token = uuid::Uuid::now_v7();
@@ -990,6 +1014,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 .as_deref()
                 .ok_or_else(|| refused("plan_required", "an apply digest is required"))?,
         )?,
+        Operation::Migration => crate::db::migrate_format1_apply(work, &directory)?,
     };
     crash_point("after-apply");
 
@@ -1075,6 +1100,12 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 }),
             )
         }
+        Operation::Migration => (
+            json!({"kind": "ocg-format-1-to-2", "source_sha256": source_sha256}),
+            None,
+            Vec::new(),
+            applied.clone(),
+        ),
     };
     let prepared = PreparedEvidence {
         schema: PREPARED_SCHEMA.to_owned(),
@@ -1192,6 +1223,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
             report["plan"] = report["applied"]["plan"].clone();
             report["plan_digest"] = report["applied"]["plan_digest"].clone();
         }
+        Operation::Migration => report["outcome"] = json!("migrated"),
     }
     Ok(report)
 }
@@ -1296,6 +1328,9 @@ fn verify_publication(
             &prepared.recovery_plan,
             prepared.plan_digest.as_deref().unwrap_or_default(),
         ),
+        Operation::Migration => {
+            crate::db::verify_migration_publication_delta(&artifact, &published_file, directory)
+        }
     }
     .map_err(|error| Refused {
         state: Some(PUBLISHED_UNFINALIZED),
@@ -1465,6 +1500,13 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
             ),
         ));
     }
+    if (prepared.database_format, prepared.record_version) != storage_format_versions() {
+        return Err(refused_in_state(
+            "offline_format_mismatch",
+            PUBLISHED_UNFINALIZED,
+            "use the OCG build for the prepared publication's database format to finalize it",
+        ));
+    }
     let operation = match kind {
         RecoveryKind::Reserved => {
             let job = prepared
@@ -1483,6 +1525,7 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
         RecoveryKind::Held => Operation::Held {
             expected_digest: prepared.plan_digest.clone(),
         },
+        RecoveryKind::Migration => Operation::Migration,
     };
     let mut current = open_original(&database_path)?;
     let (current_sha256, _) =

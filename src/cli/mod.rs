@@ -32,6 +32,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         if command == "reconcile-held" {
             return reconcile_reserved::run_held(arguments.collect());
         }
+        #[cfg(unix)]
+        if command == "migrate" {
+            return reconcile_reserved::run_migration(arguments.collect());
+        }
         if command == "verify" {
             return verify(arguments.collect());
         }
@@ -84,6 +88,7 @@ fn usage() -> &'static str {
        update [--check] [--version X.Y.Z] [--yes]\n\
        inspect-held <data-directory>            (read-only)\n\
        verify <data-directory> [--pages]\n\
+       migrate <data-directory> --apply | --finalize\n\
        reconcile-reserved <data-directory> <job> --confirm-no-start | --finalize\n\
        reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
        scheduled-external-policy <create|list|show|update|enable|disable|revoke> ...\n\

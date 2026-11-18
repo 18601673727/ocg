@@ -1144,7 +1144,7 @@ impl Batch {
         &mut self,
         token: crate::db::entities::AllocationToken,
         next: crate::db::entities::AllocationPhase,
-        uncertainty: Option<OutcomeCause>,
+        uncertainty: Option<crate::db::entities::UncertaintyReason>,
     ) -> Result<(), BatchError> {
         use crate::db::entities::AllocationPhase;
         self.require_allocation_durability()?;
@@ -1188,7 +1188,7 @@ impl Batch {
             state.outcome = Some(OutcomeRecord {
                 kind: OutcomeKind::Unknown,
                 at: self.now,
-                cause: Some(reason),
+                cause: Some(OutcomeCause::Uncertain(reason)),
             });
             self.put_job_state(token.job, &state)?;
         }

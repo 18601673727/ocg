@@ -24,8 +24,10 @@ use ::redb::{
 };
 use std::path::{Path, PathBuf};
 
-mod audit;
+pub(super) mod audit;
 pub(super) mod held;
+#[cfg(unix)]
+pub(super) mod migration;
 pub(super) mod offline;
 pub(super) mod reserved;
 mod settle;
@@ -153,7 +155,7 @@ pub(super) fn check_identity(
     };
     if found != FORMAT_VERSION {
         return Err(unsupported_format(&format!(
-            "database format {found} is not supported; this build opens only format {FORMAT_VERSION}; no migration is available"
+            "database format {found} is not supported; this build opens only format {FORMAT_VERSION}; see ocg help for offline migration"
         )));
     }
     Ok(())
@@ -378,6 +380,7 @@ fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
     check_record_payloads(tx)?;
     check_native_invariants(tx)?;
     indexes::verify_job_indexes(tx)?;
+    indexes::verify_compaction_refs(tx)?;
     check_execution_history(tx)
 }
 
