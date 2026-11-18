@@ -401,10 +401,11 @@ impl Batch {
                 (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
             )? {
                 let (key, value) = entry?;
-                if value.value() == 0 {
-                    let (_, turn, request, index) = key.value();
-                    calls.push(tool_call_ref((turn, request, index))?);
+                if value.value() != 0 {
+                    return Err(StorageError::corrupted("invalid open approval index entry"));
                 }
+                let (_, turn, request, index) = key.value();
+                calls.push(tool_call_ref((turn, request, index))?);
             }
             Ok(calls)
         })?;
@@ -492,7 +493,6 @@ impl Batch {
         }
         let record = ToolEvidenceRecord {
             call,
-            approval: None,
             tool_call_id: tool_call_id.to_owned(),
             name: name.to_owned(),
             spawns: spawns && matches!(decision, ToolDecision::Admitted(_)),
@@ -607,29 +607,6 @@ impl Batch {
     }
 }
 
-pub(crate) fn approved_calls(
-    rx: &ReadTransaction,
-    conversation: JobId,
-) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
-    let mut calls = Vec::new();
-    let table = rx.open_table(TOOL_CALLS)?;
-    for entry in rx.open_table(OPEN_APPROVALS)?.range(
-        (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
-    )? {
-        let (key, state) = entry?;
-        if state.value() != 1 {
-            continue;
-        }
-        let (_, turn, request, index) = key.value();
-        let call = tool_call_ref((turn, request, index))?;
-        let bytes = table
-            .get(tool_call_key(call))?
-            .ok_or_else(|| StorageError::corrupted("approved call missing"))?;
-        calls.push(decode_tool_evidence(call, bytes.value())?);
-    }
-    Ok(calls)
-}
-
 fn question(arguments: &str) -> String {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
@@ -741,7 +718,7 @@ pub(crate) fn read_cards(
             )? {
                 let (key, state) = entry?;
                 if state.value() != 0 {
-                    continue;
+                    return Err(StorageError::corrupted("invalid open approval index entry"));
                 }
                 let (_, turn, request, index) = key.value();
                 let call = tool_call_ref((turn, request, index))?;

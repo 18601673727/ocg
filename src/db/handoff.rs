@@ -346,6 +346,7 @@ impl DevelopmentWriteProof {
 #[derive(Debug)]
 #[allow(dead_code)]
 pub(crate) enum DevelopmentHandoffError {
+    CancelledBeforeClaim,
     NotStarted {
         cause: entities::UnstartedCause,
         detail: String,

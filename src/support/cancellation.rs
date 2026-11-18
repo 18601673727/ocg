@@ -3,6 +3,7 @@ use std::sync::{
     atomic::{AtomicU8, Ordering},
 };
 use std::task::{Poll, Waker};
+use std::time::Instant;
 
 #[derive(Clone, Debug, Default)]
 pub struct CancellationToken(Arc<Cancellation>);
@@ -20,6 +21,7 @@ pub(crate) enum CancellationReason {
 #[derive(Debug, Default)]
 struct Cancellation {
     reason: AtomicU8,
+    deadline: Mutex<Option<Instant>>,
     waiters: Mutex<Vec<Waker>>,
     children: Mutex<Vec<Weak<Cancellation>>>,
 }
@@ -30,6 +32,11 @@ impl CancellationToken {
     }
 
     pub(crate) fn cancel_for(&self, reason: CancellationReason) {
+        let reason = if self.deadline_expired() {
+            CancellationReason::Deadline
+        } else {
+            reason
+        };
         if self
             .0
             .reason
@@ -81,6 +88,23 @@ impl CancellationToken {
         self.reason().is_some()
     }
 
+    pub(crate) fn tighten_deadline(&self, limit: Instant) {
+        let mut deadline = self
+            .0
+            .deadline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *deadline = Some(deadline.map_or(limit, |current| current.min(limit)));
+    }
+
+    fn deadline_expired(&self) -> bool {
+        self.0
+            .deadline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_some_and(|deadline| deadline <= Instant::now())
+    }
+
     pub(crate) fn reason(&self) -> Option<CancellationReason> {
         use CancellationReason::{
             Deadline, EvidenceUnavailable, HostShutdown, Unspecified, UserStop,
@@ -90,7 +114,7 @@ impl CancellationToken {
             value if value == HostShutdown as u8 => Some(HostShutdown),
             value if value == Deadline as u8 => Some(Deadline),
             value if value == EvidenceUnavailable as u8 => Some(EvidenceUnavailable),
-            0 => None,
+            0 => self.deadline_expired().then_some(Deadline),
             _ => Some(Unspecified),
         }
     }

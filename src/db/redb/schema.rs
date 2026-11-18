@@ -23,6 +23,10 @@ pub(crate) type UsageTotalKey = (i64, u128, u128, [u8; 32]);
 pub(crate) type UsageTotalValue = (u64, u64, u64, u64, u64, u64, u64);
 pub(super) type RequestTimelineKey = (i64, u128, u32, u32);
 
+#[cfg(unix)]
+const FORMAT1_APPROVAL_LINKS: TableDefinition<(u128, u32, u32), (u128, u32, u32)> =
+    TableDefinition::new("approval_call");
+
 // One inventory owns definitions, fresh-store creation and layout checks.
 // Normal writes maintain indexes in the same transaction as their source facts;
 // opening an existing store never creates missing tables or rebuilds indexes.
@@ -53,8 +57,21 @@ macro_rules! tables {
 
         #[cfg(unix)]
         pub(super) fn check_format1_layout(tx: &ReadTransaction) -> Result<(), StorageError> {
-            check_layout(tx, &[$($($table,)*)*])?;
+            use ::redb::{ReadableTableMetadata, TableHandle};
+            check_layout(tx, &[$($($table,)*)* FORMAT1_APPROVAL_LINKS.name()])?;
             $($(tx.open_table($name)?;)*)*
+            if !tx.open_table(FORMAT1_APPROVAL_LINKS)?.is_empty()? {
+                return Err(StorageError::corrupted(
+                    "Format 1 has populated legacy approval links; removal would lose history",
+                ));
+            }
+            for entry in tx.open_table(OPEN_APPROVALS)?.iter()? {
+                if entry?.1.value() != 0 {
+                    return Err(StorageError::corrupted(
+                        "Format 1 has legacy decided calls in its open approval index",
+                    ));
+                }
+            }
             Ok(())
         }
 
@@ -66,6 +83,9 @@ macro_rules! tables {
             $($($(
                 recovery::migration::rewrite_tagged(source, tx, $name, &[$($tag),+])?;
             )?)*)*
+            if !tx.delete_table(FORMAT1_APPROVAL_LINKS)? {
+                return Err(StorageError::corrupted("Format 1 approval link table missing"));
+            }
             Ok(())
         }
 
@@ -174,7 +194,6 @@ tables! {
         CONVERSATION_SEARCH: ConversationSearchKey => () = "conversation_search";
         TOOL_CALL_IDS: (u128, &str) => (u32, u32) = "tool_call_id";
         OPEN_APPROVALS: (u128, u128, u32, u32) => u8 = "open_approval";
-        APPROVAL_CALLS: (u128, u32, u32) => (u128, u32, u32) = "approval_call";
 
         // Observation projections and content ownership.
         JOB_OBSERVATIONS: (u128, u8, u128) => (u32, u32) = "job_observation";

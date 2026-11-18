@@ -302,9 +302,7 @@ fn indexed_identity<'a>(
     identity.filter(|_| {
         !matches!(
             event.payload,
-            RequestPayload::Sent { .. }
-                | RequestPayload::Received { .. }
-                | RequestPayload::ApprovedCalls
+            RequestPayload::Sent { .. } | RequestPayload::Received { .. }
         )
     })
 }

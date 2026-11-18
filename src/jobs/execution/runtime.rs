@@ -1026,7 +1026,13 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
             }
             match self
                 .execution
-                .record_request(self.database, self.request, body, Timestamp::now())
+                .record_request(
+                    self.database,
+                    self.request,
+                    body,
+                    Timestamp::now(),
+                    self.cancellation,
+                )
                 .await
             {
                 Ok(()) => {}

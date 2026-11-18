@@ -18,8 +18,11 @@ use crate::db::handoff::{
 use crate::db::redb::StorageErrorKind;
 use crate::db::worker::{DatabaseHandle, run};
 use crate::db::{entities, mutations, redb};
+use crate::support::cancellation::CancellationToken;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
+
+const CANCELLED_BEFORE_CLAIM: &str = "execution cancelled before claim";
 
 fn finalization_bytes(finalization: &JobFinalization) -> u64 {
     let result = finalization.result();
@@ -119,17 +122,22 @@ impl DatabaseHandle {
     pub(crate) async fn start_development_handoff(
         &self,
         prepared: PreparedDevelopmentHandoff,
+        cancellation: &CancellationToken,
     ) -> Result<DevelopmentHandoff, DevelopmentHandoffError> {
         let owner = self.shared.clone();
         let result = self
             .write_sized(
-                (prepared, owner),
-                |(prepared, _)| {
+                (prepared, owner, cancellation.clone()),
+                |(prepared, _, _)| {
                     byte_count(crate::db::serialized_len(&prepared.request).unwrap_or(usize::MAX))
                         .saturating_add(64 * 1024)
                 },
                 OperationKind::ClaimExecution,
-                |batch, (prepared, owner)| {
+                |batch, (prepared, owner, cancellation)| {
+                    if cancellation.is_cancelled() {
+                        return batch
+                            .reject(Violation::InvalidValue("handoff", CANCELLED_BEFORE_CLAIM));
+                    }
                     let started = batch.start_mutable_job(&prepared)?;
                     Ok(DevelopmentHandoff {
                         prepared,
@@ -147,6 +155,10 @@ impl DatabaseHandle {
         match result {
             Ok(handoff) => Ok(handoff),
             Err(error) => match &error {
+                DatabaseError::Rejected(Violation::InvalidValue(
+                    "handoff",
+                    CANCELLED_BEFORE_CLAIM,
+                )) => Err(DevelopmentHandoffError::CancelledBeforeClaim),
                 DatabaseError::OutcomeUnknown { operation, .. } => {
                     let reconciliation =
                         self.reconcile_operation(*operation).await.map_err(Box::new);
@@ -192,6 +204,7 @@ impl DatabaseHandle {
         &self,
         handoff: &DevelopmentHandoff,
         body: &serde_json::Value,
+        cancellation: &CancellationToken,
         prepare: impl FnOnce() -> Result<(entities::SentRequest, S), DatabaseError>,
         remember: impl FnOnce(S),
     ) -> Result<(), DatabaseError> {
@@ -233,14 +246,20 @@ impl DatabaseHandle {
         };
         let result = self
             .write_sized(
-                (proof, sent, attachments),
-                |(_, sent, _)| {
+                (proof, sent, attachments, cancellation.clone()),
+                |(_, sent, _, _)| {
                     sent.bodies.iter().fold(0u64, |size, body| {
                         size.saturating_add(byte_count(body.byte_length()))
                     })
                 },
                 OperationKind::RecordSentRequest,
-                |batch, (proof, sent, attachments)| {
+                |batch, (proof, sent, attachments, cancellation)| {
+                    if cancellation.is_cancelled() {
+                        return batch.reject(Violation::InvalidValue(
+                            "execution",
+                            "execution cancelled before recording the Provider request",
+                        ));
+                    }
                     batch.record_development_sent_request(&proof, sent, &attachments)
                 },
             )

@@ -185,7 +185,6 @@ pub struct SubmissionRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RequestPayload {
-    ApprovedCalls,
     Sent {
         messages: Vec<ContentDigest>,
         tools: Option<ContentDigest>,

@@ -44,11 +44,6 @@ const INVALID_ROUTE_BODY: Refusal = Refusal::new(
     "invalid_body",
     "the body is not a request this route accepts",
 );
-const NATIVE_ACTION_UNSUPPORTED: Refusal = Refusal::new(
-    StatusCode::CONFLICT,
-    "native_action_unsupported",
-    "this action is not available for native Jobs and conversations",
-);
 const KEY_CONFLICT: Refusal = Refusal::new(
     StatusCode::CONFLICT,
     "idempotency_key_conflict",
@@ -891,9 +886,6 @@ pub(super) async fn action(
     use crate::db::entities::Actor;
     let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
     let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
-    if action == "queue" {
-        return Err(NATIVE_ACTION_UNSUPPORTED);
-    }
     if action == "retry" {
         if object.len() != 1 {
             return Err(INVALID_ROUTE_BODY);

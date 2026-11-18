@@ -135,9 +135,7 @@ impl ActivityProjection {
                             && failure.as_ref().is_some_and(|failure| failure.retryable);
                     }
                 }
-                RequestPayload::ApprovedCalls
-                | RequestPayload::Measurement { .. }
-                | RequestPayload::Token { .. } => {}
+                RequestPayload::Measurement { .. } | RequestPayload::Token { .. } => {}
             }
         }
         if !self.unknown_done {

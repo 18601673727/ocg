@@ -241,7 +241,6 @@ pub struct Recorded<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolEvidenceRecord {
     pub call: ToolCallRef,
-    pub approval: Option<ToolCallRef>,
     pub tool_call_id: String,
     pub name: String,
     pub spawns: bool,

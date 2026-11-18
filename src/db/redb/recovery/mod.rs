@@ -974,7 +974,6 @@ fn check_settled_job_effects(tx: &ReadTransaction, job: JobId) -> Result<(), Sto
                     AvailabilityClassification::Rejected(_)
                 );
             }
-            RequestPayload::ApprovedCalls => *state = (true, true),
             RequestPayload::Measurement { .. } | RequestPayload::Token { .. } => {}
         }
     }

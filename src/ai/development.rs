@@ -1,6 +1,8 @@
 use std::sync::Mutex;
 
-use crate::ai::providers::{RequestRecorder, openai_compatible::ChatConversation};
+use crate::ai::providers::{
+    CancellationToken, RequestRecorder, openai_compatible::ChatConversation,
+};
 use crate::db::entities::{
     self, AttachmentId, DevelopmentCandidate, DevelopmentDecisionContext,
     DevelopmentExecutionContext, Metrics, ProviderAnswer, RequestNumber, Timestamp, UnstartedCause,
@@ -52,11 +54,13 @@ impl DevelopmentExecution {
         request_number: RequestNumber,
         body: &serde_json::Value,
         observed_at: Timestamp,
+        cancellation: &CancellationToken,
     ) -> Result<(), DatabaseError> {
         database
             .record_development_request(
                 &self.handoff,
                 body,
+                cancellation,
                 || {
                     let decision = self.handoff.generative_inputs().is_none();
                     let mut pending_state = None;

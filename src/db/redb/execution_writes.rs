@@ -539,9 +539,7 @@ impl Batch {
                     RequestPayload::Sent { .. } => seq == 1,
                     RequestPayload::Measurement { .. } => seq.is_multiple_of(2),
                     RequestPayload::Token { .. } => seq > 1 && !seq.is_multiple_of(2),
-                    RequestPayload::Received { .. }
-                    | RequestPayload::Availability { .. }
-                    | RequestPayload::ApprovedCalls => false,
+                    RequestPayload::Received { .. } | RequestPayload::Availability { .. } => false,
                 };
                 if !expected {
                     return Ok(None);
@@ -582,10 +580,6 @@ impl Batch {
                 match decode_request_event(job, previous, seq, bytes.value())?.payload {
                     RequestPayload::Sent { .. } => sent = true,
                     RequestPayload::Availability { .. } => answered = true,
-                    RequestPayload::ApprovedCalls => {
-                        sent = true;
-                        answered = true;
-                    }
                     RequestPayload::Measurement { .. }
                     | RequestPayload::Received { .. }
                     | RequestPayload::Token { .. } => {}
@@ -1101,7 +1095,6 @@ impl Batch {
                             crate::db::entities::AvailabilityClassification::Rejected(_)
                         );
                     }
-                    crate::db::entities::RequestPayload::ApprovedCalls => *state = (true, true),
                     crate::db::entities::RequestPayload::Measurement { .. }
                     | crate::db::entities::RequestPayload::Token { .. } => {}
                 }

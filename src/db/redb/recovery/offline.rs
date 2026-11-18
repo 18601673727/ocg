@@ -533,7 +533,6 @@ fn inspect_held_in(
                 .ok_or_else(|| StorageError::corrupted("a stored request number is 0"))?;
             let event = super::rows::decode_request_event(job, number, seq, bytes.value())?;
             let (kind, detail) = match &event.payload {
-                RequestPayload::ApprovedCalls => ("approved_calls", json!(null)),
                 RequestPayload::Sent { .. } => ("sent", json!(null)),
                 RequestPayload::Received { .. } => ("received", json!(null)),
                 RequestPayload::Measurement { .. } => ("measurement", json!(null)),

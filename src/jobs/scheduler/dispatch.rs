@@ -121,6 +121,7 @@ async fn within_deadline<F: std::future::Future>(
     deadline: Instant,
     exchange: F,
 ) -> F::Output {
+    cancellation.tighten_deadline(deadline);
     if deadline <= Instant::now() {
         cancellation.cancel_for(CancellationReason::Deadline);
         return exchange.await;
@@ -483,8 +484,19 @@ async fn start_and_exchange(
                 // Do not drop this future if cancellation arrives during the
                 // claim. Its committed ownership determines safe settlement.
                 database
-                    .start_development_handoff(prepared.evidence)
+                    .start_development_handoff(prepared.evidence, cancellation)
                     .await
+                    .map_err(|error| match error {
+                        DevelopmentHandoffError::CancelledBeforeClaim => {
+                            let cause = cancellation_before_start(cancellation)
+                                .unwrap_or(UnstartedCause::StartRefused);
+                            DevelopmentHandoffError::NotStarted {
+                                cause,
+                                detail: cause.summary().to_owned(),
+                            }
+                        }
+                        other => other,
+                    })
                     .map(|handoff| {
                         (
                             crate::ai::development::DevelopmentExecution::new(

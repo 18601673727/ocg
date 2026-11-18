@@ -122,8 +122,7 @@ fn metrics_of(job: JobId, events: &[RequestEventRecord]) -> Vec<MetricsRecord> {
             }
             RequestPayload::Availability { .. }
             | RequestPayload::Sent { .. }
-            | RequestPayload::Received { .. }
-            | RequestPayload::ApprovedCalls => last_measurement = None,
+            | RequestPayload::Received { .. } => last_measurement = None,
         }
     }
     records

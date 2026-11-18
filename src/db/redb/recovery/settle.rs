@@ -133,8 +133,7 @@ pub(crate) fn confirmed_answer(
             RequestPayload::Measurement { .. } | RequestPayload::Token { .. } => {}
             RequestPayload::Sent { .. }
             | RequestPayload::Received { .. }
-            | RequestPayload::Availability { .. }
-            | RequestPayload::ApprovedCalls => return Ok(None),
+            | RequestPayload::Availability { .. } => return Ok(None),
         }
     }
     if prior_request.is_some() && (!prior_received || !prior_success) {

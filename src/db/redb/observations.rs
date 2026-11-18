@@ -104,9 +104,7 @@ pub(super) fn observation_kind(
                 .is_some_and(|previous| paired(previous, event)))
             .then_some(1))
         }
-        RequestPayload::Sent { .. }
-        | RequestPayload::Received { .. }
-        | RequestPayload::ApprovedCalls => Ok(None),
+        RequestPayload::Sent { .. } | RequestPayload::Received { .. } => Ok(None),
     }
 }
 
@@ -153,8 +151,7 @@ pub(super) fn metric_record(
                         RequestPayload::Measurement { .. }
                         | RequestPayload::Availability { .. }
                         | RequestPayload::Sent { .. }
-                        | RequestPayload::Received { .. }
-                        | RequestPayload::ApprovedCalls => None,
+                        | RequestPayload::Received { .. } => None,
                     });
             (measurements.clone(), token)
         }
@@ -175,8 +172,7 @@ pub(super) fn metric_record(
         }
         RequestPayload::Availability { .. }
         | RequestPayload::Sent { .. }
-        | RequestPayload::Received { .. }
-        | RequestPayload::ApprovedCalls => return Ok(None),
+        | RequestPayload::Received { .. } => return Ok(None),
     };
     Ok(Some(MetricsRecord {
         id: MetricsId::new(event.id.get()),
@@ -724,8 +720,7 @@ pub(crate) fn read_provider_request(
                 sent = Some((request_messages, request_tools, request_parameters));
             }
             RequestPayload::Received { digest } => response = Some(value(digest)?),
-            RequestPayload::ApprovedCalls
-            | RequestPayload::Measurement { .. }
+            RequestPayload::Measurement { .. }
             | RequestPayload::Availability { .. }
             | RequestPayload::Token { .. } => {}
         }

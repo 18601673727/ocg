@@ -6,7 +6,6 @@ use crate::db::entities::{
     MutableJobContent, MutableJobDetails, NativeJobItem, Origin, OutputKind, Recurrence,
     RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
 };
-use crate::db::redb::approvals::approved_calls;
 use crate::db::redb::batch::Batch;
 use crate::db::redb::reads::conversations::{conversation_summary, conversation_tip};
 use crate::db::redb::reads::read;
@@ -725,16 +724,6 @@ fn conversation_result(
         let output = decode_output(key.value(), bytes.value())?;
         summary = output.summary.unwrap_or_default();
         value = output.value;
-    }
-    for call in approved_calls(rx, row.id)? {
-        summary.push_str(&format!(
-            "\nApproved, never ran: {} {}",
-            call.name,
-            call.decision
-                .fact
-                .stored_admission()
-                .map_or("{}", |a| a.arguments.as_str())
-        ));
     }
     Ok(Some(JobOutputRecord {
         id: JobOutputId::new(1),

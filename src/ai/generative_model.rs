@@ -1,5 +1,9 @@
 use std::time::{Duration, Instant};
-use std::{future::Future, pin::Pin};
+use std::{
+    future::{Future, poll_fn},
+    pin::{Pin, pin},
+    task::Poll,
+};
 
 use ntex::http::{Payload, StatusCode};
 use ntex::util::{Either, select};
@@ -479,14 +483,14 @@ enum StreamWait {
 async fn next_stream_event(
     payload: &mut Payload,
     config: &ProviderExecutionConfig,
-    output: &StreamOutput<'_>,
+    flush_delay: Option<Duration>,
     idle_remaining: Duration,
 ) -> StreamWait {
     let chunk = ntex::time::timeout(idle_remaining, payload.recv());
-    if output.is_pending() {
+    if let Some(delay) = flush_delay {
         match select(
             config.cancellation.cancelled(),
-            select(ntex::time::sleep(output.flush_delay()), chunk),
+            select(ntex::time::sleep(delay), chunk),
         )
         .await
         {
@@ -536,7 +540,23 @@ async fn parse_stream_body(
             ));
         }
         let wait_started = Instant::now();
-        let chunk = match next_stream_event(&mut payload, config, output, remaining).await {
+        let flush_delay = output.is_pending().then(|| output.flush_delay());
+        let event = {
+            let mut next = pin!(next_stream_event(
+                &mut payload,
+                config,
+                flush_delay,
+                remaining
+            ));
+            match poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await {
+                Poll::Ready(event) => event,
+                Poll::Pending => {
+                    capture.checkpoint(output).await;
+                    next.await
+                }
+            }
+        };
+        let chunk = match event {
             StreamWait::Cancelled => {
                 return Err(local_stop(
                     "provider execution was cancelled while streaming",

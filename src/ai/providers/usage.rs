@@ -30,6 +30,7 @@ fn reported_usage(event: &Value) -> Option<NormalizedUsage> {
     })
 }
 
+#[derive(Clone)]
 struct UsageReport {
     at: Timestamp,
     usage: NormalizedUsage,
@@ -141,6 +142,19 @@ impl UsageCapture {
         if usage_only || (saw_finish && choices_finished) {
             self.pending_final = Some(report);
         } else {
+            self.emit(sink, report, UsageFinality::Cumulative).await;
+        }
+    }
+
+    pub(crate) async fn checkpoint(&mut self, sink: &mut dyn ProviderOutputSink) {
+        // The next chunk may contain a newer report or a finish marker.
+        // Persist the available counters before waiting, without promoting them.
+        if let Some(report) = self
+            .pending_final
+            .as_ref()
+            .filter(|report| self.last_cumulative.as_ref() != Some(&report.usage))
+            .cloned()
+        {
             self.emit(sink, report, UsageFinality::Cumulative).await;
         }
     }

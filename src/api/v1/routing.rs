@@ -279,7 +279,6 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                     "hold" => "hold",
                     "unhold" => "unhold",
                     "retry" => "retry",
-                    "queue" => "queue",
                     _ => return Err(NOT_FOUND),
                 };
                 Route::JobAction(job_id(conversation)?, action)

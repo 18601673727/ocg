@@ -14,12 +14,14 @@ use super::reserved::ReservedRefusal;
 use super::{io_storage_error, verify_reserved_residual};
 use crate::db::entities::{ContentDigest, OutcomeKind, UncertaintyReason};
 use crate::db::redb::codec::{
-    Code, Dec, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB_RUNTIME,
+    Code, Dec, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB_RUNTIME, TAG_REQUEST_EVENT,
+    TAG_TOOL_CALL,
 };
 use crate::db::redb::execution::TAG_EXECUTION_EVENT;
 use crate::db::redb::schema::{
     CREDENTIAL_KEY_FILE_NAME, CREDENTIALS, DATABASE_FORMAT_KEY, FORMAT_VERSION, MESSAGES, META,
-    check_format1_layout, record_version_byte, rewrite_format1_records, verify_format1_records,
+    check_format1_layout, check_required_tables, record_version_byte, rewrite_format1_records,
+    verify_format1_records,
 };
 use crate::db::redb::{StorageError, indexes, reads, rows};
 
@@ -34,6 +36,12 @@ fn source_layout(source: &ReadTransaction) -> Result<(), ReservedRefusal> {
     match format.as_ref().map(|marker| marker.value()) {
         Some(bytes) if bytes == SOURCE_FORMAT.to_le_bytes() => {}
         Some(bytes) if bytes == FORMAT_VERSION.to_le_bytes() => {
+            check_required_tables(source).map_err(|_| {
+                ReservedRefusal::new(
+                    "unsupported_source",
+                    "this Format 2 layout is obsolete; migrate an original Format 1 database",
+                )
+            })?;
             return Err(ReservedRefusal::new(
                 "already_migrated",
                 "the database is already in Format 2",
@@ -110,6 +118,30 @@ fn promote_record(bytes: &[u8], tags: &[u8]) -> Result<Vec<u8>, StorageError> {
     let mut d = Dec::new(&row, tag)?;
     let outcome = match tag {
         TAG_JOB_RUNTIME => d.opt(promote_outcome)?.flatten(),
+        TAG_TOOL_CALL => {
+            d.str_ref()?;
+            d.str_ref()?;
+            d.bool()?;
+            let position = d.position();
+            if d.bool()? {
+                return Err(StorageError::corrupted(
+                    "Format 1 tool evidence names a legacy approval link",
+                ));
+            }
+            row.remove(position);
+            None
+        }
+        TAG_REQUEST_EVENT => {
+            d.u128()?;
+            d.ts()?;
+            d.ts()?;
+            if d.u8()? == 6 {
+                return Err(StorageError::corrupted(
+                    "Format 1 request history contains a legacy approved-call entry",
+                ));
+            }
+            None
+        }
         TAG_EXECUTION_EVENT => {
             d.u128()?; // Job
             d.u64()?; // Sequence
