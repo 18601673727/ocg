@@ -72,12 +72,82 @@ impl Spellings {
         self.0.iter().any(|form| text.contains(form.as_str()))
     }
 
+    pub(crate) fn stream(&self) -> SecretStream<'_> {
+        SecretStream {
+            patterns: self.iter().map(SecretPrefix::new).collect(),
+            found: false,
+        }
+    }
+
     pub(crate) fn iter(&self) -> impl Iterator<Item = &str> {
         self.0.iter().map(String::as_str)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct SecretStream<'a> {
+    patterns: Vec<SecretPrefix<'a>>,
+    found: bool,
+}
+
+impl SecretStream<'_> {
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> bool {
+        self.found = self.found || self.patterns.iter_mut().any(|pattern| pattern.find(bytes));
+        self.found
+    }
+}
+
+struct SecretPrefix<'a> {
+    spelling: &'a [u8],
+    fallback: Vec<usize>,
+    matched: usize,
+}
+
+impl<'a> SecretPrefix<'a> {
+    fn new(spelling: &'a str) -> Self {
+        let spelling = spelling.as_bytes();
+        // KMP stores the longest proper prefix that is also a suffix at each offset.
+        let mut fallback = vec![0; spelling.len()];
+        let mut matched = 0;
+        for (index, &byte) in spelling.iter().enumerate().skip(1) {
+            matched = Self::advance(spelling, &fallback, matched, byte);
+            fallback[index] = matched;
+        }
+        Self {
+            spelling,
+            fallback,
+            matched: 0,
+        }
+    }
+
+    fn advance(spelling: &[u8], fallback: &[usize], mut matched: usize, byte: u8) -> usize {
+        while matched != 0 && spelling[matched] != byte {
+            matched = fallback[matched - 1];
+        }
+        matched + usize::from(spelling[matched] == byte)
+    }
+
+    fn find(&mut self, mut bytes: &[u8]) -> bool {
+        while let Some((&byte, rest)) = bytes.split_first() {
+            if self.matched == 0 {
+                let Some(start) = memchr::memchr(self.spelling[0], bytes) else {
+                    break;
+                };
+                self.matched = 1;
+                bytes = &bytes[start + 1..];
+            } else {
+                self.matched = Self::advance(self.spelling, &self.fallback, self.matched, byte);
+                bytes = rest;
+            }
+            if self.matched == self.spelling.len() {
+                return true;
+            }
+        }
+        false
     }
 }
 

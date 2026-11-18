@@ -1,12 +1,8 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use super::{
     NormalizedUsage, ProviderFact, ProviderOutputSink, Timestamp, UsageFinality, Value, announce_at,
 };
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ReportedUsage {
-    pub(crate) usage: NormalizedUsage,
-    pub(crate) finality: UsageFinality,
-}
 
 fn counter(value: Option<&Value>) -> Option<u32> {
     value
@@ -14,75 +10,171 @@ fn counter(value: Option<&Value>) -> Option<u32> {
         .and_then(|value| u32::try_from(value).ok())
 }
 
-pub(crate) fn reported_usage(event: &Value) -> Option<ReportedUsage> {
+fn reported_usage(event: &Value) -> Option<NormalizedUsage> {
     let value = event.get("usage").filter(|value| value.is_object())?;
-    let usage_only = event
-        .get("choices")
-        .and_then(Value::as_array)
-        .is_some_and(Vec::is_empty);
-    Some(ReportedUsage {
-        usage: NormalizedUsage {
-            input_tokens: counter(value.get("prompt_tokens")),
-            output_tokens: counter(value.get("completion_tokens")),
-            cache_read_tokens: counter(
-                value
-                    .get("prompt_tokens_details")
-                    .and_then(|details| details.get("cached_tokens")),
-            ),
-            cache_write_tokens: None,
-            reasoning_tokens: counter(
-                value
-                    .get("completion_tokens_details")
-                    .and_then(|details| details.get("reasoning_tokens")),
-            ),
-            raw: Some(value.clone()),
-        },
-        finality: if usage_only {
-            UsageFinality::Final
-        } else {
-            UsageFinality::Cumulative
-        },
+    Some(NormalizedUsage {
+        input_tokens: counter(value.get("prompt_tokens")),
+        output_tokens: counter(value.get("completion_tokens")),
+        cache_read_tokens: counter(
+            value
+                .get("prompt_tokens_details")
+                .and_then(|details| details.get("cached_tokens")),
+        ),
+        cache_write_tokens: None,
+        reasoning_tokens: counter(
+            value
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens")),
+        ),
+        raw: Some(value.clone()),
     })
 }
 
-pub(crate) struct UsageCapture {
-    last_cumulative: Option<NormalizedUsage>,
-    clock: fn() -> Timestamp,
+struct UsageReport {
+    at: Timestamp,
+    usage: NormalizedUsage,
+    usage_only: bool,
 }
 
-impl Default for UsageCapture {
-    fn default() -> Self {
-        Self::with_clock(Timestamp::now)
-    }
+#[derive(Default)]
+pub(crate) struct UsageCapture {
+    choices: BTreeMap<u64, bool>,
+    open_choices: usize,
+    ambiguous_choices: bool,
+    last_cumulative: Option<NormalizedUsage>,
+    pending_final: Option<UsageReport>,
 }
 
 impl UsageCapture {
-    pub(crate) fn with_clock(clock: fn() -> Timestamp) -> Self {
-        Self {
-            last_cumulative: None,
-            clock,
+    fn observe_choices(&mut self, choices: &[Value]) -> (bool, bool) {
+        let mut saw_finish = false;
+        let mut new_choice = false;
+        let mut seen = BTreeSet::new();
+        for choice in choices {
+            let index = match choice.get("index") {
+                Some(index) => index.as_u64(),
+                None if choices.len() == 1 => Some(0),
+                None => None,
+            };
+            let Some(index) = index.filter(|_| choice.is_object()) else {
+                self.ambiguous_choices = true;
+                continue;
+            };
+            if choices.len() > 1 && !seen.insert(index) {
+                self.ambiguous_choices = true;
+            }
+            let finished = matches!(
+                choice.get("finish_reason").and_then(Value::as_str),
+                Some(
+                    "stop" | "length" | "tool_calls" | "function_call" | "content_filter" | "error"
+                )
+            );
+            let before = self.choices.insert(index, finished);
+            self.open_choices -= usize::from(before == Some(false));
+            self.open_choices += usize::from(!finished);
+            saw_finish |= finished;
+            new_choice |= before.is_none();
+        }
+        (saw_finish, new_choice)
+    }
+
+    fn all_choices_closed(&self) -> bool {
+        self.open_choices == 0 && !self.ambiguous_choices
+    }
+
+    pub(crate) async fn observe(
+        &mut self,
+        event: &Value,
+        latest: &mut NormalizedUsage,
+        sink: &mut dyn ProviderOutputSink,
+    ) {
+        let choices = event.get("choices").and_then(Value::as_array);
+        let usage_only = choices.is_some_and(Vec::is_empty);
+        let (saw_finish, new_choice) =
+            choices.map_or((false, false), |choices| self.observe_choices(choices));
+        let choices_finished = self.all_choices_closed();
+        if (!choices_finished || new_choice)
+            && self
+                .pending_final
+                .as_ref()
+                .is_some_and(|report| !report.usage_only)
+        {
+            self.finish(sink, false).await;
+        }
+        let Some(usage) = reported_usage(event) else {
+            return;
+        };
+        let report = UsageReport {
+            at: Timestamp::now(),
+            usage,
+            usage_only,
+        };
+        // Some providers emit an empty object as a placeholder for usage.
+        if !report.usage.has_counts() {
+            if !latest.has_counts() {
+                *latest = report.usage.clone();
+            }
+            self.emit(sink, report, UsageFinality::Cumulative).await;
+            return;
+        }
+
+        // An explicit usage-only tail takes precedence over choice finish reports.
+        if let Some(tail) = self
+            .pending_final
+            .as_ref()
+            .filter(|tail| tail.usage_only && !usage_only)
+        {
+            if tail.usage != report.usage {
+                self.emit(sink, report, UsageFinality::Cumulative).await;
+            }
+            return;
+        }
+
+        // Keep a possible final report until the stream ends. Another choice may
+        // still be open, or the provider may send an authoritative usage-only tail.
+        if let Some(previous) = self.pending_final.take()
+            && previous.usage != report.usage
+        {
+            self.emit(sink, previous, UsageFinality::Cumulative).await;
+        }
+
+        *latest = report.usage.clone();
+        if usage_only || (saw_finish && choices_finished) {
+            self.pending_final = Some(report);
+        } else {
+            self.emit(sink, report, UsageFinality::Cumulative).await;
         }
     }
 
-    pub(crate) async fn record(
+    pub(crate) async fn finish(&mut self, sink: &mut dyn ProviderOutputSink, complete: bool) {
+        if let Some(report) = self.pending_final.take() {
+            let finality = if report.usage_only || complete {
+                UsageFinality::Final
+            } else {
+                UsageFinality::Cumulative
+            };
+            self.emit(sink, report, finality).await;
+        }
+    }
+
+    async fn emit(
         &mut self,
-        sink: Option<&mut (dyn ProviderOutputSink + '_)>,
-        reported: ReportedUsage,
+        sink: &mut dyn ProviderOutputSink,
+        report: UsageReport,
+        finality: UsageFinality,
     ) {
-        let Some(sink) = sink else { return };
-        let observed_at = (self.clock)();
-        if reported.finality == UsageFinality::Cumulative {
-            if self.last_cumulative.as_ref() == Some(&reported.usage) {
+        if finality == UsageFinality::Cumulative {
+            if self.last_cumulative.as_ref() == Some(&report.usage) {
                 return;
             }
-            self.last_cumulative = Some(reported.usage.clone());
+            self.last_cumulative = Some(report.usage.clone());
         }
         announce_at(
             Some(sink),
-            observed_at,
+            report.at,
             ProviderFact::Usage {
-                usage: reported.usage,
-                finality: reported.finality,
+                usage: report.usage,
+                finality,
             },
         )
         .await;

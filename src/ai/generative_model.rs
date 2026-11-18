@@ -9,7 +9,6 @@ use super::providers::observe::{self, trim_ascii};
 use super::providers::openai_compatible::{
     ChatConversation, ChatMessage, ContentPartWire, ImageInput, InvalidToolCall, ToolCallAssembler,
 };
-use super::providers::usage::reported_usage;
 use super::providers::{
     CredentialResolver, MAX_SSE_LINE_BYTES, OutputSinkError, ProviderExecutionConfig,
     ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
@@ -348,6 +347,7 @@ pub(super) async fn parse_stream(
         &mut output,
     )
     .await;
+    capture.finish(&mut output, false).await;
     let flushed = output.flush().await;
     match (result, flushed) {
         (result, Ok(())) => result,
@@ -613,10 +613,7 @@ async fn parse_stream_body(
             })?;
             buffer.clear();
             saw_event = true;
-            if let Some(reported) = reported_usage(&event) {
-                response.usage = reported.usage.clone();
-                capture.record(Some(output), reported).await;
-            }
+            capture.observe(&event, &mut response.usage, output).await;
             if let Some(error) = event.get("error").filter(|error| error.is_object()) {
                 let (message, provider_code) = observe::parse_provider_error(&event.to_string())
                     .unwrap_or_else(|| ("provider request failed".to_owned(), None));
@@ -715,6 +712,7 @@ async fn parse_stream_body(
             response.incomplete("provider stream ended without a finish event", status_code)
         );
     }
+    capture.finish(output, true).await;
     let (tool_calls, refused) =
         response
             .tool_calls

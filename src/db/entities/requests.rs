@@ -275,6 +275,18 @@ pub struct NormalizedUsage {
 }
 
 impl NormalizedUsage {
+    pub(crate) fn has_counts(&self) -> bool {
+        [
+            self.input_tokens,
+            self.output_tokens,
+            self.cache_read_tokens,
+            self.cache_write_tokens,
+            self.reasoning_tokens,
+        ]
+        .iter()
+        .any(Option::is_some)
+    }
+
     #[must_use]
     pub fn total_tokens(&self) -> Option<u32> {
         match (self.input_tokens, self.output_tokens) {

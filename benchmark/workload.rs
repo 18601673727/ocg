@@ -2250,7 +2250,7 @@ fn measure_search(
             .join(format!("search-data-{concurrency}"))
             .into_os_string(),
     )?;
-    let workspace = Workspace::authorize(&source, &directory)?;
+    let workspace = Workspace::authorize(&source, directory.root())?;
     let limits = FtsLimits::default();
     let parameters = context
         .parameters(

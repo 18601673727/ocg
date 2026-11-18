@@ -423,7 +423,7 @@ fn search_scale(options: &Options) -> Result<()> {
         let source = root.0.join("workspace");
         std::fs::create_dir(&source)?;
         corpus(&source, options.files, sizes)?;
-        let workspace = Workspace::authorize(&source, &directory)?;
+        let workspace = Workspace::authorize(&source, directory.root())?;
         let parameters = json!({"corpus": label, "requested_corpus_bytes": target,
             "effective_corpus_bytes": planned_bytes, "file_size_distribution": sizes,
             "files": options.files, "cache": "warm_os_cache",

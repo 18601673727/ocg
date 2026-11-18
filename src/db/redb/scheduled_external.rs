@@ -1,7 +1,7 @@
 use super::StorageError;
 use crate::db::entities::{
     CursorPage, FrozenConfiguration, FrozenExecutionConfig, JobId, ScheduledExternalPolicyConfig,
-    ScheduledExternalPolicyId, Violation,
+    ScheduledExternalPolicyId, ScheduledExternalTarget, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::codec::{
@@ -19,6 +19,45 @@ pub(super) enum ScheduledPolicyMatch {
         revision: u32,
     },
     Ambiguous,
+}
+
+pub(super) struct ScheduledPolicies(Vec<ScheduledPolicy>);
+
+struct ScheduledPolicy {
+    config: ScheduledExternalPolicyConfig,
+    id: ScheduledExternalPolicyId,
+    revision: u32,
+}
+
+impl ScheduledPolicies {
+    pub(super) fn matching(&self, frozen: &FrozenExecutionConfig) -> ScheduledPolicyMatch {
+        let Some(target) = ScheduledExternalTarget::new(frozen) else {
+            return ScheduledPolicyMatch::None;
+        };
+        let key = target.match_key();
+        let start = self
+            .0
+            .partition_point(|policy| policy.config.match_key() < key);
+        // Within a key, stricter output budgets follow more permissive ones.
+        let mut policies = self.0[start..].iter();
+        let Some(first) = policies
+            .next()
+            .filter(|policy| target.matches(&policy.config))
+        else {
+            return ScheduledPolicyMatch::None;
+        };
+        if policies
+            .next()
+            .is_some_and(|policy| target.matches(&policy.config))
+        {
+            ScheduledPolicyMatch::Ambiguous
+        } else {
+            ScheduledPolicyMatch::One {
+                id: first.id,
+                revision: first.revision,
+            }
+        }
+    }
 }
 
 impl Batch {
@@ -189,29 +228,34 @@ impl Batch {
         })
     }
 
-    pub(super) fn scheduled_external_policy_for(
-        &mut self,
-        frozen: &FrozenExecutionConfig,
-    ) -> Result<ScheduledPolicyMatch, BatchError> {
+    pub(super) fn scheduled_external_policies(&mut self) -> Result<ScheduledPolicies, BatchError> {
         self.step(|tx| {
             let table = tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
-            let mut matching = ScheduledPolicyMatch::None;
+            let mut policies = Vec::new();
             for entry in table.iter()? {
                 let (key, row) = entry?;
                 let record = decode_scheduled_external_policy(key.value(), row.value())?;
-                if record.is_live() && record.admits(frozen) {
-                    matching = match matching {
-                        ScheduledPolicyMatch::None => ScheduledPolicyMatch::One {
-                            id: record.id,
-                            revision: record.revision,
-                        },
-                        ScheduledPolicyMatch::One { .. } | ScheduledPolicyMatch::Ambiguous => {
-                            ScheduledPolicyMatch::Ambiguous
-                        }
-                    };
+                if let Ok(config) = ScheduledExternalPolicyConfig::from_live_record(&record) {
+                    policies.push(ScheduledPolicy {
+                        config,
+                        id: record.id,
+                        revision: record.revision,
+                    });
                 }
             }
-            Ok(matching)
+            policies.sort_unstable_by(|left, right| {
+                left.config
+                    .match_key()
+                    .cmp(&right.config.match_key())
+                    .then_with(|| {
+                        right
+                            .config
+                            .limits()
+                            .max_output_tokens
+                            .cmp(&left.config.limits().max_output_tokens)
+                    })
+            });
+            Ok(ScheduledPolicies(policies))
         })
     }
 

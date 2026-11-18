@@ -326,9 +326,11 @@ impl<'a> Dec<'a> {
         Ok(Timestamp::from_unix_micros(self.i64()?))
     }
     pub(super) fn str(&mut self) -> DecodeResult<String> {
+        self.str_ref().map(str::to_owned)
+    }
+    pub(super) fn str_ref(&mut self) -> DecodeResult<&'a str> {
         let len = self.u32()? as usize;
-        String::from_utf8(self.take(len)?.to_vec())
-            .map_err(|_| StorageError::corrupted("invalid UTF-8"))
+        std::str::from_utf8(self.take(len)?).map_err(|_| StorageError::corrupted("invalid UTF-8"))
     }
     pub(super) fn opt<T>(
         &mut self,

@@ -1,8 +1,8 @@
 use crate::db::entities::{
-    AgentConfig, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConfigRef, ConnectionConfig,
-    DecisionCapability, DecisionModelConfig, ExecutionConfiguration, ExecutionOperation,
-    FrozenConfiguration, FrozenDecisionConfig, FrozenExecutionConfig, FrozenHeaders,
-    FrozenLlmConfig, GlobalHeaders, JobId, LlmConfig, LlmTransport, ModelConfig,
+    AgentConfig, CompactionPolicy, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConfigRef,
+    ConnectionConfig, DecisionCapability, DecisionModelConfig, ExecutionConfiguration,
+    ExecutionOperation, FrozenConfiguration, FrozenDecisionConfig, FrozenExecutionConfig,
+    FrozenHeaders, FrozenLlmConfig, GlobalHeaders, JobId, LlmConfig, LlmTransport, ModelConfig,
     NativeDecisionConfig, ProjectDecisionConfig, ProviderSnapshot, RecordRef, Violation, merge,
     valid_credential_ref,
 };
@@ -16,6 +16,37 @@ use crate::db::redb::schema::{CONFIGS, CREDENTIALS, JOB_RUNTIME, META, PROJECTS}
 use crate::db::redb::state::JobRuntime;
 use ::redb::ReadableTable;
 use std::collections::{BTreeMap, BTreeSet};
+
+#[derive(Default)]
+struct ArchivePolicyRefs {
+    summaries: BTreeSet<ConfigId>,
+    predictions: BTreeSet<ConfigId>,
+    rebind: BTreeSet<ConfigId>,
+}
+
+impl ArchivePolicyRefs {
+    fn record(&mut self, policy: &CompactionPolicy, archived: &BTreeSet<ConfigId>) -> bool {
+        let mut affected = false;
+        if let Some(model) = policy.summarization_model {
+            affected = archived.contains(&model);
+            if !affected {
+                self.summaries.insert(model);
+            }
+        }
+        if let Some(prediction) = &policy.predictive {
+            self.predictions.insert(prediction.decision_agent);
+            if prediction
+                .acceptance
+                .as_ref()
+                .is_some_and(|pin| archived.contains(&pin.model.id))
+            {
+                self.rebind.insert(prediction.decision_agent);
+                affected = true;
+            }
+        }
+        affected
+    }
+}
 
 impl Batch {
     pub(crate) fn set_global_compaction_settings(
@@ -549,8 +580,6 @@ impl Batch {
         &mut self,
         policy: &crate::db::entities::CompactionPolicy,
     ) -> Result<(), BatchError> {
-        use crate::db::entities::DecisionCapability;
-
         if let Err(reason) = policy.validate() {
             return self.reject(Violation::InvalidValue("compaction_policy", reason));
         }
@@ -558,32 +587,36 @@ impl Batch {
             self.require_config_kind(model, ConfigKind::Model)?;
         }
         if let Some(predictive) = &policy.predictive {
-            let agent =
-                self.require_config_kind(predictive.decision_agent, ConfigKind::DecisionAgent)?;
-            let ConfigBody::DecisionAgent(body) = agent.body else {
-                return self.corrupted("mismatched decision agent".into());
-            };
-            if body.models.is_empty() {
-                return self.reject(Violation::InvalidValue(
-                    "decision_agent",
-                    "predictive compaction requires a configured decision model",
-                ));
-            }
-            for model in body.models {
-                self.require_config_kind(model, ConfigKind::DecisionModel)?;
-            }
-            let frozen = self.freeze_decision_profile(predictive.decision_agent)?;
-            let capabilities = frozen.capabilities();
-            if !capabilities.contains(&DecisionCapability::Choice)
-                || !capabilities.contains(&DecisionCapability::BinaryProbability)
-            {
-                return self.reject(Violation::InvalidValue(
-                    "decision_agent",
-                    "context prediction requires Choice and BinaryProbability capabilities",
-                ));
-            }
+            self.check_prediction_agent(predictive.decision_agent)?;
         }
         Ok(())
+    }
+
+    fn check_prediction_agent(&mut self, id: ConfigId) -> Result<FrozenDecisionConfig, BatchError> {
+        let agent = self.require_config_kind(id, ConfigKind::DecisionAgent)?;
+        let ConfigBody::DecisionAgent(body) = agent.body else {
+            return self.corrupted("mismatched decision agent".into());
+        };
+        if body.models.is_empty() {
+            return self.reject(Violation::InvalidValue(
+                "decision_agent",
+                "predictive compaction requires a configured decision model",
+            ));
+        }
+        for model in body.models {
+            self.require_config_kind(model, ConfigKind::DecisionModel)?;
+        }
+        let frozen = self.freeze_decision_profile(id)?;
+        let capabilities = frozen.capabilities();
+        if !capabilities.contains(&DecisionCapability::Choice)
+            || !capabilities.contains(&DecisionCapability::BinaryProbability)
+        {
+            return self.reject(Violation::InvalidValue(
+                "decision_agent",
+                "context prediction requires Choice and BinaryProbability capabilities",
+            ));
+        }
+        Ok(frozen)
     }
 
     fn put_config(&mut self, row: &ConfigRow) -> Result<(), BatchError> {
@@ -875,7 +908,7 @@ impl Batch {
         if row.archived_at.is_some() {
             return Ok(());
         }
-        self.archive_models(vec![row])
+        self.atomic(|batch| batch.archive_models(vec![row]))
     }
 
     fn archive_models(&mut self, rows: Vec<ConfigRow>) -> Result<(), BatchError> {
@@ -883,148 +916,112 @@ impl Batch {
             return self.purge_unused_credentials();
         }
         let ids: BTreeSet<_> = rows.iter().map(|row| row.id).collect();
-        let agents = self.step(|tx| {
-            let mut agents = Vec::new();
-            for entry in tx.open_table(CONFIGS)?.iter()? {
-                let (key, value) = entry?;
-                let row = ConfigRow::decode_at(key.value(), value.value())?;
-                if row.archived_at.is_none()
-                    && matches!(
-                        &row.body,
-                        ConfigBody::Agent(_) | ConfigBody::DecisionAgent(_)
-                    )
-                {
-                    agents.push(row);
+        let (refs, decision_agents, agents, conversations, mut settings, settings_changed) =
+            self.step(|tx| {
+                let mut refs = ArchivePolicyRefs::default();
+                let mut decision_agents = Vec::new();
+                let mut agents = Vec::new();
+                for entry in tx.open_table(CONFIGS)?.iter()? {
+                    let (key, value) = entry?;
+                    let row = ConfigRow::decode_at(key.value(), value.value())?;
+                    if row.archived_at.is_some() || ids.contains(&row.id) {
+                        continue;
+                    }
+                    match &row.body {
+                        ConfigBody::Agent(agent) => {
+                            let policy_changed = agent
+                                .compaction_policy
+                                .as_ref()
+                                .is_some_and(|policy| refs.record(policy, &ids));
+                            if policy_changed
+                                || agent.models.iter().any(|model| ids.contains(model))
+                            {
+                                agents.push(row);
+                            }
+                        }
+                        ConfigBody::DecisionAgent(agent) => {
+                            if agent.models.iter().any(|model| ids.contains(model))
+                                || agent
+                                    .default_model
+                                    .is_some_and(|model| ids.contains(&model))
+                            {
+                                decision_agents.push(row);
+                            }
+                        }
+                        ConfigBody::Connection(_)
+                        | ConfigBody::Model(_)
+                        | ConfigBody::DecisionModel(_) => {}
+                    }
                 }
-            }
-            Ok(agents)
-        })?;
-        let mut emptied: BTreeSet<_> = rows
-            .iter()
-            .filter(|row| row.kind == ConfigKind::DecisionAgent)
-            .map(|row| row.id)
-            .collect();
-        for row in &agents {
-            if let ConfigBody::DecisionAgent(agent) = &row.body
-                && agent.models.iter().any(|model| ids.contains(model))
-                && agent.models.iter().all(|model| ids.contains(model))
-            {
-                emptied.insert(row.id);
-            }
-        }
-        let mut policies = self.step(|tx| {
-            let mut policies = Vec::new();
-            for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
-                let (key, bytes) = entry?;
-                if let Some(policy) = JobRuntime::decode_at(key.value(), bytes.value())?
-                    .lifecycle
-                    .compaction_policy
-                {
-                    policies.push(policy);
+                let mut conversations = Vec::new();
+                for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
+                    let (key, bytes) = entry?;
+                    if let Some(policy) = JobRuntime::decode_compaction_policy(bytes.value())?
+                        && refs.record(&policy, &ids)
+                    {
+                        conversations.push((JobId::new(key.value()), policy));
+                    }
                 }
-            }
-            policies
-                .push(reads::catalog::global_compaction_settings(&tx.open_table(META)?)?.policy);
-            Ok(policies)
-        })?;
-        policies.extend(agents.iter().filter_map(|row| match &row.body {
-            ConfigBody::Agent(agent) => agent.compaction_policy.clone(),
-            ConfigBody::Connection(_)
-            | ConfigBody::Model(_)
-            | ConfigBody::DecisionModel(_)
-            | ConfigBody::DecisionAgent(_) => None,
-        }));
-        let predictive_agents: BTreeSet<_> = policies
-            .iter()
-            .filter_map(|policy| policy.predictive.as_ref().map(|p| p.decision_agent))
-            .collect();
-        if !ids.is_disjoint(&predictive_agents) {
+                let settings = reads::catalog::global_compaction_settings(&tx.open_table(META)?)?;
+                let settings_changed = refs.record(&settings.policy, &ids);
+                Ok((
+                    refs,
+                    decision_agents,
+                    agents,
+                    conversations,
+                    settings,
+                    settings_changed,
+                ))
+            })?;
+        if !ids.is_disjoint(&refs.predictions) {
             return self.reject(Violation::InvalidValue(
                 "archive",
                 "an enabled prediction policy still depends on this Decision Agent",
             ));
         }
-        let mut replacements = BTreeMap::new();
+
+        let mut emptied = BTreeSet::new();
         // Update Decision targets before validating policies that refer to them.
-        let mut agents = agents;
-        agents.sort_by_key(|row| row.kind != ConfigKind::DecisionAgent);
-        let mut changed_agents = Vec::new();
-        for mut agent_row in agents {
-            let before = agent_row.body.clone();
-            match &mut agent_row.body {
-                ConfigBody::Agent(agent) => {
-                    agent.models.retain(|model| !ids.contains(model));
-                }
-                ConfigBody::DecisionAgent(agent) => {
-                    let affected = agent.models.iter().any(|model| ids.contains(model));
-                    agent.models.retain(|model| !ids.contains(model));
-                    if agent
-                        .default_model
-                        .is_some_and(|model| ids.contains(&model))
-                    {
-                        agent.default_model = None;
-                    }
-                    if affected && predictive_agents.contains(&agent_row.id) {
-                        let mut replacement = None;
-                        for candidate in agent
-                            .default_model
-                            .into_iter()
-                            .chain(agent.models.iter().copied())
-                        {
-                            let record =
-                                self.require_config_kind(candidate, ConfigKind::DecisionModel)?;
-                            let ConfigBody::DecisionModel(model) = &record.body else {
-                                return self.corrupted("mismatched Decision Model body".into());
-                            };
-                            if !model
-                                .declared_capabilities
-                                .contains(&DecisionCapability::Choice)
-                                || !model
-                                    .declared_capabilities
-                                    .contains(&DecisionCapability::BinaryProbability)
-                            {
-                                continue;
-                            }
-                            let frozen = self.freeze_system_configuration(ExecutionConfiguration {
-                                reasoning_effort: None,
-                                agent_profile: Some(agent_row.id.into()),
-                                llm_profile: candidate.into(),
-                            });
-                            match frozen {
-                                Ok(FrozenConfiguration::Decision(frozen))
-                                    if frozen.validate().is_ok() =>
-                                {
-                                    replacement = Some((candidate, frozen));
-                                    break;
-                                }
-                                Ok(
-                                    FrozenConfiguration::Decision(_)
-                                    | FrozenConfiguration::Generative(_),
-                                )
-                                | Err(BatchError(Failure::Rejected(_))) => {}
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        let Some((model, frozen)) = replacement else {
-                            return self.reject(Violation::InvalidValue(
-                                "archive",
-                                "prediction still depends on this Decision Agent; no remaining model supports Choice and BinaryProbability",
-                            ));
-                        };
-                        agent.default_model = Some(model);
-                        replacements.insert(agent_row.id, frozen);
-                    }
-                }
-                ConfigBody::Connection(_) | ConfigBody::Model(_) | ConfigBody::DecisionModel(_) => {
-                }
+        for mut row in decision_agents {
+            let ConfigBody::DecisionAgent(agent) = &mut row.body else {
+                return self.corrupted("mismatched Decision Agent body".into());
+            };
+            agent.models.retain(|model| !ids.contains(model));
+            if agent.models.is_empty() {
+                emptied.insert(row.id);
             }
-            if matches!(agent_row.body, ConfigBody::Agent(_)) {
-                changed_agents.push((agent_row, before));
-            } else if agent_row.body != before {
-                self.update_config(agent_row.id, agent_row.name, agent_row.body)?;
+            if agent
+                .default_model
+                .is_some_and(|model| ids.contains(&model))
+            {
+                agent.default_model = None;
+            }
+            if refs.predictions.contains(&row.id) {
+                agent.default_model = Some(self.archive_prediction_fallback(
+                    row.id,
+                    agent.default_model,
+                    &agent.models,
+                )?);
+            }
+            self.update_config(row.id, row.name, row.body)?;
+        }
+
+        // The stored policies were structurally validated by their decoders.
+        // Validate each surviving configuration reference against the revised catalog.
+        for model in refs.summaries {
+            self.require_config_kind(model, ConfigKind::Model)?;
+        }
+        let mut replacements = BTreeMap::new();
+        for agent in refs.predictions {
+            let frozen = self.check_prediction_agent(agent)?;
+            if refs.rebind.contains(&agent) {
+                replacements.insert(
+                    agent,
+                    (frozen.model_ref(), frozen.confidence_semantics().to_owned()),
+                );
             }
         }
-        let clear_policy = |policy: &mut crate::db::entities::CompactionPolicy| {
+        let rewrite = |batch: &mut Self, policy: &mut CompactionPolicy| {
             if policy
                 .summarization_model
                 .is_some_and(|model| ids.contains(&model))
@@ -1034,46 +1031,28 @@ impl Batch {
             if let Some(prediction) = &mut policy.predictive
                 && let Some(pin) = &mut prediction.acceptance
                 && ids.contains(&pin.model.id)
-                && let Some(replacement) = replacements.get(&prediction.decision_agent)
             {
-                pin.model = replacement.model_ref();
+                let Some((model, semantics)) = replacements.get(&prediction.decision_agent) else {
+                    return batch.corrupted("missing archived prediction replacement".into());
+                };
+                pin.model = *model;
                 pin.reported_model.clear();
-                pin.confidence_semantics = replacement.confidence_semantics().to_owned();
+                pin.confidence_semantics.clone_from(semantics);
             }
+            Ok(())
         };
-        // Agent policies also retain their mode and acceptance thresholds.
-        for policy in &mut policies {
-            clear_policy(policy);
-            self.check_compaction_policy(policy)?;
+        for mut row in agents {
+            let ConfigBody::Agent(agent) = &mut row.body else {
+                return self.corrupted("mismatched Agent body".into());
+            };
+            agent.models.retain(|model| !ids.contains(model));
+            if let Some(policy) = &mut agent.compaction_policy {
+                rewrite(self, policy)?;
+            }
+            self.update_config(row.id, row.name, row.body)?;
         }
-        for (mut row, before) in changed_agents {
-            if let ConfigBody::Agent(agent) = &mut row.body
-                && let Some(policy) = &mut agent.compaction_policy
-            {
-                clear_policy(policy);
-            }
-            if row.body != before {
-                self.update_config(row.id, row.name, row.body)?;
-            }
-        }
-        let conversations = self.step(|tx| {
-            let mut changes = Vec::new();
-            for entry in tx.open_table(JOB_RUNTIME)?.iter()? {
-                let (key, bytes) = entry?;
-                if let Some(mut policy) = JobRuntime::decode_at(key.value(), bytes.value())?
-                    .lifecycle
-                    .compaction_policy
-                {
-                    let before = policy.clone();
-                    clear_policy(&mut policy);
-                    if policy != before {
-                        changes.push((JobId::new(key.value()), policy));
-                    }
-                }
-            }
-            Ok(changes)
-        })?;
-        for (conversation, policy) in conversations {
+        for (conversation, mut policy) in conversations {
+            rewrite(self, &mut policy)?;
             crate::db::mutations::set_conversation(
                 self,
                 conversation,
@@ -1106,11 +1085,8 @@ impl Batch {
                 Some(policy),
             )?;
         }
-        let mut settings =
-            self.step(|tx| reads::catalog::global_compaction_settings(&tx.open_table(META)?))?;
-        let before = settings.policy.clone();
-        clear_policy(&mut settings.policy);
-        if settings.policy != before {
+        if settings_changed {
+            rewrite(self, &mut settings.policy)?;
             self.set_global_compaction_settings(settings)?;
         }
         for mut row in rows {
@@ -1123,22 +1099,68 @@ impl Batch {
         Ok(())
     }
 
-    pub(crate) fn remove_provider(&mut self, id: ConfigId) -> Result<(), BatchError> {
-        self.set_config_enabled(id, ConfigKind::Connection, false)?;
-        let models = self.step(|tx| {
-            let mut models = Vec::new();
-            for entry in tx.open_table(CONFIGS)?.iter()? {
-                let (key, value) = entry?;
-                let row = ConfigRow::decode_at(key.value(), value.value())?;
-                if row.archived_at.is_none()
-                    && matches!(&row.body, ConfigBody::Model(model) if model.connection_id == id)
-                {
-                    models.push(row);
-                }
+    fn archive_prediction_fallback(
+        &mut self,
+        agent: ConfigId,
+        default: Option<ConfigId>,
+        models: &[ConfigId],
+    ) -> Result<ConfigId, BatchError> {
+        let default = default.filter(|id| models.contains(id));
+        for candidate in default
+            .into_iter()
+            .chain(models.iter().copied().filter(|id| Some(*id) != default))
+        {
+            let record = self.require_config_kind(candidate, ConfigKind::DecisionModel)?;
+            let ConfigBody::DecisionModel(model) = &record.body else {
+                return self.corrupted("mismatched Decision Model body".into());
+            };
+            if !model
+                .declared_capabilities
+                .contains(&DecisionCapability::Choice)
+                || !model
+                    .declared_capabilities
+                    .contains(&DecisionCapability::BinaryProbability)
+            {
+                continue;
             }
-            Ok(models)
-        })?;
-        self.archive_models(models)
+            let frozen = self.freeze_system_configuration(ExecutionConfiguration {
+                reasoning_effort: None,
+                agent_profile: Some(agent.into()),
+                llm_profile: candidate.into(),
+            });
+            match frozen {
+                Ok(FrozenConfiguration::Decision(frozen)) if frozen.validate().is_ok() => {
+                    return Ok(candidate);
+                }
+                Ok(FrozenConfiguration::Decision(_) | FrozenConfiguration::Generative(_))
+                | Err(BatchError(Failure::Rejected(_))) => {}
+                Err(error) => return Err(error),
+            }
+        }
+        self.reject(Violation::InvalidValue(
+            "archive",
+            "prediction still depends on this Decision Agent; no remaining model supports Choice and BinaryProbability",
+        ))
+    }
+
+    pub(crate) fn remove_provider(&mut self, id: ConfigId) -> Result<(), BatchError> {
+        self.atomic(|batch| {
+            batch.set_config_enabled(id, ConfigKind::Connection, false)?;
+            let models = batch.step(|tx| {
+                let mut models = Vec::new();
+                for entry in tx.open_table(CONFIGS)?.iter()? {
+                    let (key, value) = entry?;
+                    let row = ConfigRow::decode_at(key.value(), value.value())?;
+                    if row.archived_at.is_none()
+                        && matches!(&row.body, ConfigBody::Model(model) if model.connection_id == id)
+                    {
+                        models.push(row);
+                    }
+                }
+                Ok(models)
+            })?;
+            batch.archive_models(models)
+        })
     }
 }
 

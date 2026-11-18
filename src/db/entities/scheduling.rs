@@ -260,8 +260,9 @@ impl ScheduledExternalPolicyRecord {
     }
 
     pub(in crate::db) fn admits(&self, frozen: &FrozenExecutionConfig) -> bool {
-        ScheduledExternalPolicyConfig::from_live_record(self)
-            .is_ok_and(|config| config.admits(frozen))
+        ScheduledExternalPolicyConfig::from_live_record(self).is_ok_and(|config| {
+            ScheduledExternalTarget::new(frozen).is_some_and(|target| target.matches(&config))
+        })
     }
 }
 
@@ -571,26 +572,8 @@ impl ScheduledExternalPolicyConfig {
         })
     }
 
-    fn admits(&self, frozen: &FrozenExecutionConfig) -> bool {
-        let provider = &frozen.llm.provider;
-        let parameters = &frozen.llm.config.parameters;
-        let bounds = [parameters.max_tokens, parameters.max_completion_tokens];
-        frozen.native_execution_refusal().is_none()
-            && provider.transport == LlmTransport::OpenAiChatCompletions
-            && provider
-                .endpoint
-                .as_deref()
-                .is_some_and(|endpoint| self.permits_endpoint(endpoint))
-            && provider.credential_ref.as_deref() == Some(self.credential_ref())
-            && provider.headers.secret_refs().next().is_none()
-            && frozen.llm.config.model == self.model
-            && bounds.iter().any(Option::is_some)
-            && bounds
-                .into_iter()
-                .flatten()
-                .all(|bound| bound <= self.limits.max_output_tokens)
-            && self.limits.max_request_bytes != 0
-            && !self.limits.timeout.is_zero()
+    pub(in crate::db) fn match_key(&self) -> (&str, &str, &str) {
+        (self.endpoint(), self.credential_ref(), self.model())
     }
 
     pub(crate) fn endpoint(&self) -> &str {
@@ -619,5 +602,42 @@ impl ScheduledExternalPolicyConfig {
 
     pub(crate) fn limits(&self) -> ScheduledExternalLimits {
         self.limits
+    }
+}
+
+pub(crate) struct ScheduledExternalTarget<'a> {
+    endpoint: ApprovedEndpoint,
+    credential_ref: &'a str,
+    model: &'a str,
+    max_output_tokens: u32,
+}
+
+impl<'a> ScheduledExternalTarget<'a> {
+    pub(in crate::db) fn new(frozen: &'a FrozenExecutionConfig) -> Option<Self> {
+        let provider = &frozen.llm.provider;
+        if frozen.native_execution_refusal().is_some()
+            || provider.transport != LlmTransport::OpenAiChatCompletions
+            || provider.headers.secret_refs().next().is_some()
+        {
+            return None;
+        }
+        let parameters = &frozen.llm.config.parameters;
+        Some(Self {
+            endpoint: ApprovedEndpoint::parse(provider.endpoint.as_deref()?).ok()?,
+            credential_ref: provider.credential_ref.as_deref()?,
+            model: &frozen.llm.config.model,
+            max_output_tokens: parameters
+                .max_tokens
+                .max(parameters.max_completion_tokens)?,
+        })
+    }
+
+    pub(in crate::db) fn match_key(&self) -> (&str, &str, &str) {
+        (&self.endpoint.request_url, self.credential_ref, self.model)
+    }
+
+    pub(in crate::db) fn matches(&self, policy: &ScheduledExternalPolicyConfig) -> bool {
+        self.match_key() == policy.match_key()
+            && self.max_output_tokens <= policy.limits().max_output_tokens
     }
 }

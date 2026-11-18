@@ -21,6 +21,7 @@ use crate::db::entities::{
 use crate::db::{DatabaseError, DatabaseHandle};
 use crate::jobs::authorization::scheduled::ScheduledExternalGrant;
 use crate::support::cancellation::CancellationReason;
+use crate::support::secrets::SecretStream;
 
 #[derive(Clone, Copy)]
 pub(crate) enum EndpointPolicy<'a> {
@@ -118,7 +119,7 @@ pub(crate) async fn supervise_development_generative(
             sent: false,
             evidence_incomplete: false,
             persisted_usage: false,
-            streamed: String::new(),
+            secret_stream: handoff.secret_stream(),
         };
         let result = crate::ai::generative_model::execute_conversation(
             frozen,
@@ -504,18 +505,6 @@ fn offer_mismatch(
     }
 }
 
-fn has_usage_counts(usage: &crate::db::entities::NormalizedUsage) -> bool {
-    [
-        usage.input_tokens,
-        usage.output_tokens,
-        usage.cache_read_tokens,
-        usage.cache_write_tokens,
-        usage.reasoning_tokens,
-    ]
-    .iter()
-    .any(Option::is_some)
-}
-
 async fn record_answered_request(
     database: &DatabaseHandle,
     execution: &DevelopmentExecution,
@@ -650,7 +639,7 @@ pub(crate) async fn supervise_development_decision(
         sent: false,
         evidence_incomplete: false,
         persisted_usage: false,
-        streamed: String::new(),
+        secret_stream: handoff.secret_stream(),
     };
     let result = crate::ai::decisive_model::execute_decision_with_sink(
         frozen,
@@ -698,7 +687,7 @@ pub(crate) async fn supervise_development_decision(
             "Decision response cannot be recorded",
         ))
     })?;
-    let usages = if !sink.persisted_usage && has_usage_counts(&result.usage) {
+    let usages = if !sink.persisted_usage && result.usage.has_counts() {
         vec![(
             5,
             Metrics {
@@ -990,7 +979,7 @@ struct DevelopmentLoopbackSink<'a> {
     sent: bool,
     evidence_incomplete: bool,
     persisted_usage: bool,
-    streamed: String,
+    secret_stream: SecretStream<'a>,
 }
 
 impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
@@ -1036,8 +1025,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
         Box::pin(async move {
-            self.streamed.push_str(text);
-            if self.execution.handoff.contains_secret(&self.streamed) {
+            if self.secret_stream.push(text.as_bytes()) {
                 return Err(OutputSinkError {
                     message: "output contains credential material".into(),
                 });
@@ -1072,7 +1060,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
             let ProviderFact::Usage { usage, finality } = &observation.fact else {
                 return;
             };
-            if !has_usage_counts(usage) {
+            if !usage.has_counts() {
                 return;
             }
             let metrics = Metrics {

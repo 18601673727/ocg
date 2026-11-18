@@ -3,7 +3,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use super::{StorageError, StorageErrorKind, execution, scheduled_external::ScheduledPolicyMatch};
+use super::{
+    StorageError, StorageErrorKind, execution,
+    scheduled_external::{ScheduledPolicies, ScheduledPolicyMatch},
+};
 use crate::db::entities::{
     AllocationPhase, DevelopmentCandidate, ExecutionOperation, FrozenConfiguration,
     FrozenDecisionConfig, FrozenExecutionConfig, JobId, LlmTransport, MutableJobPhase,
@@ -203,6 +206,7 @@ impl Batch {
                 .map(|entry| Ok(entry?.0.value()))
                 .collect::<Result<Vec<_>, StorageError>>()
         })?;
+        let mut policies: Option<ScheduledPolicies> = None;
         for key in &keys {
             let id = JobId::new(key.2);
             let Some(mut job) =
@@ -283,7 +287,11 @@ impl Batch {
             }
             let scheduled_external = match &frozen {
                 FrozenConfiguration::Generative(target) => {
-                    match self.scheduled_external_policy_for(target)? {
+                    let policies = match &mut policies {
+                        Some(policies) => policies,
+                        slot @ None => slot.insert(self.scheduled_external_policies()?),
+                    };
+                    match policies.matching(target) {
                         ScheduledPolicyMatch::One { id, revision } => Some((id, revision)),
                         ScheduledPolicyMatch::Ambiguous => continue,
                         ScheduledPolicyMatch::None => None,

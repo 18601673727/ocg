@@ -185,6 +185,15 @@ impl DevelopmentHandoff {
             .as_ref()
             .is_some_and(|spellings| spellings.found_in(value))
     }
+
+    pub(crate) fn secret_stream(&self) -> crate::support::secrets::SecretStream<'_> {
+        self.prepared
+            .credentials
+            .spellings
+            .as_ref()
+            .map(crate::support::secrets::Spellings::stream)
+            .unwrap_or_default()
+    }
     pub(crate) fn generative_inputs(
         &self,
     ) -> Option<(
