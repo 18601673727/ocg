@@ -1048,12 +1048,35 @@ fn development_candidate_in(
         }
         let awaiting_batch =
             read_awaiting_batch(rx, id, prior_outputs.last(), &mut selected_bytes)?;
+        let response_replay = if configuration.llm.provider.transport
+            == crate::db::entities::LlmTransport::OpenAiResponses
+            && matches!(&prior.job.frozen,
+                Some(crate::db::entities::MutableFrozenConfiguration::Generative(previous))
+                    if previous.llm.provider == configuration.llm.provider
+                        && previous.llm.config.model == configuration.llm.config.model
+                        && previous.agent.as_ref().and_then(|agent| agent.workspace_grant())
+                            == configuration.agent.as_ref().and_then(|agent| agent.workspace_grant()))
+            && prior
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+        {
+            super::super::observations::read_responses_replay(
+                rx,
+                id,
+                awaiting_batch.is_empty(),
+                &mut selected_bytes,
+            )?
+        } else {
+            Vec::new()
+        };
         previous = prior.job.previous;
         history.push(DevelopmentContextTurn {
             record: prior,
             attachments: prior_attachments,
             outputs: prior_outputs,
             awaiting_batch,
+            response_replay,
         });
     }
     covered_inputs.reverse();

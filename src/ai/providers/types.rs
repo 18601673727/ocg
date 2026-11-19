@@ -155,6 +155,7 @@ pub struct ProviderExecutionResult {
     pub request_id: Option<String>,
     pub ttfb: Duration,
     pub finished_in: Duration,
+    pub(crate) response_output: Option<super::responses::ResponseOutput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

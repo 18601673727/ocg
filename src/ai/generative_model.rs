@@ -17,10 +17,12 @@ use super::providers::{
     CredentialResolver, MAX_SSE_LINE_BYTES, OutputSinkError, ProviderExecutionConfig,
     ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
     ProviderOutputSink, ResponseFacts, UsageCapture, announce, endpoint, incomplete_tool_calls,
-    openai_compatible, unannounced_fact,
+    openai_compatible, responses, unannounced_fact,
 };
 use crate::db::entities::{ChatFinishReason, NormalizedUsage, ProviderFailure};
-use crate::db::entities::{FrozenExecutionConfig, IntermediateOutputKind, LlmParameters};
+use crate::db::entities::{
+    FrozenExecutionConfig, FrozenLlmConfig, IntermediateOutputKind, LlmTransport,
+};
 
 const STREAM_OUTPUT_BUFFER_BYTES: usize = 4 * 1024;
 const STREAM_OUTPUT_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
@@ -65,7 +67,13 @@ pub fn objective_conversation(
         .and_then(|agent| agent.instructions.as_deref())
         .filter(|instructions| !instructions.is_empty())
     {
-        messages.push(ChatMessage::system(instructions));
+        messages.push(
+            if frozen.llm.provider.transport == LlmTransport::OpenAiResponses {
+                ChatMessage::developer(instructions)
+            } else {
+                ChatMessage::system(instructions)
+            },
+        );
     }
     messages.push(ChatMessage::user(objective.unwrap_or("")));
     ChatConversation {
@@ -100,8 +108,7 @@ pub fn objective_conversation_with_images(
 }
 
 pub(crate) fn request_body(
-    model: &str,
-    parameters: &LlmParameters,
+    frozen: &FrozenLlmConfig,
     conversation: &ChatConversation,
 ) -> Result<Value, ProviderExecutionError> {
     conversation
@@ -109,6 +116,17 @@ pub(crate) fn request_body(
         .map_err(|error| ProviderExecutionError::Build {
             message: error.to_string(),
         })?;
+    match frozen.provider.transport {
+        LlmTransport::OpenAiResponses => return responses::request_body(frozen, conversation),
+        LlmTransport::OpenAiChatCompletions => {}
+        LlmTransport::AnthropicMessages => {
+            return Err(ProviderExecutionError::Build {
+                message: "the configured transport does not support generative execution".into(),
+            });
+        }
+    }
+    let model = &frozen.config.model;
+    let parameters = &frozen.config.parameters;
     let mut body =
         serde_json::to_value(conversation).map_err(|error| ProviderExecutionError::Build {
             message: format!("could not encode the chat request: {error}"),
@@ -203,12 +221,21 @@ async fn exchange(
     announced: &mut bool,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let provider = &frozen.llm.provider;
+    let resource = match provider.transport {
+        LlmTransport::OpenAiChatCompletions => "chat/completions",
+        LlmTransport::OpenAiResponses => "responses",
+        LlmTransport::AnthropicMessages => {
+            return Err(ProviderExecutionError::Build {
+                message: "Anthropic Messages execution is unavailable".into(),
+            });
+        }
+    };
     let endpoint = endpoint(
         provider
             .endpoint
             .as_deref()
             .unwrap_or(openai_compatible::DEFAULT_ENDPOINT),
-        "chat/completions",
+        resource,
     )?;
 
     let (response, started, redactor) = super::providers::send(
@@ -236,9 +263,26 @@ async fn exchange(
         .await);
     }
 
-    let payload = response.take_payload();
+    let format = match provider.transport {
+        LlmTransport::OpenAiResponses
+            if response
+                .header("content-type")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.split(';').next())
+                .is_some_and(|mime| {
+                    let mime = mime.trim().to_ascii_lowercase();
+                    mime == "application/json" || mime.ends_with("+json")
+                }) =>
+        {
+            ResponseFormat::ResponsesJson
+        }
+        LlmTransport::OpenAiResponses => ResponseFormat::ResponsesSse,
+        LlmTransport::OpenAiChatCompletions | LlmTransport::AnthropicMessages => {
+            ResponseFormat::ChatSse
+        }
+    };
     read_response(
-        payload,
+        (response.take_payload(), format),
         status,
         started,
         request_id,
@@ -247,11 +291,33 @@ async fn exchange(
         conversation,
     )
     .await
+    .map(|mut result| {
+        if let Some(output) = &mut result.response_output {
+            result.raw_finish_reason = result
+                .raw_finish_reason
+                .as_deref()
+                .map(|reason| redactor.text(reason));
+            if let Some(mut failure) = output.failure.take() {
+                if conversation.carries_images() {
+                    failure.message = "provider terminated the image request".to_owned();
+                }
+                output.failure = Some(redactor.failure(failure));
+            }
+        }
+        result
+    })
     .map_err(|error| redactor.error(error))
 }
 
-pub(crate) async fn read_response(
-    payload: Payload,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ResponseFormat {
+    ChatSse,
+    ResponsesSse,
+    ResponsesJson,
+}
+
+async fn read_response(
+    input: (Payload, ResponseFormat),
     status_code: u16,
     started: Instant,
     request_id: Option<String>,
@@ -261,7 +327,7 @@ pub(crate) async fn read_response(
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut capture = UsageCapture::default();
     let mut result = parse_stream(
-        payload,
+        input,
         status_code,
         started,
         request_id,
@@ -331,8 +397,8 @@ pub(crate) async fn read_response(
     Ok(result)
 }
 
-pub(super) async fn parse_stream(
-    payload: Payload,
+async fn parse_stream(
+    input: (Payload, ResponseFormat),
     status_code: u16,
     started: Instant,
     request_id: Option<String>,
@@ -342,7 +408,7 @@ pub(super) async fn parse_stream(
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut output = StreamOutput::new(sink);
     let result = parse_stream_body(
-        payload,
+        input,
         status_code,
         started,
         request_id,
@@ -509,7 +575,7 @@ async fn next_stream_event(
 }
 
 async fn parse_stream_body(
-    mut payload: Payload,
+    (mut payload, format): (Payload, ResponseFormat),
     status_code: u16,
     started: Instant,
     request_id: Option<String>,
@@ -518,6 +584,17 @@ async fn parse_stream_body(
     output: &mut StreamOutput<'_>,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let mut buffer = Vec::with_capacity(MAX_SSE_LINE_BYTES);
+    let mut frame = Vec::new();
+    let mut responses_stream = responses::Stream::default();
+    let wire_limit = if format == ResponseFormat::ChatSse {
+        MAX_SSE_LINE_BYTES
+    } else {
+        config
+            .max_output_bytes
+            .saturating_mul(2)
+            .saturating_add(2 * 1024 * 1024)
+    };
+    let mut terminal = None;
     let mut response = StreamedResponse::default();
     let mut saw_event = false;
     let mut first_byte = None;
@@ -599,8 +676,17 @@ async fn parse_stream_body(
         }
         let chunk = chunk.map_err(|error| response.unknown(error.to_string(), status_code))?;
         first_byte.get_or_insert_with(Instant::now);
+        if format == ResponseFormat::ResponsesJson {
+            if buffer.len().saturating_add(chunk.len()) > wire_limit {
+                return Err(
+                    response.incomplete("Responses JSON exceeded its wire limit", status_code)
+                );
+            }
+            buffer.extend_from_slice(&chunk);
+            continue;
+        }
         for byte in chunk {
-            if buffer.len() == MAX_SSE_LINE_BYTES {
+            if buffer.len() == wire_limit {
                 return Err(
                     response.incomplete("provider SSE line exceeded its limit", status_code)
                 );
@@ -611,6 +697,48 @@ async fn parse_stream_body(
             }
             let line = buffer.strip_suffix(b"\n").unwrap_or(&buffer);
             let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if format == ResponseFormat::ResponsesSse {
+                if let Some(data) = line.strip_prefix(b"data:") {
+                    if frame.len().saturating_add(data.len()).saturating_add(1) > wire_limit {
+                        return Err(response.incomplete(
+                            "Responses SSE event exceeded its wire limit",
+                            status_code,
+                        ));
+                    }
+                    frame.extend_from_slice(data.strip_prefix(b" ").unwrap_or(data));
+                    frame.push(b'\n');
+                } else if line.is_empty() && !frame.is_empty() {
+                    let data = trim_ascii(&frame);
+                    if data == b"[DONE]" {
+                        break 'stream;
+                    }
+                    let event = serde_json::from_slice(data).map_err(|_| {
+                        response.incomplete("malformed Responses SSE event", status_code)
+                    })?;
+                    frame.clear();
+                    match responses_stream.event(
+                        event,
+                        status_code,
+                        request_id.as_deref(),
+                        config.max_output_bytes,
+                    )? {
+                        responses::Event::Terminal(value) => {
+                            terminal = Some(value);
+                            break 'stream;
+                        }
+                        responses::Event::Progress => saw_delta = true,
+                        responses::Event::Delta(kind, delta) => {
+                            saw_delta = true;
+                            output.buffer(kind, &delta).await.map_err(|error| {
+                                local_stop(&error.message, status_code, None, None)
+                            })?;
+                        }
+                        responses::Event::Ignore => {}
+                    }
+                }
+                buffer.clear();
+                continue;
+            }
             if line.len() > MAX_SSE_LINE_BYTES {
                 return Err(
                     response.incomplete("provider SSE line exceeded its limit", status_code)
@@ -712,6 +840,45 @@ async fn parse_stream_body(
             }
         }
     }
+    let mut response_output = None;
+    let terminal = match format {
+        ResponseFormat::ResponsesJson => Some(serde_json::from_slice(&buffer).map_err(|_| {
+            response.incomplete("malformed or incomplete Responses JSON", status_code)
+        })?),
+        ResponseFormat::ResponsesSse => Some(terminal.ok_or_else(|| {
+            response.unknown(
+                "Responses stream ended before a terminal event",
+                status_code,
+            )
+        })?),
+        ResponseFormat::ChatSse => None,
+    };
+    if let Some(terminal) = terminal {
+        response.usage = UsageCapture::responses_terminal(&terminal, output).await;
+        let terminal = responses_stream.terminal(
+            terminal,
+            status_code,
+            request_id.as_deref(),
+            config.max_output_bytes,
+        )?;
+        response.text = terminal.text;
+        response.tool_calls = terminal.calls;
+        response.finish_reason = Some(terminal.finish);
+        response.raw_finish_reason = Some(terminal.detail);
+        response_output = Some(terminal.output);
+        for (kind, delta) in terminal.remaining {
+            output.buffer(kind, &delta).await.map_err(|error| {
+                local_stop(
+                    &error.message,
+                    status_code,
+                    response.finish_reason,
+                    response.raw_finish_reason.as_deref(),
+                )
+            })?;
+        }
+        buffer.clear();
+        saw_event = true;
+    }
     let cut_short = !buffer.is_empty() || !saw_event || response.finish_reason.is_none();
     if cut_short && config.cancellation.is_cancelled() {
         return Err(local_stop(
@@ -757,6 +924,7 @@ async fn parse_stream_body(
         request_id,
         ttfb: first_byte.map_or(finished_in, |first| first.duration_since(started)),
         finished_in,
+        response_output,
     })
 }
 

@@ -7,7 +7,7 @@ use super::tools::tool_loop::{
 };
 use crate::ai::compact::{ContextLimits, estimate_request_tokens};
 use crate::ai::development::DevelopmentExecution;
-use crate::ai::providers::openai_compatible::{ChatMessage, ChatToolCallWire};
+use crate::ai::providers::openai_compatible::{ChatConversation, ChatMessage, ChatToolCallWire};
 use crate::ai::providers::{
     self, CancellationToken, DestinationPolicy, OutputSinkError, ProviderExecutionConfig,
     ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
@@ -114,6 +114,7 @@ pub(crate) async fn supervise_development_generative(
             execution: &execution,
             request,
             prepared: &body,
+            conversation: Some(&conversation),
             cancellation: &config.cancellation,
             destination: &config.destination,
             output_seq,
@@ -165,6 +166,16 @@ pub(crate) async fn supervise_development_generative(
             )));
         }
         record_answered_request(database, &execution, token.job, request, &result).await?;
+        if let Some(failure) = providers::responses::terminal_failure(&result) {
+            return database
+                .finalize_development_failure(
+                    handoff,
+                    output_seq,
+                    JobFinalization::Failed(failure),
+                    None,
+                )
+                .await;
+        }
         let Some(tools) = tools.as_ref().filter(|_| result.requests_tools()) else {
             let mut value = providers::result_value(&result);
             #[cfg(unix)]
@@ -242,11 +253,7 @@ pub(crate) async fn supervise_development_generative(
             )
             .await;
         }
-        body = match crate::ai::generative_model::request_body(
-            &frozen.llm.config.model,
-            &frozen.llm.config.parameters,
-            &conversation,
-        ) {
+        body = match crate::ai::generative_model::request_body(&frozen.llm, &conversation) {
             Ok(body) => body,
             Err(error) => {
                 let stop = ToolLoopStop::ResponseUnserializable {
@@ -513,13 +520,12 @@ async fn record_answered_request(
     request: RequestNumber,
     result: &ProviderExecutionResult,
 ) -> Result<(), DatabaseError> {
-    let message = assistant_message(result);
-    let response = MessageBody::new(&serde_json::to_value(message).map_err(|_| {
-        DatabaseError::Rejected(Violation::InvalidValue(
-            "response",
-            "response cannot be serialized",
-        ))
-    })?)
+    let response = if let Some(output) = &result.response_output {
+        MessageBody::new_exact(&serde_json::json!({"output": output.items}))
+    } else {
+        serde_json::to_value(assistant_message(result))
+            .and_then(|message| MessageBody::new(&message))
+    }
     .map_err(|_| {
         DatabaseError::Rejected(Violation::InvalidValue(
             "response",
@@ -635,6 +641,7 @@ pub(crate) async fn supervise_development_decision(
         execution: &execution,
         request: RequestNumber::FIRST,
         prepared: body,
+        conversation,
         cancellation: &config.cancellation,
         destination: &config.destination,
         output_seq: 1,
@@ -683,7 +690,14 @@ pub(crate) async fn supervise_development_decision(
             "Decision request evidence incomplete; ownership remains held",
         )));
     }
-    let response = MessageBody::new(&result.raw).map_err(|_| {
+    let response = if matches!(frozen,
+        crate::db::entities::FrozenDecisionConfig::Generative(generative, _)
+            if generative.llm.provider.transport == crate::db::entities::LlmTransport::OpenAiResponses)
+    {
+        MessageBody::new_exact(&result.raw)
+    } else {
+        MessageBody::new(&result.raw)
+    }.map_err(|_| {
         DatabaseError::Rejected(Violation::InvalidValue(
             "response",
             "Decision response cannot be recorded",
@@ -729,9 +743,23 @@ pub(crate) async fn supervise_development_decision(
             usages,
         )
         .await?;
-    database
-        .finalize_development_decision(handoff, sink.output_seq, result.result)
-        .await
+    match result.result {
+        Ok(decision) => {
+            database
+                .finalize_development_decision(handoff, sink.output_seq, decision)
+                .await
+        }
+        Err(failure) => {
+            database
+                .finalize_development_failure(
+                    handoff,
+                    sink.output_seq,
+                    JobFinalization::Failed(failure),
+                    None,
+                )
+                .await
+        }
+    }
 }
 
 enum DevelopmentSettlement {
@@ -972,6 +1000,7 @@ struct DevelopmentLoopbackSink<'a> {
     execution: &'a DevelopmentExecution,
     request: RequestNumber,
     prepared: &'a serde_json::Value,
+    conversation: Option<&'a ChatConversation>,
     cancellation: &'a CancellationToken,
     destination: &'a DestinationPolicy,
     output_seq: u32,
@@ -1029,6 +1058,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                     self.database,
                     self.request,
                     body,
+                    self.conversation,
                     Timestamp::now(),
                     self.cancellation,
                 )
@@ -1164,6 +1194,9 @@ const NOT_DELIVERED: &str = "not_delivered";
 const BUILD_FAILED: &str = "build_failed";
 const NOT_SENT: &str = "not_sent";
 fn assistant_message(result: &ProviderExecutionResult) -> ChatMessage {
+    if let Some(output) = &result.response_output {
+        return ChatMessage::responses(output.items.clone());
+    }
     ChatMessage::assistant(
         Some(result.text.clone()).filter(|text| !text.is_empty()),
         result

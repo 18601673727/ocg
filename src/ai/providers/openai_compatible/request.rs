@@ -163,6 +163,8 @@ pub struct ChatMessage {
     pub reasoning_content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub refusal: Option<String>,
+    #[serde(skip)]
+    pub(crate) response_items: Option<Vec<Value>>,
 }
 
 impl ChatMessage {
@@ -175,6 +177,7 @@ impl ChatMessage {
             tool_call_id: None,
             reasoning_content: None,
             refusal: None,
+            response_items: None,
         }
     }
 
@@ -183,6 +186,20 @@ impl ChatMessage {
         Self {
             content: Some(MessageContentWire::Text(content.into())),
             ..Self::with_role(ChatRole::System)
+        }
+    }
+
+    pub(crate) fn developer(content: impl Into<String>) -> Self {
+        Self {
+            content: Some(MessageContentWire::Text(content.into())),
+            ..Self::with_role(ChatRole::Developer)
+        }
+    }
+
+    pub(crate) fn responses(items: Vec<Value>) -> Self {
+        Self {
+            response_items: Some(items),
+            ..Self::with_role(ChatRole::Assistant)
         }
     }
 

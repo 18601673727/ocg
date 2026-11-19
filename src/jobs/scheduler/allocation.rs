@@ -24,6 +24,10 @@ const GENERATIVE_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
     ExecutionOperation::LlmRequest,
     Some(LlmTransport::OpenAiChatCompletions),
 );
+const RESPONSES_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
+    ExecutionOperation::LlmRequest,
+    Some(LlmTransport::OpenAiResponses),
+);
 const DECISION_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) =
     (ExecutionOperation::Decision, None);
 
@@ -201,7 +205,7 @@ pub(super) struct Allocator {
     shutdown: CancellationToken,
     stops: NativeStops,
     // Each supported executor capability set has its own ready cursor.
-    resume: Cell<[Option<DevelopmentReadyCursor>; 4]>,
+    resume: Cell<[Option<DevelopmentReadyCursor>; 8]>,
     // A changed queue may make a Job eligible in a previously scanned segment.
     rescan: Cell<u8>,
     discovery: Cell<Discovery>,
@@ -222,7 +226,7 @@ impl Allocator {
             database,
             shutdown,
             stops,
-            resume: Cell::new([None; 4]),
+            resume: Cell::new([None; 8]),
             rescan: Cell::new(0),
             discovery: Cell::new(Discovery::default()),
             running: RefCell::new(Vec::new()),
@@ -284,14 +288,17 @@ impl Allocator {
                 .allocation_executors(before, EXECUTOR_PAGE)
                 .await?;
             for executor in page.records {
-                if executor.enabled
-                    && (executor.capabilities.contains(&GENERATIVE_CAPABILITY)
-                        || executor.capabilities.contains(&DECISION_CAPABILITY))
-                {
-                    let capabilities =
-                        usize::from(executor.capabilities.contains(&GENERATIVE_CAPABILITY))
-                            | (usize::from(executor.capabilities.contains(&DECISION_CAPABILITY))
-                                << 1);
+                let capabilities = [
+                    GENERATIVE_CAPABILITY,
+                    DECISION_CAPABILITY,
+                    RESPONSES_CAPABILITY,
+                ]
+                .into_iter()
+                .enumerate()
+                .fold(0, |mask, (bit, capability)| {
+                    mask | (usize::from(executor.capabilities.contains(&capability)) << bit)
+                });
+                if executor.enabled && capabilities != 0 {
                     executors.push((executor.pool, executor.id, capabilities));
                 }
             }

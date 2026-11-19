@@ -832,11 +832,11 @@ impl Batch {
             if matches!(
                 &frozen,
                 FrozenDecisionConfig::Generative(generative, _)
-                    if generative.llm.provider.transport != LlmTransport::OpenAiChatCompletions
+                    if generative.llm.provider.transport.execution_refusal().is_some()
             ) {
                 return self.reject(Violation::InvalidValue(
                     "decision",
-                    "generative decision execution requires the OpenAI Chat Completions protocol",
+                    "the configured transport does not support generative Decision execution",
                 ));
             }
             if frozen.references().collect::<Vec<_>>() != *references {
@@ -1600,11 +1600,11 @@ impl Batch {
         if matches!(
             &frozen,
             FrozenDecisionConfig::Generative(generative, _)
-                if generative.llm.provider.transport != LlmTransport::OpenAiChatCompletions
+                if generative.llm.provider.transport.execution_refusal().is_some()
         ) {
             return self.reject(Violation::InvalidValue(
                 "decision",
-                "generative decision execution requires the OpenAI Chat Completions protocol",
+                "the configured transport does not support generative Decision execution",
             ));
         }
         if let Err(reason) = request.validate(&frozen.capabilities()) {

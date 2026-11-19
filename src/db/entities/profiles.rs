@@ -33,8 +33,8 @@ impl LlmTransport {
 
     pub(crate) const fn execution_refusal(self) -> Option<&'static str> {
         match self {
-            Self::OpenAiChatCompletions => None,
-            Self::OpenAiResponses | Self::AnthropicMessages => {
+            Self::OpenAiChatCompletions | Self::OpenAiResponses => None,
+            Self::AnthropicMessages => {
                 Some("native execution requires the OpenAI Chat Completions protocol")
             }
         }

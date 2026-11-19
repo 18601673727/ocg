@@ -200,6 +200,7 @@ pub(crate) struct DevelopmentContextTurn {
     pub attachments: Vec<AttachmentRecord>,
     pub outputs: Vec<JobOutputRecord>,
     pub awaiting_batch: Vec<crate::db::entities::ToolEvidenceRecord>,
+    pub response_replay: Vec<serde_json::Value>,
 }
 
 pub(crate) const AWAITING_TOOL_DECISION: &str = "awaiting_tool_decision";
