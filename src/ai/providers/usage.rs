@@ -47,6 +47,35 @@ pub(crate) struct UsageCapture {
 }
 
 impl UsageCapture {
+    pub(crate) async fn responses_terminal(
+        response: &Value,
+        sink: &mut dyn ProviderOutputSink,
+    ) -> NormalizedUsage {
+        let Some(value) = response.get("usage").filter(|value| value.is_object()) else {
+            return NormalizedUsage::default();
+        };
+        let usage = NormalizedUsage {
+            input_tokens: counter(value.get("input_tokens")),
+            output_tokens: counter(value.get("output_tokens")),
+            cache_read_tokens: counter(value["input_tokens_details"].get("cached_tokens")),
+            cache_write_tokens: counter(value["input_tokens_details"].get("cache_write_tokens")),
+            reasoning_tokens: counter(value["output_tokens_details"].get("reasoning_tokens")),
+            raw: Some(value.clone()),
+        };
+        if usage.has_counts() {
+            announce_at(
+                Some(sink),
+                Timestamp::now(),
+                ProviderFact::Usage {
+                    usage: usage.clone(),
+                    finality: UsageFinality::Final,
+                },
+            )
+            .await;
+        }
+        usage
+    }
+
     fn observe_choices(&mut self, choices: &[Value]) -> (bool, bool) {
         let mut saw_finish = false;
         let mut new_choice = false;

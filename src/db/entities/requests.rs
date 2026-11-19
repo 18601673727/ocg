@@ -22,7 +22,11 @@ impl MessageBody {
         } else {
             std::borrow::Cow::Borrowed(value)
         };
-        let bytes = serde_json::to_vec(filtered.as_ref())?;
+        Self::new_exact(filtered.as_ref())
+    }
+
+    pub(crate) fn new_exact(value: &Value) -> Result<Self, serde_json::Error> {
+        let bytes = serde_json::to_vec(value)?;
         Ok(Self {
             digest: ContentDigest::of(&bytes),
             bytes,

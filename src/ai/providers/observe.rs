@@ -425,7 +425,10 @@ pub fn success_observation(
         status_code: Some(result.status_code),
         finish_reason: result.finish_reason,
         raw_finish_reason: result.raw_finish_reason.clone(),
-        failure: None,
+        failure: result
+            .response_output
+            .as_ref()
+            .and_then(|output| output.failure.clone()),
     }
 }
 

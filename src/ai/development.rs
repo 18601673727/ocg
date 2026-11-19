@@ -1,7 +1,8 @@
 use std::sync::Mutex;
 
 use crate::ai::providers::{
-    CancellationToken, RequestRecorder, openai_compatible::ChatConversation,
+    CancellationToken, RequestRecorder,
+    openai_compatible::{ChatConversation, ChatMessage, ContentPartWire, MessageContentWire},
 };
 use crate::db::entities::{
     self, AttachmentId, DevelopmentCandidate, DevelopmentDecisionContext,
@@ -53,6 +54,7 @@ impl DevelopmentExecution {
         database: &DatabaseHandle,
         request_number: RequestNumber,
         body: &serde_json::Value,
+        conversation: Option<&ChatConversation>,
         observed_at: Timestamp,
         cancellation: &CancellationToken,
     ) -> Result<(), DatabaseError> {
@@ -86,23 +88,15 @@ impl DevelopmentExecution {
                             required_messages: Vec::new(),
                         }
                     } else {
-                        let mut recorder = self
+                        let recorder = self
                             .recorder
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        if request_number == entities::RequestNumber::FIRST {
-                            recorder.image_attachments = self
-                                .conversation
-                                .as_ref()
-                                .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
-                                    "request",
-                                    "prepared conversation missing",
-                                )))?
-                                .image_attachments
-                                .clone();
-                        }
+                        let conversation = conversation.ok_or(DatabaseError::Rejected(
+                            Violation::InvalidValue("request", "prepared conversation missing"),
+                        ))?;
                         let (sent, state) = recorder
-                            .prepare(self.handoff.job(), request_number, body, 0)
+                            .prepare(self.handoff.job(), request_number, body, conversation, 0)
                             .map_err(|_| {
                                 DatabaseError::Rejected(Violation::InvalidValue(
                                     "request",
@@ -263,13 +257,16 @@ pub(crate) fn prepare_development_handoff(
         DevelopmentResolvedCandidate::Generative(context) => {
             let snapshot = &context.snapshot;
             let frozen = &snapshot.configuration;
+            let responses =
+                frozen.llm.provider.transport == entities::LlmTransport::OpenAiResponses;
             let is_summary = snapshot.is_summary_work();
             if is_summary {
-                let mut messages = vec![
-                    crate::ai::providers::openai_compatible::ChatMessage::system(
-                        "You are a context summarizer. Return ONLY valid JSON matching {\"source\":\"...\",\"summary\":\"...\",\"omitted_details\":[...]}. Do not use tools, Markdown fences, or extra prose.",
-                    ),
-                ];
+                let prompt = "You are a context summarizer. Return ONLY valid JSON matching {\"source\":\"...\",\"summary\":\"...\",\"omitted_details\":[...]}. Do not use tools, Markdown fences, or extra prose.";
+                let mut messages = vec![if responses {
+                    ChatMessage::developer(prompt)
+                } else {
+                    ChatMessage::system(prompt)
+                }];
                 let mut combined = String::new();
                 for input in &snapshot.covered_inputs {
                     combined.push_str(&input.text);
@@ -286,12 +283,12 @@ pub(crate) fn prepare_development_handoff(
                     messages,
                     ..Default::default()
                 };
-                let request = crate::ai::generative_model::request_body(
-                    &frozen.llm.config.model,
-                    &frozen.llm.config.parameters,
-                    &conversation,
-                )
-                .map_err(|_| unavailable())?;
+                let mut request =
+                    crate::ai::generative_model::request_body(&frozen.llm, &conversation)
+                        .map_err(|_| unavailable())?;
+                if responses {
+                    request["text"] = serde_json::json!({"format": {"type": "json_object"}});
+                }
                 return Ok(PreparedDevelopmentExecution::new(
                     DevelopmentCandidate::Generative(context.snapshot),
                     Vec::new(),
@@ -323,23 +320,43 @@ pub(crate) fn prepare_development_handoff(
                         summary.summary.context_text()
                     )),
                     Vec::new(),
-                    None,
+                    Vec::new(),
                 ));
             }
             for input in &snapshot.covered_inputs {
                 prior.push((
                     Some(input.text.clone()),
                     images_for(&input.attachments)?,
-                    None,
+                    Vec::new(),
                 ));
             }
             for turn in &snapshot.history {
+                let mut replay = turn
+                    .response_replay
+                    .iter()
+                    .map(|message| {
+                        if let Some(items) = message["output"]
+                            .as_array()
+                            .filter(|items| !items.is_empty())
+                        {
+                            return Ok(ChatMessage::responses(items.clone()));
+                        }
+                        if message["type"] == "function_call_output"
+                            && let (Some(call_id), Some(output)) =
+                                (message["call_id"].as_str(), message["output"].as_str())
+                        {
+                            return Ok(ChatMessage::tool(call_id, output));
+                        }
+                        Err(unavailable())
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
                 let mut answer = if turn
                     .record
                     .outcome
                     .as_ref()
                     .is_some_and(|outcome| outcome.kind == entities::OutcomeKind::Cancelled)
                     || turn.record.job.phase != entities::MutableJobPhase::Executing
+                    || (!replay.is_empty() && turn.awaiting_batch.is_empty())
                 {
                     None
                 } else {
@@ -355,10 +372,13 @@ pub(crate) fn prepare_development_handoff(
                     }
                     answer.push_str(&context);
                 }
+                if let Some(answer) = answer {
+                    replay.push(ChatMessage::assistant(Some(answer), Vec::new()));
+                }
                 prior.push((
                     Some(turn.record.job.input.text().to_owned()),
                     images_for(&turn.attachments)?,
-                    answer,
+                    replay,
                 ));
             }
             let current_images = images_for(&snapshot.attachments)?;
@@ -379,7 +399,8 @@ pub(crate) fn prepare_development_handoff(
                 ContextNotices::default(),
             )
             .ok_or_else(unavailable)?;
-            if offer.is_none_or(|offer| offer.grant.is_none())
+            if !responses
+                && offer.is_none_or(|offer| offer.grant.is_none())
                 && let Some(project) = &snapshot.project
             {
                 let first = conversation.messages.first_mut().ok_or_else(unavailable)?;
@@ -395,25 +416,19 @@ pub(crate) fn prepare_development_handoff(
             {
                 return Err(unavailable());
             }
-            let request = crate::ai::generative_model::request_body(
-                &frozen.llm.config.model,
-                &frozen.llm.config.parameters,
-                &conversation,
-            )
-            .map_err(|_| unavailable())?;
+            let request = crate::ai::generative_model::request_body(&frozen.llm, &conversation)
+                .map_err(|_| unavailable())?;
             let mut verified = context.images.iter();
-            let messages = request
-                .get("messages")
-                .and_then(serde_json::Value::as_array)
-                .ok_or_else(unavailable)?;
-            for (index, message) in messages.iter().enumerate() {
+            for (index, message) in conversation.messages.iter().enumerate() {
                 let mut ids = Vec::new();
-                if let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) {
-                    for part in parts.iter().filter(|part| {
-                        part.get("type").and_then(serde_json::Value::as_str) == Some("image_url")
-                    }) {
+                if let Some(MessageContentWire::Parts(parts)) = &message.content {
+                    for part in parts {
+                        let ContentPartWire::ImageUrl { image_url } = part else {
+                            continue;
+                        };
                         let (id, image) = verified.next().ok_or_else(unavailable)?;
-                        if serde_json::to_value(image.part()).map_err(|_| unavailable())? != *part {
+                        if !matches!(image.part(), ContentPartWire::ImageUrl { image_url: expected } if expected == *image_url)
+                        {
                             return Err(unavailable());
                         }
                         ids.push(*id);

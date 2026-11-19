@@ -1,5 +1,6 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
+use super::openai_compatible::ChatConversation;
 use super::{OutputSinkError, Timestamp, Value, json};
 use crate::db::entities::{
     AttachmentId, ContentDigest, JobId, MessageBody, RequestNumber, SentRequest,
@@ -10,7 +11,6 @@ pub struct RequestRecorder {
     messages: Vec<ContentDigest>,
     stored: BTreeSet<ContentDigest>,
     sent: bool,
-    pub(crate) image_attachments: BTreeMap<usize, Vec<AttachmentId>>,
 }
 
 pub struct SentRequestState {
@@ -24,30 +24,59 @@ impl RequestRecorder {
         job: JobId,
         request: RequestNumber,
         body: &Value,
+        conversation: &ChatConversation,
         dropped_turns: u32,
     ) -> Result<(SentRequest, SentRequestState), OutputSinkError> {
         let mut bodies = Vec::new();
         let mut pending = BTreeSet::new();
+        let responses = body.get("input").is_some();
         let messages = body
-            .get("messages")
+            .get(if responses { "input" } else { "messages" })
             .and_then(Value::as_array)
             .ok_or_else(|| record_error("request has no messages"))?;
-        if messages.len() < self.messages.len() {
+        if conversation.messages.len() < self.messages.len() {
             return Err(record_error("recorded messages must only be appended"));
         }
-        let mut digests = Vec::with_capacity(messages.len());
-        for (index, value) in messages.iter().enumerate() {
-            let attachments = self
+        let mut digests = Vec::with_capacity(conversation.messages.len());
+        let mut wire = messages.as_slice();
+        for (index, message) in conversation.messages.iter().enumerate() {
+            let attachments = conversation
                 .image_attachments
                 .get(&index)
                 .map_or(&[][..], Vec::as_slice);
-            let mut value = value.clone();
-            replace_images(&mut value, attachments)?;
-            let body = MessageBody::new(&value).map_err(|error| record_error(error.to_string()))?;
+            let group = message.response_items.as_deref().filter(|_| responses);
+            let count = group.map_or(1, <[Value]>::len);
+            let (items, remaining) = wire
+                .split_at_checked(count)
+                .ok_or_else(|| record_error("request input differs from its conversation"))?;
+            wire = remaining;
+            let value = if let Some(group) = group {
+                if group != items || !attachments.is_empty() {
+                    return Err(record_error(
+                        "request replay differs from its recorded output",
+                    ));
+                }
+                json!({"output": items})
+            } else {
+                let mut value = items[0].clone();
+                replace_images(&mut value, attachments)?;
+                value
+            };
+            let body = if responses {
+                MessageBody::new_exact(&value)
+            } else {
+                MessageBody::new(&value)
+            }
+            .map_err(|error| record_error(error.to_string()))?;
             digests.push(body.digest());
             if !self.stored.contains(&body.digest()) && pending.insert(body.digest()) {
                 bodies.push(body);
             }
+        }
+        if !wire.is_empty() || (responses && !digests.starts_with(&self.messages)) {
+            return Err(record_error(
+                "recorded request must preserve its input prefix",
+            ));
         }
         let tools = body
             .get("tools")
@@ -124,16 +153,23 @@ fn record_error(message: impl Into<String>) -> OutputSinkError {
 
 fn replace_images(value: &mut Value, attachments: &[AttachmentId]) -> Result<(), OutputSinkError> {
     let Some(parts) = value.get_mut("content").and_then(Value::as_array_mut) else {
-        return Ok(());
+        return if attachments.is_empty() {
+            Ok(())
+        } else {
+            Err(record_error(
+                "request message has Attachments but no content parts",
+            ))
+        };
     };
     let mut attachments = attachments.iter();
     for part in parts {
-        if part.get("type").and_then(Value::as_str) != Some("image_url") {
-            continue;
-        }
-        let url = part
-            .get_mut("image_url")
-            .and_then(|image| image.get_mut("url"));
+        let url = match part.get("type").and_then(Value::as_str) {
+            Some("image_url") => part
+                .get_mut("image_url")
+                .and_then(|image| image.get_mut("url")),
+            Some("input_image") => part.get_mut("image_url"),
+            _ => continue,
+        };
         let Some(url) = url else {
             return Err(record_error("request image has no URL"));
         };
@@ -147,6 +183,11 @@ fn replace_images(value: &mut Value, attachments: &[AttachmentId]) -> Result<(),
             .next()
             .ok_or_else(|| record_error("request image has no stored Attachment"))?;
         *url = json!({"attachment": attachment.to_string()});
+    }
+    if attachments.next().is_some() {
+        return Err(record_error(
+            "request does not carry all its stored Attachments",
+        ));
     }
     Ok(())
 }

@@ -757,7 +757,7 @@ export function SettingsSurface(props: {
                               {profile.credential_ref
                                 ? ` · ${i18n.t("settings.credentialRef", { ref: profile.credential_ref })}`
                                 : ""}
-                              {kind === "llm" && profile.protocol !== "openai_chat_completions"
+                              {kind === "llm" && profile.protocol === "anthropic_messages"
                                 ? ` · ${i18n.t("settings.llm.executionUnavailable")}`
                                 : ""}
                             </p>

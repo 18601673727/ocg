@@ -25,6 +25,7 @@ mod models;
 pub(crate) mod observe;
 pub mod openai_compatible;
 mod record;
+pub(crate) mod responses;
 pub use record::{RequestRecorder, SentRequestState};
 mod transport;
 mod types;

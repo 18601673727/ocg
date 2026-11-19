@@ -203,6 +203,11 @@ const EXECUTOR_CAPABILITIES: {
     },
   },
   {
+    key: "openai_responses",
+    label: "OpenAI Responses",
+    capability: { operation: "llm_request", protocol: "openai_responses" },
+  },
+  {
     key: "decision",
     label: null,
     capability: { operation: "decision", protocol: null },

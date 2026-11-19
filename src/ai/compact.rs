@@ -3,7 +3,7 @@ use super::providers::openai_compatible::{
     ToolWire,
 };
 use crate::db::entities::{
-    DevelopmentContextRequirements, FrozenExecutionConfig, LlmConfig, ProjectRecord,
+    DevelopmentContextRequirements, FrozenExecutionConfig, LlmConfig, LlmTransport, ProjectRecord,
     VerifiedNativeSummary,
 };
 
@@ -50,6 +50,9 @@ fn append_omitted_notice(conversation: &mut ChatConversation) {
 }
 
 fn message_weights(message: &ChatMessage) -> (usize, usize) {
+    if let Some(items) = &message.response_items {
+        return (crate::db::serialized_len(items).unwrap_or(usize::MAX), 0);
+    }
     let mut bytes: usize = 0;
     let mut images: usize = 0;
 
@@ -139,7 +142,7 @@ impl ContextLimits {
 
 pub(crate) struct PriorTurnMessages {
     pub(crate) user: Option<ChatMessage>,
-    pub(crate) assistant: Option<ChatMessage>,
+    pub(crate) assistant: Vec<ChatMessage>,
 }
 
 fn system_messages(
@@ -157,35 +160,49 @@ fn system_messages(
     }
 
     if let Some(project) = project {
-        let command_names = crate::db::entities::BUILT_IN_COMMANDS
-            .into_iter()
-            .chain(
-                project
-                    .commands
-                    .iter()
-                    .filter(|command| command.status == crate::db::entities::CommandStatus::Allowed)
-                    .map(|command| command.name.as_str()),
-            )
-            .collect::<Vec<_>>();
-        messages.push(super::generative_model::ground_project(
-            &project.name,
-            &project.root,
-            grant,
-            &command_names,
+        if frozen.llm.provider.transport == LlmTransport::OpenAiResponses && grant.is_none() {
+            messages.push(ChatMessage::system(format!(
+                "You work in the Project {:?}. Its workspace root is {}. No workspace access or tools are available for this execution; do not claim to read or change project files.",
+                project.name, project.root
+            )));
+        } else {
+            let command_names = crate::db::entities::BUILT_IN_COMMANDS
+                .into_iter()
+                .chain(
+                    project
+                        .commands
+                        .iter()
+                        .filter(|command| {
+                            command.status == crate::db::entities::CommandStatus::Allowed
+                        })
+                        .map(|command| command.name.as_str()),
+                )
+                .collect::<Vec<_>>();
+            messages.push(super::generative_model::ground_project(
+                &project.name,
+                &project.root,
+                grant,
+                &command_names,
+            ));
+        }
+    }
+    if frozen.llm.provider.transport == LlmTransport::OpenAiResponses {
+        if omitted_notice {
+            messages.push(ChatMessage::system(OMITTED_NOTICE));
+        }
+    } else {
+        messages.push(ChatMessage::system(
+            super::generative_model::CHART_INSTRUCTIONS,
         ));
+
+        let mut agent_conv = super::generative_model::objective_conversation(frozen, None);
+        agent_conv.messages.pop();
+
+        if omitted_notice {
+            append_omitted_notice(&mut agent_conv);
+        }
+        messages.extend(agent_conv.messages);
     }
-    messages.push(ChatMessage::system(
-        super::generative_model::CHART_INSTRUCTIONS,
-    ));
-
-    let mut agent_conv = super::generative_model::objective_conversation(frozen, None);
-    agent_conv.messages.pop();
-
-    if omitted_notice {
-        append_omitted_notice(&mut agent_conv);
-    }
-
-    messages.extend(agent_conv.messages);
 
     if let Some(agents_md) = agents_md.filter(|content| !content.is_empty()) {
         messages.push(ChatMessage::system(agents_md));
@@ -205,9 +222,7 @@ fn assemble_final_conversation(
         if let Some(user) = turn.user {
             messages.push(user);
         }
-        if let Some(assistant) = turn.assistant {
-            messages.push(assistant);
-        }
+        messages.extend(turn.assistant);
     }
     if let Some(current) = current_message {
         messages.push(current);
@@ -230,7 +245,7 @@ pub(crate) struct ContextNotices<'a> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn fit_with_notices(
     frozen: &FrozenExecutionConfig,
-    prior_turns: Vec<(Option<String>, Vec<ImageInput>, Option<String>)>,
+    prior_turns: Vec<(Option<String>, Vec<ImageInput>, Vec<ChatMessage>)>,
     current_objective: Option<&str>,
     current_images: &[ImageInput],
     project: Option<&ProjectRecord>,
@@ -243,6 +258,19 @@ pub(crate) fn fit_with_notices(
     let web = tools.iter().any(|tool| tool.function.name == "web_fetch");
     let with_prefix = |omitted: bool| {
         let mut system = Vec::new();
+        if frozen.llm.provider.transport == LlmTransport::OpenAiResponses {
+            let mut stable = super::generative_model::CHART_INSTRUCTIONS.to_owned();
+            if let Some(instructions) = frozen
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.instructions.as_deref())
+                .filter(|text| !text.is_empty())
+            {
+                stable.push_str("\n\n");
+                stable.push_str(instructions);
+            }
+            system.push(ChatMessage::developer(stable));
+        }
         if let Some(status) = notices.tree_status.filter(|status| !status.is_empty()) {
             system.push(ChatMessage::system(status));
         }
@@ -256,7 +284,7 @@ pub(crate) fn fit_with_notices(
     };
     let prior_messages: Vec<PriorTurnMessages> = prior_turns
         .into_iter()
-        .map(|(objective, images, assistant_text)| {
+        .map(|(objective, images, assistant)| {
             let user = super::generative_model::objective_conversation_with_images(
                 frozen,
                 objective.as_deref(),
@@ -264,8 +292,6 @@ pub(crate) fn fit_with_notices(
             )
             .messages
             .pop();
-            let assistant =
-                assistant_text.map(|text| ChatMessage::assistant(Some(text), Vec::new()));
             PriorTurnMessages { user, assistant }
         })
         .collect();
@@ -322,7 +348,13 @@ pub(crate) fn fit_with_notices(
         .iter()
         .map(|turn| {
             let (user_b, user_img) = turn.user.as_ref().map_or((0, 0), message_weights);
-            let (asst_b, asst_img) = turn.assistant.as_ref().map_or((0, 0), message_weights);
+            let (asst_b, asst_img) = turn
+                .assistant
+                .iter()
+                .map(message_weights)
+                .fold((0usize, 0usize), |(bytes, images), (b, i)| {
+                    (bytes.saturating_add(b), images.saturating_add(i))
+                });
             (
                 user_b.saturating_add(asst_b),
                 user_img.saturating_add(asst_img),

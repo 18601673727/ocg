@@ -20,6 +20,7 @@ use crate::db::redb::schema::{
     RequestTimelineKey,
 };
 use ::redb::{Database, ReadTransaction, ReadableTable};
+use serde_json::Value;
 
 #[derive(Clone)]
 enum ObservationTarget {
@@ -578,7 +579,7 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
                 }
             }
         }
-        text
+        crate::db::entities::output_filter::text(&text).into_owned()
     } else {
         text
     };
@@ -749,4 +750,63 @@ pub(crate) fn read_provider_request(
         dropped_turns,
         response,
     }))
+}
+
+pub(super) fn read_responses_replay(
+    rx: &::redb::ReadTransaction,
+    job: JobId,
+    include_last_answer: bool,
+    budget: &mut usize,
+) -> Result<Vec<Value>, StorageError> {
+    let events = rx.open_table(REQUEST_EVENTS)?;
+    let messages = rx.open_table(MESSAGES)?;
+    let mut first: Option<Vec<ContentDigest>> = None;
+    let mut tail = Vec::new();
+    let mut answer = None;
+    for entry in events.range((job.get(), 1, 0)..=(job.get(), u32::MAX, u32::MAX))? {
+        let (key, bytes) = entry?;
+        let (_, number, seq) = key.value();
+        let request = RequestNumber::new(number)
+            .ok_or_else(|| StorageError::corrupted("zero request number"))?;
+        match decode_request_event(job, request, seq, bytes.value())?.payload {
+            RequestPayload::Sent { messages, .. } => {
+                answer = None;
+                if let Some(prefix) = &first {
+                    tail = messages
+                        .strip_prefix(prefix.as_slice())
+                        .ok_or_else(|| {
+                            StorageError::corrupted("Responses request changed its initial input")
+                        })?
+                        .to_vec();
+                } else {
+                    first = Some(messages);
+                }
+            }
+            RequestPayload::Received { digest } => answer = Some(digest),
+            RequestPayload::Availability { .. }
+            | RequestPayload::Measurement { .. }
+            | RequestPayload::Token { .. } => {}
+        }
+    }
+    if include_last_answer {
+        tail.extend(answer);
+    }
+    tail.into_iter()
+        .map(|digest| {
+            let body = messages.get(digest.as_bytes().as_slice())?.ok_or_else(|| {
+                StorageError::corrupted("Responses history references a missing message")
+            })?;
+            *budget = budget.saturating_add(body.value().len());
+            if *budget > 8 * 1024 * 1024 {
+                return Err(StorageError {
+                    kind: super::StorageErrorKind::Other,
+                    os_error: None,
+                    detail: "selected Responses history exceeds execution context limit".to_owned(),
+                });
+            }
+            serde_json::from_slice(body.value()).map_err(|error| {
+                StorageError::corrupted(format!("invalid Responses history JSON: {error}"))
+            })
+        })
+        .collect()
 }
