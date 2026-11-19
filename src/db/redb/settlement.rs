@@ -10,12 +10,14 @@ use crate::db::redb::codec::Code;
 use crate::db::redb::jobs::{
     TurnMembership, decode_mutable_job, is_predictive_helper, mutable_priority,
 };
-use crate::db::redb::reads::execution_context::NativeSourceError;
+use crate::db::redb::reads::execution_context::{
+    NativeSourceError, summary_child_job, summary_history_job, summary_job_state, summary_turn_head,
+};
 use crate::db::redb::reservations::mutable_configuration_requirement;
 use crate::db::redb::rows::decode_output;
 use crate::db::redb::schema::{
-    CHILDREN, DEPENDENCY_WAITERS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, META, MUTABLE_READY,
-    RECURRENCE_DUE, RECURRENCES,
+    CHILDREN, CONVERSATIONS, DEPENDENCY_WAITERS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, META,
+    MUTABLE_READY, RECURRENCE_DUE, RECURRENCES,
 };
 use crate::db::redb::{reads, state};
 use ::redb::ReadableTable;
@@ -25,7 +27,7 @@ impl Batch {
         &mut self,
         read: impl FnOnce(&::redb::WriteTransaction) -> Result<T, NativeSourceError>,
     ) -> Result<T, BatchError> {
-        self.step(|tx| match read(tx) {
+        let result = self.step(|tx| match read(tx) {
             Ok(value) => Ok(Ok(value)),
             Err(NativeSourceError::Storage(error)) => Err(error),
             Err(NativeSourceError::Corrupt { job, detail }) => {
@@ -34,8 +36,51 @@ impl Batch {
             Err(NativeSourceError::Unavailable(reason)) => {
                 Ok(Err(Violation::InvalidValue("summary_source", reason)))
             }
-        })?
-        .map_err(|violation| BatchError(Failure::Rejected(violation)))
+        })?;
+        if let Err(Violation::SummarySourceCorrupt { job, detail }) = &result {
+            self.note_summary_corruption(*job, detail);
+        }
+        result.map_err(|violation| BatchError(Failure::Rejected(violation)))
+    }
+
+    /// Records that a read proved some committed record is damaged.
+    ///
+    /// The caller decides what to do with the affected Job; the database must
+    /// still re-verify every record before the next start trusts a clean
+    /// shutdown marker.
+    pub(super) fn note_summary_corruption(&mut self, producer: JobId, detail: &str) {
+        self.needs_full_verification = true;
+        log::error!(
+            "corrupt summary source {producer}: {detail}. Full storage verification required on next open"
+        );
+    }
+
+    /// Verifies one published summary, isolating damage confined to the producer.
+    ///
+    /// Returns `Ok(None)` when the summary is simply unusable: not yet settled,
+    /// withdrawn, or inconsistent with the consumer. Source-local corruption is
+    /// also isolated as `Ok(None)`, but only after recording that the next open
+    /// owes a full verification. Damage to shared rows still fails the caller.
+    pub(super) fn verify_summary_source<T>(
+        &mut self,
+        read: impl FnOnce(
+            &::redb::WriteTransaction,
+        )
+            -> Result<Option<T>, super::reads::execution_context::SummarySourceError>,
+    ) -> Result<Option<T>, BatchError> {
+        use super::reads::execution_context::SummarySourceError;
+        let read = self.step(|tx| match read(tx) {
+            Ok(value) => Ok(Ok(value)),
+            Err(SummarySourceError::Storage(error)) => Err(error),
+            Err(SummarySourceError::Corrupt { producer, detail }) => Ok(Err((producer, detail))),
+        })?;
+        match read {
+            Ok(found) => Ok(found),
+            Err((producer, detail)) => {
+                self.note_summary_corruption(producer, &detail);
+                Ok(None)
+            }
+        }
     }
 
     pub(super) fn automatic_compaction(
@@ -48,10 +93,6 @@ impl Batch {
         self.probe = probe;
         self.check_failure()?;
         match result {
-            Err(BatchError(Failure::Rejected(Violation::SummarySourceCorrupt { job, detail }))) => {
-                log::error!("automatic compaction skipped for corrupt source {job}: {detail}");
-                Ok(())
-            }
             Err(BatchError(Failure::Rejected(reason))) => {
                 log::debug!("automatic compaction declined before writes: {reason}");
                 Ok(())
@@ -85,7 +126,7 @@ impl Batch {
         };
         let summarizer = policy.summarization_model.unwrap_or(frozen.llm.model.id);
         let total_tokens = self.read_summary_source(|tx| {
-            let Some(tip) = reads::jobs::turn_head(tx, conversation)? else {
+            let Some(tip) = summary_turn_head(tx, conversation)? else {
                 return Ok(0usize);
             };
             let jobs = tx.table(JOBS)?;
@@ -98,13 +139,7 @@ impl Batch {
                 if steps > 4096 {
                     break;
                 }
-                let row = jobs.get(turn_id.get())?.ok_or_else(|| {
-                    NativeSourceError::malformed(turn_id, "source Job is missing")
-                })?;
-                let turn_job = NativeSourceError::decoded(
-                    turn_id,
-                    decode_mutable_job(turn_id.get(), row.value()),
-                )?;
+                let turn_job = summary_history_job(&jobs, turn_id, conversation)?;
                 let mut bytes = 16usize
                     .saturating_add(turn_job.input.text().len())
                     .saturating_add(turn_job.input.attachments().len().saturating_mul(4800));
@@ -132,6 +167,7 @@ impl Batch {
         let (summary_blocked, pred_blocked, pred_count) = self.read_summary_source(|tx| {
             let children = tx.table(CHILDREN)?;
             let jobs = tx.table(JOBS)?;
+            let groups = tx.table(CONVERSATIONS)?;
             let states = tx.table(JOB_RUNTIME)?;
             let mut summary_blocked = false;
             let mut pred_blocked = false;
@@ -141,19 +177,12 @@ impl Batch {
             {
                 let (entry_key, _) = entry?;
                 let (_, child_id) = entry_key.value();
-                let Some(row) = jobs.get(child_id)? else {
+                let child = JobId::new(child_id);
+                let Some(child_job) = summary_child_job(&jobs, &groups, conversation, child)?
+                else {
                     continue;
                 };
-                let child = JobId::new(child_id);
-                let child_job =
-                    NativeSourceError::decoded(child, decode_mutable_job(child_id, row.value()))?;
-                let outcome = states
-                    .get(child_id)?
-                    .map(|s| {
-                        NativeSourceError::decoded(child, state::decode_state(child_id, s.value()))
-                    })
-                    .transpose()?
-                    .and_then(|s| s.outcome);
+                let outcome = summary_job_state(&states, child)?.outcome;
                 if child_job.summary_source.is_some() {
                     if outcome.is_none()
                         || (cooldown_micros > 0

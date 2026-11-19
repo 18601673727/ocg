@@ -51,6 +51,7 @@ pub(crate) enum NativeResourceDelta {
 pub(crate) struct BatchOutcome<T> {
     pub(crate) result: Result<T, BatchFailure>,
     pub(crate) storage_failure: Option<StorageError>,
+    pub(crate) needs_full_verification: bool,
     pub(crate) durable_commit_us: Option<u64>,
     pub(crate) scheduling_wake: bool,
     pub(crate) capacity_freed: bool,
@@ -68,6 +69,7 @@ impl<T> BatchOutcome<T> {
         Self {
             result: Err(failure),
             storage_failure,
+            needs_full_verification: false,
             durable_commit_us: None,
             scheduling_wake: false,
             capacity_freed: false,
@@ -90,6 +92,7 @@ pub(crate) struct Batch {
     pub(super) probe: Option<Probe>,
     pub(super) resource_deltas: Vec<NativeResourceDelta>,
     pub(super) execution_transaction: Option<u64>,
+    pub(super) needs_full_verification: bool,
     pub(crate) native_stops: Option<crate::db::NativeStops>,
     failure: Option<Failure>,
 }
@@ -141,10 +144,12 @@ pub(crate) fn run_batch_declinable<T>(
         Err(error) => return (BatchOutcome::failed_storage(error), false),
     };
     let result = body(&mut batch);
-    if let Some(failure) = batch.failure.take() {
-        return (finish_abort(batch.tx, failure), false);
-    }
-    match result {
+    let needs_full_verification = batch.needs_full_verification;
+    let result = match batch.failure.take() {
+        Some(failure) => Err(BatchError(failure)),
+        None => result,
+    };
+    let (mut outcome, declined) = match result {
         Err(BatchError(failure)) => (finish_abort(batch.tx, failure), false),
         Ok(Continue(value)) => (commit_batch(batch, value, commit), false),
         Ok(Break(value)) => match batch.tx.abort() {
@@ -152,6 +157,7 @@ pub(crate) fn run_batch_declinable<T>(
                 BatchOutcome {
                     result: Ok(value),
                     storage_failure: None,
+                    needs_full_verification: false,
                     durable_commit_us: None,
                     scheduling_wake: false,
                     capacity_freed: false,
@@ -163,7 +169,10 @@ pub(crate) fn run_batch_declinable<T>(
             ),
             Err(error) => (BatchOutcome::failed_storage(error.into()), false),
         },
-    }
+    };
+    // A failed read can discover damage already present in the committed snapshot.
+    outcome.needs_full_verification = needs_full_verification;
+    (outcome, declined)
 }
 
 fn commit_batch<T>(batch: Batch, value: T, commit: Commit) -> BatchOutcome<T> {
@@ -174,6 +183,7 @@ fn commit_batch<T>(batch: Batch, value: T, commit: Commit) -> BatchOutcome<T> {
         Ok(()) => BatchOutcome {
             result: Ok(value),
             storage_failure: None,
+            needs_full_verification: false,
             durable_commit_us,
             scheduling_wake: batch.touched_ready_or_delayed || batch.changed_pool,
             capacity_freed: batch.freed_capacity,
@@ -259,6 +269,7 @@ impl Batch {
             probe: None,
             resource_deltas: Vec::new(),
             execution_transaction: None,
+            needs_full_verification: false,
             native_stops: None,
             failure: None,
         }

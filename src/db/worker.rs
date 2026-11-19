@@ -58,6 +58,7 @@ pub(super) struct Executed {
     resource_deltas: Vec<redb::NativeResourceDelta>,
     answer: Answer,
     failure: Option<StorageFailure>,
+    needs_full_verification: bool,
 }
 
 pub(super) fn run<T: Send + 'static>(
@@ -129,6 +130,7 @@ pub(super) fn settle<T: Send + 'static>(
             error,
             outcome_unknown,
         }),
+        needs_full_verification: outcome.needs_full_verification,
     }
 }
 
@@ -279,6 +281,7 @@ impl DatabaseWorker {
                     credential_key_writer: std::sync::Mutex::new(()),
                     undecryptable_credentials_at_open,
                     open_warnings_logged: AtomicBool::new(false),
+                    needs_full_verification: AtomicBool::new(false),
                     native_resources,
                 });
                 let _release = ReleaseOnPanic {
@@ -296,6 +299,7 @@ impl DatabaseWorker {
                     next_check: None,
                     uncertain: Vec::new(),
                     storage_failure: None,
+                    needs_full_verification: false,
                     last_compaction: None,
                     shutdown_requested: false,
                 };
@@ -449,6 +453,7 @@ pub(super) struct WriteWorker {
     pub(super) next_check: Option<Instant>,
     pub(super) uncertain: Vec<(OperationId, Option<Probe>)>,
     pub(super) storage_failure: Option<StorageError>,
+    needs_full_verification: bool,
     pub(super) last_compaction: Option<Instant>,
     pub(super) shutdown_requested: bool,
 }
@@ -636,6 +641,7 @@ impl WriteWorker {
                 };
                 started.store(true, Ordering::SeqCst);
                 let mut ran = command.execute(&opened.database, operation, commit);
+                self.needs_full_verification |= ran.needs_full_verification;
                 drop(in_flight);
                 if ran.committed && !ran.resource_deltas.is_empty() {
                     let mut catalog = shared
@@ -1010,6 +1016,10 @@ impl WriteWorker {
         self.shared.next_operation.store(1, Ordering::SeqCst);
         self.shared.released.store(false, Ordering::SeqCst);
         self.storage_failure = None;
+        self.needs_full_verification = false;
+        self.shared
+            .needs_full_verification
+            .store(false, Ordering::SeqCst);
         Ok(epoch)
     }
 
@@ -1057,16 +1067,6 @@ impl WriteWorker {
     }
 
     pub(super) fn exit(self) -> Result<(), DatabaseError> {
-        if self.storage_failure.is_none()
-            && let Some(opened) = self
-                .shared
-                .database
-                .read()
-                .unwrap_or_else(PoisonError::into_inner)
-                .as_ref()
-        {
-            let _ = crate::db::redb::record_clean_shutdown(&opened.database);
-        }
         {
             let mut admission = self
                 .shared
@@ -1075,7 +1075,24 @@ impl WriteWorker {
                 .unwrap_or_else(PoisonError::into_inner);
             *admission = Admission::ShuttingDown;
         }
-        self.shared.release_database();
+        let opened = self
+            .shared
+            .database
+            .write()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        // Opening durably cleared clean_shutdown. Leave it clear if a source read
+        // detected corruption, even if that command rolled back, only declined,
+        // or ran on the read pool.
+        if self.storage_failure.is_none()
+            && !self.needs_full_verification
+            && !self.shared.needs_full_verification.load(Ordering::SeqCst)
+            && let Some(opened) = opened.as_ref()
+        {
+            let _ = crate::db::redb::record_clean_shutdown(&opened.database);
+        }
+        drop(opened);
+        self.shared.released.store(true, Ordering::SeqCst);
         for message in self.receiver.drain() {
             if let Message::Run(envelope) = message {
                 let Envelope {
@@ -1096,5 +1113,202 @@ impl WriteWorker {
             None => Ok(()),
             Some(error) => Err(DatabaseError::StorageUnavailable(error)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::future::Future;
+    use std::path::{Path, PathBuf};
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    use ::redb::ReadableTable;
+    use uuid::Uuid;
+
+    use super::{DatabaseError, DatabaseWorker};
+    use crate::db::entities::Project;
+    use crate::db::{StorageErrorKind, database_file};
+    use crate::host::data_directory::DataDirectory;
+
+    const PROJECTS_TABLE: ::redb::TableDefinition<'_, u128, &[u8]> =
+        ::redb::TableDefinition::new("project");
+
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!("{prefix}-{}", Uuid::now_v7()));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self(path)
+        }
+
+        fn data_directory(&self) -> DataDirectory {
+            DataDirectory::bootstrap(self.0.clone().into_os_string()).expect("bootstrap data dir")
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    struct Unpark(std::thread::Thread);
+
+    impl Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+
+    fn block_on<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = Waker::from(Arc::new(Unpark(std::thread::current())));
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut Context::from_waker(&waker)) {
+                return value;
+            }
+            std::thread::park();
+        }
+    }
+
+    fn corrupt_project_row(directory: &Path, project_id: u128) {
+        let db = ::redb::Database::open(database_file(directory)).expect("open raw redb");
+        let tx = db.begin_write().expect("begin write");
+        {
+            let mut table = tx.open_table(PROJECTS_TABLE).expect("open PROJECTS");
+            let mut bytes = table
+                .get(project_id)
+                .expect("read PROJECTS row")
+                .expect("project row exists")
+                .value()
+                .to_vec();
+            assert!(bytes.pop().is_some(), "non-empty project record");
+            table
+                .insert(project_id, bytes.as_slice())
+                .expect("corrupt PROJECTS row");
+        }
+        tx.commit().expect("commit corruption");
+    }
+
+    #[test]
+    fn read_only_corruption_detection_forces_full_verification_on_next_startup() {
+        let temp = TempDir::new("ocg-ro-corrupt");
+        let directory = temp.data_directory();
+
+        let worker = DatabaseWorker::start(&directory).expect("initial start");
+        let project_id = block_on(worker.handle().create_project(Project {
+            name: "alpha".to_owned(),
+            description: None,
+            root: "/tmp/alpha".to_owned(),
+            commands: Vec::new(),
+        }))
+        .expect("create project");
+        worker.shutdown().expect("initial clean shutdown");
+
+        corrupt_project_row(&temp.0, project_id.get());
+
+        // clean_shutdown = 1 -> Quick verification opens without scanning PROJECTS.
+        let worker = DatabaseWorker::start(&directory).expect("quick startup before detection");
+        let read_err = block_on(worker.handle().project(project_id))
+            .expect_err("read-only projection must report corruption");
+        assert!(
+            matches!(
+                read_err,
+                DatabaseError::Read(ref storage) if storage.kind == StorageErrorKind::Corrupted
+            ),
+            "unexpected read error: {read_err:?}"
+        );
+
+        // No further writes; clean shutdown must not mark clean_shutdown = 1.
+        worker
+            .shutdown()
+            .expect("clean shutdown after ro detection");
+
+        // Next startup must take Full verification and refuse the corrupt database.
+        let reopen_err = match DatabaseWorker::start(&directory) {
+            Ok(_) => panic!("next startup must refuse corrupt database via Full verification"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                reopen_err,
+                DatabaseError::Open(ref storage)
+                    if storage.kind == StorageErrorKind::Corrupted
+            ),
+            "unexpected startup error: {reopen_err:?}"
+        );
+    }
+
+    #[test]
+    fn read_only_corruption_preserves_unrelated_writes_and_pause_boundary() {
+        let temp = TempDir::new("ocg-ro-writes");
+        let directory = temp.data_directory();
+
+        let worker = DatabaseWorker::start(&directory).expect("initial start");
+        let bad_project_id = block_on(worker.handle().create_project(Project {
+            name: "corrupt-target".to_owned(),
+            description: None,
+            root: "/tmp/corrupt-target".to_owned(),
+            commands: Vec::new(),
+        }))
+        .expect("create project");
+        worker.shutdown().expect("initial clean shutdown");
+
+        corrupt_project_row(&temp.0, bad_project_id.get());
+
+        let worker = DatabaseWorker::start(&directory).expect("quick startup");
+        let handle = worker.handle();
+
+        // Trigger read-only corruption detection.
+        let read_err = block_on(handle.project(bad_project_id))
+            .expect_err("read-only projection must report corruption");
+        assert!(matches!(
+            read_err,
+            DatabaseError::Read(ref storage) if storage.kind == StorageErrorKind::Corrupted
+        ));
+
+        // Unrelated writes and reads must remain available.
+        let saved_headers = block_on(handle.set_global_outbound_headers(0, Vec::new()))
+            .expect("unrelated write must remain available");
+        assert_eq!(saved_headers.revision, 1);
+        let read_headers = block_on(handle.global_outbound_headers())
+            .expect("unrelated read must remain available");
+        assert_eq!(read_headers.revision, 1);
+
+        // pause_for_update -> drop(pause) must not clear needs_full_verification.
+        let pause = handle
+            .pause_for_update()
+            .expect("pause_for_update")
+            .expect("idle pause acquired");
+        assert!(
+            worker
+                .handle
+                .shared
+                .needs_full_verification
+                .load(Ordering::SeqCst)
+        );
+        drop(pause);
+        assert!(
+            worker
+                .handle
+                .shared
+                .needs_full_verification
+                .load(Ordering::SeqCst)
+        );
+
+        worker.shutdown().expect("clean shutdown");
+
+        let reopen_err = match DatabaseWorker::start(&directory) {
+            Ok(_) => panic!("next startup must refuse corrupt database"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            reopen_err,
+            DatabaseError::Open(ref storage)
+                if storage.kind == StorageErrorKind::Corrupted
+        ));
     }
 }

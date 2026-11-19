@@ -3,8 +3,8 @@ use crate::db::entities::{ConfigBody, ConfigId, DependencyState, OutcomeKind, To
 use crate::db::entities::{
     DependencyCondition, ExecutionEventKind, JobId, JobLifecycle, JobOutputId, JobOutputRecord,
     JobSearchPage, JobSpec, JobState, JobTree, JobUsage, MutableConfiguration, MutableJob,
-    MutableJobContent, MutableJobDetails, NativeJobItem, Origin, OutputKind, Recurrence,
-    RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
+    MutableJobContent, MutableJobDetails, MutableJobPhase, NativeJobItem, Origin, OutputKind,
+    Recurrence, RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
 };
 use crate::db::redb::batch::Batch;
 use crate::db::redb::reads::conversations::{conversation_summary, conversation_tip};
@@ -42,17 +42,44 @@ pub(crate) fn read_state(rx: &ReadTransaction, id: JobId) -> Result<JobState, St
 }
 
 pub(crate) fn turn_head(tx: &impl TxRead, group: JobId) -> Result<Option<JobId>, StorageError> {
+    turn_head_with(tx, group, |_, error| error)
+}
+
+pub(in crate::db::redb) fn turn_head_with<E>(
+    tx: &impl TxRead,
+    group: JobId,
+    decode_error: impl Fn(JobId, StorageError) -> E,
+) -> Result<Option<JobId>, E>
+where
+    E: From<StorageError> + From<::redb::StorageError> + From<::redb::TableError>,
+{
     let turns = tx.table(TURNS)?;
     let jobs = tx.table(JOBS)?;
+    let children = tx.table(CHILDREN)?;
     for entry in turns
         .range((group.get(), 0)..=(group.get(), u128::MAX))?
         .rev()
     {
         let id = entry?.0.value().1;
-        let row = jobs
-            .get(id)?
-            .ok_or_else(|| StorageError::corrupted("turn has no source Job"))?;
-        let job = crate::db::redb::jobs::decode_mutable_job(id, row.value())?;
+        let row = jobs.get(id)?.ok_or_else(|| {
+            StorageError::corrupted(format!(
+                "turn index of {group} references missing {}",
+                JobId::new(id)
+            ))
+        })?;
+        let job = crate::db::redb::jobs::decode_mutable_job(id, row.value())
+            .map_err(|error| decode_error(JobId::new(id), error))?;
+        if job.parent_id != group
+            || job.phase == MutableJobPhase::Unsubmitted
+            || job.summary_source.is_some()
+            || children.get((group.get(), id))?.is_none()
+        {
+            return Err(StorageError::corrupted(format!(
+                "turn index of {group} disagrees with {}",
+                job.id
+            ))
+            .into());
+        }
         if project_planning_target(tx, &job)?.is_none() {
             return Ok(Some(job.id));
         }

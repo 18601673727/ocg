@@ -5,7 +5,7 @@ use crate::db::entities::{ContentDigest, OperationId};
 use crate::db::errors::{DatabaseError, MaintenanceError};
 use crate::db::protection::{ProtectionCell, ProtectionLock};
 use crate::db::redb;
-use crate::db::redb::{Probe, StorageError};
+use crate::db::redb::{Probe, StorageError, StorageErrorKind};
 use crate::db::scheduler_wake::{SchedulerWake, SchedulerWakeSubscription};
 use crate::host::data_directory::DataDirectory;
 use ::redb::Database;
@@ -95,6 +95,7 @@ pub(super) struct Shared {
     pub(super) credential_key_writer: std::sync::Mutex<()>,
     pub(super) undecryptable_credentials_at_open: u64,
     pub(super) open_warnings_logged: AtomicBool,
+    pub(super) needs_full_verification: AtomicBool,
     pub(super) native_resources: Arc<RwLock<redb::NativeResourceCatalog>>,
 }
 
@@ -103,6 +104,12 @@ pub(super) fn flush_staged(_shared: &Shared, database: &Database) -> Result<u64,
 }
 
 impl Shared {
+    pub(super) fn note_read_error(&self, error: &StorageError) {
+        if error.kind == StorageErrorKind::Corrupted {
+            self.needs_full_verification.store(true, Ordering::SeqCst);
+        }
+    }
+
     pub(super) fn record_durable_commit(&self, commit_us: u64) {
         self.durable_commits.fetch_add(1, Ordering::SeqCst);
         self.commit_us_total.fetch_add(commit_us, Ordering::Relaxed);

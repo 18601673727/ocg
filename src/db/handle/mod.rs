@@ -169,7 +169,10 @@ impl DatabaseHandle {
             return Err(DatabaseError::ShuttingDown);
         }
         let opened = database.as_ref().ok_or(DatabaseError::ReadsClosed)?;
-        let counts = redb::queue_counts(&opened.database, true).map_err(DatabaseError::Read)?;
+        let counts = redb::queue_counts(&opened.database, true).map_err(|error| {
+            self.shared.note_read_error(&error);
+            DatabaseError::Read(error)
+        })?;
         if counts.pending != 0
             || counts.ready != 0
             || counts.delayed != 0
@@ -312,8 +315,14 @@ impl DatabaseHandle {
             if *stopped {
                 return Err(DatabaseError::ReadPoolStopped);
             }
+            let shared = self.shared.clone();
             let job: ReadJob = Box::new(move |opened| {
-                let result = opened.and_then(|opened| read(opened).map_err(DatabaseError::Read));
+                let result = opened.and_then(|opened| {
+                    read(opened).map_err(|error| {
+                        shared.note_read_error(&error);
+                        DatabaseError::Read(error)
+                    })
+                });
                 reply.send(result).ok();
             });
             ReadMessage::Run(job)

@@ -1,5 +1,8 @@
 use super::catalog::global_compaction_settings;
-use crate::db::entities::{AllocationPhase, ExecutionOperation, OutcomeKind};
+use crate::db::entities::{
+    AllocationPhase, ExecutionOperation, JobSpec, JobState, MutableJob, MutableJobPhase,
+    OutcomeKind,
+};
 use crate::db::entities::{
     AttachmentId, AttachmentRecord, ContentDigest, DevelopmentCandidate, DevelopmentContextTurn,
     DevelopmentDecisionContext, DevelopmentExecutionContext, DevelopmentRetainedInput, JobId,
@@ -135,14 +138,18 @@ impl NativeSourceError {
         }
     }
 
+    // Use only for payload decoders of Job-owned rows. Index and cross-record
+    // checks, shared rows and redb errors go through the Storage conversion.
+    pub(crate) fn payload_error(job: JobId, error: StorageError) -> Self {
+        if error.kind == super::StorageErrorKind::Corrupted {
+            Self::malformed(job, error.detail)
+        } else {
+            Self::Storage(error)
+        }
+    }
+
     pub(crate) fn decoded<T>(job: JobId, decoded: Result<T, StorageError>) -> Result<T, Self> {
-        decoded.map_err(|error| {
-            if error.kind == crate::db::redb::StorageErrorKind::Corrupted {
-                Self::malformed(job, error.detail)
-            } else {
-                Self::Storage(error)
-            }
-        })
+        decoded.map_err(|error| Self::payload_error(job, error))
     }
 }
 
@@ -167,6 +174,74 @@ impl From<::redb::TableError> for NativeSourceError {
 pub(crate) struct SummaryBudget {
     pub(crate) bytes: usize,
     pub(crate) outputs: usize,
+}
+
+pub(in crate::db::redb) fn summary_turn_head(
+    tx: &impl crate::db::redb::TxRead,
+    conversation: JobId,
+) -> Result<Option<JobId>, NativeSourceError> {
+    super::jobs::turn_head_with(tx, conversation, NativeSourceError::payload_error)
+}
+
+fn check_summary_history_job(job: &MutableJob, conversation: JobId) -> Result<(), StorageError> {
+    if job.parent_id != conversation || job.phase == MutableJobPhase::Unsubmitted {
+        return Err(StorageError::corrupted(format!(
+            "{} is outside the submitted history of {conversation}",
+            job.id
+        )));
+    }
+    Ok(())
+}
+
+pub(in crate::db::redb) fn summary_history_job(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    job: JobId,
+    conversation: JobId,
+) -> Result<MutableJob, NativeSourceError> {
+    let row = jobs.get(job.get())?.ok_or_else(|| {
+        StorageError::corrupted(format!(
+            "summary history of {conversation} references missing {job}"
+        ))
+    })?;
+    let job = NativeSourceError::decoded(job, jobs::decode_mutable_job(job.get(), row.value()))?;
+    check_summary_history_job(&job, conversation)?;
+    Ok(job)
+}
+
+pub(in crate::db::redb) fn summary_child_job(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    groups: &impl ReadableTable<u128, &'static [u8]>,
+    conversation: JobId,
+    child: JobId,
+) -> Result<Option<MutableJob>, NativeSourceError> {
+    if let Some(row) = jobs.get(child.get())? {
+        let job =
+            NativeSourceError::decoded(child, jobs::decode_mutable_job(child.get(), row.value()))?;
+        check_summary_history_job(&job, conversation)?;
+        return Ok(Some(job));
+    }
+    let group = groups.get(child.get())?.ok_or_else(|| {
+        StorageError::corrupted(format!(
+            "child index of {conversation} references missing {child}"
+        ))
+    })?;
+    if JobSpec::decode_at(child.get(), group.value())?.parent_id != Some(conversation) {
+        return Err(StorageError::corrupted(format!(
+            "child index of {conversation} disagrees with Group {child}"
+        ))
+        .into());
+    }
+    Ok(None)
+}
+
+pub(in crate::db::redb) fn summary_job_state(
+    states: &impl ReadableTable<u128, &'static [u8]>,
+    job: JobId,
+) -> Result<JobState, NativeSourceError> {
+    let row = states.get(job.get())?.ok_or_else(|| {
+        StorageError::corrupted(format!("summary source {job} runtime is missing"))
+    })?;
+    NativeSourceError::decoded(job, state::decode_state(job.get(), row.value()))
 }
 
 impl SummaryBudget {
@@ -219,31 +294,42 @@ fn native_summary_owner(
     budget: &mut SummaryBudget,
 ) -> Result<(), NativeSourceError> {
     let job = allocation.token.job;
-    let pool = pools
-        .get(allocation.token.pool.get())?
-        .ok_or_else(|| NativeSourceError::malformed(job, "Allocation Pool is missing"))?;
+    let pool = pools.get(allocation.token.pool.get())?.ok_or_else(|| {
+        StorageError::corrupted(format!(
+            "{job} Allocation references missing {}",
+            allocation.token.pool
+        ))
+    })?;
     let executor = executors
         .get(allocation.token.executor.get())?
-        .ok_or_else(|| NativeSourceError::malformed(job, "Allocation Executor is missing"))?;
+        .ok_or_else(|| {
+            StorageError::corrupted(format!(
+                "{job} Allocation references missing {}",
+                allocation.token.executor
+            ))
+        })?;
+    let pool_row = allocations::decode_allocation_pool(allocation.token.pool.get(), pool.value())?;
+    let executor_row =
+        allocations::decode_allocation_executor(allocation.token.executor.get(), executor.value())?;
+    let supports_operation = executor_row
+        .capabilities
+        .contains(&(allocation.operation, allocation.protocol));
+    if executor_row.pool != pool_row.id
+        || pool_row.revision < allocation.pool_revision
+        || executor_row.revision < allocation.executor_revision
+        || (executor_row.revision == allocation.executor_revision && !supports_operation)
+    {
+        return Err(StorageError::corrupted(format!(
+            "{job} Allocation ownership disagrees with {} and {}",
+            pool_row.id, executor_row.id
+        ))
+        .into());
+    }
     budget.bytes(pool.value().len())?;
     budget.bytes(executor.value().len())?;
-    let pool = NativeSourceError::decoded(
-        job,
-        allocations::decode_allocation_pool(allocation.token.pool.get(), pool.value()),
-    )?;
-    let executor = NativeSourceError::decoded(
-        job,
-        allocations::decode_allocation_executor(allocation.token.executor.get(), executor.value()),
-    )?;
-    if executor.pool != pool.id
-        || pool.revision < allocation.pool_revision
-        || executor.revision < allocation.executor_revision
-        || !executor
-            .capabilities
-            .contains(&(allocation.operation, allocation.protocol))
-    {
+    if !supports_operation {
         return Err(NativeSourceError::Unavailable(
-            "summary allocation ownership is inconsistent",
+            "summary Executor no longer supports the source operation",
         ));
     }
     Ok(())
@@ -276,7 +362,6 @@ where
     P: ReadableTable<u128, &'static [u8]>,
     E: ReadableTable<u128, &'static [u8]>,
 {
-    use crate::db::entities::MutableJobPhase;
     use aws_lc_rs::digest::{Context, SHA256};
     let jobs = &tables.jobs;
     let states = &tables.states;
@@ -284,16 +369,19 @@ where
     let attachments = &tables.attachments;
     let outputs = &tables.outputs;
     let tools = &tables.tools;
-    let job_bytes = jobs
-        .get(id.get())?
-        .ok_or_else(|| NativeSourceError::malformed(id, "source Job is missing"))?;
-    let state_bytes = states
-        .get(id.get())?
-        .ok_or_else(|| NativeSourceError::malformed(id, "source runtime is missing"))?;
+    let job_bytes = jobs.get(id.get())?.ok_or_else(|| {
+        StorageError::corrupted(format!(
+            "summary history of {conversation} references missing {id}"
+        ))
+    })?;
+    let state_bytes = states.get(id.get())?.ok_or_else(|| {
+        StorageError::corrupted(format!("summary source {id} runtime is missing"))
+    })?;
     budget.bytes(job_bytes.value().len())?;
     budget.bytes(state_bytes.value().len())?;
     let job =
         NativeSourceError::decoded(id, jobs::decode_mutable_job(id.get(), job_bytes.value()))?;
+    check_summary_history_job(&job, conversation)?;
     if matches!(
         job.input.content,
         crate::db::entities::MutableJobContent::Decision { .. }
@@ -303,32 +391,26 @@ where
         ));
     }
     let state = NativeSourceError::decoded(id, state::decode_state(id.get(), state_bytes.value()))?;
-    if job.phase != MutableJobPhase::Executing {
+    if job.phase != MutableJobPhase::Executing || !state.confirmed_terminal() {
         return Err(NativeSourceError::Unavailable(
-            "summary source Job never started",
+            "summary source Job has no settled execution",
         ));
     }
-    let allocation_bytes = allocations
-        .get(id.get())?
-        .ok_or_else(|| NativeSourceError::malformed(id, "source Allocation is missing"))?;
+    let allocation_bytes = allocations.get(id.get())?.ok_or_else(|| {
+        StorageError::corrupted(format!("settled summary source {id} has no Allocation"))
+    })?;
+    let allocation = allocations::decode_pool_allocation(id.get(), allocation_bytes.value())?;
     budget.bytes(allocation_bytes.value().len())?;
-    let allocation = NativeSourceError::decoded(
-        id,
-        allocations::decode_pool_allocation(id.get(), allocation_bytes.value()),
-    )?;
-    if job.parent_id != conversation
-        || job.summary_source.is_some()
+    if allocation.phase != AllocationPhase::Released || allocation.job_revision != job.revision {
+        return Err(StorageError::corrupted(format!(
+            "{id} Allocation contradicts its settled Job"
+        ))
+        .into());
+    }
+    if job.summary_source.is_some()
         || job.context_selection != crate::db::entities::MutableContextSelection::FullHistory
-        || !state.outcome.as_ref().is_some_and(|o| {
-            matches!(
-                o.kind,
-                OutcomeKind::Completed | OutcomeKind::Failed | OutcomeKind::Cancelled
-            )
-        })
-        || allocation.phase != AllocationPhase::Released
         || allocation.stop_confirmed_at.is_some()
         || allocation.stop_proof.is_some()
-        || allocation.job_revision != job.revision
         || allocation.operation != ExecutionOperation::LlmRequest
         || !job
             .frozen
@@ -364,14 +446,12 @@ where
     native_summary_frame(&mut hash, budget, allocation_bytes.value())?;
     for attachment_id in job.input.attachments() {
         let bytes = attachments.get(attachment_id.get())?.ok_or_else(|| {
-            NativeSourceError::malformed(
-                id,
-                format!("source attachment {attachment_id} is missing"),
-            )
+            StorageError::corrupted(format!(
+                "summary source {id} references missing {attachment_id}"
+            ))
         })?;
+        let attachment = decode_attachment(attachment_id.get(), bytes.value())?;
         native_summary_frame(&mut hash, budget, bytes.value())?;
-        let attachment =
-            NativeSourceError::decoded(id, decode_attachment(attachment_id.get(), bytes.value()))?;
         if !attachment.is_available() {
             return Err(NativeSourceError::Unavailable(
                 "summary source attachment unavailable",
@@ -439,13 +519,70 @@ where
     ))
 }
 
+/// Why a published summary could not be verified.
+///
+/// `Corrupt` is confined to rows the producer Job owns: its payload no longer
+/// decodes, so that one summary is unusable. Batch callers isolate it, record
+/// that storage verification is due, and continue with other work. Read-only
+/// projections cannot record that, so they surface it as `Storage`.
+///
+/// `Storage` covers everything else: a missing referenced row, an index or
+/// cross-record disagreement, and damage to shared `MESSAGES`, `POOLS` or
+/// `EXECUTORS`. Those stay fail-closed because they are not confined to the
+/// summary being verified.
+pub(crate) enum SummarySourceError {
+    Corrupt { producer: JobId, detail: String },
+    Storage(StorageError),
+}
+
+impl SummarySourceError {
+    // Only payload decoders of Job-owned rows qualify; see the variant docs.
+    fn payload(producer: JobId, error: StorageError) -> Self {
+        if error.kind == super::StorageErrorKind::Corrupted {
+            Self::Corrupt {
+                producer,
+                detail: error.detail,
+            }
+        } else {
+            Self::Storage(error)
+        }
+    }
+
+    pub(crate) fn into_storage(self) -> StorageError {
+        match self {
+            Self::Corrupt { producer, detail } => {
+                StorageError::corrupted(format!("summary source {producer} is corrupt: {detail}"))
+            }
+            Self::Storage(error) => error,
+        }
+    }
+}
+
+impl From<StorageError> for SummarySourceError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+impl From<::redb::StorageError> for SummarySourceError {
+    fn from(error: ::redb::StorageError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
+impl From<::redb::TableError> for SummarySourceError {
+    fn from(error: ::redb::TableError) -> Self {
+        Self::Storage(error.into())
+    }
+}
+
 pub(super) fn verify_native_summary_in(
     rx: &ReadTransaction,
     conversation: JobId,
     consumer: JobId,
     producer: JobId,
     source: ContentDigest,
-) -> Result<VerifiedNativeSummary, StorageError> {
+) -> Result<Option<VerifiedNativeSummary>, SummarySourceError> {
     verify_native_summary_tables(
         &rx.open_table(JOBS)?,
         &rx.open_table(JOB_RUNTIME)?,
@@ -468,7 +605,7 @@ pub(crate) fn verify_native_summary_tables<J, S, O, M>(
     consumer: JobId,
     producer: JobId,
     source: ContentDigest,
-) -> Result<VerifiedNativeSummary, StorageError>
+) -> Result<Option<VerifiedNativeSummary>, SummarySourceError>
 where
     J: ReadableTable<u128, &'static [u8]>,
     S: ReadableTable<u128, &'static [u8]>,
@@ -476,22 +613,19 @@ where
     M: ReadableTable<&'static [u8], &'static [u8]>,
 {
     if consumer == producer {
-        return Err(context_unavailable(
-            "summary consumer cannot be its own producer",
-        ));
+        return Ok(None);
     }
     let producer_bytes = jobs
         .get(producer.get())?
         .ok_or_else(|| StorageError::corrupted("summary producer missing"))?;
     let producer_job =
-        crate::db::redb::jobs::decode_mutable_job(producer.get(), producer_bytes.value())?;
-    let state = state::decode_state(
-        producer.get(),
-        states
-            .get(producer.get())?
-            .ok_or_else(|| StorageError::corrupted("summary producer state missing"))?
-            .value(),
-    )?;
+        crate::db::redb::jobs::decode_mutable_job(producer.get(), producer_bytes.value())
+            .map_err(|error| SummarySourceError::payload(producer, error))?;
+    let state_bytes = states
+        .get(producer.get())?
+        .ok_or_else(|| StorageError::corrupted("summary producer state missing"))?;
+    let state = state::decode_state(producer.get(), state_bytes.value())
+        .map_err(|error| SummarySourceError::payload(producer, error))?;
     if producer_job.parent_id != conversation
         || producer_job.summary_source != Some(source)
         || !state
@@ -499,9 +633,7 @@ where
             .as_ref()
             .is_some_and(|o| o.kind == OutcomeKind::Completed)
     {
-        return Err(context_unavailable(
-            "summary producer is not authorized and completed",
-        ));
+        return Ok(None);
     }
     let manifest_bytes = messages
         .get(source.as_bytes().as_slice())?
@@ -511,16 +643,15 @@ where
             .map_err(|_| StorageError::corrupted("malformed summary manifest"))?;
     manifest.validate().map_err(StorageError::corrupted)?;
     if manifest.conversation != conversation {
-        return Err(context_unavailable(
-            "summary manifest has an unsupported scope",
-        ));
+        return Err(StorageError::corrupted("summary manifest names another conversation").into());
     }
     let output = outputs
         .range((producer.get(), 0)..=(producer.get(), u32::MAX))?
         .next_back()
         .transpose()?
         .map(|(k, b)| decode_output(k.value(), b.value()))
-        .transpose()?
+        .transpose()
+        .map_err(|error| SummarySourceError::payload(producer, error))?
         .filter(|o| o.kind == OutputKind::Result)
         .ok_or_else(|| StorageError::corrupted("summary producer result missing"))?;
     let link: crate::db::entities::NativeSummaryResultLink = serde_json::from_value(
@@ -528,9 +659,12 @@ where
             .value
             .ok_or_else(|| StorageError::corrupted("summary result link missing"))?,
     )
-    .map_err(|_| StorageError::corrupted("malformed summary result link"))?;
+    .map_err(|_| SummarySourceError::Corrupt {
+        producer,
+        detail: "malformed summary result link".to_owned(),
+    })?;
     if link.source != source {
-        return Err(context_unavailable("summary result source changed"));
+        return Err(StorageError::corrupted("summary result names another source").into());
     }
     let payload = messages
         .get(link.payload.as_bytes().as_slice())?
@@ -539,9 +673,9 @@ where
         .map_err(|_| StorageError::corrupted("malformed summary payload"))?;
     summary.validate().map_err(StorageError::corrupted)?;
     if summary.source != source {
-        return Err(context_unavailable("summary payload names another source"));
+        return Err(StorageError::corrupted("summary payload names another source").into());
     }
-    Ok(VerifiedNativeSummary { manifest, summary })
+    Ok(Some(VerifiedNativeSummary { manifest, summary }))
 }
 
 pub(crate) fn read_trial_job(
@@ -630,7 +764,9 @@ fn development_candidate_in(
     let adopted_summary = match record.job.context_selection {
         crate::db::entities::MutableContextSelection::FullHistory => None,
         crate::db::entities::MutableContextSelection::AdoptedSummary { producer, source } => Some(
-            verify_native_summary_in(rx, record.job.parent_id, record.job.id, producer, source)?,
+            verify_native_summary_in(rx, record.job.parent_id, record.job.id, producer, source)
+                .map_err(SummarySourceError::into_storage)?
+                .ok_or_else(|| context_unavailable("adopted summary is unavailable"))?,
         ),
     };
     let pools = rx.open_table(POOLS)?;

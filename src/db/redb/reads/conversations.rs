@@ -14,7 +14,7 @@ use crate::db::entities::{
 use crate::db::redb::allocations::pools_offering_capability;
 use crate::db::redb::batch::{BatchError, Failure};
 use crate::db::redb::configs::ConfigurationResolver;
-use crate::db::redb::reads::execution_context::verify_native_summary_in;
+use crate::db::redb::reads::execution_context::{SummarySourceError, verify_native_summary_in};
 use crate::db::redb::reads::jobs::{
     active_job_in, first_entry_text, mutable_job_details_in, mutable_job_record_in,
     project_planning_target, read_conversation_row, read_job_lifecycle, read_state, turn_first,
@@ -656,15 +656,19 @@ pub(crate) fn read_context_state(
             continue;
         };
         let state = read_state(&rx, child_id)?;
-        let manifest_bytes = rx.open_table(MESSAGES)?.get(source.as_bytes().as_slice())?;
-        let Some(manifest_bytes) = manifest_bytes else {
-            continue;
-        };
-        let Ok(manifest) = serde_json::from_slice::<crate::db::entities::NativeSummaryManifest>(
+        let manifest_bytes = rx
+            .open_table(MESSAGES)?
+            .get(source.as_bytes().as_slice())?
+            .ok_or_else(|| {
+                StorageError::corrupted(format!("summary manifest for {child_id} is missing"))
+            })?;
+        let manifest = serde_json::from_slice::<crate::db::entities::NativeSummaryManifest>(
             manifest_bytes.value(),
-        ) else {
-            continue;
-        };
+        )
+        .map_err(|_| {
+            StorageError::corrupted(format!("summary manifest for {child_id} is malformed"))
+        })?;
+        manifest.validate().map_err(StorageError::corrupted)?;
         let (Some(first_b), Some(last_b)) = (manifest.sources.first(), manifest.sources.last())
         else {
             continue;
@@ -682,7 +686,9 @@ pub(crate) fn read_context_state(
                 if adopted_producer == Some(child_id) {
                     "adopted"
                 } else if let Some(t) = tip
-                    && verify_native_summary_in(&rx, conversation, t, child_id, source).is_ok()
+                    && verify_native_summary_in(&rx, conversation, t, child_id, source)
+                        .map_err(SummarySourceError::into_storage)?
+                        .is_some()
                 {
                     "completed"
                 } else {

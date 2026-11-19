@@ -1427,22 +1427,40 @@ fn preflight(
 
 fn initialize(database: &Database, fresh: bool) -> Result<u64, StorageError> {
     reservations::init_promotion_clock(Timestamp::now().as_unix_micros());
-    let mut excluded = std::collections::BTreeSet::new();
+    let mut deferred_groups = std::collections::BTreeSet::new();
     let batch = loop {
         let mut batch = initialize_batch(database, fresh)?;
-        match settle::settle_startup(&mut batch, &excluded) {
+        match settle::settle_startup(&mut batch, &deferred_groups) {
             Ok(()) => break batch,
-            Err(settle::StartupSettlementError::Storage(error)) => return Err(error),
-            Err(settle::StartupSettlementError::Rejected(target, reason)) => {
+            Err(settle::StartupSettlementError::Storage(error)) => {
+                if let Err(abort) = batch.tx.abort() {
+                    let mut abort = StorageError::from(abort);
+                    abort.detail = format!(
+                        "{error}; startup transaction abort failed: {}",
+                        abort.detail
+                    );
+                    return Err(abort);
+                }
+                return Err(error);
+            }
+            Err(settle::StartupSettlementError::ClosingGroupRejected(group, reason)) => {
                 // A settlement can reject after writing. Retry from the committed
-                // snapshot so the excluded object keeps its facts and ownership.
-                batch.tx.abort()?;
-                if !excluded.insert(target) {
+                // snapshot so the deferred Group keeps its facts and ownership.
+                if let Err(abort) = batch.tx.abort() {
+                    let mut abort = StorageError::from(abort);
+                    abort.detail = format!(
+                        "startup settlement of closing Chunk Group {group} was rejected ({reason}); startup transaction abort failed: {}",
+                        abort.detail
+                    );
+                    return Err(abort);
+                }
+                if !deferred_groups.insert(group) {
                     return Err(StorageError::corrupted(format!(
-                        "startup settlement attempted excluded object {target:?}"
+                        "startup settlement attempted deferred closing Chunk Group {group}"
                     )));
                 }
-                eprintln!("OCG startup settlement deferred {target:?}: {reason}");
+                log::error!("startup settlement deferred closing Chunk Group {group}: {reason}");
+                eprintln!("OCG startup settlement deferred closing Chunk Group {group}: {reason}");
             }
         }
     };

@@ -1,4 +1,6 @@
-use super::reads::execution_context::NativeSourceError;
+use super::reads::execution_context::{
+    NativeSourceError, summary_child_job, summary_history_job, summary_job_state, summary_turn_head,
+};
 use super::{StorageError, TxRead, jobs};
 use crate::db::entities::ToolCallRef;
 use crate::db::entities::{
@@ -23,16 +25,6 @@ use crate::db::redb::schema::{
 use crate::db::redb::{allocations, indexes, reads, reservations, rows, state};
 use ::redb::ReadableTable;
 use ::redb::ReadableTableMetadata;
-
-fn summary_source_job(
-    jobs: &impl ReadableTable<u128, &'static [u8]>,
-    job: JobId,
-) -> Result<crate::db::entities::MutableJob, NativeSourceError> {
-    let row = jobs
-        .get(job.get())?
-        .ok_or_else(|| NativeSourceError::malformed(job, "source Job is missing"))?;
-    NativeSourceError::decoded(job, jobs::decode_mutable_job(job.get(), row.value()))
-}
 
 impl Batch {
     pub(crate) fn request_compaction(
@@ -176,7 +168,7 @@ impl Batch {
             );
         }
         let active = self.active_job(conversation)?;
-        let tip = self.group_head(conversation)?;
+        let tip = self.read_summary_source(|tx| summary_turn_head(tx, conversation))?;
         let Some(mut through) = tip else {
             return Ok(crate::db::entities::CompactionRequest::Noop {
                 reason: "no settled source",
@@ -184,15 +176,8 @@ impl Batch {
         };
         loop {
             let (candidate, state) = self.read_summary_source(|tx| {
-                let candidate = summary_source_job(&tx.table(JOBS)?, through)?;
-                let states = tx.table(JOB_RUNTIME)?;
-                let row = states.get(through.get())?.ok_or_else(|| {
-                    NativeSourceError::malformed(through, "source runtime is missing")
-                })?;
-                let state = NativeSourceError::decoded(
-                    through,
-                    state::decode_state(through.get(), row.value()),
-                )?;
+                let candidate = summary_history_job(&tx.table(JOBS)?, through, conversation)?;
+                let state = summary_job_state(&tx.table(JOB_RUNTIME)?, through)?;
                 Ok((candidate, state))
             })?;
             if candidate.summary_source.is_none()
@@ -212,8 +197,9 @@ impl Batch {
         }
         if let Some(recipe) = &automatic {
             for _ in 0..recipe.preserve_recent_turns {
-                let job =
-                    self.read_summary_source(|tx| summary_source_job(&tx.table(JOBS)?, through))?;
+                let job = self.read_summary_source(|tx| {
+                    summary_history_job(&tx.table(JOBS)?, through, conversation)
+                })?;
                 let Some(prev) = job.previous else {
                     return Ok(crate::db::entities::CompactionRequest::Noop {
                         reason: "recent turns are protected",
@@ -267,7 +253,7 @@ impl Batch {
             let mut text = String::new();
             let mut context_tokens = 0usize;
             for boundary in &boundaries {
-                let job = summary_source_job(&tables.jobs, boundary.job)?;
+                let job = summary_history_job(&tables.jobs, boundary.job, conversation)?;
                 let mut turn_text = format!("User: {}\n", job.input.text());
                 for entry in tables
                     .outputs
@@ -316,6 +302,7 @@ impl Batch {
         let existing = self.read_summary_source(|tx| {
             let children = tx.table(CHILDREN)?;
             let jobs = tx.table(JOBS)?;
+            let groups = tx.table(CONVERSATIONS)?;
             let states = tx.table(JOB_RUNTIME)?;
             let allocations = tx.table(POOL_ALLOCATIONS)?;
             for entry in children
@@ -323,39 +310,32 @@ impl Batch {
                 .rev()
             {
                 let child_id = JobId::new(entry?.0.value().1);
-                let Some(bytes) = jobs.get(child_id.get())? else {
+                let Some(job) = summary_child_job(&jobs, &groups, conversation, child_id)? else {
                     continue;
                 };
-                let job = NativeSourceError::decoded(
-                    child_id,
-                    jobs::decode_mutable_job(child_id.get(), bytes.value()),
-                )?;
                 if job.summary_source != Some(source_digest) {
                     continue;
                 }
-                let row = states.get(child_id.get())?.ok_or_else(|| {
-                    NativeSourceError::malformed(child_id, "summary producer runtime is missing")
-                })?;
-                let state = NativeSourceError::decoded(
-                    child_id,
-                    state::decode_state(child_id.get(), row.value()),
-                )?;
+                let state = summary_job_state(&states, child_id)?;
                 match state.outcome.as_ref().map(|o| o.kind) {
                     None => return Ok(Some(child_id)),
                     Some(OutcomeKind::Completed) => {
-                        let released = allocations
-                            .get(child_id.get())?
-                            .map(|b| {
-                                NativeSourceError::decoded(
-                                    child_id,
-                                    allocations::decode_pool_allocation(child_id.get(), b.value()),
-                                )
-                            })
-                            .transpose()?
-                            .is_some_and(|a| a.phase == AllocationPhase::Released);
-                        if released {
-                            return Ok(Some(child_id));
+                        let row = allocations.get(child_id.get())?.ok_or_else(|| {
+                            StorageError::corrupted(format!(
+                                "completed summary producer {child_id} has no Allocation"
+                            ))
+                        })?;
+                        let allocation =
+                            allocations::decode_pool_allocation(child_id.get(), row.value())?;
+                        if allocation.phase != AllocationPhase::Released
+                            || allocation.job_revision != job.revision
+                        {
+                            return Err(StorageError::corrupted(format!(
+                                "completed summary producer {child_id} contradicts its Allocation"
+                            ))
+                            .into());
                         }
+                        return Ok(Some(child_id));
                     }
                     Some(OutcomeKind::Failed | OutcomeKind::Cancelled | OutcomeKind::Unknown) => {}
                 }

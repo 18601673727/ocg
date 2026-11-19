@@ -9,11 +9,12 @@ use crate::db::entities::{
 };
 use crate::db::handoff::DevelopmentUsageCheckpoint;
 use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
-use crate::db::redb::jobs::{decode_mutable_job, encode_mutable_job};
+use crate::db::redb::jobs::encode_mutable_job;
+use crate::db::redb::reads::execution_context::summary_child_job;
 use crate::db::redb::rows::encode_output;
 use crate::db::redb::schema::{
-    CHILDREN, JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MESSAGES, META, REQUEST_EVENTS,
-    REQUEST_TIMELINE, TOOL_CALLS, USAGE_TOTALS,
+    CHILDREN, CONVERSATIONS, JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MESSAGES, META,
+    REQUEST_EVENTS, REQUEST_TIMELINE, TOOL_CALLS, USAGE_TOTALS,
 };
 use crate::db::redb::{indexes, reads, rows, state};
 use ::redb::ReadableTable;
@@ -1172,19 +1173,19 @@ impl Batch {
         conversation: JobId,
         consumer: JobId,
     ) -> Result<Option<(JobId, ContentDigest)>, BatchError> {
-        let candidates = self.step(|tx| {
+        let candidates = self.read_summary_source(|tx| {
             let children = tx.open_table(CHILDREN)?;
             let jobs = tx.open_table(JOBS)?;
+            let groups = tx.open_table(CONVERSATIONS)?;
             let mut found = Vec::new();
             for entry in children
                 .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
                 .rev()
             {
                 let child_id = JobId::new(entry?.0.value().1);
-                let Some(bytes) = jobs.get(child_id.get())? else {
+                let Some(child) = summary_child_job(&jobs, &groups, conversation, child_id)? else {
                     continue;
                 };
-                let child = decode_mutable_job(child_id.get(), bytes.value())?;
                 if let Some(source) = child.summary_source {
                     found.push((child_id, source));
                     if found.len() >= 8 {
@@ -1195,8 +1196,8 @@ impl Batch {
             Ok(found)
         })?;
         for (producer, source) in candidates {
-            let ok = self.step(|tx| {
-                Ok(reads::execution_context::verify_native_summary_tables(
+            let verified = self.verify_summary_source(|tx| {
+                reads::execution_context::verify_native_summary_tables(
                     &tx.open_table(JOBS)?,
                     &tx.open_table(JOB_RUNTIME)?,
                     &tx.open_table(JOB_OUTPUTS)?,
@@ -1206,9 +1207,8 @@ impl Batch {
                     producer,
                     source,
                 )
-                .is_ok())
             })?;
-            if ok {
+            if verified.is_some() {
                 return Ok(Some((producer, source)));
             }
         }

@@ -1,4 +1,4 @@
-use super::{StorageError, StorageErrorKind, execution};
+use super::{StorageError, execution};
 use crate::db::entities::{
     Appended, AttachmentId, ConfigId, ExecutionConfiguration, ExecutionEventKind,
     ExecutionOperation, FrozenConfiguration, FrozenDecisionConfig, JobId, JobLifecycle, JobSpec,
@@ -463,7 +463,13 @@ pub(super) fn is_predictive_helper(
     }
     // System Decisions can be non-Turn children. Public Decisions always become Turns.
     let key = (job.parent_id.get(), job.id.get());
-    if tx.table(TURNS)?.get(key)?.is_some() || tx.table(CHILDREN)?.get(key)?.is_none() {
+    if tx.table(CHILDREN)?.get(key)?.is_none() {
+        return Err(StorageError::corrupted(format!(
+            "predictive Decision {} is missing its membership in {}",
+            job.id, job.parent_id
+        )));
+    }
+    if tx.table(TURNS)?.get(key)?.is_some() {
         return Ok(false);
     }
     let conversations = tx.table(CONVERSATIONS)?;
@@ -636,9 +642,16 @@ impl Batch {
         let MutableContextSelection::AdoptedSummary { producer, source } = selection else {
             return Ok(true);
         };
-        self.step(|tx| {
-            match reads::execution_context::verify_native_summary_tables(
-                &tx.open_table(JOBS)?,
+        // A stored selection naming a missing producer is a broken reference,
+        // so it must stay fail-closed. A candidate borrowed for a prospective
+        // selection only has to be usable.
+        let verified = self.verify_summary_source(|tx| {
+            let jobs = tx.open_table(JOBS)?;
+            if selection != job.context_selection && jobs.get(producer.get())?.is_none() {
+                return Ok(None);
+            }
+            reads::execution_context::verify_native_summary_tables(
+                &jobs,
                 &tx.open_table(JOB_RUNTIME)?,
                 &tx.open_table(JOB_OUTPUTS)?,
                 &tx.open_table(MESSAGES)?,
@@ -646,19 +659,9 @@ impl Batch {
                 job.id,
                 producer,
                 source,
-            ) {
-                Ok(_) => Ok(true),
-                Err(error)
-                    if matches!(
-                        error.kind,
-                        StorageErrorKind::Other | StorageErrorKind::Corrupted
-                    ) =>
-                {
-                    Ok(false)
-                }
-                Err(error) => Err(error),
-            }
-        })
+            )
+        })?;
+        Ok(verified.is_some())
     }
 
     pub(super) fn store_mutable_job(

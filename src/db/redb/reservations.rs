@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use super::{
-    StorageError, StorageErrorKind, execution,
+    StorageError, execution,
     scheduled_external::{ScheduledPolicies, ScheduledPolicyMatch},
 };
 use crate::db::entities::{
@@ -643,30 +643,22 @@ impl Batch {
                     if source != summary.summary.source {
                         return Err(stale());
                     }
-                    let current =
-                        self.step(
-                            |tx| match reads::execution_context::verify_native_summary_tables(
-                                &tx.open_table(JOBS)?,
-                                &tx.open_table(JOB_RUNTIME)?,
-                                &tx.open_table(JOB_OUTPUTS)?,
-                                &tx.open_table(MESSAGES)?,
-                                job.parent_id,
-                                job.id,
-                                producer,
-                                source,
-                            ) {
-                                Ok(value) => Ok(Some(value)),
-                                Err(error)
-                                    if matches!(
-                                        error.kind,
-                                        StorageErrorKind::Other | StorageErrorKind::Corrupted
-                                    ) =>
-                                {
-                                    Ok(None)
-                                }
-                                Err(error) => Err(error),
-                            },
-                        )?;
+                    // A prepared handoff is a durability promise: if its source
+                    // can no longer be verified the preparation is unusable, and
+                    // the damage must surface instead of being reported as staleness.
+                    let current = self.step(|tx| {
+                        reads::execution_context::verify_native_summary_tables(
+                            &tx.open_table(JOBS)?,
+                            &tx.open_table(JOB_RUNTIME)?,
+                            &tx.open_table(JOB_OUTPUTS)?,
+                            &tx.open_table(MESSAGES)?,
+                            job.parent_id,
+                            job.id,
+                            producer,
+                            source,
+                        )
+                        .map_err(reads::execution_context::SummarySourceError::into_storage)
+                    })?;
                     let Some(current) = current else {
                         return Err(stale());
                     };
