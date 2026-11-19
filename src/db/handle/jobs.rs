@@ -72,8 +72,9 @@ impl DatabaseHandle {
         &self,
         before: Option<JobId>,
         limit: usize,
+        archived: bool,
     ) -> Result<crate::db::entities::ConversationsPage, DatabaseError> {
-        self.read(move |database| redb::read_conversations(database, before, limit))
+        self.read(move |database| redb::read_conversations(database, before, limit, archived))
             .await
     }
 
@@ -472,7 +473,7 @@ impl DatabaseHandle {
             (root, edit),
             |(_, edit)| match edit {
                 JobEdit::Title(title) => byte_count(title.len()),
-                JobEdit::Hide | JobEdit::Limits(_) => 16,
+                JobEdit::Hide | JobEdit::Unhide | JobEdit::Limits(_) => 16,
                 JobEdit::CompactionPolicy(policy) => compaction_bytes(policy.as_ref()),
             },
             OperationKind::SetConversation,

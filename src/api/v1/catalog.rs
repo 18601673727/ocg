@@ -873,8 +873,9 @@ pub(super) async fn conversations(
     database: &DatabaseHandle,
     before: Option<JobId>,
     limit: usize,
+    archived: bool,
 ) -> Result<Reply, Refusal> {
-    let page = database.conversations(before, limit).await?;
+    let page = database.conversations(before, limit, archived).await?;
     Ok(Reply::ok(envelope(conversation_page(page))))
 }
 
@@ -1187,6 +1188,7 @@ pub(super) async fn edit_conversation(
             JobEdit::Title(title)
         }
         (None, Some(true), None, None) => JobEdit::Hide,
+        (None, Some(false), None, None) => JobEdit::Unhide,
         (None, None, Some(limits), None) => JobEdit::Limits(limits),
         (None, None, None, Some(_)) => {
             return Err(Refusal::new(

@@ -310,8 +310,9 @@ pub(crate) fn read_conversations(
     database: &Database,
     before: Option<JobId>,
     limit: usize,
+    archived: bool,
 ) -> Result<ConversationsPage, StorageError> {
-    conversation_page(database, before, limit, &[])
+    conversation_page(database, before, limit, &[], archived)
 }
 
 pub(crate) fn read_conversation_search(
@@ -320,7 +321,7 @@ pub(crate) fn read_conversation_search(
     before: Option<JobId>,
     limit: usize,
 ) -> Result<ConversationsPage, StorageError> {
-    conversation_page(database, before, limit, terms)
+    conversation_page(database, before, limit, terms, false)
 }
 
 fn conversation_page(
@@ -328,6 +329,7 @@ fn conversation_page(
     before: Option<JobId>,
     limit: usize,
     terms: &[String],
+    archived: bool,
 ) -> Result<ConversationsPage, StorageError> {
     let rx = read(database)?;
     let groups = rx.open_table(CONVERSATIONS)?;
@@ -341,7 +343,7 @@ fn conversation_page(
         .rev()
         .enumerate()
     {
-        if !terms.is_empty() && examined == 5_000 {
+        if (archived || !terms.is_empty()) && examined == 5_000 {
             has_more = true;
             last = last_examined;
             break;
@@ -354,7 +356,7 @@ fn conversation_page(
             continue;
         }
         let metadata = read_job_lifecycle(&rx, conversation)?;
-        if metadata.hidden_at.is_some() {
+        if metadata.hidden_at.is_some() != archived {
             continue;
         }
         let Some(tip) = turn_head(&rx, conversation)? else {

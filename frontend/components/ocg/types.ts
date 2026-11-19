@@ -14,6 +14,8 @@ export type ChatSession = {
   conversationId?: string;
   jobState?: string;
   hasChildren?: boolean;
+  archived?: boolean;
+  closed?: boolean;
 };
 
 export type MessageRole = "user" | "assistant" | "call" | "tool";

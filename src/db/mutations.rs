@@ -398,6 +398,8 @@ pub(crate) fn set_conversation(batch: &mut Batch, root: JobId, edit: JobEdit) ->
         JobEdit::Title(title) => row.title = Some(title),
         JobEdit::Hide if row.hidden_at.is_some() => return Ok(()),
         JobEdit::Hide => row.hidden_at = Some(batch.now()),
+        JobEdit::Unhide if row.hidden_at.is_none() => return Ok(()),
+        JobEdit::Unhide => row.hidden_at = None,
     }
     batch.put_job_lifecycle(root, &row)
 }

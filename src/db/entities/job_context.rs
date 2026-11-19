@@ -609,6 +609,7 @@ pub enum JobEdit {
     CompactionPolicy(Option<super::CompactionPolicy>),
     Title(String),
     Hide,
+    Unhide,
 }
 
 pub(in crate::db) fn summary_chunks(

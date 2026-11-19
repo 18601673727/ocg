@@ -16,6 +16,7 @@ import type {
   ToolCall,
 } from "../contracts";
 import { ContractError, materializeUserEntries } from "../contracts";
+import type * as Api from "../contracts/api";
 import { fileSnapshots } from "../markdown/file-snapshot";
 import type { ChatMessage, ChatSession, OcgRuntimeEvent } from "../types";
 import {
@@ -33,13 +34,14 @@ import {
   type OutputView,
 } from "./output-history";
 import { RuntimeClientBase } from "./runtime-client-base";
-import type { CreateSessionInput } from "./runtime-types";
+import type { CreateSessionInput, HideSessionOutcome } from "./runtime-types";
 
 const TURN_PAGE_SIZE = 20;
 const CATALOG_REFRESH_DELAY_MS = 750;
 const MAX_RECOVERY_DELAY_MS = 10_000;
 const TOOL_TIME_CACHE_LIMIT = 128;
 const TOOL_TIME_BATCH_SIZE = 4;
+const ARCHIVE_STOP_TIMEOUT_MS = 15_000;
 
 function reuseEvidence<T>(previous: T[], next: T[] | null | undefined): T[] {
   if (!next || next === previous) return previous;
@@ -323,9 +325,13 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     if (this.disposed) return;
     const updates: Promise<string>[] = [];
     const visible = new Set(page.conversations.map((item) => item.root_job));
+    for (const root of this.hiddenRoots) {
+      if (!visible.delete(root)) this.hiddenRoots.delete(root);
+    }
     for (const session of this.getSnapshot().sessions) {
       if (
         session.conversationId &&
+        !session.archived &&
         this.listedRoots.has(session.conversationId) &&
         !visible.has(session.conversationId)
       ) {
@@ -343,7 +349,6 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         item.root_job;
       this.roots.set(item.root_job, id);
       this.unlisted.delete(id);
-      const current = this.getSnapshot().sessions.find((session) => session.id === id);
       const known = this.tips.get(id);
       const local = known ? this.turns.get(known) : undefined;
       // A stale list can arrive after the client has accepted a newer tip.
@@ -355,26 +360,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           (item.tip_created_at_us === local.job.created_at_us && item.tip_job < known))
       )
         continue;
-      this.tips.set(id, item.tip_job);
-      const session: ChatSession = {
-        id,
-        conversationId: item.root_job,
-        jobState: item.job_state,
-        hasChildren: item.has_children,
-        sessionId: item.tip_job,
-        title: item.title,
-        agentProfile: item.agent ?? undefined,
-        llmProfile: current?.llmProfile,
-        reasoningEffort: current?.reasoningEffort,
-        model: current?.model,
-        projectId: item.project ?? undefined,
-        workType: "research",
-        updatedAt: new Date(item.tip_created_at_us / 1000).toISOString(),
-      };
-      this.emit({
-        type: current ? "conversation.session-updated" : "conversation.session-created",
-        session,
-      });
+      this.publishCatalogSession(item, id, false);
       if (known && known !== item.tip_job && local && !this.loading.has(item.tip_job)) {
         updates.push(
           this.openConversation(item.tip_job).catch((error) => {
@@ -389,6 +375,31 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     await Promise.all(updates);
     if (!this.disposed)
       this.emit({ type: "runtime.status-changed", status: { state: "connected" } });
+  }
+
+  private publishCatalogSession(item: Api.Conversation, id: string, archived: boolean) {
+    const current = this.getSnapshot().sessions.find((session) => session.id === id);
+    this.tips.set(id, item.tip_job);
+    this.emit({
+      type: current ? "conversation.session-updated" : "conversation.session-created",
+      session: {
+        id,
+        conversationId: item.root_job,
+        jobState: item.job_state,
+        hasChildren: item.has_children,
+        sessionId: item.tip_job,
+        title: item.title,
+        agentProfile: item.agent ?? undefined,
+        llmProfile: current?.llmProfile,
+        reasoningEffort: current?.reasoningEffort,
+        model: current?.model,
+        projectId: item.project ?? undefined,
+        workType: "research",
+        updatedAt: new Date(item.tip_created_at_us / 1000).toISOString(),
+        archived,
+        closed: item.state !== "open",
+      },
+    });
   }
 
   override async createSession(input: CreateSessionInput): Promise<ChatSession> {
@@ -459,13 +470,54 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     }
   }
 
-  async hideSession(sessionId: string): Promise<void> {
+  private async readArchiveTurns(root: string, signal: AbortSignal) {
+    const unsettled: string[] = [];
+    let before: string | undefined;
+    do {
+      const page = await this.api.readConversationTurns(root, before, 1, signal);
+      const job = page.turns[0]?.job;
+      if (!job || job.settlement.state !== "unsettled") return { unsettled, settled: job };
+      unsettled.push(job.id);
+      before = page.next_before ?? undefined;
+    } while (before);
+    return { unsettled };
+  }
+
+  async hideSession(sessionId: string, stopFirst: boolean): Promise<HideSessionOutcome> {
     const root = this.sessionRoot(sessionId);
     if (this.hiding.has(sessionId)) throw new Error("This conversation is being hidden.");
     this.hiding.add(sessionId);
     try {
+      const signal = AbortSignal.any([
+        this.lifetime.signal,
+        AbortSignal.timeout(ARCHIVE_STOP_TIMEOUT_MS),
+      ]);
+      const { unsettled, settled } = await this.readArchiveTurns(root, signal);
+      if (
+        settled?.settlement.state === "unknown" &&
+        (this.stopAccepted.has(settled.id) || (stopFirst && !unsettled.length))
+      ) {
+        return "stop-unconfirmed";
+      }
+      if (unsettled.length) {
+        if (!stopFirst) return "stop-required";
+        await this.api.stopConversation(root, signal);
+        for (const job of unsettled) this.stopAccepted.add(job);
+        for (const job of unsettled) {
+          let state = await this.api.readExecutionState(job, { signal });
+          while (state.settlement.state === "unsettled" && state.execution_phase !== "unknown") {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            signal.throwIfAborted();
+            state = await this.api.readExecutionState(job, { signal });
+          }
+          if (state.settlement.state === "unknown" || state.execution_phase === "unknown")
+            return "stop-unconfirmed";
+        }
+        if ((await this.readArchiveTurns(root, signal)).unsettled.length) return "stop-required";
+      }
       await this.api.editConversation(root, { hidden: true }, this.lifetime.signal);
       this.hiddenRoots.add(root);
+      this.listedRoots.delete(root);
       this.selections.delete(sessionId);
       this.earlier.delete(sessionId);
       this.loadingEarlier.delete(sessionId);
@@ -476,6 +528,26 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     } finally {
       this.hiding.delete(sessionId);
     }
+  }
+
+  presentArchivedConversation(item: Api.Conversation): void {
+    const root = item.root_job;
+    const id = this.roots.get(root) ?? root;
+    this.roots.set(root, id);
+    this.listedRoots.delete(root);
+    this.unlisted.add(id);
+    this.publishCatalogSession(item, id, true);
+  }
+
+  async restoreConversation(item: Api.Conversation): Promise<void> {
+    const root = item.root_job;
+    await this.api.editConversation(root, { hidden: false }, this.lifetime.signal);
+    this.hiddenRoots.delete(root);
+    const id = this.roots.get(root) ?? root;
+    this.roots.set(root, id);
+    this.unlisted.delete(id);
+    const current = this.getSnapshot().sessions.find((session) => session.id === id);
+    if (!current || current.archived) this.publishCatalogSession(item, id, false);
   }
 
   setChatSelection(sessionId: string, selection: ChatModelSelection) {
@@ -545,12 +617,11 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
 
   private async readConversation(job: string): Promise<string> {
     const root = await this.api.resolveConversation(job, this.lifetime.signal);
-    const page = await this.api.readConversationTurns(
-      root,
-      undefined,
-      TURN_PAGE_SIZE,
-      this.lifetime.signal,
-    );
+    const signal = this.lifetime.signal;
+    const [page, state] = await Promise.all([
+      this.api.readConversationTurns(root, undefined, TURN_PAGE_SIZE, signal),
+      this.roots.has(root) ? undefined : this.api.readExecutionState(root, { signal }),
+    ]);
     const conversation = { ...page, turns: [...page.turns].reverse() };
     const hiddenBefore = this.hiddenRoots.has(root);
     const id = this.roots.get(root) ?? root;
@@ -570,10 +641,17 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           title: conversation.turns[0]?.input.objective?.slice(0, 80) || "Conversation",
           workType: "research",
           updatedAt: new Date().toISOString(),
+          archived: state?.hidden_at_us != null,
+          closed:
+            state !== undefined &&
+            (state.closing_at_us !== null || state.settlement.state !== "unsettled"),
         },
       });
     }
-    const isCurrent = () => !this.disposed && (hiddenBefore || !this.hiddenRoots.has(root));
+    const isCurrent = () =>
+      !this.disposed &&
+      this.roots.get(root) === id &&
+      (hiddenBefore || !this.hiddenRoots.has(root));
     const held = new Set(
       [...this.turns.values()].filter((turn) => turn.sessionId === id).map((turn) => turn.job.id),
     );
@@ -585,7 +663,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         this.turns.set(turn.job.id, loaded.state);
       }),
     );
-    if (this.disposed || (!hiddenBefore && this.hiddenRoots.has(root))) return id;
+    if (!isCurrent()) return id;
     if (!this.earlier.has(id)) {
       this.earlier.set(id, pageTurns(new Set(), undefined, page).next);
     } else if (
@@ -651,7 +729,6 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     const root = this.sessionRoot(sessionId);
     const isCurrent = () =>
       !this.disposed &&
-      !this.hiddenRoots.has(root) &&
       this.roots.get(root) === sessionId &&
       this.earlier.get(sessionId) === cursor;
     const task = (async () => {

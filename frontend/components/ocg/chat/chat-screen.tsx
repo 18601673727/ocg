@@ -42,6 +42,16 @@ type ChatComposerContextValue = {
 
 const ChatComposerContext = createContext<ChatComposerContextValue | null>(null);
 
+const HistoryComposer: Component = () => {
+  const value = useContext(ChatComposerContext);
+  const i18n = useI18n();
+  return (
+    <p class="py-2 text-center text-sm text-muted-foreground">
+      {i18n.t(value?.session.archived ? "chat.archivedReadOnly" : "chat.closedReadOnly")}
+    </p>
+  );
+};
+
 const ChatComposerSlot: Component = () => {
   const value = useContext(ChatComposerContext);
   const { api } = useOcgRuntime();
@@ -255,7 +265,9 @@ export const ChatScreen: Component<ChatScreenProps> = (props) => {
         <div class="flex h-full min-h-0 w-full flex-col">
           <Thread
             Assistant={ChatAssistantMessage}
-            Composer={ChatComposerSlot}
+            Composer={
+              props.session.archived || props.session.closed ? HistoryComposer : ChatComposerSlot
+            }
             Welcome={Welcome}
             footerAction={props.backButton}
             afterMessages={

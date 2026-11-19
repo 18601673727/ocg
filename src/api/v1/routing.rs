@@ -21,6 +21,7 @@ pub(super) enum Route {
     Conversations {
         before: Option<JobId>,
         limit: usize,
+        archived: bool,
     },
     ConversationSearch {
         query: Vec<String>,
@@ -353,8 +354,12 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             .map(|query| Route::Subscription(subscriptions::Topic::Usage(query))),
         ["availability", "events"] => dashboard::ObservationQuery::parse(query)
             .map(|query| Route::Subscription(subscriptions::Topic::Availability(query))),
-        ["conversations"] => catalog::conversations_query(query)
-            .map(|(before, limit)| Route::Conversations { before, limit }),
+        ["conversations"] | ["conversations", "archived"] => catalog::conversations_query(query)
+            .map(|(before, limit)| Route::Conversations {
+                before,
+                limit,
+                archived: segments.len() == 2,
+            }),
         ["conversations", "search"] => {
             catalog::conversation_search_query(query).map(|(query, before, limit)| {
                 Route::ConversationSearch {
@@ -579,9 +584,11 @@ pub(super) async fn respond(
             limit,
             terms,
         } => dashboard::jobs(shared, before, limit, terms).await,
-        Route::Conversations { before, limit } => {
-            catalog::conversations(database, before, limit).await
-        }
+        Route::Conversations {
+            before,
+            limit,
+            archived,
+        } => catalog::conversations(database, before, limit, archived).await,
         Route::ConversationSearch {
             query,
             before,

@@ -48,14 +48,17 @@ import {
 } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
 import type { Project } from "../contracts";
+import type * as Api from "../contracts/api";
 import { runtimeStateLabel, useI18n } from "../i18n";
 import type { WorkspaceView } from "../layout/view-domain";
 import { useAccountEmail, useRemoteLogout } from "../login/access-boundary";
 import { OcgLogo } from "../primitives/ocg-logo";
 import { SELECTED_ROW } from "../primitives/selection";
 import { type ApiClient, ApiError } from "../runtime/api-client";
+import type { HideSessionOutcome } from "../runtime/runtime-types";
 import type { ChatSession, RuntimeStatus } from "../types";
 import { AccountMenu } from "./account-menu";
+import { ArchivedConversations } from "./archived-conversations";
 import { SidebarConversationChildren } from "./conversation-children";
 import { ConversationPreview, type ConversationPreviewDetails } from "./conversation-preview";
 import { ConversationSearch } from "./conversation-search";
@@ -111,11 +114,13 @@ type OcgSidebarProps = {
   api?: ApiClient;
   activeAncestors?: string[];
   onOpenConversation?: (conversation: string) => void;
+  onOpenArchivedConversation?: (conversation: Api.Conversation) => Promise<boolean>;
+  onRestoreConversation?: (conversation: Api.Conversation) => Promise<void>;
   onNewChat: () => void;
   onHome?: () => void;
   onRename?: (id: string, title: string) => Promise<void>;
   onRenameChild?: (conversation: string, title: string) => Promise<void>;
-  onHide?: (id: string) => Promise<void>;
+  onHide?: (id: string, stopFirst: boolean) => Promise<HideSessionOutcome>;
   runtimeStatus: RuntimeStatus;
   activeView?: WorkspaceView;
   attentionCount?: number;
@@ -278,7 +283,11 @@ export function OcgSidebar(props: OcgSidebarProps) {
       unitDisplay: "narrow",
     }).format(amount);
   };
-  const [hideTarget, setHideTarget] = createSignal<ChatSession | null>(null);
+  const [hideTarget, setHideTarget] = createSignal<{
+    id: string;
+    title: string;
+    stopFirst: boolean | null;
+  } | null>(null);
   const [hiding, setHiding] = createSignal(false);
   const [hideError, setHideError] = createSignal<string | null>(null);
 
@@ -342,18 +351,68 @@ export function OcgSidebar(props: OcgSidebarProps) {
     }
   };
 
+  const openHide = (session: ChatSession, jobState: string | undefined) => {
+    const active =
+      jobState === "queued" ||
+      jobState === "running" ||
+      jobState === "waiting" ||
+      jobState === "waiting_for_user" ||
+      jobState === "reserved" ||
+      jobState === "stop_requested";
+    const { api } = props;
+    const root = session.conversationId;
+    const target = {
+      id: session.id,
+      title: session.title,
+      stopFirst: !active && api && root ? null : active,
+    };
+    setHideError(null);
+    setHideTarget(target);
+    if (target.stopFirst !== null || !api || !root) return;
+    void api
+      .readConversationTurns(root, undefined, 1, AbortSignal.timeout(5000))
+      .then(
+        (page) => page.turns[0]?.job.settlement.state === "unsettled",
+        () => false,
+      )
+      .then((stopFirst) => {
+        if (hideTarget() === target) setHideTarget({ ...target, stopFirst });
+      });
+  };
+
   const confirmHide = async () => {
-    if (!hideTarget() || !props.onHide || hiding()) return;
+    const target = hideTarget();
+    if (!target || target.stopFirst === null || !props.onHide || hiding()) return;
     setHiding(true);
     setHideError(null);
     try {
-      await props.onHide(hideTarget()!.id);
-      setHideTarget(null);
+      const result = await props.onHide(target.id, target.stopFirst);
+      if (result === "stop-unconfirmed") {
+        setHideError(i18n.t("sidebar.hideStopUnconfirmed"));
+      } else {
+        setHideTarget(result === "stop-required" ? { ...target, stopFirst: true } : null);
+      }
     } catch (cause: unknown) {
-      setHideError(i18n.t("sidebar.hideFailed", { error: conversationError(cause, "hide") }));
+      setHideError(
+        cause instanceof DOMException && cause.name === "TimeoutError" && target.stopFirst
+          ? i18n.t("sidebar.hideStopUnconfirmed")
+          : i18n.t("sidebar.hideFailed", { error: conversationError(cause, "hide") }),
+      );
     } finally {
       setHiding(false);
     }
+  };
+  const archive = (compact: boolean) => {
+    const { api, onOpenArchivedConversation, onRestoreConversation } = props;
+    if (!api || !onOpenArchivedConversation || !onRestoreConversation) return null;
+    return (
+      <ArchivedConversations
+        api={api}
+        compact={compact}
+        onOpenConversation={onOpenArchivedConversation}
+        onRestore={onRestoreConversation}
+      />
+    );
   };
   const workbenchNav = WORKSPACE_NAV.filter((item) => item.target !== "chat");
   const hasNav = createMemo(() => Boolean(props.onNavigate));
@@ -455,6 +514,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
                     </button>
                   }
                 />
+                {archive(true)}
                 {hasNav() && (
                   <>
                     <div class="my-2 h-px w-8 bg-border" aria-hidden="true" />
@@ -640,6 +700,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
                     </Button>
                   }
                 />
+                {archive(false)}
               </div>
 
               <ScrollArea
@@ -887,10 +948,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
                                                   )}
                                                   {props.onHide && (
                                                     <DropdownMenuItem
-                                                      onSelect={() => {
-                                                        setHideError(null);
-                                                        setHideTarget(session);
-                                                      }}
+                                                      onSelect={() => openHide(session, jobState)}
                                                     >
                                                       {i18n.t("sidebar.hideChat")}
                                                     </DropdownMenuItem>
@@ -1058,9 +1116,14 @@ export function OcgSidebar(props: OcgSidebarProps) {
               >
                 <DialogHeader>
                   <DialogTitle class="normal-case tracking-normal">
-                    {i18n.t("sidebar.hideChatTitle")}
+                    {i18n.t(
+                      hideTarget()?.stopFirst
+                        ? "sidebar.stopAndHideTitle"
+                        : "sidebar.hideChatTitle",
+                    )}
                   </DialogTitle>
                   <DialogDescription>
+                    {hideTarget()?.stopFirst && <>{i18n.t("sidebar.stopAndHideBody")} </>}
                     {i18n.t("sidebar.hideChatBody", {
                       title: hideTarget()?.title || i18n.t("sidebar.newChat"),
                     })}
@@ -1085,11 +1148,23 @@ export function OcgSidebar(props: OcgSidebarProps) {
                   </Button>
                   <Button
                     variant="destructive"
-                    disabled={hiding()}
+                    disabled={hiding() || hideTarget()?.stopFirst === null}
                     onClick={() => void confirmHide()}
                   >
-                    {hiding() && <LoaderCircle class="size-3.5 animate-spin" aria-hidden="true" />}
-                    {i18n.t(hiding() ? "sidebar.hiding" : "sidebar.hideChat")}
+                    {(hiding() || hideTarget()?.stopFirst === null) && (
+                      <LoaderCircle class="size-3.5 animate-spin" aria-hidden="true" />
+                    )}
+                    {i18n.t(
+                      hideTarget()?.stopFirst === null
+                        ? "common.loading"
+                        : hideTarget()?.stopFirst
+                          ? hiding()
+                            ? "sidebar.stoppingAndHiding"
+                            : "sidebar.stopAndHide"
+                          : hiding()
+                            ? "sidebar.hiding"
+                            : "sidebar.hideChat",
+                    )}
                   </Button>
                 </DialogFooter>
               </DialogContent>

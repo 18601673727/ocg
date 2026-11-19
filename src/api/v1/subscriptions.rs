@@ -235,7 +235,8 @@ impl Feed {
                 )
             }
             Page::Conversations(before) => {
-                let reply = catalog::conversations(&self.shared.database, before, 100).await?;
+                let reply =
+                    catalog::conversations(&self.shared.database, before, 100, false).await?;
                 let next = cursor(&reply.body)?;
                 self.page = match next {
                     Some(id) => Page::Conversations(Some(id)),

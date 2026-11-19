@@ -436,6 +436,14 @@ function AppShellContent(props: AppShellProps) {
     });
   }
 
+  async function openArchivedConversation(conversation: Api.Conversation) {
+    if (!(await confirmMutableComposerNavigation())) return false;
+    runtime.client.presentArchivedConversation?.(conversation);
+    setSessionId("");
+    goDirect("chat", conversation.root_job);
+    return true;
+  }
+
   function closeJobDetails() {
     setDetailJob(null);
     if (location().view === "jobs" && location().job) {
@@ -510,6 +518,12 @@ function AppShellContent(props: AppShellProps) {
       api={props.client}
       activeAncestors={ancestors()}
       onOpenConversation={(job) => void openNestedConversation(job)}
+      onOpenArchivedConversation={openArchivedConversation}
+      onRestoreConversation={
+        runtime.client.restoreConversation
+          ? (conversation) => runtime.client.restoreConversation!(conversation)
+          : undefined
+      }
       activeSessionId={sessionId()}
       collapsed={!mobile() && collapsed()}
       drawer={mobile()}
@@ -532,9 +546,10 @@ function AppShellContent(props: AppShellProps) {
       }}
       onHide={
         runtime.client.hideSession
-          ? async (id) => {
+          ? async (id, stopFirst) => {
               if (id === sessionId() && !(await confirmMutableComposerNavigation())) return;
-              await runtime.client.hideSession!(id);
+              const result = await runtime.client.hideSession!(id, stopFirst);
+              if (result) return result;
               if (id === sessionId()) {
                 setSessionId("");
                 goDirect("chat");

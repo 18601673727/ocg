@@ -14,6 +14,8 @@ export type CreateSessionInput = {
   workType: ChatSession["workType"];
 };
 
+export type HideSessionOutcome = "stop-required" | "stop-unconfirmed" | void;
+
 export interface OcgRuntimeClient {
   isListedConversation?(sessionId: string): boolean;
   openConversation?(job: string): Promise<string>;
@@ -25,7 +27,9 @@ export interface OcgRuntimeClient {
   createSession(input: CreateSessionInput): Promise<ChatSession>;
   deleteSession?(sessionId: string): Promise<void>;
   renameSession?(sessionId: string, title: string): Promise<void>;
-  hideSession?(sessionId: string): Promise<void>;
+  hideSession?(sessionId: string, stopFirst: boolean): Promise<HideSessionOutcome>;
+  presentArchivedConversation?(conversation: import("../contracts/api").Conversation): void;
+  restoreConversation?(conversation: import("../contracts/api").Conversation): Promise<void>;
   uploadChatImage?(
     request: import("../contracts").ChatImageUploadRequest,
     signal?: AbortSignal,

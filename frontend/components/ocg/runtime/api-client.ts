@@ -174,7 +174,7 @@ export function configurationIdentity(): string {
 
 export type ConversationEdit =
   | { title: string; hidden?: never }
-  | { hidden: true; title?: never }
+  | { hidden: boolean; title?: never }
   | {
       limits: Pick<Api.ConversationLimits, "max_depth" | "max_auto_turns" | "max_iterations">;
       title?: never;
@@ -1796,14 +1796,16 @@ export function createApiClient(options: ApiClientOptions) {
     },
 
     async readConversations(
-      settings: { before?: string; limit?: number; signal?: AbortSignal } = {},
+      settings: { before?: string; limit?: number; archived?: boolean; signal?: AbortSignal } = {},
     ) {
       const query = [`limit=${settings.limit ?? 50}`];
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
       return (
-        await send("GET", `/api/v1/conversations?${query.join("&")}`, {
-          signal: settings.signal,
-        })
+        await send(
+          "GET",
+          `/api/v1/conversations${settings.archived ? "/archived" : ""}?${query.join("&")}`,
+          { signal: settings.signal },
+        )
       ).input as Api.Conversations;
     },
 
