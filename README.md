@@ -121,6 +121,29 @@ Keep the OCG data directory separate from project workspaces. The [data layout](
 
 ## Performance
 
+### Backend reference (2026-11-20)
+
+Measured commit [`d421854`](https://github.com/18601673727/ocg/commit/d421854c230da8a4af0b5947170ddf35071e5be4) on `chuncheon` using the optimized Cargo benchmark profile and Rust 1.99.1. The host ran Debian Linux 6.12.113 on ARM64 with 2 vCPUs and 11.66 GiB RAM. Benchmark data used a separate directory on ext4 (`/dev/sda2`). The existing OCG service remained running.
+
+The reference workload used concurrency 8, 1,000 jobs, 1,000 workspace files, three trials and 32 warm-up jobs. Startup used ten measured launches and two warm-up launches. History used 625 page pairs per reader and search used 200 iterations per reader. Each reference job made three mock model requests and two real workspace tool calls. Except for startup, values are medians of the three corresponding trial statistics.
+
+| Metric | Result |
+| --- | --- |
+| Startup readiness | 35.68 ms median, 35.36–36.49 ms range |
+| Memory | 17.37 MiB idle, 113.61 MiB sampled loaded peak |
+| Job admission | 20.80 ms p50, 25.41 ms p95 |
+| Job throughput | 11.67 jobs/s, 685.15 ms completion p50, 714.79 ms p95 |
+| Streaming delivery | 14.35 ms p50, 21.54 ms p95 |
+| History read | 3.91 ms p50, 7.75 ms p95 |
+| Workspace search | 0.036 ms p50, 0.606 ms p95 |
+| Database footprint | 48.19 MiB, 48.32 KiB apparent growth per completed job |
+
+All eight sections completed successfully, with 73 successful measurements and no failed, rejected, timed-out or unfinished operations. The memory peak is sampled. Database growth uses a 1,056,768-byte empty baseline and apparent file lengths, which can differ from allocated disk space.
+
+The earlier ext4 reference below reported 38.10 jobs/s and 236.15 ms completion p95. That run used an earlier source snapshot, so this comparison describes the observed difference and does not isolate its cause.
+
+The source snapshot, build log, per-section JSONL and stderr, combined results and generated summary are preserved on the host at `/srv/ocg-backend-bench-d421854/`. All 381 tracked source files were checked against the local snapshot. The combined JSONL SHA-256 is `0f230ea93407332dabe4e43b02da273b92ada9e8b42e6247b1dacbedc19c9ee0`. The extracted source has no Git metadata, so the benchmark's reported clean-tree status does not independently identify the commit. Use the eight-section commands in the earlier ext4 reference to reproduce this run.
+
 ### Long-conversation frontend benchmark
 
 The benchmark starts an isolated Rust backend and a local mock model provider, seeds 56 conversation turns, and opens the production frontend in headless Chrome. It measures initial JavaScript size, latency from provider updates to the browser DOM, and scroll frame intervals. [Benchmark source](benchmark/frontend/)
