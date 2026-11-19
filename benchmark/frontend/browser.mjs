@@ -192,6 +192,8 @@ async function measure(browser, fixture, directory, rate, keepAnchor) {
   });
   const pageErrors = [];
   const responseErrors = [];
+  const expectedResponses = [];
+  const responseChecks = [];
   try {
     const prefix = await startJob(fixture);
     const page = await context.newPage();
@@ -199,7 +201,27 @@ async function measure(browser, fixture, directory, rate, keepAnchor) {
     page.on("response", (response) => {
       const url = new URL(response.url());
       if (url.pathname.startsWith("/api/v1/") && response.status() >= 400) {
-        responseErrors.push(`${url.pathname} ${response.status()}`);
+        const description = `${url.pathname} ${response.status()}`;
+        if (
+          url.origin === fixture.origin &&
+          url.pathname === "/api/v1/jobs/current" &&
+          !url.search &&
+          response.status() === 404 &&
+          response.request().method() === "GET" &&
+          response.request().headers()["x-ocg-composer-context"]
+        ) {
+          responseChecks.push(
+            response
+              .json()
+              .then((body) => {
+                if (body?.error?.code === "not_found") expectedResponses.push(description);
+                else responseErrors.push(description);
+              })
+              .catch(() => responseErrors.push(description)),
+          );
+        } else {
+          responseErrors.push(description);
+        }
       }
     });
     if (rate > 1) {
@@ -217,10 +239,13 @@ async function measure(browser, fixture, directory, rate, keepAnchor) {
     await observe(page, prefix);
     await control(fixture, "release", "POST");
     const sent = await readSentTimes(directory, prefix, fixture.updateCount);
+    const measurement = await finish(page, sent, fixture.updateCount);
+    await Promise.all(responseChecks);
     const live = {
-      ...(await finish(page, sent, fixture.updateCount)),
+      ...measurement,
       pageErrors,
       responseErrors,
+      expectedResponses,
     };
     console.log(
       `${prefix} ${rate}x, ${rows} messages, ${js.files} JS files, ${js.gzip} gzip bytes`,
