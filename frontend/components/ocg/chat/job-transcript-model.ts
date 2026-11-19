@@ -29,9 +29,10 @@ export function outputText(output: OutputView | null | undefined): string | null
 }
 
 export function outputDisplayText(output: OutputView | null | undefined): string {
-  return [outputText(output), output?.summary]
-    .filter((text) => text != null && text !== "")
-    .join("\n");
+  const text = outputText(output);
+  const summary = output?.summary;
+  if (output?.kind === "result" && text !== null && text === summary) return text;
+  return [text, summary].filter((part) => part != null && part !== "").join("\n");
 }
 
 // Rebuildable projection of stored outputs, maintained incrementally during streaming.

@@ -1,0 +1,12 @@
+{
+  "name": "ocg-frontend-benchmark",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "bench": "node browser.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.65.1"
+  },
+  "packageManager": "pnpm@12.15.0"
+}
