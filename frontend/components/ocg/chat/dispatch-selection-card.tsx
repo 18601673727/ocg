@@ -1,45 +1,30 @@
-"use client";
-
-import { useEffect, useState } from "react";
+import { createEffect, createMemo, createSignal } from "solid-js";
+import { OptionList } from "@/components/ocg/chat/ui/option-list";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { OptionList } from "@/components/assistant-ui/elements/option-list";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectLabel,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Select, SelectItem } from "@/components/ui/select";
 import type { ProfilesSnapshot, Project } from "../contracts";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
+import type { ApiClient } from "../runtime/api-client";
 
 type Selection = { agent: string | null; model: string; projects: string[] };
 
-export function DispatchSelectionCard({
-  client,
-  arguments: argumentsText,
-  disabled,
-  onSelect,
-}: {
+export function DispatchSelectionCard(props: {
   client: ApiClient;
   arguments: string;
   disabled: boolean;
   onSelect: (selection: Selection) => void;
 }) {
-  const { t } = useI18n();
-  const [catalog, setCatalog] = useState<{
+  const i18n = useI18n();
+  const [catalog, setCatalog] = createSignal<{
     profiles: ProfilesSnapshot;
     projects: Project[];
   } | null>(null);
-  const [target, setTarget] = useState("");
-  const [modelId, setModelId] = useState("");
-  const [projects, setProjects] = useState<string[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [revision, setRevision] = useState(0);
+  const [target, setTarget] = createSignal("");
+  const [modelId, setModelId] = createSignal("");
+  const [projects, setProjects] = createSignal<string[]>([]);
+  const [error, setError] = createSignal<string | null>(null);
+  const [revision, setRevision] = createSignal(0);
   let request: {
     objective?: string;
     project?: string;
@@ -49,210 +34,222 @@ export function DispatchSelectionCard({
     depends_on?: unknown[];
   } = {};
   try {
-    const parsed = JSON.parse(argumentsText);
+    const parsed = JSON.parse(props.arguments);
     if (parsed && typeof parsed === "object") request = parsed;
   } catch {}
-  useEffect(() => {
-    const controller = new AbortController();
-    void Promise.all([
-      client.readProfiles(controller.signal),
-      client.readAllProjects(controller.signal),
-    ])
-      .then(([profiles, projects]) => {
-        if (controller.signal.aborted) return;
-        setCatalog({ profiles, projects });
-        setError(null);
-        try {
-          const request = JSON.parse(argumentsText);
-          const suggested: unknown[] = Array.isArray(request.projects)
-            ? request.projects
-            : request.project
-              ? [request.project]
-              : [];
-          setProjects(
-            projects
-              .filter((project) => suggested.includes(project.id))
-              .map((project) => project.id),
-          );
-        } catch {
-          setProjects([]);
-        }
-      })
-      .catch((cause) => {
-        if (!controller.signal.aborted)
-          setError(cause instanceof Error ? cause.message : String(cause));
-      });
-    return () => controller.abort();
-  }, [client, argumentsText, revision]);
-  const models = (catalog?.profiles.llm_profiles ?? []).filter(
-    (model) => model.enabled && model.declared_capabilities.includes("chat"),
+  createEffect(
+    () => [props.client, props.arguments, revision()],
+    () => {
+      const controller = new AbortController();
+      void Promise.all([
+        props.client.readProfiles(controller.signal),
+        props.client.readAllProjects(controller.signal),
+      ])
+        .then(([profiles, projects]) => {
+          if (controller.signal.aborted) return;
+          setCatalog({ profiles, projects });
+          setError(null);
+          try {
+            const request = JSON.parse(props.arguments);
+            const suggested: unknown[] = Array.isArray(request.projects)
+              ? request.projects
+              : request.project
+                ? [request.project]
+                : [];
+            setProjects(
+              projects
+                .filter((project) => suggested.includes(project.id))
+                .map((project) => project.id),
+            );
+          } catch {
+            setProjects([]);
+          }
+        })
+        .catch((cause) => {
+          if (!controller.signal.aborted)
+            setError(cause instanceof Error ? cause.message : String(cause));
+        });
+      return () => controller.abort();
+    },
   );
-  const agents = (catalog?.profiles.agent_profiles ?? []).filter(
-    (agent) =>
-      (agent.capabilities.includes("chat") || agent.capabilities.includes("coding")) &&
-      agent.llm_targets.some((id) => models.some((model) => model.id === id)),
+  const models = createMemo(() =>
+    (catalog()?.profiles.llm_profiles ?? []).filter(
+      (model) => model.enabled && model.declared_capabilities.includes("chat"),
+    ),
   );
-  const agent = agents.find((agent) => target === `agent:${agent.id}`);
-  const direct = target.startsWith("model:")
-    ? models.find((model) => target === `model:${model.id}`)
-    : undefined;
-  const choices = agent
-    ? agent.llm_targets
-        .map((id) => models.find((model) => model.id === id))
-        .filter((model) => model !== undefined)
-    : direct
-      ? [direct]
-      : [];
-  const model = modelId ? choices.find((model) => model.id === modelId) : choices[0];
-  const needsProject = Boolean(direct || agent?.capabilities.includes("coding"));
-  const validProjects = projects.filter((id) =>
-    catalog?.projects.some((project) => project.id === id),
+  const agents = createMemo(() =>
+    (catalog()?.profiles.agent_profiles ?? []).filter(
+      (agent) =>
+        (agent.capabilities.includes("chat") || agent.capabilities.includes("coding")) &&
+        agent.llm_targets.some((id) => models().some((model) => model.id === id)),
+    ),
+  );
+  const agent = createMemo(() => agents().find((agent) => target() === `agent:${agent.id}`));
+  const direct = createMemo(() =>
+    target().startsWith("model:")
+      ? models().find((model) => target() === `model:${model.id}`)
+      : undefined,
+  );
+  const choices = createMemo(() =>
+    agent()
+      ? agent()!
+          .llm_targets.map((id) => models().find((model) => model.id === id))
+          .filter((model) => model !== undefined)
+      : direct()
+        ? [direct()]
+        : [],
+  );
+  const model = createMemo(() =>
+    modelId() ? choices().find((model) => model!.id === modelId()) : choices()[0],
+  );
+  const needsProject = createMemo(() =>
+    Boolean(direct() || agent()?.capabilities.includes("coding")),
+  );
+  const validProjects = createMemo(() =>
+    projects().filter((id) => catalog()?.projects.some((project) => project.id === id)),
   );
   return (
     <form
-      className="flex flex-col gap-3 text-sm"
+      class="flex flex-col gap-3 text-sm"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!model || (!agent && !direct)) return;
-        onSelect({ agent: agent?.id ?? null, model: model.id, projects: validProjects });
+        if (!model() || (!agent() && !direct())) return;
+        props.onSelect({
+          agent: agent()?.id ?? null,
+          model: model()!.id,
+          projects: validProjects(),
+        });
       }}
     >
-      <p className="text-muted-foreground">{t("chat.dispatch.waiting")}</p>
+      <p class="text-muted-foreground">{i18n.t("chat.dispatch.waiting")}</p>
       <ScrollArea
-        className="max-h-40 rounded-md bg-muted/40"
-        viewportProps={{ className: "ocg-subtle-scrollbar" }}
-        contentProps={{ className: "p-3" }}
+        class="max-h-40 rounded-md bg-muted/40"
+        viewportProps={{ class: "ocg-subtle-scrollbar" }}
+        contentProps={{ class: "p-3" }}
       >
-        <p className="whitespace-pre-wrap break-words">{request.objective}</p>
+        <p class="whitespace-pre-wrap break-words">{request.objective}</p>
       </ScrollArea>
       {request.every_seconds && (
-        <p className="text-xs text-muted-foreground">
-          {t("chat.dispatch.recurrence", { seconds: request.every_seconds })}
+        <p class="text-xs text-muted-foreground">
+          {i18n.t("chat.dispatch.recurrence", { seconds: request.every_seconds })}
         </p>
       )}
       {request.keep_open && (
-        <p className="text-xs text-muted-foreground">{t("chat.dispatch.keepOpen")}</p>
+        <p class="text-xs text-muted-foreground">{i18n.t("chat.dispatch.keepOpen")}</p>
       )}
       {Array.isArray(request.depends_on) && request.depends_on.length > 0 && (
-        <p className="text-xs text-muted-foreground">
-          {t("chat.dispatch.dependencies", { count: request.depends_on.length })}
+        <p class="text-xs text-muted-foreground">
+          {i18n.t("chat.dispatch.dependencies", { count: request.depends_on.length })}
         </p>
       )}
-      {error && (
+      {error() && (
         <div role="alert">
-          <p className="text-destructive">{error}</p>
+          <p class="text-destructive">{error()}</p>
           <Button
             type="button"
             size="xs"
             variant="outline"
             onClick={() => setRevision((value) => value + 1)}
           >
-            {t("common.retry")}
+            {i18n.t("common.retry")}
           </Button>
         </div>
       )}
-      {!catalog && !error && <p role="status">{t("common.loading")}</p>}
-      <label className="flex flex-col gap-1">
-        {t("chat.dispatch.target")}
+      {!catalog() && !error() && <p role="status">{i18n.t("common.loading")}</p>}
+      <label class="flex flex-col gap-1">
+        {i18n.t("chat.dispatch.target")}
         <Select
-          value={target}
+          value={target()}
           items={[
-            { value: "", label: t("chat.dispatch.choose") },
-            ...agents.map((agent) => ({
+            { value: "", label: i18n.t("chat.dispatch.choose") },
+            ...agents().map((agent) => ({
               value: `agent:${agent.id}`,
               label: `${agent.name} · ${agent.capabilities
-                .map((capability) => t(`settings.agent.capability.${capability}`))
+                .map((capability) => i18n.t(`settings.agent.capability.${capability}`))
                 .join(" / ")}`,
             })),
           ]}
-          disabled={disabled || !catalog}
+          disabled={props.disabled || !catalog()}
           onValueChange={(next) => {
             if (next === null) return;
             setTarget(next);
             setModelId("");
           }}
+          class="min-h-10 w-full rounded-md border-border bg-background px-2"
         >
-          <SelectTrigger className="min-h-10 w-full rounded-md border-border bg-background px-2">
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="">{t("chat.dispatch.choose")}</SelectItem>
-            <SelectGroup>
-              <SelectLabel>{t("chat.agent")}</SelectLabel>
-              {agents.map((agent) => (
-                <SelectItem key={agent.id} value={`agent:${agent.id}`}>
-                  {agent.name} ·{" "}
-                  {agent.capabilities
-                    .map((capability) => t(`settings.agent.capability.${capability}`))
-                    .join(" / ")}
-                </SelectItem>
-              ))}
-            </SelectGroup>
-          </SelectContent>
+          <SelectItem value="">{i18n.t("chat.dispatch.choose")}</SelectItem>
+          <optgroup label={i18n.t("chat.agent")}>
+            {agents().map((agent) => (
+              <SelectItem value={`agent:${agent.id}`}>
+                {agent.name} ·{" "}
+                {agent.capabilities
+                  .map((capability) => i18n.t(`settings.agent.capability.${capability}`))
+                  .join(" / ")}
+              </SelectItem>
+            ))}
+          </optgroup>
         </Select>
       </label>
-      {agent?.instructions && (
+      {agent()?.instructions && (
         <p
-          className="line-clamp-3 whitespace-pre-wrap text-xs text-muted-foreground"
-          title={agent.instructions}
+          class="line-clamp-3 whitespace-pre-wrap text-xs text-muted-foreground"
+          title={agent()!.instructions!}
         >
-          {agent.instructions}
+          {agent()!.instructions}
         </p>
       )}
-      {model && (
-        <label className="flex flex-col gap-1">
-          {t("chat.model")}
+      {model() && (
+        <label class="flex flex-col gap-1">
+          {i18n.t("chat.model")}
           <Select
-            value={model.id}
-            items={choices.map((model) => ({
-              value: model.id,
-              label: `${model.name} · ${model.model}${
-                agent?.llm_targets[0] === model.id ? ` (${t("settings.agent.defaultModel")})` : ""
+            value={model()!.id}
+            items={choices().map((model) => ({
+              value: model!.id,
+              label: `${model!.name} · ${model!.model}${
+                agent()?.llm_targets[0] === model!.id
+                  ? ` (${i18n.t("settings.agent.defaultModel")})`
+                  : ""
               }`,
             }))}
-            disabled={disabled}
+            disabled={props.disabled}
             onValueChange={(next) => {
               if (next !== null) setModelId(next);
             }}
+            class="min-h-10 w-full rounded-md border-border bg-background px-2"
           >
-            <SelectTrigger className="min-h-10 w-full rounded-md border-border bg-background px-2">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {choices.map((model) => (
-                <SelectItem key={model.id} value={model.id}>
-                  {model.name} · {model.model}
-                  {agent?.llm_targets[0] === model.id
-                    ? ` (${t("settings.agent.defaultModel")})`
-                    : ""}
-                </SelectItem>
-              ))}
-            </SelectContent>
+            {choices().map((model) => (
+              <SelectItem value={model!.id}>
+                {model!.name} · {model!.model}
+                {agent()?.llm_targets[0] === model!.id
+                  ? ` (${i18n.t("settings.agent.defaultModel")})`
+                  : ""}
+              </SelectItem>
+            ))}
           </Select>
         </label>
       )}
-      <fieldset disabled={disabled} className="flex flex-col gap-2">
-        <legend className="mb-2">{t("chat.project")}</legend>
+      <fieldset disabled={props.disabled} class="flex flex-col gap-2">
+        <legend class="mb-2">{i18n.t("chat.project")}</legend>
         <ScrollArea
-          className="max-h-56 rounded-md border border-border"
-          viewportProps={{ className: "ocg-subtle-scrollbar" }}
+          class="max-h-56 rounded-md border border-border"
+          viewportProps={{ class: "ocg-subtle-scrollbar" }}
         >
           <OptionList
-            aria-label={t("chat.project")}
-            className="max-w-none rounded-none border-0 bg-transparent dark:bg-transparent"
+            aria-label={i18n.t("chat.project")}
+            class="max-w-none rounded-none border-0 bg-transparent dark:bg-transparent"
             selectionMode="multiple"
-            selected={validProjects}
+            selected={validProjects()}
             maxSelections={16}
             onSelectionChange={setProjects}
-            options={(catalog?.projects ?? []).map((project) => {
+            options={(catalog()?.projects ?? []).map((project) => {
               const commands = project.commands.filter((command) => command.status === "allowed");
               return {
                 id: project.id,
                 label: project.name,
                 description: (
                   <>
-                    <span className="block break-all">{project.root}</span>
-                    {t("chat.dispatch.commands", { count: commands.length })}
+                    <span class="block break-all">{project.root}</span>
+                    {i18n.t("chat.dispatch.commands", { count: commands.length })}
                     {commands.length > 0 &&
                       ` · ${commands.map((command) => command.name).join(", ")}`}
                   </>
@@ -261,21 +258,24 @@ export function DispatchSelectionCard({
             })}
           />
         </ScrollArea>
-        {needsProject && !validProjects.length && (
-          <p className="text-xs text-muted-foreground">{t("chat.dispatch.projectRequired")}</p>
+        {needsProject() && !validProjects().length && (
+          <p class="text-xs text-muted-foreground">{i18n.t("chat.dispatch.projectRequired")}</p>
         )}
       </fieldset>
-      <p className="text-xs text-muted-foreground">
-        {t("chat.dispatch.jobCount", { count: validProjects.length || 1 })}
+      <p class="text-xs text-muted-foreground">
+        {i18n.t("chat.dispatch.jobCount", { count: validProjects().length || 1 })}
       </p>
       <Button
         type="submit"
         size="sm"
         disabled={
-          disabled || !model || (!agent && !direct) || (needsProject && !validProjects.length)
+          props.disabled ||
+          !model() ||
+          (!agent() && !direct()) ||
+          (needsProject() && !validProjects().length)
         }
       >
-        {t("chat.dispatch.submit")}
+        {i18n.t("chat.dispatch.submit")}
       </Button>
     </form>
   );

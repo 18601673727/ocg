@@ -1,27 +1,27 @@
-import type { Projects, Pool, Pools, Children } from "../contracts";
 import type * as Api from "@/components/ocg/contracts/api";
+import type { Children, Pool, Pools, Projects } from "../contracts";
 import {
   API_VERSION,
-  projectJob,
-  executionSequence,
-  projectContextStatus,
-  ContractError,
-  TREE_MAX_DEPTH,
-  projectAgentProfiles,
   type Approval,
-  projectJobDetails,
-  projectNativeStop,
-  projectConversation,
-  projectJobEvent,
-  projectProfiles,
   type Attachment,
-  type Output,
   type Capability,
+  ContractError,
+  executionSequence,
   type JobEvent,
   type JobToolsPage,
+  type Output,
   type Project,
-  type ToolCall,
   type ProviderResponse,
+  projectAgentProfiles,
+  projectContextStatus,
+  projectConversation,
+  projectJob,
+  projectJobDetails,
+  projectJobEvent,
+  projectNativeStop,
+  projectProfiles,
+  type ToolCall,
+  TREE_MAX_DEPTH,
 } from "../contracts";
 import { SseParser } from "./sse";
 

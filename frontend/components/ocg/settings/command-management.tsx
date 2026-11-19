@@ -1,18 +1,7 @@
-"use client";
+import { Check } from "@lucide/solid";
+import { createEffect, createMemo, createSignal } from "solid-js";
 
-import { useEffect, useState } from "react";
-import { Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectGroup,
-  SelectItem,
-  SelectLabel,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import {
   Dialog,
   DialogContent,
@@ -22,88 +11,95 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { Select, SelectItem } from "@/components/ui/select";
 import type { ProfilesSnapshot, Project } from "../contracts";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
+import type { ApiClient } from "../runtime/api-client";
 import { describeError, selectableLlmProfiles } from "./settings-parts";
 
-export function ProjectDecisionConfigButton({
-  client,
-  project,
-  disabled,
-  onChanged,
-}: {
+export function ProjectDecisionConfigButton(props: {
   client: ApiClient;
   project: Project | null;
   disabled: boolean;
   onChanged(project: Project): void;
 }) {
-  const { t } = useI18n();
-  const [open, setOpen] = useState(false);
-  const [profiles, setProfiles] = useState<ProfilesSnapshot | null>(null);
-  const [selected, setSelected] = useState("");
-  const [cutoff, setCutoff] = useState("0.6");
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-  const [status, setStatus] = useState("");
-  useEffect(() => {
-    if (!open) return;
-    const controller = new AbortController();
-    void client
-      .readProfiles(controller.signal)
-      .then((value) => {
-        if (!controller.signal.aborted) setProfiles(value);
-      })
-      .catch((cause) => {
-        if (!controller.signal.aborted) setError(describeError(cause, t));
-      });
-    return () => controller.abort();
-  }, [client, open, t]);
+  const i18n = useI18n();
+  const [open, setOpen] = createSignal(false);
+  const [profiles, setProfiles] = createSignal<ProfilesSnapshot | null>(null);
+  const [selected, setSelected] = createSignal("");
+  const [cutoff, setCutoff] = createSignal("0.6");
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string>();
+  const [status, setStatus] = createSignal("");
+  createEffect(
+    () => [props.client, open(), i18n.t],
+    () => {
+      if (!open()) return;
+      const controller = new AbortController();
+      void props.client
+        .readProfiles(controller.signal)
+        .then((value) => {
+          if (!controller.signal.aborted) setProfiles(value);
+        })
+        .catch((cause) => {
+          if (!controller.signal.aborted) setError(describeError(cause, i18n.t));
+        });
+      return () => controller.abort();
+    },
+  );
 
   async function configure() {
-    if (!project) return;
+    if (!props.project) return;
     setBusy(true);
     setError(undefined);
     try {
-      const updated = await client.configureProjectDecision(
-        project.id,
-        selected === "default" || selected === "off" ? null : selected,
-        selected === "off" ? (project.decision?.minimum_confidence ?? 0.6) : Number(cutoff),
-        selected !== "off",
+      const updated = await props.client.configureProjectDecision(
+        props.project.id,
+        selected() === "default" || selected() === "off" ? null : selected(),
+        selected() === "off"
+          ? (props.project.decision?.minimum_confidence ?? 0.6)
+          : Number(cutoff()),
+        selected() !== "off",
       );
-      onChanged(updated);
-      setStatus(t(selected === "off" ? "commands.disabled" : "commands.enabled"));
+      props.onChanged(updated);
+      setStatus(i18n.t(selected() === "off" ? "commands.disabled" : "commands.enabled"));
       setOpen(false);
     } catch (cause) {
-      setError(describeError(cause, t));
+      setError(describeError(cause, i18n.t));
     } finally {
       setBusy(false);
     }
   }
-  const decisionProfiles = profiles?.decision_agent_profiles ?? [];
-  const models = [
-    ...selectableLlmProfiles(profiles?.llm_profiles ?? [], project?.decision?.decision_profile),
-    ...(profiles?.decision_profiles ?? []),
-  ];
-  const choices = [...decisionProfiles, ...models];
-  const confidence = Number(cutoff);
-  const validCutoff =
-    cutoff.trim() !== "" &&
-    Number.isFinite(confidence) &&
-    confidence >= 0 &&
-    confidence <= 1 &&
-    Math.abs(confidence * 1000 - Math.round(confidence * 1000)) < 1e-9;
+  const decisionProfiles = createMemo(() => profiles()?.decision_agent_profiles ?? []);
+  const models = createMemo(() => [
+    ...selectableLlmProfiles(
+      profiles()?.llm_profiles ?? [],
+      props.project?.decision?.decision_profile,
+    ),
+    ...(profiles()?.decision_profiles ?? []),
+  ]);
+  const choices = createMemo(() => [...decisionProfiles(), ...models()]);
+  const confidence = createMemo(() => Number(cutoff()));
+  const validCutoff = createMemo(
+    () =>
+      cutoff().trim() !== "" &&
+      Number.isFinite(confidence()) &&
+      confidence() >= 0 &&
+      confidence() <= 1 &&
+      Math.abs(confidence() * 1000 - Math.round(confidence() * 1000)) < 1e-9,
+  );
   return (
     <Dialog
-      open={open}
+      open={open()}
       onOpenChange={(value) => {
         if (value) {
           setSelected(
-            project?.decision?.enabled === false
+            props.project?.decision?.enabled === false
               ? "off"
-              : (project?.decision?.decision_profile ?? "default"),
+              : (props.project?.decision?.decision_profile ?? "default"),
           );
-          setCutoff(String(project?.decision?.minimum_confidence ?? 0.6));
+          setCutoff(String(props.project?.decision?.minimum_confidence ?? 0.6));
           setError(undefined);
           setStatus("");
         }
@@ -114,123 +110,111 @@ export function ProjectDecisionConfigButton({
         render={
           <button
             type="button"
-            className="flex cursor-pointer items-center gap-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
+            class="flex cursor-pointer items-center gap-2 text-sm disabled:cursor-not-allowed disabled:opacity-50"
           />
         }
-        disabled={disabled || !project}
-        title={!project ? t("commands.saveFirst") : undefined}
+        disabled={props.disabled || !props.project}
+        title={!props.project ? i18n.t("commands.saveFirst") : undefined}
       >
         <span
           aria-hidden="true"
-          className="flex size-4 items-center justify-center rounded-sm border border-input"
+          class="flex size-4 items-center justify-center rounded-sm border border-input"
         >
-          {project?.decision?.enabled !== false && <Check className="size-3" />}
+          {props.project?.decision?.enabled !== false && <Check class="size-3" />}
         </span>
-        <span>{t("commands.assist")}</span>
-        <span className="sr-only">
-          {t(
-            project?.decision?.enabled !== false
+        <span>{i18n.t("commands.assist")}</span>
+        <span class="sr-only">
+          {i18n.t(
+            props.project?.decision?.enabled !== false
               ? "settings.pools.enabled"
               : "settings.pools.disabled",
           )}
         </span>
       </DialogTrigger>
-      <DialogContent className="grid-cols-[minmax(0,1fr)] max-w-lg">
+      <DialogContent class="grid-cols-[minmax(0,1fr)] max-w-lg">
         <DialogHeader>
-          <DialogTitle>{t("commands.manage")}</DialogTitle>
-          <DialogDescription>{t("commands.description")}</DialogDescription>
+          <DialogTitle>{i18n.t("commands.manage")}</DialogTitle>
+          <DialogDescription>{i18n.t("commands.description")}</DialogDescription>
         </DialogHeader>
-        <p className="text-sm text-muted-foreground">{t("commands.scope")}</p>
-        <label className="flex flex-col gap-1 text-sm">
-          {t("commands.profile")}
+        <p class="text-sm text-muted-foreground">{i18n.t("commands.scope")}</p>
+        <label class="flex flex-col gap-1 text-sm">
+          {i18n.t("commands.profile")}
           <Select
-            value={selected}
+            value={selected()}
             items={[
-              { value: "default", label: t("commands.default") },
-              { value: "off", label: t("commands.disable") },
-              ...models.map((model) => ({
+              { value: "default", label: i18n.t("commands.default") },
+              { value: "off", label: i18n.t("commands.disable") },
+              ...models().map((model) => ({
                 value: model.id,
                 label:
                   "enabled" in model && !model.enabled
-                    ? `${model.name} · ${model.model} (${t("settings.llm.disabled")})`
+                    ? `${model.name} · ${model.model} (${i18n.t("settings.llm.disabled")})`
                     : `${model.name} · ${model.model}`,
               })),
-              ...decisionProfiles.map((profile) => ({
+              ...decisionProfiles().map((profile) => ({
                 value: profile.id,
                 label: profile.name,
               })),
             ]}
-            disabled={busy}
+            disabled={busy()}
             onValueChange={(next) => {
               if (next !== null) setSelected(next);
             }}
+            class="h-10 w-full min-w-0 rounded-md border-input bg-background px-3"
           >
-            <SelectTrigger className="h-10 w-full min-w-0 rounded-md border-input bg-background px-3">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="default">{t("commands.default")}</SelectItem>
-              <SelectItem value="off">{t("commands.disable")}</SelectItem>
-              <SelectGroup>
-                <SelectLabel>{t("settings.nav.models")}</SelectLabel>
-                {models.map((model) => (
-                  <SelectItem
-                    key={model.id}
-                    value={model.id}
-                    disabled={"enabled" in model && !model.enabled}
-                  >
-                    {model.name} · {model.model}
-                    {"enabled" in model && !model.enabled && ` (${t("settings.llm.disabled")})`}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-              <SelectGroup>
-                <SelectLabel>{t("decision.title")}</SelectLabel>
-                {decisionProfiles.map((profile) => (
-                  <SelectItem key={profile.id} value={profile.id}>
-                    {profile.name}
-                  </SelectItem>
-                ))}
-              </SelectGroup>
-            </SelectContent>
+            <SelectItem value="default">{i18n.t("commands.default")}</SelectItem>
+            <SelectItem value="off">{i18n.t("commands.disable")}</SelectItem>
+            <optgroup label={i18n.t("settings.nav.models")}>
+              {models().map((model) => (
+                <SelectItem value={model.id} disabled={"enabled" in model && !model.enabled}>
+                  {model.name} · {model.model}
+                  {"enabled" in model && !model.enabled && ` (${i18n.t("settings.llm.disabled")})`}
+                </SelectItem>
+              ))}
+            </optgroup>
+            <optgroup label={i18n.t("decision.title")}>
+              {decisionProfiles().map((profile) => (
+                <SelectItem value={profile.id}>{profile.name}</SelectItem>
+              ))}
+            </optgroup>
           </Select>
         </label>
-        <label className="flex flex-col gap-1 text-sm">
-          {t("commands.cutoff")}
+        <label class="flex flex-col gap-1 text-sm">
+          {i18n.t("commands.cutoff")}
           <Input
             type="number"
             min="0"
             max="1"
             step="0.001"
-            value={cutoff}
-            disabled={busy || selected === "off"}
-            onChange={(event) => setCutoff(event.target.value)}
+            value={cutoff()}
+            disabled={busy() || selected() === "off"}
+            onInput={(event) => setCutoff(event.target.value)}
           />
         </label>
-        <p className="text-xs text-muted-foreground">{t("commands.cutoffHelp")}</p>
-        {status && (
-          <p role="status" className="text-sm text-muted-foreground">
-            {status}
+        <p class="text-xs text-muted-foreground">{i18n.t("commands.cutoffHelp")}</p>
+        {status() && (
+          <p role="status" class="text-sm text-muted-foreground">
+            {status()}
           </p>
         )}
-        {error && (
-          <p role="alert" className="text-sm text-destructive">
-            {error}
+        {error() && (
+          <p role="alert" class="text-sm text-destructive">
+            {error()}
           </p>
         )}
         <DialogFooter>
           <Button
             type="button"
             disabled={
-              busy ||
-              (selected !== "off" && !validCutoff) ||
-              (selected !== "default" &&
-                selected !== "off" &&
-                !choices.some((profile) => profile.id === selected))
+              busy() ||
+              (selected() !== "off" && !validCutoff()) ||
+              (selected() !== "default" &&
+                selected() !== "off" &&
+                !choices().some((profile) => profile.id === selected()))
             }
             onClick={() => void configure()}
           >
-            {t(busy ? "commands.saving" : "commands.enable")}
+            {i18n.t(busy() ? "commands.saving" : "commands.enable")}
           </Button>
         </DialogFooter>
       </DialogContent>

@@ -1,13 +1,12 @@
-"use client";
-
+import { ExternalLink } from "@lucide/solid";
+import { createEffect, createMemo, createSignal } from "solid-js";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { ExternalLink } from "lucide-react";
-import { useEffect, useState, type Ref } from "react";
-import type { ChatModelSelection, AgentProfile, Project } from "../contracts";
-import { ModelSelectorView } from "./model-selector-view";
-import { useOcgRuntime } from "../runtime/runtime-context";
+import { type Ref } from "@/lib/ui-state";
+import type { AgentProfile, ChatModelSelection, Project } from "../contracts";
 import { useI18n } from "../i18n";
+import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context";
 import { settingsPath } from "../settings/settings-sections";
+import { ModelSelectorView } from "./model-selector-view";
 
 const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -15,18 +14,7 @@ type Catalog = { agents: AgentProfile[]; projects: Project[] };
 
 export type ModelImageSupport = { llmProfile: string | undefined; supported: boolean };
 
-export function ModelSelector({
-  sessionId,
-  selection,
-  onChange,
-  onPreference,
-  onImageSupportChange,
-  busy,
-  projectLocked = false,
-  lockedProject,
-  statusText,
-  triggerRef,
-}: {
+export function ModelSelector(props: {
   sessionId?: string;
   selection?: ChatModelSelection;
   onChange: (selection: ChatModelSelection) => void;
@@ -38,213 +26,273 @@ export function ModelSelector({
   statusText?: string;
   triggerRef?: Ref<HTMLButtonElement>;
 }) {
-  const { api, client, snapshot } = useOcgRuntime();
-  const { t } = useI18n();
-  const [catalog, setCatalog] = useState<Catalog | null>(null);
-  const [error, setError] = useState<string>();
-  const [attempt, setAttempt] = useState(0);
-  useEffect(() => {
-    if (!api) return;
-    const controller = new AbortController();
-    const load = async () => {
-      const [profiles, projects] = await Promise.all([
-        api.readProfiles(controller.signal),
-        api.readAllProjects(controller.signal),
-      ]);
-      const agents: AgentProfile[] = [];
-      let before: string | undefined;
-      for (;;) {
-        const page = await api.readAgentProfiles({
-          before,
-          limit: 100,
-          signal: controller.signal,
-        });
-        agents.push(...page.agent_profiles);
-        if (!page.has_more) break;
-        if (!page.next_before || page.next_before === before)
-          throw new Error("Agent Profile cursor did not advance.");
-        before = page.next_before;
-      }
-      const listed = new Set(profiles.agent_profiles.map((profile) => profile.id));
-      if (agents.some((agent) => !listed.has(agent.id)))
-        throw new Error("Profile catalog changed while loading. Refresh the selection.");
-      if (!controller.signal.aborted) {
-        setCatalog({ agents, projects });
-        setError(undefined);
-      }
-    };
-    void load().catch((cause) => {
-      if (!controller.signal.aborted) {
-        setCatalog(null);
-        setError(cause instanceof Error ? cause.message : String(cause));
-      }
-    });
-    return () => controller.abort();
-  }, [api, attempt]);
-  useEffect(() => api?.onProfilesChanged(() => setAttempt((value) => value + 1)), [api]);
-
-  const session = snapshot.sessions.find((session) => session.id === sessionId);
-  const fixedAgent = session?.agentProfile;
-  const agents = (catalog?.agents ?? []).filter(
-    (agent) =>
-      (agent.capabilities.includes("chat") || agent.capabilities.includes("coding")) &&
-      agent.llm_targets.some((target) => target.declared_capabilities.includes("chat")),
+  const { api, client } = useOcgRuntime();
+  const i18n = useI18n();
+  const [catalog, setCatalog] = createSignal<Catalog | null>(null);
+  const [error, setError] = createSignal<string>();
+  const [attempt, setAttempt] = createSignal(0);
+  createEffect(
+    () => [api, attempt()],
+    () => {
+      if (!api) return;
+      const controller = new AbortController();
+      const load = async () => {
+        const [profiles, projects] = await Promise.all([
+          api.readProfiles(controller.signal),
+          api.readAllProjects(controller.signal),
+        ]);
+        const agents: AgentProfile[] = [];
+        let before: string | undefined;
+        for (;;) {
+          const page = await api.readAgentProfiles({
+            before,
+            limit: 100,
+            signal: controller.signal,
+          });
+          agents.push(...page.agent_profiles);
+          if (!page.has_more) break;
+          if (!page.next_before || page.next_before === before)
+            throw new Error("Agent Profile cursor did not advance.");
+          before = page.next_before;
+        }
+        const listed = new Set(profiles.agent_profiles.map((profile) => profile.id));
+        if (agents.some((agent) => !listed.has(agent.id)))
+          throw new Error("Profile catalog changed while loading. Refresh the selection.");
+        if (!controller.signal.aborted) {
+          setCatalog({ agents, projects });
+          setError(undefined);
+        }
+      };
+      void load().catch((cause) => {
+        if (!controller.signal.aborted) {
+          setCatalog(null);
+          setError(cause instanceof Error ? cause.message : String(cause));
+        }
+      });
+      return () => controller.abort();
+    },
   );
-  const agent =
-    agents.find((agent) => agent.id === (fixedAgent ?? selection?.agentProfile)) ??
-    (!fixedAgent ? agents[0] : undefined);
-  const targets =
-    agent?.llm_targets.filter((target) => target.declared_capabilities.includes("chat")) ?? [];
-  const llm = targets.find((target) => target.id === selection?.llmProfile) ?? targets[0];
-  const agentId = agent?.id;
-  const llmId = llm?.id;
-  const supportsImages = llm?.declared_capabilities.includes("vision") ?? false;
-  useEffect(() => {
-    onImageSupportChange({ llmProfile: llmId, supported: supportsImages });
-  }, [llmId, supportsImages, onImageSupportChange]);
-  const model = llm?.model;
-  const efforts =
-    llm?.reasoning_efforts ??
-    (llm?.declared_capabilities.includes("reasoning") ? WIRE_EFFORTS : []);
-  const effort =
-    selection?.llmProfile === llmId &&
-    selection?.effort &&
-    selection.effort !== llm?.default_effort &&
-    efforts.includes(selection.effort)
-      ? selection.effort
-      : null;
-  const disabled = busy || !catalog || !llm;
-  const needsSetup = Boolean(
-    session && !session.conversationId && !fixedAgent && !busy && catalog && !error && !agent,
+  createEffect(
+    () => [api],
+    () => api?.onProfilesChanged(() => setAttempt((value) => value + 1)),
   );
-  useEffect(() => {
-    if (!needsSetup) return;
-    const refresh = () => setAttempt((value) => value + 1);
-    window.addEventListener("focus", refresh);
-    return () => window.removeEventListener("focus", refresh);
-  }, [needsSetup]);
-  const projects = !fixedAgent ? (catalog?.projects ?? []) : [];
-  const projectId = projectLocked
-    ? (lockedProject ?? undefined)
-    : projects.find((project) => project.id === selection?.project)?.id;
 
-  useEffect(() => {
-    if (!agentId || !llmId || !model) return;
-    const next = {
-      model,
-      effort,
-      agentProfile: agentId,
-      llmProfile: llmId,
-      ...(projectId ? { project: projectId } : {}),
-    };
-    if (
-      selection?.agentProfile !== agentId ||
-      selection?.llmProfile !== llmId ||
-      selection?.model !== model ||
-      selection?.project !== projectId ||
-      (selection?.effort ?? null) !== effort
-    )
-      onChange(next);
-    if (sessionId) client.setChatSelection?.(sessionId, next);
-  }, [agentId, llmId, model, projectId, effort, selection, onChange, client, sessionId]);
+  const session = useOcgRuntimeSnapshot((snapshot) =>
+    snapshot.sessions.find((session) => session.id === props.sessionId),
+  );
+  const fixedAgent = createMemo(() => session()?.agentProfile);
+  const agents = createMemo(() =>
+    (catalog()?.agents ?? []).filter(
+      (agent) =>
+        (agent.capabilities.includes("chat") || agent.capabilities.includes("coding")) &&
+        agent.llm_targets.some((target) => target.declared_capabilities.includes("chat")),
+    ),
+  );
+  const agent = createMemo(
+    () =>
+      agents().find((agent) => agent.id === (fixedAgent() ?? props.selection?.agentProfile)) ??
+      (!fixedAgent() ? agents()[0] : undefined),
+  );
+  const targets = createMemo(
+    () =>
+      agent()?.llm_targets.filter((target) => target.declared_capabilities.includes("chat")) ?? [],
+  );
+  const llm = createMemo(
+    () => targets().find((target) => target.id === props.selection?.llmProfile) ?? targets()[0],
+  );
+  const agentId = createMemo(() => agent()?.id);
+  const llmId = createMemo(() => llm()?.id);
+  const supportsImages = createMemo(() => llm()?.declared_capabilities.includes("vision") ?? false);
+  createEffect(
+    () => [llmId(), supportsImages(), props.onImageSupportChange],
+    () => {
+      props.onImageSupportChange({ llmProfile: llmId(), supported: supportsImages() });
+    },
+  );
+  const model = createMemo(() => llm()?.model);
+  const efforts = createMemo(
+    () =>
+      llm()?.reasoning_efforts ??
+      (llm()?.declared_capabilities.includes("reasoning") ? WIRE_EFFORTS : []),
+  );
+  const effort = createMemo(() =>
+    props.selection?.llmProfile === llmId() &&
+    props.selection?.effort &&
+    props.selection.effort !== llm()?.default_effort &&
+    efforts().includes(props.selection.effort)
+      ? props.selection.effort
+      : null,
+  );
+  const disabled = createMemo(() => props.busy || !catalog() || !llm());
+  const needsSetup = createMemo(() =>
+    Boolean(
+      session() &&
+        !session()!.conversationId &&
+        !fixedAgent() &&
+        !props.busy &&
+        catalog() &&
+        !error() &&
+        !agent(),
+    ),
+  );
+  createEffect(
+    () => [needsSetup()],
+    () => {
+      if (!needsSetup()) return;
+      const refresh = () => setAttempt((value) => value + 1);
+      window.addEventListener("focus", refresh);
+      return () => window.removeEventListener("focus", refresh);
+    },
+  );
+  const projects = createMemo(() => (!fixedAgent() ? (catalog()?.projects ?? []) : []));
+  const projectId = createMemo(() =>
+    (props.projectLocked === undefined ? false : props.projectLocked)
+      ? (props.lockedProject ?? undefined)
+      : projects().find((project) => project.id === props.selection?.project)?.id,
+  );
+
+  createEffect(
+    () => [
+      agentId(),
+      llmId(),
+      model(),
+      projectId(),
+      effort(),
+      props.selection,
+      props.onChange,
+      client,
+      props.sessionId,
+    ],
+    () => {
+      if (!agentId() || !llmId() || !model()) return;
+      const next = {
+        model: model(),
+        effort: effort(),
+        agentProfile: agentId(),
+        llmProfile: llmId(),
+        ...(projectId() ? { project: projectId() } : {}),
+      };
+      if (
+        props.selection?.agentProfile !== agentId() ||
+        props.selection?.llmProfile !== llmId() ||
+        props.selection?.model !== model() ||
+        props.selection?.project !== projectId() ||
+        (props.selection?.effort ?? null) !== effort()
+      )
+        props.onChange(next);
+      if (props.sessionId) client.setChatSelection?.(props.sessionId, next);
+    },
+  );
 
   function choose(agentProfile: string, llmProfile?: string) {
-    const agent = agents.find((agent) => agent.id === agentProfile);
+    const agent = agents().find((agent) => agent.id === agentProfile);
     const choices =
       agent?.llm_targets.filter((target) => target.declared_capabilities.includes("chat")) ?? [];
     const llm = choices.find((target) => target.id === llmProfile) ?? choices[0];
     if (!agent || !llm) return;
     const next = {
       model: llm.model,
-      effort: llm.id === selection?.llmProfile ? effort : null,
+      effort: llm.id === props.selection?.llmProfile ? effort() : null,
       agentProfile,
       llmProfile: llm.id,
-      ...(selection?.project ? { project: selection.project } : {}),
+      ...(props.selection?.project ? { project: props.selection.project } : {}),
     };
-    onChange(next);
-    onPreference?.(next);
+    props.onChange(next);
+    props.onPreference?.(next);
   }
 
   function chooseProject(project: string) {
-    if (!selection) return;
-    const next = { ...selection, project: project || undefined };
-    onChange(next);
-    onPreference?.(next);
+    if (!props.selection) return;
+    const next = { ...props.selection, project: project || undefined };
+    props.onChange(next);
+    props.onPreference?.(next);
   }
 
   return (
-    <div className="min-w-0 flex-1">
+    <div class="min-w-0 flex-1">
       <ModelSelectorView
-        triggerRef={triggerRef}
-        status={statusText ?? (busy ? t("chat.settingsLocked") : t("chat.settingsNextTurn"))}
-        disabled={disabled}
-        loading={!catalog && !error}
-        error={error ?? (catalog && fixedAgent && !agent ? t("chat.agentUnavailable") : undefined)}
-        providerLabel={t("chat.agent")}
-        defaultEffort={llm?.default_effort}
+        triggerRef={props.triggerRef}
+        status={
+          props.statusText ??
+          (props.busy ? i18n.t("chat.settingsLocked") : i18n.t("chat.settingsNextTurn"))
+        }
+        disabled={disabled()}
+        loading={!catalog() && !error()}
+        error={
+          error() ??
+          (catalog() && fixedAgent() && !agent() ? i18n.t("chat.agentUnavailable") : undefined)
+        }
+        providerLabel={i18n.t("chat.agent")}
+        defaultEffort={llm()?.default_effort}
         project={{
-          value: projectLocked
-            ? (lockedProject ?? "")
-            : fixedAgent
-              ? (session?.projectId ?? "")
-              : (projectId ?? ""),
-          options: (fixedAgent || projectLocked ? (catalog?.projects ?? []) : projects).map(
-            (project) => ({
-              value: project.id,
-              label: project.name,
-            }),
-          ),
-          disabled: busy || !catalog || Boolean(fixedAgent) || projectLocked,
-          placeholder: t("chat.pureConversation"),
+          value: (props.projectLocked === undefined ? false : props.projectLocked)
+            ? (props.lockedProject ?? "")
+            : fixedAgent()
+              ? (session()?.projectId ?? "")
+              : (projectId() ?? ""),
+          options: (fixedAgent() ||
+          (props.projectLocked === undefined ? false : props.projectLocked)
+            ? (catalog()?.projects ?? [])
+            : projects()
+          ).map((project) => ({
+            value: project.id,
+            label: project.name,
+          })),
+          disabled:
+            props.busy ||
+            !catalog() ||
+            Boolean(fixedAgent()) ||
+            (props.projectLocked === undefined ? false : props.projectLocked),
+          placeholder: i18n.t("chat.pureConversation"),
           onChange: chooseProject,
         }}
         provider={{
-          value: agentId ?? "",
-          options: agents
-            .filter((option) => !fixedAgent || option.id === fixedAgent)
+          value: agentId() ?? "",
+          options: agents()
+            .filter((option) => !fixedAgent() || option.id === fixedAgent())
             .map((agent) => ({ value: agent.id, label: agent.name })),
           onChange: (value) => choose(value),
         }}
         model={{
-          value: llmId ?? "",
-          options: targets.map((target) => ({
+          value: llmId() ?? "",
+          options: targets().map((target) => ({
             value: target.id,
             label: target.name.trim() || target.model,
           })),
           onChange: (value) => {
-            if (agentId) choose(agentId, value);
+            if (agentId()) choose(agentId()!, value);
           },
         }}
         effort={{
-          value: effort ?? "",
-          options: efforts.map((value) => ({ value, label: value })),
+          value: effort() ?? "",
+          options: efforts().map((value) => ({ value, label: value })),
           onChange: (value) => {
-            if (!selection) return;
-            const next = { ...selection, effort: value || null };
-            onChange(next);
-            onPreference?.(next);
+            if (!props.selection) return;
+            const next = { ...props.selection, effort: value || null };
+            props.onChange(next);
+            props.onPreference?.(next);
           },
         }}
       />
-      {needsSetup && (
+      {needsSetup() && (
         <a
           href={settingsPath("models")}
           target="_blank"
           rel="noopener noreferrer"
-          className="mt-2 inline-flex items-start gap-1.5 rounded-sm px-1 text-xs leading-5 text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+          class="mt-2 inline-flex items-start gap-1.5 rounded-sm px-1 text-xs leading-5 text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
         >
-          <ExternalLink className="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
+          <ExternalLink class="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
           <span>
-            {t("chat.setupModels")}
-            <span className="sr-only"> ({t("chat.setupNewTab")})</span>
+            {i18n.t("chat.setupModels")}
+            <span class="sr-only"> ({i18n.t("chat.setupNewTab")})</span>
           </span>
         </a>
       )}
-      {llm && !llm.declared_capabilities.includes("tools") && (
+      {llm() && !llm().declared_capabilities.includes("tools") && (
         <DismissibleNotice
           tone="warning"
-          message={t("chat.toolsWarning")}
-          className="mt-1 px-1 text-xs text-muted-foreground"
+          message={i18n.t("chat.toolsWarning")}
+          class="mt-1 px-1 text-xs text-muted-foreground"
         />
       )}
     </div>

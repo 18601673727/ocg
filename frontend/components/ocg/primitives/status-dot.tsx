@@ -1,31 +1,23 @@
-"use client";
-
 import { cn } from "@/lib/utils";
 import { DOT_TONE, type Tone } from "./tone";
 
-export function StatusDot({
-  tone,
-  pulse = false,
-  size = "sm",
-  title,
-  className,
-}: {
+export function StatusDot(props: {
   tone: Tone;
   pulse?: boolean;
   size?: "sm" | "md";
   title?: string;
-  className?: string;
+  class?: string;
 }) {
   return (
     <span
-      className={cn(
+      class={cn(
         "shrink-0 rounded-full",
-        size === "sm" ? "size-1.5" : "size-2",
-        DOT_TONE[tone],
-        pulse && "animate-pulse",
-        className,
+        (props.size === undefined ? "sm" : props.size) === "sm" ? "size-1.5" : "size-2",
+        DOT_TONE[props.tone],
+        (props.pulse === undefined ? false : props.pulse) && "animate-pulse",
+        props.class,
       )}
-      title={title}
+      title={props.title}
       aria-hidden="true"
     />
   );

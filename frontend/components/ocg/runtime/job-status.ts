@@ -1,5 +1,5 @@
 import type { ExecutionPhase, Job, JobDetails, TaskPlan } from "../contracts";
-import type { I18nKey, TranslateFn } from "../i18n";
+import type { I18nKey, TranslateFn } from "../i18n/dictionaries";
 import type { Tone } from "../primitives/tone";
 
 export function reconcileJob(current: Job, incoming: Job): Job {

@@ -1,20 +1,13 @@
-"use client";
-
+import { createMemo } from "solid-js";
+import { Input } from "@/components/ui/input";
+import { Select, SelectItem } from "@/components/ui/select";
 import type { ProfilesSnapshot } from "../contracts";
 import type {
   CompactionPolicy as CompactionPolicy,
   PredictiveCompaction as PredictiveCompaction,
 } from "../contracts/api";
-import { useI18n, type I18nKey } from "../i18n";
+import { type I18nKey, useI18n } from "../i18n";
 import { selectableLlmProfiles } from "./settings-parts";
-import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 
 const off: CompactionPolicy = {
   mode: { kind: "off" },
@@ -22,23 +15,18 @@ const off: CompactionPolicy = {
   predictive: null,
 };
 const selectClass = "min-h-10 w-full rounded-md border border-border bg-background px-2 text-sm";
-export function CompactionPolicyFields({
-  value,
-  onChange,
-  profiles,
-  disabled = false,
-}: {
+export function CompactionPolicyFields(props: {
   value: CompactionPolicy | null;
   onChange(value: CompactionPolicy | null): void;
   profiles: ProfilesSnapshot;
   disabled?: boolean;
 }) {
-  const { t } = useI18n();
-  const policy = value ?? off;
-  const prediction = policy.predictive;
-  const change = (patch: Partial<CompactionPolicy>) => onChange({ ...policy, ...patch });
+  const i18n = useI18n();
+  const policy = createMemo(() => props.value ?? off);
+  const prediction = createMemo(() => policy().predictive);
+  const change = (patch: Partial<CompactionPolicy>) => props.onChange({ ...policy(), ...patch });
   const updatePrediction = (patch: Partial<PredictiveCompaction>) => {
-    if (prediction) change({ predictive: { ...prediction, ...patch } });
+    if (prediction()) change({ predictive: { ...prediction()!, ...patch } });
   };
   const number = (
     label: I18nKey,
@@ -47,8 +35,8 @@ export function CompactionPolicyFields({
     min = 1,
     max = 1_000_000,
   ) => (
-    <label className="grid gap-1 text-xs">
-      {t(label)}
+    <label class="grid gap-1 text-xs">
+      {i18n.t(label)}
       <Input
         type="number"
         min={min}
@@ -56,27 +44,35 @@ export function CompactionPolicyFields({
         step={1}
         required
         value={value === 0 && min > 0 ? "" : value}
-        onChange={(event) => update(event.currentTarget.valueAsNumber || 0)}
+        onInput={(event) => update(event.currentTarget.valueAsNumber || 0)}
       />
     </label>
   );
-  const mode = policy.mode.kind === "auto" ? policy.mode.preset : policy.mode.kind;
+  const mode = createMemo(() => {
+    const mode = policy().mode;
+    return mode.kind === "auto" ? mode.preset : mode.kind;
+  });
   return (
-    <fieldset disabled={disabled} className="space-y-3 rounded-md border border-border p-3">
-      <legend className="px-1 text-sm font-medium">{t("context.title")}</legend>
-      <label className="grid gap-1 text-xs">
-        {t("context.automatic")}
+    <fieldset
+      disabled={props.disabled === undefined ? false : props.disabled}
+      class="space-y-3 rounded-md border border-border p-3"
+    >
+      <legend class="px-1 text-sm font-medium">{i18n.t("context.title")}</legend>
+      <label class="grid gap-1 text-xs">
+        {i18n.t("context.automatic")}
         <Select
-          value={mode}
+          value={mode()}
           items={(["off", "conservative", "balanced", "aggressive", "custom"] as const).map(
-            (mode) => ({ value: mode, label: t(`context.${mode}`) }),
+            (mode) => ({ value: mode, label: i18n.t(`context.${mode}`) }),
           )}
           onValueChange={(mode) => {
             if (mode === "off")
               change({
                 mode: { kind: "off" },
                 predictive:
-                  prediction?.mode === "prepare" ? { ...prediction, mode: "shadow" } : prediction,
+                  prediction()?.mode === "prepare"
+                    ? { ...prediction()!, mode: "shadow" }
+                    : prediction(),
               });
             else if (mode === "custom")
               change({
@@ -96,27 +92,21 @@ export function CompactionPolicyFields({
             else if (mode === "conservative" || mode === "balanced" || mode === "aggressive")
               change({
                 mode: { kind: "auto", preset: mode },
-                predictive: prediction ? { ...prediction, mode: "prepare" } : null,
+                predictive: prediction() ? { ...prediction()!, mode: "prepare" } : null,
               });
           }}
+          class={selectClass}
         >
-          <SelectTrigger className={selectClass}>
-            <SelectValue />
-          </SelectTrigger>
-          <SelectContent>
-            {(["off", "conservative", "balanced", "aggressive", "custom"] as const).map((mode) => (
-              <SelectItem key={mode} value={mode}>
-                {t(`context.${mode}`)}
-              </SelectItem>
-            ))}
-          </SelectContent>
+          {(["off", "conservative", "balanced", "aggressive", "custom"] as const).map((mode) => (
+            <SelectItem value={mode}>{i18n.t(`context.${mode}`)}</SelectItem>
+          ))}
         </Select>
       </label>
-      <p className="text-xs text-muted-foreground">{t("context.experimental")}</p>
-      {value !== null && (
+      <p class="text-xs text-muted-foreground">{i18n.t("context.experimental")}</p>
+      {props.value !== null && (
         <>
-          {policy.mode.kind === "custom" && (
-            <div className="grid grid-cols-2 gap-2">
+          {policy().mode.kind === "custom" && (
+            <div class="grid grid-cols-2 gap-2">
               {(
                 [
                   ["trigger_tokens", "context.trigger"],
@@ -128,9 +118,9 @@ export function CompactionPolicyFields({
                   ["cooldown_seconds", "context.cooldown"],
                 ] as const
               ).map(([field, label]) => {
-                const mode = policy.mode;
+                const mode = policy().mode;
                 return mode.kind === "custom" ? (
-                  <div key={field}>
+                  <div>
                     {number(
                       label,
                       mode.policy[field],
@@ -142,95 +132,92 @@ export function CompactionPolicyFields({
               })}
             </div>
           )}
-          <label className="grid gap-1 text-xs">
-            {t("context.summarizer")}
+          <label class="grid gap-1 text-xs">
+            {i18n.t("context.summarizer")}
             <Select
-              value={policy.summarization_model ?? ""}
+              value={policy().summarization_model ?? ""}
               items={[
-                { value: "", label: t("context.foregroundFallback") },
-                ...selectableLlmProfiles(profiles.llm_profiles, policy.summarization_model).map(
-                  (model) => ({
-                    value: model.id,
-                    label: model.enabled
-                      ? model.name
-                      : `${model.name} (${t("settings.llm.disabled")})`,
-                  }),
-                ),
+                { value: "", label: i18n.t("context.foregroundFallback") },
+                ...selectableLlmProfiles(
+                  props.profiles.llm_profiles,
+                  policy().summarization_model,
+                ).map((model) => ({
+                  value: model.id,
+                  label: model.enabled
+                    ? model.name
+                    : `${model.name} (${i18n.t("settings.llm.disabled")})`,
+                })),
               ]}
               onValueChange={(next) => change({ summarization_model: next || null })}
+              class={selectClass}
             >
-              <SelectTrigger className={selectClass}>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="">{t("context.foregroundFallback")}</SelectItem>
-                {selectableLlmProfiles(profiles.llm_profiles, policy.summarization_model).map(
-                  (model) => (
-                    <SelectItem key={model.id} value={model.id} disabled={!model.enabled}>
-                      {model.name}
-                      {!model.enabled && ` (${t("settings.llm.disabled")})`}
-                    </SelectItem>
-                  ),
-                )}
-              </SelectContent>
+              <SelectItem value="">{i18n.t("context.foregroundFallback")}</SelectItem>
+              {selectableLlmProfiles(props.profiles.llm_profiles, policy().summarization_model).map(
+                (model) => (
+                  <SelectItem value={model.id} disabled={!model.enabled}>
+                    {model.name}
+                    {!model.enabled && ` (${i18n.t("settings.llm.disabled")})`}
+                  </SelectItem>
+                ),
+              )}
             </Select>
           </label>
-          <div className="space-y-3">
-            <p className="text-xs text-muted-foreground">{t("context.predictionHint")}</p>
-            {prediction && (
-              <details className="space-y-3">
-                <summary className="cursor-pointer text-sm">{t("context.advanced")}</summary>
-                <div className="grid grid-cols-2 gap-2">
-                  {number("context.interval", prediction.minimum_interval_seconds, (n) =>
+          <div class="space-y-3">
+            <p class="text-xs text-muted-foreground">{i18n.t("context.predictionHint")}</p>
+            {prediction() && (
+              <details class="space-y-3">
+                <summary class="cursor-pointer text-sm">{i18n.t("context.advanced")}</summary>
+                <div class="grid grid-cols-2 gap-2">
+                  {number("context.interval", prediction()!.minimum_interval_seconds, (n) =>
                     updatePrediction({ minimum_interval_seconds: n }),
                   )}
-                  {number("context.predictionBudget", prediction.max_prediction_tokens, (n) =>
+                  {number("context.predictionBudget", prediction()!.max_prediction_tokens, (n) =>
                     updatePrediction({ max_prediction_tokens: n }),
                   )}
-                  {number("context.preparationBudget", prediction.max_preparation_tokens, (n) =>
+                  {number("context.preparationBudget", prediction()!.max_preparation_tokens, (n) =>
                     updatePrediction({ max_preparation_tokens: n }),
                   )}
                 </div>
-                {prediction.mode === "prepare" && prediction.acceptance && (
-                  <div className="space-y-2">
-                    <div className="grid grid-cols-2 gap-2">
+                {prediction()!.mode === "prepare" && prediction()!.acceptance && (
+                  <div class="space-y-2">
+                    <div class="grid grid-cols-2 gap-2">
                       {number(
                         "context.probability",
-                        prediction.acceptance.minimum_probability_millionths,
+                        prediction()!.acceptance!.minimum_probability_millionths,
                         (n) =>
-                          prediction.acceptance &&
+                          prediction()!.acceptance &&
                           updatePrediction({
                             acceptance: {
-                              ...prediction.acceptance,
+                              ...prediction()!.acceptance!,
                               minimum_probability_millionths: n,
                             },
                           }),
                       )}
                       {number(
                         "context.confidence",
-                        prediction.acceptance.minimum_confidence_millionths,
+                        prediction()!.acceptance!.minimum_confidence_millionths,
                         (n) =>
-                          prediction.acceptance &&
+                          prediction()!.acceptance &&
                           updatePrediction({
                             acceptance: {
-                              ...prediction.acceptance,
+                              ...prediction()!.acceptance!,
                               minimum_confidence_millionths: n,
                             },
                           }),
                       )}
                       {number(
                         "context.hourlyPreparations",
-                        prediction.max_preparations_per_hour ?? 0,
+                        prediction()!.max_preparations_per_hour ?? 0,
                         (n) => updatePrediction({ max_preparations_per_hour: n }),
                       )}
                       {number(
                         "context.hourlyRequests",
-                        prediction.max_requests_per_hour ?? 0,
+                        prediction()!.max_requests_per_hour ?? 0,
                         (n) => updatePrediction({ max_requests_per_hour: n }),
                       )}
                       {number(
                         "context.hourlyTokens",
-                        prediction.max_tokens_per_hour ?? 0,
+                        prediction()!.max_tokens_per_hour ?? 0,
                         (n) => updatePrediction({ max_tokens_per_hour: n }),
                         1,
                         4_000_000_000,

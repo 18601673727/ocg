@@ -1,19 +1,19 @@
-import { Inbox, LoaderCircle } from "lucide-react";
+import { Inbox, LoaderCircle } from "@lucide/solid";
 
-export function ListStatus({ message, loading = false }: { message: string; loading?: boolean }) {
+export function ListStatus(props: { message: string; loading?: boolean }) {
   return (
-    <div role="status" className="flex flex-col items-center gap-3 px-4 py-10 text-center">
+    <div role="status" class="flex flex-col items-center gap-3 px-4 py-10 text-center">
       <span
         aria-hidden="true"
-        className="grid size-10 place-items-center rounded-xl bg-muted text-muted-foreground"
+        class="grid size-10 place-items-center rounded-xl bg-muted text-muted-foreground"
       >
-        {loading ? (
-          <LoaderCircle className="size-5 motion-safe:animate-spin" />
+        {(props.loading === undefined ? false : props.loading) ? (
+          <LoaderCircle class="size-5 motion-safe:animate-spin" />
         ) : (
-          <Inbox className="size-5" />
+          <Inbox class="size-5" />
         )}
       </span>
-      <p className="text-sm text-muted-foreground">{message}</p>
+      <p class="text-sm text-muted-foreground">{props.message}</p>
     </div>
   );
 }

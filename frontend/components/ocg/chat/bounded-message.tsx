@@ -1,71 +1,71 @@
-"use client";
+import { ChevronDown } from "@lucide/solid";
+import { createEffect, createMemo, createSignal } from "solid-js";
+import { ariaState, bindElementRef, elementRef, type View } from "@/lib/ui-state";
 
-import { useEffect, useRef, useState } from "react";
-import { ChevronDown } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
 import { BOUNDED_MESSAGE_CLASS, boundedToggle, followAfterScroll } from "./message-bounds";
 
-export function BoundedMessage({
-  streaming,
-  children,
-  expandable = true,
-  className,
-  label,
-}: {
+export function BoundedMessage(props: {
   streaming: boolean;
-  children: React.ReactNode;
+  children: View;
   expandable?: boolean;
-  className?: string;
+  class?: string;
   label?: string;
 }) {
-  const { t } = useI18n();
-  const viewport = useRef<HTMLDivElement>(null);
-  const content = useRef<HTMLDivElement>(null);
-  const following = useRef(true);
-  const lastTop = useRef(0);
-  const touchY = useRef<number | null>(null);
-  const [expanded, setExpanded] = useState(false);
-  const [overflowing, setOverflowing] = useState(false);
+  const i18n = useI18n();
+  const viewport = elementRef<HTMLElement>(null);
+  const content = elementRef<HTMLDivElement>(null);
+  const following = elementRef(true);
+  const lastTop = elementRef(0);
+  const touchY = elementRef<number | null>(null);
+  const [expanded, setExpanded] = createSignal(false);
+  const [overflowing, setOverflowing] = createSignal(false);
 
-  useEffect(() => {
-    const el = viewport.current;
-    const inner = content.current;
-    if (!el || !inner) return;
-    const observer = new ResizeObserver(() => {
-      if (!expanded && streaming && following.current) {
-        el.scrollTop = el.scrollHeight;
-        lastTop.current = el.scrollTop;
-      }
-      setOverflowing(el.scrollHeight - el.clientHeight > 1);
-    });
-    observer.observe(inner);
-    observer.observe(el);
-    return () => observer.disconnect();
-  }, [expanded, streaming]);
+  createEffect(
+    () => [expanded(), props.streaming],
+    () => {
+      const el = viewport.current;
+      const inner = content.current;
+      if (!el || !inner) return;
+      const observer = new ResizeObserver(() => {
+        if (!expanded() && props.streaming && following.current) {
+          el.scrollTop = el.scrollHeight;
+          lastTop.current = el.scrollTop;
+        }
+        setOverflowing(el.scrollHeight - el.clientHeight > 1);
+      });
+      observer.observe(inner);
+      observer.observe(el);
+      return () => observer.disconnect();
+    },
+  );
 
-  const toggle = expandable ? boundedToggle(overflowing, expanded) : null;
+  const toggle = createMemo(() =>
+    (props.expandable === undefined ? true : props.expandable)
+      ? boundedToggle(overflowing(), expanded())
+      : null,
+  );
   return (
     <>
-      <div
-        ref={viewport}
-        data-message-bounds={expanded ? "expanded" : "bounded"}
-        role={label ? "region" : undefined}
-        aria-label={label}
-        tabIndex={label ? 0 : undefined}
-        onWheelCapture={(event) => {
+      <section
+        ref={bindElementRef(viewport)}
+        data-message-bounds={expanded() ? "expanded" : "bounded"}
+        aria-label={props.label}
+        tabindex={props.label ? 0 : undefined}
+        onWheel={(event) => {
           if (event.deltaY < 0) following.current = false;
         }}
-        onTouchStartCapture={(event) => {
+        onTouchStart={(event) => {
           touchY.current = event.touches[0]?.clientY ?? null;
         }}
-        onTouchMoveCapture={(event) => {
+        onTouchMove={(event) => {
           const next = event.touches[0]?.clientY ?? null;
           if (next !== null && touchY.current !== null && next > touchY.current)
             following.current = false;
           touchY.current = next;
         }}
-        onKeyDownCapture={(event) => {
+        onKeyDown={(event) => {
           if (
             event.key === "ArrowUp" ||
             event.key === "PageUp" ||
@@ -76,31 +76,32 @@ export function BoundedMessage({
         }}
         onScroll={() => {
           const el = viewport.current;
-          if (!el || expanded) return;
+          if (!el || expanded()) return;
           following.current = followAfterScroll(following.current, lastTop.current, el);
           lastTop.current = el.scrollTop;
         }}
-        className={cn(
+        class={cn(
           "min-w-0",
-          !expanded && BOUNDED_MESSAGE_CLASS,
-          label && "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
-          className,
+          !expanded() && BOUNDED_MESSAGE_CLASS,
+          props.label &&
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/30",
+          props.class,
         )}
       >
-        <div ref={content}>{children}</div>
-      </div>
-      {toggle && (
+        <div ref={bindElementRef(content)}>{props.children}</div>
+      </section>
+      {toggle() && (
         <button
           type="button"
-          aria-expanded={expanded}
+          aria-expanded={ariaState(expanded())}
           onClick={() => setExpanded((value) => !value)}
-          className="mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring"
+          class="mt-1 inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-ring"
         >
           <ChevronDown
-            className={cn("size-3 transition-transform", expanded && "rotate-180")}
+            class={cn("size-3 transition-transform", expanded() && "rotate-180")}
             aria-hidden="true"
           />
-          {t(toggle === "collapse" ? "chat.collapseMessage" : "chat.expandMessage")}
+          {i18n.t(toggle() === "collapse" ? "chat.collapseMessage" : "chat.expandMessage")}
         </button>
       )}
     </>

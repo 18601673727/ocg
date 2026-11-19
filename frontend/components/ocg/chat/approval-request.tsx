@@ -1,8 +1,7 @@
-"use client";
-
-import { useI18n, type I18nKey } from "../i18n";
+import { createMemo } from "solid-js";
+import { ApprovalCard } from "@/components/ocg/chat/ui/approval-card";
 import type { ApprovalAssessment } from "../contracts/api";
-import { ApprovalCard } from "@/components/assistant-ui/elements/approval-card";
+import { type I18nKey, useI18n } from "../i18n";
 
 const ACTION_LABELS: Record<string, I18nKey> = {
   job_plan: "chat.card.plan",
@@ -14,14 +13,7 @@ const ACTION_LABELS: Record<string, I18nKey> = {
   job_close: "chat.card.close",
 };
 
-export function ApprovalRequest({
-  tool,
-  arguments: raw,
-  assessment,
-  disabled,
-  onApprove,
-  onReject,
-}: {
+export function ApprovalRequest(props: {
   tool: string;
   arguments: string;
   assessment?: ApprovalAssessment;
@@ -29,19 +21,21 @@ export function ApprovalRequest({
   onApprove: () => void;
   onReject: () => void;
 }) {
-  const { t, locale } = useI18n();
+  const i18n = useI18n();
   const percent = (value: number) =>
-    new Intl.NumberFormat(locale, { style: "percent", maximumFractionDigits: 2 }).format(value);
+    new Intl.NumberFormat(i18n.locale, { style: "percent", maximumFractionDigits: 2 }).format(
+      value,
+    );
   let args: Record<string, unknown> = {};
-  let formatted = raw;
+  let formatted = props.arguments;
   try {
-    const value: unknown = JSON.parse(raw);
+    const value: unknown = JSON.parse(props.arguments);
     formatted = JSON.stringify(value, null, 2);
     if (value && typeof value === "object" && !Array.isArray(value))
       args = Object.fromEntries(Object.entries(value));
   } catch {}
-  const steps =
-    tool === "job_plan" && Array.isArray(args.steps)
+  const steps = createMemo(() =>
+    props.tool === "job_plan" && Array.isArray(args.steps)
       ? args.steps.map((value: unknown, index) => {
           if (
             !value ||
@@ -69,75 +63,80 @@ export function ApprovalRequest({
             model: "model" in value && typeof value.model === "string" ? value.model : null,
           };
         })
-      : null;
-  const plan = steps?.length && steps.every((step) => step !== null) ? steps : null;
-  const target =
-    tool === "workspace_run_command" && typeof args.command === "string"
+      : null,
+  );
+  const plan = createMemo(() =>
+    steps()?.length && steps()!.every((step) => step !== null) ? steps() : null,
+  );
+  const target = createMemo(() =>
+    props.tool === "workspace_run_command" && typeof args.command === "string"
       ? args.command
-      : tool === "workspace_request_command" &&
+      : props.tool === "workspace_request_command" &&
           Array.isArray(args.argv) &&
           args.argv.every((arg) => typeof arg === "string")
         ? args.argv.join(" ")
-        : tool === "workspace_write_file" && typeof args.path === "string"
+        : props.tool === "workspace_write_file" && typeof args.path === "string"
           ? args.path
-          : null;
-  const note =
-    tool === "job_plan" && Array.isArray(args.steps)
-      ? t("chat.card.planNote", { count: args.steps.length })
-      : tool === "workspace_request_command"
-        ? t("chat.card.commandGrantNote")
-        : t("chat.card.review");
+          : null,
+  );
+  const note = createMemo(() =>
+    props.tool === "job_plan" && Array.isArray(args.steps)
+      ? i18n.t("chat.card.planNote", { count: args.steps.length })
+      : props.tool === "workspace_request_command"
+        ? i18n.t("chat.card.commandGrantNote")
+        : i18n.t("chat.card.review"),
+  );
   return (
     <ApprovalCard
       state="request"
-      className="max-w-none text-xs"
-      title={t(ACTION_LABELS[tool] ?? "chat.card.action")}
-      subtitle={t("chat.card.approval")}
-      description={note}
-      command={target ?? undefined}
-      disabled={disabled}
-      allowOnceLabel={t("chat.card.approve")}
-      denyLabel={t("chat.card.reject")}
-      onAllowOnce={onApprove}
-      onDeny={onReject}
+      class="max-w-none text-xs"
+      title={i18n.t(ACTION_LABELS[props.tool] ?? "chat.card.action")}
+      subtitle={i18n.t("chat.card.approval")}
+      description={note()}
+      command={target() ?? undefined}
+      disabled={props.disabled}
+      allowOnceLabel={i18n.t("chat.card.approve")}
+      denyLabel={i18n.t("chat.card.reject")}
+      onAllowOnce={props.onApprove}
+      onDeny={props.onReject}
     >
-      {plan && (
-        <ol className="space-y-3 py-1" aria-label={t("chat.card.plan")}>
-          {plan.map((step, index) => (
-            <li key={index} className="rounded-lg border border-border p-3">
-              <div className="flex items-start gap-2.5">
+      {plan() && (
+        <ol class="space-y-3 py-1" aria-label={i18n.t("chat.card.plan")}>
+          {plan()!.map((step, index) => (
+            <li class="rounded-lg border border-border p-3">
+              <div class="flex items-start gap-2.5">
                 <span
-                  className="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium tabular-nums"
+                  class="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium tabular-nums"
                   aria-hidden="true"
                 >
                   {index + 1}
                 </span>
-                <div className="min-w-0 space-y-2">
-                  <h3 className="text-sm font-medium break-words">{step.title}</h3>
-                  <p className="text-xs text-muted-foreground">
-                    {step.dependencies.length
-                      ? t("job.activity.dependsOn", {
-                          steps: step.dependencies
-                            .map((dependency) => `${dependency + 1}. ${plan[dependency].title}`)
+                <div class="min-w-0 space-y-2">
+                  <h3 class="text-sm font-medium break-words">{step!.title}</h3>
+                  <p class="text-xs text-muted-foreground">
+                    {step!.dependencies.length
+                      ? i18n.t("job.activity.dependsOn", {
+                          steps: step!.dependencies
+                            .map((dependency) => `${dependency + 1}. ${plan()![dependency]!.title}`)
                             .join(" · "),
                         })
-                      : t("chat.card.independentStep")}
+                      : i18n.t("chat.card.independentStep")}
                   </p>
-                  <p className="text-sm leading-relaxed whitespace-pre-wrap break-words">
-                    {step.objective}
+                  <p class="text-sm leading-relaxed whitespace-pre-wrap break-words">
+                    {step!.objective}
                   </p>
-                  {(step.agent || step.model) && (
-                    <dl className="space-y-1 text-xs text-muted-foreground">
-                      {step.agent && (
+                  {(step!.agent || step!.model) && (
+                    <dl class="space-y-1 text-xs text-muted-foreground">
+                      {step!.agent && (
                         <div>
-                          <dt className="inline font-medium">{t("chat.agent")}: </dt>
-                          <dd className="inline break-all">{step.agent}</dd>
+                          <dt class="inline font-medium">{i18n.t("chat.agent")}: </dt>
+                          <dd class="inline break-all">{step!.agent}</dd>
                         </div>
                       )}
-                      {step.model && (
+                      {step!.model && (
                         <div>
-                          <dt className="inline font-medium">{t("chat.model")}: </dt>
-                          <dd className="inline break-all">{step.model}</dd>
+                          <dt class="inline font-medium">{i18n.t("chat.model")}: </dt>
+                          <dd class="inline break-all">{step!.model}</dd>
                         </div>
                       )}
                     </dl>
@@ -148,41 +147,43 @@ export function ApprovalRequest({
           ))}
         </ol>
       )}
-      {assessment && (
+      {props.assessment && (
         <div
-          className="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground"
+          class="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground"
           role="status"
         >
-          {assessment.confidence === null ? (
+          {props.assessment.confidence === null ? (
             <p>
-              {t(
-                assessment.state === "pending" || assessment.state === "running"
+              {i18n.t(
+                props.assessment.state === "pending" || props.assessment.state === "running"
                   ? "chat.card.assessmentPending"
-                  : assessment.state === "failed"
+                  : props.assessment.state === "failed"
                     ? "chat.card.assessmentFailed"
                     : "chat.card.assessmentUnavailable",
               )}
             </p>
           ) : (
             <p>
-              {t("chat.card.assessmentConfidence", { confidence: percent(assessment.confidence) })}
+              {i18n.t("chat.card.assessmentConfidence", {
+                confidence: percent(props.assessment.confidence),
+              })}
             </p>
           )}
           <p>
-            {t("chat.card.assessmentThreshold", {
-              threshold: percent(assessment.minimum_confidence),
+            {i18n.t("chat.card.assessmentThreshold", {
+              threshold: percent(props.assessment.minimum_confidence),
             })}
           </p>
         </div>
       )}
-      <details className="rounded-lg border border-border">
-        <summary className="cursor-pointer px-3 py-2 text-muted-foreground">
-          {t("chat.card.rawRequest")}
+      <details class="rounded-lg border border-border">
+        <summary class="cursor-pointer px-3 py-2 text-muted-foreground">
+          {i18n.t("chat.card.rawRequest")}
         </summary>
-        <div className="space-y-2 border-t border-border p-3">
-          <p className="text-muted-foreground">{t("chat.card.originalDetails")}</p>
-          <p className="font-mono">{tool}</p>
-          <pre className="ocg-subtle-scrollbar max-h-64 max-w-full overflow-auto overscroll-contain rounded-md bg-muted/50 p-3 font-mono text-xs whitespace-pre-wrap break-all">
+        <div class="space-y-2 border-t border-border p-3">
+          <p class="text-muted-foreground">{i18n.t("chat.card.originalDetails")}</p>
+          <p class="font-mono">{props.tool}</p>
+          <pre class="ocg-subtle-scrollbar max-h-64 max-w-full overflow-auto overscroll-contain rounded-md bg-muted/50 p-3 font-mono text-xs whitespace-pre-wrap break-all">
             {formatted}
           </pre>
         </div>

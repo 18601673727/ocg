@@ -1,7 +1,6 @@
-"use client";
+import { FileCode2, ImageIcon } from "@lucide/solid";
+import { createMemo, createSignal } from "solid-js";
 
-import { useMemo, useState } from "react";
-import { FileCode2, ImageIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -10,18 +9,18 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useOcgRuntime } from "../runtime/runtime-context";
 import { useI18n } from "../i18n";
+import { useOcgRuntimeSnapshot } from "../runtime/runtime-context";
 import { artifactTitle, isArtifactCall, managedArtifactImages } from "./artifact-model";
-import { ArtifactPreview, type Artifact } from "./artifact-preview";
+import { type Artifact, ArtifactPreview } from "./artifact-preview";
 
-export function ConversationArtifacts({ sessionId }: { sessionId: string }) {
-  const { snapshot } = useOcgRuntime();
-  const { t } = useI18n();
-  const [selected, setSelected] = useState<Artifact | null>(null);
-  const artifacts = useMemo(() => {
+export function ConversationArtifacts(props: { sessionId: string }) {
+  const messages = useOcgRuntimeSnapshot((snapshot) => snapshot.messagesBySession[props.sessionId]);
+  const i18n = useI18n();
+  const [selected, setSelected] = createSignal<Artifact | null>(null);
+  const artifacts = createMemo(() => {
     const found = new Map<string, Artifact>();
-    for (const message of snapshot.messagesBySession[sessionId] ?? []) {
+    for (const message of messages() ?? []) {
       if (message.role !== "assistant") continue;
       for (const call of message.toolCalls ?? []) {
         if (!message.jobId || !isArtifactCall(call)) continue;
@@ -37,65 +36,73 @@ export function ConversationArtifacts({ sessionId }: { sessionId: string }) {
       }
     }
     return [...found.values()].reverse();
-  }, [snapshot.messagesBySession, sessionId]);
-  const remaining = artifacts.filter(
-    (artifact) => !("call" in artifact) || artifact.call.name !== "workspace_write_file",
+  });
+  const remaining = createMemo(() =>
+    artifacts().filter(
+      (artifact) => !("call" in artifact) || artifact.call.name !== "workspace_write_file",
+    ),
   );
-  if (!remaining.length) return null;
   return (
     <>
-      {remaining.length > 0 && (
-        <section
-          className="my-3 rounded-lg border border-border p-3"
-          data-slot="conversation-artifacts"
-        >
-          <details>
-            <summary className="cursor-pointer text-sm font-medium">
-              {t("chat.artifacts.title", { count: remaining.length })}
-            </summary>
-            <ul className="mt-2 grid gap-1">
-              {remaining.map((artifact) => (
-                <li key={artifact.id}>
-                  <Button
-                    variant="ghost"
-                    className="h-auto max-w-full justify-start py-2 text-left normal-case tracking-normal"
-                    onClick={() => setSelected(artifact)}
-                  >
-                    {"call" in artifact ? (
-                      <FileCode2 aria-hidden="true" />
-                    ) : (
-                      <ImageIcon aria-hidden="true" />
+      {(() => {
+        if (!remaining().length) return null;
+        return (
+          <>
+            {remaining().length > 0 && (
+              <section
+                class="my-3 rounded-lg border border-border p-3"
+                data-slot="conversation-artifacts"
+              >
+                <details>
+                  <summary class="cursor-pointer text-sm font-medium">
+                    {i18n.t("chat.artifacts.title", { count: remaining().length })}
+                  </summary>
+                  <ul class="mt-2 grid gap-1">
+                    {remaining().map((artifact) => (
+                      <li>
+                        <Button
+                          variant="ghost"
+                          class="h-auto max-w-full justify-start py-2 text-left normal-case tracking-normal"
+                          onClick={() => setSelected(artifact)}
+                        >
+                          {"call" in artifact ? (
+                            <FileCode2 aria-hidden="true" />
+                          ) : (
+                            <ImageIcon aria-hidden="true" />
+                          )}
+                          <span class="min-w-0 truncate">
+                            {artifact.title || i18n.t("chat.artifacts.image")}
+                          </span>
+                        </Button>
+                      </li>
+                    ))}
+                  </ul>
+                </details>
+                <Dialog
+                  open={selected() !== null}
+                  onOpenChange={(open) => {
+                    if (!open) setSelected(null);
+                  }}
+                >
+                  <DialogContent class="flex max-h-[85dvh] min-w-0 flex-col sm:max-w-5xl">
+                    <DialogHeader class="min-w-0 pr-6">
+                      <DialogTitle class="break-all normal-case tracking-normal">
+                        {selected()?.title || i18n.t("chat.artifacts.image")}
+                      </DialogTitle>
+                      <DialogDescription>{i18n.t("chat.artifacts.note")}</DialogDescription>
+                    </DialogHeader>
+                    {selected() && (
+                      <div class="ocg-subtle-scrollbar min-h-0 min-w-0 overflow-y-auto">
+                        <ArtifactPreview artifact={selected()!} />
+                      </div>
                     )}
-                    <span className="min-w-0 truncate">
-                      {artifact.title || t("chat.artifacts.image")}
-                    </span>
-                  </Button>
-                </li>
-              ))}
-            </ul>
-          </details>
-          <Dialog
-            open={selected !== null}
-            onOpenChange={(open) => {
-              if (!open) setSelected(null);
-            }}
-          >
-            <DialogContent className="flex max-h-[85dvh] min-w-0 flex-col sm:max-w-5xl">
-              <DialogHeader className="min-w-0 pr-6">
-                <DialogTitle className="break-all normal-case tracking-normal">
-                  {selected?.title || t("chat.artifacts.image")}
-                </DialogTitle>
-                <DialogDescription>{t("chat.artifacts.note")}</DialogDescription>
-              </DialogHeader>
-              {selected && (
-                <div className="ocg-subtle-scrollbar min-h-0 min-w-0 overflow-y-auto">
-                  <ArtifactPreview key={selected.id} artifact={selected} />
-                </div>
-              )}
-            </DialogContent>
-          </Dialog>
-        </section>
-      )}
+                  </DialogContent>
+                </Dialog>
+              </section>
+            )}
+          </>
+        );
+      })()}
     </>
   );
 }

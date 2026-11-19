@@ -1,48 +1,42 @@
-"use client";
-
-import type { ReactNode } from "react";
+import { BORDER_RADIUS, TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import { type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
 import { StatusDot } from "./status-dot";
-import { TONE_CLASS, TEXT_TONE, type Tone } from "./tone";
-import { TYPOGRAPHY_SCALE, BORDER_RADIUS } from "@/lib/design-tokens";
+import { TEXT_TONE, TONE_CLASS, type Tone } from "./tone";
 
-export function Pill({
-  children,
-  tone = "slate",
-  variant = "solid",
-  dot,
-  pulse,
-  title,
-  className,
-}: {
-  children: ReactNode;
+export function Pill(props: {
+  children: View;
   tone?: Tone;
   variant?: "solid" | "quiet";
   dot?: boolean;
   pulse?: boolean;
   title?: string;
-  className?: string;
+  class?: string;
 }) {
   return (
     <span
-      title={title}
-      className={cn(
+      title={props.title}
+      class={cn(
         "inline-flex shrink-0 items-center gap-1",
         BORDER_RADIUS.interactive,
         "border px-1.5 py-0.5",
         TYPOGRAPHY_SCALE.caption,
         "font-medium capitalize",
-        variant === "solid"
-          ? TONE_CLASS[tone]
+        (props.variant === undefined ? "solid" : props.variant) === "solid"
+          ? TONE_CLASS[props.tone === undefined ? "slate" : props.tone]
           : cn(
               "border-border bg-muted/40",
-              tone === "slate" ? "text-muted-foreground" : TEXT_TONE[tone],
+              (props.tone === undefined ? "slate" : props.tone) === "slate"
+                ? "text-muted-foreground"
+                : TEXT_TONE[props.tone === undefined ? "slate" : props.tone],
             ),
-        className,
+        props.class,
       )}
     >
-      {dot && <StatusDot tone={tone} pulse={pulse} />}
-      {children}
+      {props.dot && (
+        <StatusDot tone={props.tone === undefined ? "slate" : props.tone} pulse={props.pulse} />
+      )}
+      {props.children}
     </span>
   );
 }

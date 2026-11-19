@@ -1,33 +1,6 @@
-"use client";
-
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useEffect, useMemo, useRef, useState } from "react";
-
-import { Button } from "@/components/ui/button";
-import { TaskStatus } from "./task-status";
-import { ExecutionHistory } from "./execution-history";
-import {
-  EXECUTION_PHASE_KEYS,
-  executionDetail,
-  nativeExecutionStatus,
-  reconcileJob,
-} from "../runtime/job-status";
+import { createEffect, createMemo, createSignal, Show } from "solid-js";
 import { JobTranscript } from "@/components/ocg/chat/job-transcript";
 import { jobTranscript, outputText } from "@/components/ocg/chat/job-transcript-model";
-import {
-  JOB_WATCH_RESIDENT_OUTPUTS,
-  JOB_WATCH_WINDOW_STEP,
-  hasEvictedOutputs,
-  mergeOutputWindow,
-} from "./output-window";
-import {
-  ApiError,
-  readTranscriptEvidence,
-  readOutputWindow,
-  type ApiClient,
-  type JobStreamEvent,
-  type JobStreamSubscription,
-} from "@/components/ocg/runtime/api-client";
 import {
   ContractError,
   type ExecutionPhase,
@@ -38,7 +11,32 @@ import {
   type ProviderResponse,
   type ToolCall,
 } from "@/components/ocg/contracts";
-import { useI18n, type I18nKey, type TranslateFn } from "@/components/ocg/i18n";
+import { type I18nKey, type TranslateFn, useI18n } from "@/components/ocg/i18n";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import {
+  type ApiClient,
+  ApiError,
+  type JobStreamEvent,
+  type JobStreamSubscription,
+  readOutputWindow,
+  readTranscriptEvidence,
+} from "@/components/ocg/runtime/api-client";
+import { Button } from "@/components/ui/button";
+import { elementRef } from "@/lib/ui-state";
+import {
+  EXECUTION_PHASE_KEYS,
+  executionDetail,
+  nativeExecutionStatus,
+  reconcileJob,
+} from "../runtime/job-status";
+import { ExecutionHistory } from "./execution-history";
+import {
+  hasEvictedOutputs,
+  JOB_WATCH_RESIDENT_OUTPUTS,
+  JOB_WATCH_WINDOW_STEP,
+  mergeOutputWindow,
+} from "./output-window";
+import { TaskStatus } from "./task-status";
 
 type StreamState = "loading" | "live" | "reconnecting" | "settled" | "stream_error" | "closed";
 
@@ -52,35 +50,40 @@ function formatMicros(micros: number | null): string {
   return micros === null ? "—" : new Date(micros / 1000).toLocaleString();
 }
 
-function OutputContent({ output }: { output: Output }) {
-  const { t } = useI18n();
-  const [open, setOpen] = useState(false);
-  const body = outputText(output);
-  const value = output.value;
-  let structured = value;
-  if (body !== null && value !== null && typeof value === "object" && !Array.isArray(value)) {
-    const fields = Object.fromEntries(Object.entries(value).filter(([key]) => key !== "text"));
+function OutputContent(props: { output: Output }) {
+  const i18n = useI18n();
+  const [open, setOpen] = createSignal(false);
+  const body = createMemo(() => outputText(props.output));
+  const value = createMemo(() => props.output.value);
+  let structured = value();
+  if (
+    body() !== null &&
+    value() !== null &&
+    typeof value() === "object" &&
+    !Array.isArray(value())
+  ) {
+    const fields = Object.fromEntries(Object.entries(value()!).filter(([key]) => key !== "text"));
     structured = Object.keys(fields).length > 0 ? fields : null;
   }
 
   return (
     <>
-      {output.summary && output.summary !== body ? (
-        <p className="whitespace-pre-wrap break-words text-sm">{output.summary}</p>
+      {props.output.summary && props.output.summary !== body() ? (
+        <p class="whitespace-pre-wrap break-words text-sm">{props.output.summary}</p>
       ) : null}
-      {body ? <p className="whitespace-pre-wrap break-words text-sm">{body}</p> : null}
-      {output.code ? (
-        <pre className="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
-          {output.code}
+      {body() ? <p class="whitespace-pre-wrap break-words text-sm">{body()}</p> : null}
+      {props.output.code ? (
+        <pre class="ocg-subtle-scrollbar overflow-x-auto whitespace-pre-wrap rounded-md bg-muted p-3 font-mono text-xs">
+          {props.output.code}
         </pre>
       ) : null}
       {structured !== null && structured !== undefined ? (
         <details onToggle={(event) => setOpen(event.currentTarget.open)}>
-          <summary className="cursor-pointer text-xs text-muted-foreground">
-            {t("job.structuredData")}
+          <summary class="cursor-pointer text-xs text-muted-foreground">
+            {i18n.t("job.structuredData")}
           </summary>
-          {open && (
-            <pre className="ocg-subtle-scrollbar mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 font-mono text-xs">
+          {open() && (
+            <pre class="ocg-subtle-scrollbar mt-1 overflow-x-auto whitespace-pre-wrap break-words rounded-md bg-muted p-3 font-mono text-xs">
               {JSON.stringify(structured, null, 2)}
             </pre>
           )}
@@ -173,24 +176,15 @@ export function JobWatch(props: {
     job: Job | null,
   ) => void;
 }) {
-  const [attempt, setAttempt] = useState(0);
+  const [attempt, setAttempt] = createSignal(0);
   return (
-    <JobWatchBody
-      key={`${props.jobId}:${attempt}`}
-      {...props}
-      onRetry={() => setAttempt((current) => current + 1)}
-    />
+    <Show when={`${props.jobId}:${attempt()}`} keyed>
+      <JobWatchBody {...props} onRetry={() => setAttempt((current) => current + 1)} />
+    </Show>
   );
 }
 
-function JobWatchBody({
-  client,
-  jobId,
-  presentation = "inspector",
-  bare = false,
-  onStateChange,
-  onRetry,
-}: {
+function JobWatchBody(props: {
   client: ApiClient;
   jobId: string;
   presentation?: "inspector" | "chat";
@@ -201,39 +195,41 @@ function JobWatchBody({
   ) => void;
   onRetry: () => void;
 }) {
-  const { t } = useI18n();
-  const [details, setDetails] = useState<JobDetails | null>(null);
-  const [statusFailure, setStatusFailure] = useState(false);
-  const [job, setJob] = useState<Job | null>(null);
-  const [outputs, setOutputs] = useState<Output[]>([]);
-  const storedTotal = outputs.at(-1)?.seq ?? 0;
-  const [storedOpen, setStoredOpen] = useState(false);
-  const windowRef = useRef(JOB_WATCH_RESIDENT_OUTPUTS);
-  const [loadingEarlier, setLoadingEarlier] = useState(false);
-  const [earlierFailure, setEarlierFailure] = useState<{ code: string; scope: "read" } | null>(
+  const i18n = useI18n();
+  const [details, setDetails] = createSignal<JobDetails | null>(null);
+  const [statusFailure, setStatusFailure] = createSignal(false);
+  const [job, setJob] = createSignal<Job | null>(null);
+  const [outputs, setOutputs] = createSignal<Output[]>([]);
+  const storedTotal = createMemo(() => outputs().at(-1)?.seq ?? 0);
+  const [storedOpen, setStoredOpen] = createSignal(false);
+  const windowRef = elementRef(JOB_WATCH_RESIDENT_OUTPUTS);
+  const [loadingEarlier, setLoadingEarlier] = createSignal(false);
+  const [earlierFailure, setEarlierFailure] = createSignal<{ code: string; scope: "read" } | null>(
     null,
   );
-  const earlierLoad = useRef<AbortController | null>(null);
-  const [tools, setTools] = useState<ToolCall[]>([]);
-  const [evidenceFailure, setEvidenceFailure] = useState<string>();
-  const [responses, setResponses] = useState<ProviderResponse[]>([]);
-  const [settlement, setSettlement] = useState<Settlement | null>(null);
-  const [stream, setStream] = useState<StreamState>("loading");
-  const [failure, setFailure] = useState<{ code: string; scope: "read" | "stream" } | null>(null);
-  const [input, setInput] = useState<
+  const earlierLoad = elementRef<AbortController | null>(null);
+  const [tools, setTools] = createSignal<ToolCall[]>([]);
+  const [evidenceFailure, setEvidenceFailure] = createSignal<string>();
+  const [responses, setResponses] = createSignal<ProviderResponse[]>([]);
+  const [settlement, setSettlement] = createSignal<Settlement | null>(null);
+  const [stream, setStream] = createSignal<StreamState>("loading");
+  const [failure, setFailure] = createSignal<{ code: string; scope: "read" | "stream" } | null>(
+    null,
+  );
+  const [input, setInput] = createSignal<
     { objective: string | null; attachments: string[] } | { error: string } | null
   >(null);
-  const unknownReason = details?.unknown_reason ?? null;
-  const reloadRef = useRef<() => void>(() => {});
-  const refreshRef = useRef<() => void>(() => {});
-  const stopRequest = useRef<AbortController | null>(null);
-  const [stopState, setStopState] = useState<StopState>("idle");
-  const [stopOutcome, setStopOutcome] = useState<NativeStop | null>(null);
-  const [stopNotice, setStopNotice] = useState<StopNotice | null>(null);
-  const statusReads = useRef(0);
-  const [readCount, setReadCount] = useState(0);
-  const [stopLockedAt, setStopLockedAt] = useState<number | null>(null);
-  const watchRef = useRef({
+  const unknownReason = createMemo(() => details()?.unknown_reason ?? null);
+  const reloadRef = elementRef<() => void>(() => {});
+  const refreshRef = elementRef<() => void>(() => {});
+  const stopRequest = elementRef<AbortController | null>(null);
+  const [stopState, setStopState] = createSignal<StopState>("idle");
+  const [stopOutcome, setStopOutcome] = createSignal<NativeStop | null>(null);
+  const [stopNotice, setStopNotice] = createSignal<StopNotice | null>(null);
+  const statusReads = elementRef(0);
+  const [readCount, setReadCount] = createSignal(0);
+  const [stopLockedAt, setStopLockedAt] = createSignal<number | null>(null);
+  const watchRef = elementRef({
     evidenceRevision: 0,
     processed: 0, // Shared replay cursor for stored pages and the stream.
     historyComplete: false,
@@ -242,384 +238,412 @@ function JobWatchBody({
     replies: [] as ProviderResponse[],
   });
 
-  useEffect(
+  createEffect(
+    () => [props.client, props.jobId],
     () => () => {
       earlierLoad.current?.abort();
       earlierLoad.current = null;
       stopRequest.current?.abort();
       stopRequest.current = null;
     },
-    [client, jobId],
   );
-  useEffect(() => {
-    if (!job && !settlement) return;
-    onStateChange?.(settlement?.state ?? "unsettled", job);
-  }, [job, settlement, onStateChange]);
+  createEffect(
+    () => [job(), settlement(), props.onStateChange],
+    () => {
+      if (!job() && !settlement()) return;
+      props.onStateChange?.(settlement()?.state ?? "unsettled", job());
+    },
+  );
 
-  useEffect(() => {
-    let alive = true;
-    let subscription: JobStreamSubscription | null = null;
-    const watch = watchRef.current;
-    watch.processed = 0;
-    watch.historyComplete = false;
-    watch.completed = false;
-    watch.reconciled = false;
-    watch.replies = [];
-    windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
-    let currentJob: Job | null = null;
-    let refreshingStatus = true;
-    let statusQueued = false;
-    const evidenceController = new AbortController();
-
-    const fail = (error: unknown, scope: "read" | "stream") => {
-      if (error instanceof ApiError) setFailure({ code: error.code, scope });
-      else if (error instanceof ContractError) setFailure({ code: "contract", scope });
-      else setFailure({ code: "unreachable", scope });
-      setStream("closed");
-    };
-
-    let reloading = false;
-    let reloadQueued = false;
-    let retryAfter = 0;
-    let retryTimer: ReturnType<typeof setTimeout> | undefined;
-
-    const invalidateReplies = () => {
-      watch.evidenceRevision++;
+  createEffect(
+    () => [props.client, props.jobId],
+    () => {
+      let alive = true;
+      let subscription: JobStreamSubscription | null = null;
+      const watch = watchRef.current;
+      watch.processed = 0;
+      watch.historyComplete = false;
+      watch.completed = false;
       watch.reconciled = false;
       watch.replies = [];
-      setResponses([]);
-    };
+      windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
+      let currentJob: Job | null = null;
+      let refreshingStatus = true;
+      let statusQueued = false;
+      const evidenceController = new AbortController();
 
-    const requestReload = () => {
-      if (!alive) return;
-      if (reloading) {
-        reloadQueued = true;
-        return;
-      }
-      const delay = retryAfter - Date.now();
-      if (delay > 0) {
-        retryTimer ??= setTimeout(() => {
-          retryTimer = undefined;
-          requestReload();
-        }, delay);
-        return;
-      }
-      reloading = true;
-      const baseRevision = watch.evidenceRevision;
-      const completeWindow = watch.historyComplete && watch.processed <= windowRef.current;
-      const catchUp = completeWindow && watch.completed && !watch.reconciled;
-      readTranscriptEvidence(client, jobId, {
-        signal: evidenceController.signal,
-        previous: completeWindow ? watch.replies : [],
-        settled: catchUp,
-        readReplies: completeWindow,
-      })
-        .then(
-          (evidence) => {
-            if (!alive) return;
-            retryAfter = evidence.error ? Date.now() + 2000 : 0;
-            const windowCompleteNow = watch.historyComplete && watch.processed <= windowRef.current;
-            if (watch.evidenceRevision !== baseRevision || (!completeWindow && windowCompleteNow)) {
-              reloadQueued = true;
-              return;
-            }
-            if (catchUp) watch.reconciled = true;
-            if (evidence.tools) setTools(evidence.tools);
-            watch.replies =
-              completeWindow && windowCompleteNow ? (evidence.responses ?? watch.replies) : [];
-            setResponses(watch.replies);
-            setEvidenceFailure(evidence.error);
-          },
-          (error) => {
-            if (!alive || evidenceController.signal.aborted) return;
-            retryAfter = Date.now() + 2000;
-            const windowCompleteNow = watch.historyComplete && watch.processed <= windowRef.current;
-            if (watch.evidenceRevision !== baseRevision || (!completeWindow && windowCompleteNow)) {
-              reloadQueued = true;
-              return;
-            }
-            if (catchUp) watch.reconciled = true;
-            setEvidenceFailure(
-              `Transcript evidence unavailable; showing stored output. ${error instanceof Error ? error.message : String(error)}`,
-            );
-          },
-        )
-        .finally(() => {
-          reloading = false;
-          if (reloadQueued && alive) {
-            reloadQueued = false;
-            requestReload();
-          }
-        });
-    };
-    reloadRef.current = requestReload;
-    const onOnline = () => {
-      retryAfter = 0;
-      if (retryTimer !== undefined) clearTimeout(retryTimer);
-      retryTimer = undefined;
-      requestReload();
-    };
-    if (typeof window !== "undefined") window.addEventListener("online", onOnline);
+      const fail = (error: unknown, scope: "read" | "stream") => {
+        if (error instanceof ApiError) setFailure({ code: error.code, scope });
+        else if (error instanceof ContractError) setFailure({ code: "contract", scope });
+        else setFailure({ code: "unreachable", scope });
+        setStream("closed");
+      };
 
-    const refreshStatus = async () => {
-      if (!alive) return;
-      if (refreshingStatus) {
-        statusQueued = true;
-        return;
-      }
-      refreshingStatus = true;
-      try {
-        const record = await client.readJobDetails(jobId, evidenceController.signal);
+      let reloading = false;
+      let reloadQueued = false;
+      let retryAfter = 0;
+      let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+      const invalidateReplies = () => {
+        watch.evidenceRevision++;
+        watch.reconciled = false;
+        watch.replies = [];
+        setResponses([]);
+      };
+
+      const requestReload = () => {
         if (!alive) return;
-        const reconciled = currentJob ? reconcileJob(currentJob, record) : record;
-        if (reconciled === record) {
-          currentJob = record;
-          setDetails(record);
-        } else {
-          currentJob = reconciled;
+        if (reloading) {
+          reloadQueued = true;
+          return;
         }
-        setJob(currentJob);
-        setStatusFailure(false);
-        statusReads.current += 1;
-        setReadCount(statusReads.current);
-        watch.completed = currentJob?.settlement.state === "completed";
-        if (record.activity.last_output_seq > watch.processed) {
-          const window = await readOutputWindow(client, jobId, {
+        const delay = retryAfter - Date.now();
+        if (delay > 0) {
+          retryTimer ??= setTimeout(() => {
+            retryTimer = undefined;
+            requestReload();
+          }, delay);
+          return;
+        }
+        reloading = true;
+        const baseRevision = watch.evidenceRevision;
+        const completeWindow = watch.historyComplete && watch.processed <= windowRef.current;
+        const catchUp = completeWindow && watch.completed && !watch.reconciled;
+        readTranscriptEvidence(props.client, props.jobId, {
+          signal: evidenceController.signal,
+          previous: completeWindow ? watch.replies : [],
+          settled: catchUp,
+          readReplies: completeWindow,
+        })
+          .then(
+            (evidence) => {
+              if (!alive) return;
+              retryAfter = evidence.error ? Date.now() + 2000 : 0;
+              const windowCompleteNow =
+                watch.historyComplete && watch.processed <= windowRef.current;
+              if (
+                watch.evidenceRevision !== baseRevision ||
+                (!completeWindow && windowCompleteNow)
+              ) {
+                reloadQueued = true;
+                return;
+              }
+              if (catchUp) watch.reconciled = true;
+              if (evidence.tools) setTools(evidence.tools);
+              watch.replies =
+                completeWindow && windowCompleteNow ? (evidence.responses ?? watch.replies) : [];
+              setResponses(watch.replies);
+              setEvidenceFailure(evidence.error);
+            },
+            (error) => {
+              if (!alive || evidenceController.signal.aborted) return;
+              retryAfter = Date.now() + 2000;
+              const windowCompleteNow =
+                watch.historyComplete && watch.processed <= windowRef.current;
+              if (
+                watch.evidenceRevision !== baseRevision ||
+                (!completeWindow && windowCompleteNow)
+              ) {
+                reloadQueued = true;
+                return;
+              }
+              if (catchUp) watch.reconciled = true;
+              setEvidenceFailure(
+                `Transcript evidence unavailable; showing stored output. ${error instanceof Error ? error.message : String(error)}`,
+              );
+            },
+          )
+          .finally(() => {
+            reloading = false;
+            if (reloadQueued && alive) {
+              reloadQueued = false;
+              requestReload();
+            }
+          });
+      };
+      reloadRef.current = requestReload;
+      const onOnline = () => {
+        retryAfter = 0;
+        if (retryTimer !== undefined) clearTimeout(retryTimer);
+        retryTimer = undefined;
+        requestReload();
+      };
+      if (typeof window !== "undefined") window.addEventListener("online", onOnline);
+
+      const refreshStatus = async () => {
+        if (!alive) return;
+        if (refreshingStatus) {
+          statusQueued = true;
+          return;
+        }
+        refreshingStatus = true;
+        try {
+          const record = await props.client.readJobDetails(props.jobId, evidenceController.signal);
+          if (!alive) return;
+          const reconciled = currentJob ? reconcileJob(currentJob, record) : record;
+          if (reconciled === record) {
+            currentJob = record;
+            setDetails(record);
+          } else {
+            currentJob = reconciled;
+          }
+          setJob(currentJob);
+          setStatusFailure(false);
+          statusReads.current += 1;
+          setReadCount(statusReads.current);
+          watch.completed = currentJob?.settlement.state === "completed";
+          if (record.activity.last_output_seq > watch.processed) {
+            const window = await readOutputWindow(props.client, props.jobId, {
+              signal: evidenceController.signal,
+            });
+            if (!alive) return;
+            const previousProcessed = watch.processed;
+            if (window.latestSeq > previousProcessed) {
+              const gap = (window.outputs[0]?.seq ?? 1) > previousProcessed + 1;
+              const lostCompleteness =
+                watch.historyComplete &&
+                previousProcessed <= windowRef.current &&
+                window.latestSeq > windowRef.current;
+              if (gap) {
+                earlierLoad.current?.abort();
+                earlierLoad.current = null;
+                setLoadingEarlier(false);
+                windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
+              }
+              if (gap || lostCompleteness) invalidateReplies();
+              watch.processed = window.latestSeq;
+              setOutputs((existing) =>
+                gap
+                  ? window.outputs
+                  : mergeOutputWindow(existing, window.outputs, windowRef.current),
+              );
+              if (gap || lostCompleteness) requestReload();
+            }
+          }
+          if (currentJob && currentJob.settlement.state !== "unsettled") {
+            setSettlement({
+              ...currentJob.settlement,
+              stop_confirmed_at_us: currentJob.stop_confirmed_at_us,
+            });
+            if (currentJob.settlement.state !== "unknown") setStream("settled");
+            requestReload();
+          } else {
+            setSettlement(null);
+          }
+        } catch {
+          if (alive) setStatusFailure(true);
+        } finally {
+          finishStatus();
+        }
+      };
+
+      refreshRef.current = () => {
+        void refreshStatus();
+      };
+
+      const finishStatus = () => {
+        refreshingStatus = false;
+        if (statusQueued && alive) {
+          statusQueued = false;
+          void refreshStatus();
+        }
+      };
+
+      const listener = (event: JobStreamEvent) => {
+        if (!alive) return;
+        setStream((current) => (current === "reconnecting" ? "live" : current));
+        if (event.type === "job") {
+          currentJob = currentJob ? reconcileJob(currentJob, event.job) : event.job;
+          setJob(currentJob);
+          watch.completed = currentJob.settlement.state === "completed";
+          if (currentJob !== event.job) return;
+          if (event.job.settlement.state !== "unsettled") {
+            setSettlement({
+              state: event.job.settlement.state,
+              settled_at_us: event.job.settlement.settled_at_us,
+              stop_confirmed_at_us: event.job.stop_confirmed_at_us,
+            });
+            void refreshStatus();
+            requestReload();
+          } else {
+            setSettlement(null);
+          }
+        } else if (event.type === "output") {
+          if (event.output.seq <= watch.processed) return;
+          if (
+            watch.historyComplete &&
+            watch.processed <= windowRef.current &&
+            event.output.seq > windowRef.current
+          )
+            invalidateReplies();
+          watch.processed = event.output.seq;
+          const incoming = event.output;
+          setOutputs((existing) => mergeOutputWindow(existing, [incoming], windowRef.current));
+          requestReload();
+        } else if (event.type === "settlement") {
+          if (currentJob) {
+            const confirmed = event.stop_confirmed_at_us;
+            currentJob = reconcileJob(currentJob, {
+              ...currentJob,
+              event_seq: event.event_seq,
+              settlement: event.settlement,
+              stop_confirmed_at_us: confirmed,
+              updated_at_us: Math.max(
+                currentJob.updated_at_us,
+                event.settlement.settled_at_us ?? 0,
+                confirmed ?? 0,
+              ),
+            });
+            setJob(currentJob);
+          }
+          watch.completed = event.settlement.state === "completed";
+          setSettlement({
+            state: event.settlement.state,
+            settled_at_us: event.settlement.settled_at_us,
+            stop_confirmed_at_us: currentJob?.stop_confirmed_at_us ?? event.stop_confirmed_at_us,
+          });
+          setStream("settled");
+          void refreshStatus();
+          requestReload();
+        } else if (event.type === "stream_error") {
+          setFailure({ code: event.error.code, scope: "stream" });
+          setStream("stream_error");
+          void refreshStatus();
+        }
+      };
+
+      const unsubscribeCatalog = props.client.subscribeCatalog(
+        () => {
+          requestReload();
+          void refreshStatus();
+        },
+        () => {
+          if (alive) setStatusFailure(true);
+        },
+      );
+
+      (async () => {
+        try {
+          const record = await props.client.readJobDetails(props.jobId, evidenceController.signal);
+          if (!alive) return;
+          currentJob = record;
+          setJob(record);
+          setDetails(record);
+          watch.completed = record.settlement.state === "completed";
+          if (record.settlement.state !== "unsettled") {
+            setSettlement({
+              state: record.settlement.state,
+              settled_at_us: record.settlement.settled_at_us,
+              stop_confirmed_at_us: record.stop_confirmed_at_us,
+            });
+          }
+        } catch (error) {
+          if (alive) fail(error, "read");
+          return;
+        }
+        props.client.readJobInput(props.jobId).then(
+          (frozen) => {
+            if (alive) setInput({ objective: frozen.objective, attachments: frozen.attachments });
+          },
+          (error: unknown) => {
+            if (alive)
+              setInput({
+                error: error instanceof ApiError ? error.code : "unreachable",
+              });
+          },
+        );
+        requestReload();
+        try {
+          const window = await readOutputWindow(props.client, props.jobId, {
             signal: evidenceController.signal,
           });
           if (!alive) return;
-          const previousProcessed = watch.processed;
-          if (window.latestSeq > previousProcessed) {
-            const gap = (window.outputs[0]?.seq ?? 1) > previousProcessed + 1;
-            const lostCompleteness =
-              watch.historyComplete &&
-              previousProcessed <= windowRef.current &&
-              window.latestSeq > windowRef.current;
-            if (gap) {
-              earlierLoad.current?.abort();
-              earlierLoad.current = null;
-              setLoadingEarlier(false);
-              windowRef.current = JOB_WATCH_RESIDENT_OUTPUTS;
-            }
-            if (gap || lostCompleteness) invalidateReplies();
-            watch.processed = window.latestSeq;
-            setOutputs((existing) =>
-              gap ? window.outputs : mergeOutputWindow(existing, window.outputs, windowRef.current),
-            );
-            if (gap || lostCompleteness) requestReload();
-          }
-        }
-        if (currentJob && currentJob.settlement.state !== "unsettled") {
-          setSettlement({
-            ...currentJob.settlement,
-            stop_confirmed_at_us: currentJob.stop_confirmed_at_us,
-          });
-          if (currentJob.settlement.state !== "unknown") setStream("settled");
-          requestReload();
-        } else {
-          setSettlement(null);
-        }
-      } catch {
-        if (alive) setStatusFailure(true);
-      } finally {
-        finishStatus();
-      }
-    };
-
-    refreshRef.current = () => {
-      void refreshStatus();
-    };
-
-    const finishStatus = () => {
-      refreshingStatus = false;
-      if (statusQueued && alive) {
-        statusQueued = false;
-        void refreshStatus();
-      }
-    };
-
-    const listener = (event: JobStreamEvent) => {
-      if (!alive) return;
-      setStream((current) => (current === "reconnecting" ? "live" : current));
-      if (event.type === "job") {
-        currentJob = currentJob ? reconcileJob(currentJob, event.job) : event.job;
-        setJob(currentJob);
-        watch.completed = currentJob.settlement.state === "completed";
-        if (currentJob !== event.job) return;
-        if (event.job.settlement.state !== "unsettled") {
-          setSettlement({
-            state: event.job.settlement.state,
-            settled_at_us: event.job.settlement.settled_at_us,
-            stop_confirmed_at_us: event.job.stop_confirmed_at_us,
-          });
-          void refreshStatus();
-          requestReload();
-        } else {
-          setSettlement(null);
-        }
-      } else if (event.type === "output") {
-        if (event.output.seq <= watch.processed) return;
-        if (
-          watch.historyComplete &&
-          watch.processed <= windowRef.current &&
-          event.output.seq > windowRef.current
-        )
-          invalidateReplies();
-        watch.processed = event.output.seq;
-        const incoming = event.output;
-        setOutputs((existing) => mergeOutputWindow(existing, [incoming], windowRef.current));
-        requestReload();
-      } else if (event.type === "settlement") {
-        if (currentJob) {
-          const confirmed = event.stop_confirmed_at_us;
-          currentJob = reconcileJob(currentJob, {
-            ...currentJob,
-            event_seq: event.event_seq,
-            settlement: event.settlement,
-            stop_confirmed_at_us: confirmed,
-            updated_at_us: Math.max(
-              currentJob.updated_at_us,
-              event.settlement.settled_at_us ?? 0,
-              confirmed ?? 0,
-            ),
-          });
-          setJob(currentJob);
-        }
-        watch.completed = event.settlement.state === "completed";
-        setSettlement({
-          state: event.settlement.state,
-          settled_at_us: event.settlement.settled_at_us,
-          stop_confirmed_at_us: currentJob?.stop_confirmed_at_us ?? event.stop_confirmed_at_us,
-        });
-        setStream("settled");
-        void refreshStatus();
-        requestReload();
-      } else if (event.type === "stream_error") {
-        setFailure({ code: event.error.code, scope: "stream" });
-        setStream("stream_error");
-        void refreshStatus();
-      }
-    };
-
-    const unsubscribeCatalog = client.subscribeCatalog(
-      () => {
-        requestReload();
-        void refreshStatus();
-      },
-      () => {
-        if (alive) setStatusFailure(true);
-      },
-    );
-
-    (async () => {
-      try {
-        const record = await client.readJobDetails(jobId, evidenceController.signal);
-        if (!alive) return;
-        currentJob = record;
-        setJob(record);
-        setDetails(record);
-        watch.completed = record.settlement.state === "completed";
-        if (record.settlement.state !== "unsettled") {
-          setSettlement({
-            state: record.settlement.state,
-            settled_at_us: record.settlement.settled_at_us,
-            stop_confirmed_at_us: record.stop_confirmed_at_us,
-          });
-        }
-      } catch (error) {
-        if (alive) fail(error, "read");
-        return;
-      }
-      client.readJobInput(jobId).then(
-        (frozen) => {
-          if (alive) setInput({ objective: frozen.objective, attachments: frozen.attachments });
-        },
-        (error: unknown) => {
-          if (alive)
-            setInput({
-              error: error instanceof ApiError ? error.code : "unreachable",
-            });
-        },
-      );
-      requestReload();
-      try {
-        const window = await readOutputWindow(client, jobId, { signal: evidenceController.signal });
-        if (!alive) return;
-        watch.processed = window.latestSeq;
-        setOutputs(window.outputs);
-      } catch (error) {
-        if (alive) fail(error, "read");
-        return;
-      }
-      watch.historyComplete = true;
-      requestReload();
-      try {
-        subscription = client.subscribeJobEvents(jobId, listener, {
-          afterSeq: watch.processed,
-          onReconnect: () => {
-            if (alive) setStream("reconnecting");
-          },
-        });
-        if (!alive) {
-          subscription.close();
+          watch.processed = window.latestSeq;
+          setOutputs(window.outputs);
+        } catch (error) {
+          if (alive) fail(error, "read");
           return;
         }
-        setStream("live");
-        subscription.closed.then(
-          (end) => {
-            if (!alive) return;
-            void refreshStatus();
-            if (end === "settled") {
-              setStream("settled");
-              requestReload();
-            } else if (end === "stream_error") {
-              setStream("stream_error");
-            } else {
-              setStream("closed");
-            }
-          },
-          (error: unknown) => {
-            if (alive) fail(error, "stream");
-          },
-        );
-      } catch (error) {
-        if (alive) fail(error, "stream");
-      }
-    })().finally(finishStatus);
+        watch.historyComplete = true;
+        requestReload();
+        try {
+          subscription = props.client.subscribeJobEvents(props.jobId, listener, {
+            afterSeq: watch.processed,
+            onReconnect: () => {
+              if (alive) setStream("reconnecting");
+            },
+          });
+          if (!alive) {
+            subscription.close();
+            return;
+          }
+          setStream("live");
+          subscription.closed.then(
+            (end) => {
+              if (!alive) return;
+              void refreshStatus();
+              if (end === "settled") {
+                setStream("settled");
+                requestReload();
+              } else if (end === "stream_error") {
+                setStream("stream_error");
+              } else {
+                setStream("closed");
+              }
+            },
+            (error: unknown) => {
+              if (alive) fail(error, "stream");
+            },
+          );
+        } catch (error) {
+          if (alive) fail(error, "stream");
+        }
+      })().finally(finishStatus);
 
-    return () => {
-      alive = false;
-      if (retryTimer !== undefined) clearTimeout(retryTimer);
-      if (typeof window !== "undefined") window.removeEventListener("online", onOnline);
-      if (reloadRef.current === requestReload) reloadRef.current = () => {};
-      refreshRef.current = () => {};
-      unsubscribeCatalog();
-      subscription?.close();
-      evidenceController.abort();
-    };
-  }, [client, jobId]);
+      return () => {
+        alive = false;
+        if (retryTimer !== undefined) clearTimeout(retryTimer);
+        if (typeof window !== "undefined") window.removeEventListener("online", onOnline);
+        if (reloadRef.current === requestReload) reloadRef.current = () => {};
+        refreshRef.current = () => {};
+        unsubscribeCatalog();
+        subscription?.close();
+        evidenceController.abort();
+      };
+    },
+  );
 
-  const phase: ExecutionPhase | null =
-    settlement && settlement.state !== "unsettled"
-      ? settlement.state
-      : (job?.execution_phase ?? null);
-  const execution = phase ? nativeExecutionStatus(phase, details ?? undefined) : null;
-  const phaseNote = execution ? executionDetail(t, execution) : undefined;
-  const badgeText = phase
-    ? t(EXECUTION_PHASE_KEYS[phase])
-    : t(failure ? "job.state.unavailable" : "job.state.loading");
-  const badgeClass = phase ? PHASE_BADGE[phase] : TONE.loading;
-  const stopPhase = phase === "queued" || phase === "reserved" || phase === "running";
-  const stopAvailable = Boolean(details?.context);
+  const phase = createMemo<ExecutionPhase | null>(() => {
+    const state = settlement()?.state;
+    return state && state !== "unsettled" ? state : (job()?.execution_phase ?? null);
+  });
+  const execution = createMemo(() =>
+    phase() ? nativeExecutionStatus(phase()!, details() ?? undefined) : null,
+  );
+  const phaseNote = createMemo(() =>
+    execution() ? executionDetail(i18n.t, execution()!) : undefined,
+  );
+  const badgeText = createMemo(() =>
+    phase()
+      ? i18n.t(EXECUTION_PHASE_KEYS[phase!()!])
+      : i18n.t(failure() ? "job.state.unavailable" : "job.state.loading"),
+  );
+  const badgeClass = createMemo(() => (phase() ? PHASE_BADGE[phase!()!] : TONE.loading));
+  const stopPhase = createMemo(
+    () => phase() === "queued" || phase() === "reserved" || phase() === "running",
+  );
+  const stopAvailable = createMemo(() => Boolean(details()?.context));
   // An unconfirmed stop can be retried only after a fresh Job read.
-  const stopRetry =
-    stopState === "locked" &&
-    stopOutcome === null &&
-    stopLockedAt !== null &&
-    readCount > stopLockedAt;
+  const stopRetry = createMemo(
+    () =>
+      stopState() === "locked" &&
+      stopOutcome() === null &&
+      stopLockedAt() !== null &&
+      readCount() > stopLockedAt()!,
+  );
 
   async function requestStop() {
-    const context = details?.context;
+    const context = details()?.context;
     if (!context || stopRequest.current) return;
     const controller = new AbortController();
     stopRequest.current = controller;
@@ -627,13 +651,13 @@ function JobWatchBody({
     setStopOutcome(null);
     setStopNotice(null);
     try {
-      const stop = await client.stopNativeJob(context, jobId, controller.signal);
+      const stop = await props.client.stopNativeJob(context, props.jobId, controller.signal);
       if (controller.signal.aborted) return;
       setStopOutcome(stop);
       setStopState("locked");
     } catch (cause) {
       if (controller.signal.aborted) return;
-      const failure = classifyStopFailure(t, cause);
+      const failure = classifyStopFailure(i18n.t, cause);
       setStopNotice(failure);
       setStopLockedAt(failure.locked ? statusReads.current : null);
       setStopState(failure.locked ? "locked" : "idle");
@@ -644,27 +668,27 @@ function JobWatchBody({
   }
 
   const stopMessage = (() => {
-    if (stopNotice) return stopNotice;
-    if (!stopOutcome) return null;
-    if (phase === "completed")
-      return { message: t("job.stop.completedFirst"), tone: "warning" as const };
-    if (phase === "failed" || stopOutcome.execution_phase === "failed")
-      return { message: t("job.stop.failedFirst"), tone: "warning" as const };
-    if (phase === "unknown")
-      return { message: t("job.stop.outcomeUnknown"), tone: "warning" as const };
-    if (phase === "cancelled")
+    if (stopNotice()) return stopNotice();
+    if (!stopOutcome()) return null;
+    if (phase() === "completed")
+      return { message: i18n.t("job.stop.completedFirst"), tone: "warning" as const };
+    if (phase() === "failed" || stopOutcome()!.execution_phase === "failed")
+      return { message: i18n.t("job.stop.failedFirst"), tone: "warning" as const };
+    if (phase() === "unknown")
+      return { message: i18n.t("job.stop.outcomeUnknown"), tone: "warning" as const };
+    if (phase() === "cancelled")
       return {
         message:
-          stopOutcome.request === "ended_before_start"
-            ? t("job.stop.endedBeforeStart")
-            : t("job.stop.cancelledOutcome"),
+          stopOutcome()!.request === "ended_before_start"
+            ? i18n.t("job.stop.endedBeforeStart")
+            : i18n.t("job.stop.cancelledOutcome"),
         tone: "status" as const,
       };
-    if (stopOutcome.request === "ended_before_start")
-      return { message: t("job.stop.endedBeforeStart"), tone: "status" as const };
+    if (stopOutcome()!.request === "ended_before_start")
+      return { message: i18n.t("job.stop.endedBeforeStart"), tone: "status" as const };
     return {
-      message: t(
-        stopOutcome.request === "requested" ? "job.stop.requested" : "job.stop.alreadyRequested",
+      message: i18n.t(
+        stopOutcome()!.request === "requested" ? "job.stop.requested" : "job.stop.alreadyRequested",
       ),
       tone: "warning" as const,
     };
@@ -679,17 +703,19 @@ function JobWatchBody({
     setLoadingEarlier(true);
     setEarlierFailure(null);
     try {
-      const { outputs: walked } = await readOutputWindow(client, jobId, {
-        beforeSeq: outputs[0]?.seq ?? 1,
+      const { outputs: walked } = await readOutputWindow(props.client, props.jobId, {
+        beforeSeq: outputs()[0]?.seq ?? 1,
         limit: JOB_WATCH_WINDOW_STEP,
         signal: controller.signal,
       });
       if (controller.signal.aborted) return;
-      if (watch.processed - (outputs.at(-1)?.seq ?? 0) > windowRef.current) return;
+      if (watch.processed - (outputs().at(-1)?.seq ?? 0) > windowRef.current) return;
       windowRef.current = nextWindow;
       const incoming = walked;
-      setOutputs((existing) => mergeOutputWindow([...outputs, ...existing], incoming, nextWindow));
-      if ((walked[0]?.seq ?? outputs[0]?.seq) === 1 && watch.processed <= windowRef.current) {
+      setOutputs((existing) =>
+        mergeOutputWindow([...outputs(), ...existing], incoming, nextWindow),
+      );
+      if ((walked[0]?.seq ?? outputs()[0]?.seq) === 1 && watch.processed <= windowRef.current) {
         reloadRef.current();
       }
     } catch (error) {
@@ -714,232 +740,238 @@ function JobWatchBody({
     }
   }
 
-  const objective = input !== null && "objective" in input ? input.objective : null;
-  const attachments = input !== null && "attachments" in input ? input.attachments : undefined;
-  const streaming = stream === "live" || stream === "reconnecting";
-  const turns = useMemo(
-    () =>
-      jobTranscript(
-        jobId,
-        objective,
-        outputs,
-        settlement,
-        streaming,
-        attachments,
-        tools,
-        job?.previous === null,
-        responses,
-      ),
-    [
-      jobId,
-      objective,
-      outputs,
-      settlement,
-      streaming,
-      attachments,
-      tools,
-      job?.previous,
-      responses,
-    ],
+  const executionInput = createMemo(() => {
+    const data = input();
+    return data && "objective" in data ? data : undefined;
+  });
+  const inputError = createMemo(() => {
+    const data = input();
+    return data && "error" in data ? data.error : undefined;
+  });
+  function inputValue<K extends "objective" | "attachments">(key: K) {
+    return executionInput()?.[key];
+  }
+  const objective = createMemo(() => inputValue("objective") ?? null);
+  const attachments = createMemo(() => inputValue("attachments"));
+  const streaming = createMemo(() => stream() === "live" || stream() === "reconnecting");
+  const turns = createMemo(() =>
+    jobTranscript(
+      props.jobId,
+      objective(),
+      outputs(),
+      settlement(),
+      streaming(),
+      attachments(),
+      tools(),
+      job()?.previous === null,
+      responses(),
+    ),
   );
-  const evictedOutputs = hasEvictedOutputs(storedTotal, outputs.length);
+  const evictedOutputs = createMemo(() => hasEvictedOutputs(storedTotal(), outputs().length));
 
-  const recordFacts = (
-    <dl className="grid gap-x-6 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
-      <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-        <dt>{t("job.fact.created")}</dt>
-        <dd className="min-w-0 break-all">{formatMicros(job?.created_at_us ?? null)}</dd>
+  const recordFacts = createMemo(() => (
+    <dl class="grid gap-x-6 gap-y-1 text-xs text-muted-foreground sm:grid-cols-2">
+      <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
+        <dt>{i18n.t("job.fact.created")}</dt>
+        <dd class="min-w-0 break-all">{formatMicros(job()?.created_at_us ?? null)}</dd>
       </div>
-      <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-        <dt>{t("job.fact.started")}</dt>
-        <dd className="min-w-0 break-all">{formatMicros(job?.started_at_us ?? null)}</dd>
+      <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
+        <dt>{i18n.t("job.fact.started")}</dt>
+        <dd class="min-w-0 break-all">{formatMicros(job()?.started_at_us ?? null)}</dd>
       </div>
-      <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-        <dt>{t("job.fact.updated")}</dt>
-        <dd className="min-w-0 break-all">{formatMicros(job?.updated_at_us ?? null)}</dd>
+      <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
+        <dt>{i18n.t("job.fact.updated")}</dt>
+        <dd class="min-w-0 break-all">{formatMicros(job()?.updated_at_us ?? null)}</dd>
       </div>
-      <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-        <dt>{t("job.fact.settled")}</dt>
-        <dd className="min-w-0 break-all">{formatMicros(settlement?.settled_at_us ?? null)}</dd>
+      <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
+        <dt>{i18n.t("job.fact.settled")}</dt>
+        <dd class="min-w-0 break-all">{formatMicros(settlement()?.settled_at_us ?? null)}</dd>
       </div>
-      {job ? (
-        <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-          <dt>{t("job.fact.input")}</dt>
-          <dd className="min-w-0 break-all">
-            <code className="font-mono">{job.input}</code>
+      {job() ? (
+        <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
+          <dt>{i18n.t("job.fact.input")}</dt>
+          <dd class="min-w-0 break-all">
+            <code class="font-mono">{job()!.input}</code>
           </dd>
         </div>
       ) : null}
-      {job?.previous ? (
-        <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-          <dt>{t("job.fact.previous")}</dt>
-          <dd className="min-w-0 break-all">
-            <code className="font-mono">{job.previous}</code>
+      {job()?.previous ? (
+        <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
+          <dt>{i18n.t("job.fact.previous")}</dt>
+          <dd class="min-w-0 break-all">
+            <code class="font-mono">{job()!.previous}</code>
           </dd>
         </div>
       ) : null}
-      {settlement?.state === "unknown" ? (
-        <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-          <dt>{t("job.fact.stopConfirmed")}</dt>
-          <dd className="min-w-0 break-all">{formatMicros(settlement.stop_confirmed_at_us)}</dd>
+      {settlement()?.state === "unknown" ? (
+        <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
+          <dt>{i18n.t("job.fact.stopConfirmed")}</dt>
+          <dd class="min-w-0 break-all">{formatMicros(settlement()!.stop_confirmed_at_us)}</dd>
         </div>
       ) : null}
-      {settlement?.state === "unknown" ? (
-        <div className="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-          <dt>{t("job.fact.unknownReason")}</dt>
-          <dd className="min-w-0 break-all">{unknownReason ?? "—"}</dd>
+      {settlement()?.state === "unknown" ? (
+        <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
+          <dt>{i18n.t("job.fact.unknownReason")}</dt>
+          <dd class="min-w-0 break-all">{unknownReason() ?? "—"}</dd>
         </div>
       ) : null}
     </dl>
-  );
-  const storedOutputs = job ? (
-    <details
-      onToggle={(event) => {
-        if (event.target === event.currentTarget) setStoredOpen(event.currentTarget.open);
-      }}
-      className="flex flex-col gap-2"
-    >
-      <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-        {evictedOutputs
-          ? t("job.storedOutputsWindowed", { shown: outputs.length, total: storedTotal })
-          : t("job.storedOutputs", { count: outputs.length })}
-      </summary>
-      {storedOpen && (
-        <>
-          {evictedOutputs ? (
-            <div className="mt-2">
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => void loadEarlierOutputs()}
-                disabled={loadingEarlier}
-              >
-                {loadingEarlier ? t("common.loading") : t("job.loadEarlierOutputs")}
-              </Button>
-              {earlierFailure ? (
-                <DismissibleNotice
-                  message={failureText(t, earlierFailure)}
-                  className="mt-2 text-sm text-destructive"
+  ));
+  const storedOutputs = createMemo(() =>
+    job() ? (
+      <details
+        onToggle={(event) => {
+          if (event.target === event.currentTarget) setStoredOpen(event.currentTarget.open);
+        }}
+        class="flex flex-col gap-2"
+      >
+        <summary class="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+          {evictedOutputs()
+            ? i18n.t("job.storedOutputsWindowed", { shown: outputs().length, total: storedTotal() })
+            : i18n.t("job.storedOutputs", { count: outputs().length })}
+        </summary>
+        {storedOpen() && (
+          <>
+            {evictedOutputs() ? (
+              <div class="mt-2">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void loadEarlierOutputs()}
+                  disabled={loadingEarlier()}
                 >
-                  {failureText(t, earlierFailure)}
-                </DismissibleNotice>
-              ) : null}
-            </div>
-          ) : null}
-          <ol className="mt-2 flex flex-col gap-2">
-            {outputs.map((output) => (
-              <li
-                key={output.seq}
-                className="flex flex-col gap-1.5 rounded-md border border-border p-3"
-              >
-                <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-                  <code className="font-mono">#{output.seq}</code>
-                  <span className="rounded-full bg-muted px-2 py-0.5 font-semibold tracking-widest uppercase">
-                    {output.kind}
-                  </span>
-                  <span>{formatMicros(output.created_at_us)}</span>
-                  {output.goal_reached === null ? null : (
-                    <span>
-                      {output.goal_reached ? t("job.goalReached") : t("job.goalNotReached")}
+                  {loadingEarlier() ? i18n.t("common.loading") : i18n.t("job.loadEarlierOutputs")}
+                </Button>
+                {earlierFailure() ? (
+                  <DismissibleNotice
+                    message={failureText(i18n.t, earlierFailure()!)}
+                    class="mt-2 text-sm text-destructive"
+                  >
+                    {failureText(i18n.t, earlierFailure()!)}
+                  </DismissibleNotice>
+                ) : null}
+              </div>
+            ) : null}
+            <ol class="mt-2 flex flex-col gap-2">
+              {outputs().map((output) => (
+                <li class="flex flex-col gap-1.5 rounded-md border border-border p-3">
+                  <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                    <code class="font-mono">#{output.seq}</code>
+                    <span class="rounded-full bg-muted px-2 py-0.5 font-semibold tracking-widest uppercase">
+                      {output.kind}
                     </span>
-                  )}
-                </div>
-                <OutputContent output={output} />
-              </li>
-            ))}
-          </ol>
-        </>
-      )}
-    </details>
-  ) : null;
-  const answer = job ? (
-    <>
-      {evidenceFailure && (
-        <DismissibleNotice message={evidenceFailure} className="text-xs text-destructive">
-          {evidenceFailure}
-        </DismissibleNotice>
-      )}
-      <JobTranscript
-        jobId={jobId}
-        client={client}
-        turns={turns}
-        userLabel={presentation === "chat" ? t("job.you") : t("job.objective")}
-        attachmentContentUrl={(id) => client.attachmentContentUrl(id)}
-      />
-      {input !== null && "error" in input ? (
-        <p className="text-xs text-muted-foreground">
-          {t("job.objectiveUnreadable", { error: input.error })}
-        </p>
-      ) : null}
-    </>
-  ) : null;
+                    <span>{formatMicros(output.created_at_us)}</span>
+                    {output.goal_reached === null ? null : (
+                      <span>
+                        {output.goal_reached
+                          ? i18n.t("job.goalReached")
+                          : i18n.t("job.goalNotReached")}
+                      </span>
+                    )}
+                  </div>
+                  <OutputContent output={output} />
+                </li>
+              ))}
+            </ol>
+          </>
+        )}
+      </details>
+    ) : null,
+  );
+  const answer = createMemo(() =>
+    job() ? (
+      <>
+        {evidenceFailure() && (
+          <DismissibleNotice message={evidenceFailure()!} class="text-xs text-destructive">
+            {evidenceFailure()}
+          </DismissibleNotice>
+        )}
+        <JobTranscript
+          jobId={props.jobId}
+          client={props.client}
+          turns={turns()}
+          userLabel={
+            (props.presentation === undefined ? "inspector" : props.presentation) === "chat"
+              ? i18n.t("job.you")
+              : i18n.t("job.objective")
+          }
+          attachmentContentUrl={(id) => props.client.attachmentContentUrl(id)}
+        />
+        {input() !== null && inputError() !== undefined ? (
+          <p class="text-xs text-muted-foreground">
+            {i18n.t("job.objectiveUnreadable", { error: inputError()! })}
+          </p>
+        ) : null}
+      </>
+    ) : null,
+  );
 
   return (
     <section
-      className={
-        bare
+      class={
+        (props.bare === undefined ? false : props.bare)
           ? "flex flex-col text-card-foreground lg:h-full lg:min-h-0"
           : "flex flex-col rounded-lg border border-border bg-card p-5 text-card-foreground"
       }
     >
       <header
-        className={
-          bare
+        class={
+          (props.bare === undefined ? false : props.bare)
             ? "sticky top-0 z-10 flex min-h-16 shrink-0 flex-wrap items-center gap-3 border-b border-border bg-popover px-5 py-3 lg:static"
             : "flex flex-wrap items-center gap-3"
         }
       >
-        <h2 className="min-w-0 flex-1 break-all font-heading text-lg">{job?.name ?? jobId}</h2>
-        <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+        <h2 class="min-w-0 flex-1 break-all font-heading text-lg">{job()?.name ?? props.jobId}</h2>
+        <div class="ml-auto flex flex-wrap items-center justify-end gap-2">
           <span
-            className={`rounded-full px-3 py-1 text-xs font-semibold tracking-widest uppercase ${badgeClass}`}
+            class={`rounded-full px-3 py-1 text-xs font-semibold tracking-widest uppercase ${badgeClass()}`}
           >
-            {badgeText}
+            {badgeText()}
           </span>
-          <span className="rounded-full bg-muted px-3 py-1 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-            {t(STREAM_KEYS[stream])}
+          <span class="rounded-full bg-muted px-3 py-1 text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+            {i18n.t(STREAM_KEYS[stream()])}
           </span>
         </div>
       </header>
       <div
-        className={
-          bare
+        class={
+          (props.bare === undefined ? false : props.bare)
             ? "ocg-subtle-scrollbar flex min-h-0 flex-col gap-4 p-5 lg:flex-1 lg:overflow-auto"
             : "mt-4 flex flex-col gap-4"
         }
       >
-        <p className="break-all text-xs text-muted-foreground">
-          <code className="font-mono">{jobId}</code>
-          {job ? ` · ${job.execution_mode}` : ""}
-          {job?.assigned_executor
-            ? ` · ${t("job.currentExecutor", { executor: job.assigned_executor })}`
-            : job?.last_executor
-              ? ` · ${t("job.lastExecutor", { executor: job.last_executor })}`
+        <p class="break-all text-xs text-muted-foreground">
+          <code class="font-mono">{props.jobId}</code>
+          {job() ? ` · ${job()!.execution_mode}` : ""}
+          {job()?.assigned_executor
+            ? ` · ${i18n.t("job.currentExecutor", { executor: job()!.assigned_executor! })}`
+            : job()?.last_executor
+              ? ` · ${i18n.t("job.lastExecutor", { executor: job()!.last_executor! })}`
               : ""}
         </p>
-        <TaskStatus plan={details?.task_plan} />
-        {statusFailure && (
-          <p className="text-sm text-destructive">{t("job.activity.statusFailed")}</p>
+        <TaskStatus plan={details()?.task_plan} />
+        {statusFailure() && (
+          <p class="text-sm text-destructive">{i18n.t("job.activity.statusFailed")}</p>
         )}
-        {phaseNote ? (
-          <p className="text-sm text-muted-foreground" role="status">
-            {phaseNote}
+        {phaseNote() ? (
+          <p class="text-sm text-muted-foreground" role="status">
+            {phaseNote()}
           </p>
         ) : null}
-        {stopPhase && stopAvailable && (stopState !== "locked" || stopRetry) ? (
-          <div className="flex flex-wrap items-center gap-2">
+        {stopPhase() && stopAvailable() && (stopState() !== "locked" || stopRetry()) ? (
+          <div class="flex flex-wrap items-center gap-2">
             <Button
               variant="outline"
               size="sm"
               onClick={() => void requestStop()}
-              disabled={stopState === "sending"}
+              disabled={stopState() === "sending"}
             >
-              {stopState === "sending" ? t("job.stop.stopping") : t("job.stop.action")}
+              {stopState() === "sending" ? i18n.t("job.stop.stopping") : i18n.t("job.stop.action")}
             </Button>
           </div>
         ) : null}
-        {stopPhase && !stopAvailable ? (
-          <p className="text-sm text-muted-foreground">{t("job.stop.unavailable")}</p>
+        {stopPhase() && !stopAvailable() ? (
+          <p class="text-sm text-muted-foreground">{i18n.t("job.stop.unavailable")}</p>
         ) : null}
         {stopMessage ? (
           <DismissibleNotice
@@ -949,34 +981,45 @@ function JobWatchBody({
             <p>{stopMessage.message}</p>
           </DismissibleNotice>
         ) : null}
-        {failure ? (
-          <DismissibleNotice message={failureText(t, failure)} className="text-sm text-destructive">
-            <p>{failureText(t, failure)}</p>
-            <Button variant="outline" size="sm" onClick={onRetry}>
-              {t("common.retry")}
+        {failure() ? (
+          <DismissibleNotice
+            message={failureText(i18n.t, failure()!)}
+            class="text-sm text-destructive"
+          >
+            <p>{failureText(i18n.t, failure()!)}</p>
+            <Button variant="outline" size="sm" onClick={props.onRetry}>
+              {i18n.t("common.retry")}
             </Button>
           </DismissibleNotice>
         ) : null}
-        {presentation === "chat" ? (
+        {(props.presentation === undefined ? "inspector" : props.presentation) === "chat" ? (
           <>
-            {answer}
-            <details className="flex flex-col gap-3">
-              <summary className="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
-                {t("job.record")}
+            {answer()}
+            <details class="flex flex-col gap-3">
+              <summary class="cursor-pointer text-xs font-semibold tracking-widest uppercase text-muted-foreground">
+                {i18n.t("job.record")}
               </summary>
-              <div className="mt-3 flex flex-col gap-4">
-                {recordFacts}
-                <ExecutionHistory client={client} jobId={jobId} context={details?.context} />
-                {storedOutputs}
+              <div class="mt-3 flex flex-col gap-4">
+                {recordFacts()}
+                <ExecutionHistory
+                  client={props.client}
+                  jobId={props.jobId}
+                  context={details()?.context}
+                />
+                {storedOutputs()}
               </div>
             </details>
           </>
         ) : (
           <>
-            {recordFacts}
-            <ExecutionHistory client={client} jobId={jobId} context={details?.context} />
-            {answer}
-            {storedOutputs}
+            {recordFacts()}
+            <ExecutionHistory
+              client={props.client}
+              jobId={props.jobId}
+              context={details()?.context}
+            />
+            {answer()}
+            {storedOutputs()}
           </>
         )}
       </div>

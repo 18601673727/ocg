@@ -1,85 +1,53 @@
-"use client";
-
-import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react";
-import type { ReactNode } from "react";
+import type { JSX } from "@solidjs/web";
+import { createContext, createEffect, createSignal, useContext } from "solid-js";
 import {
+  type AccentPreference,
   APPEARANCE_STORAGE_KEY,
+  type AppearancePreferences,
   DEFAULT_APPEARANCE,
   readAppearancePreferences,
   serializeAppearancePreferences,
-  type AppearancePreferences,
-  type AccentPreference,
   type ThemePreference,
 } from "./theme-domain";
 
-type ThemeContextValue = {
+const ThemeContext = createContext<{
   preferences: AppearancePreferences;
   hydrated: boolean;
   setTheme: (theme: ThemePreference) => void;
   setAccent: (accent: AccentPreference) => void;
   resetAppearance: () => void;
-};
+}>();
 
-const ThemeContext = createContext<ThemeContextValue | null>(null);
-
-function applyRootAppearance({ theme, accent }: AppearancePreferences) {
-  const root = document.documentElement;
-  root.classList.toggle("dark", theme === "dark");
-  root.dataset.theme = theme;
-  root.dataset.accent = accent;
-}
-
-export function ThemeProvider({ children }: { children: ReactNode }) {
-  const [preferences, setPreferences] = useState<AppearancePreferences>(() => ({
-    ...DEFAULT_APPEARANCE,
-  }));
-  const [hydrated, setHydrated] = useState(false);
-
-  useEffect(() => {
-    const loadTimer = window.setTimeout(() => {
-      const stored = readAppearancePreferences();
-      setPreferences(stored);
-      setHydrated(true);
-    }, 0);
-    return () => window.clearTimeout(loadTimer);
-  }, []);
-
-  useEffect(() => {
-    if (!hydrated) return;
-    applyRootAppearance(preferences);
+export function ThemeProvider(props: { children: JSX.Element }) {
+  const [preferences, setPreferences] = createSignal(readAppearancePreferences());
+  createEffect(preferences, (appearance) => {
+    const root = document.documentElement;
+    root.classList.toggle("dark", appearance.theme === "dark");
+    root.dataset.theme = appearance.theme;
+    root.dataset.accent = appearance.accent;
     try {
-      window.localStorage.setItem(
-        APPEARANCE_STORAGE_KEY,
-        serializeAppearancePreferences(preferences),
-      );
+      localStorage.setItem(APPEARANCE_STORAGE_KEY, serializeAppearancePreferences(appearance));
     } catch {}
-  }, [hydrated, preferences]);
-
-  const setTheme = useCallback(
-    (theme: ThemePreference) => setPreferences((current) => ({ ...current, theme })),
-    [],
+  });
+  return (
+    <ThemeContext
+      value={{
+        get preferences() {
+          return preferences();
+        },
+        hydrated: true,
+        setTheme: (theme) => setPreferences((previous) => ({ ...previous, theme })),
+        setAccent: (accent) => setPreferences((previous) => ({ ...previous, accent })),
+        resetAppearance: () => setPreferences({ ...DEFAULT_APPEARANCE }),
+      }}
+    >
+      {props.children}
+    </ThemeContext>
   );
-  const setAccent = useCallback(
-    (accent: AccentPreference) => setPreferences((current) => ({ ...current, accent })),
-    [],
-  );
-  const resetAppearance = useCallback(() => setPreferences({ ...DEFAULT_APPEARANCE }), []);
-  const value = useMemo(
-    () => ({
-      preferences,
-      hydrated,
-      setTheme,
-      setAccent,
-      resetAppearance,
-    }),
-    [hydrated, preferences, resetAppearance, setAccent, setTheme],
-  );
-
-  return <ThemeContext.Provider value={value}>{children}</ThemeContext.Provider>;
 }
 
-export function useTheme(): ThemeContextValue {
-  const value = useContext(ThemeContext);
-  if (!value) throw new Error("useTheme must be used inside ThemeProvider");
-  return value;
+export function useTheme() {
+  const theme = useContext(ThemeContext);
+  if (!theme) throw new Error("useTheme must be used inside ThemeProvider");
+  return theme;
 }

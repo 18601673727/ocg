@@ -1,18 +1,17 @@
-"use client";
-
-import { useEffect, useRef, useState } from "react";
-
+import { createEffect, createSignal } from "solid-js";
+import { elementRef } from "@/lib/ui-state";
 export type UseCopyToClipboardOptions = {
   copiedDuration?: number;
 };
 
 export const useCopyToClipboard = ({ copiedDuration = 3000 }: UseCopyToClipboardOptions = {}) => {
-  const [isCopied, setIsCopied] = useState<boolean>(false);
-  const [isCopyFailed, setIsCopyFailed] = useState<boolean>(false);
-  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
-  const scopeGenerationRef = useRef(0);
+  const [isCopied, setIsCopied] = createSignal<boolean>(false);
+  const [isCopyFailed, setIsCopyFailed] = createSignal<boolean>(false);
+  const copiedTimerRef = elementRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const scopeGenerationRef = elementRef(0);
 
-  useEffect(
+  createEffect(
+    () => [],
     () => () => {
       scopeGenerationRef.current += 1;
       if (copiedTimerRef.current === undefined) return;
@@ -22,7 +21,6 @@ export const useCopyToClipboard = ({ copiedDuration = 3000 }: UseCopyToClipboard
       setIsCopied(false);
       setIsCopyFailed(false);
     },
-    [],
   );
 
   const settle = (succeeded: boolean) => {
@@ -61,5 +59,9 @@ export const useCopyToClipboard = ({ copiedDuration = 3000 }: UseCopyToClipboard
     );
   };
 
-  return { isCopied, isCopyFailed, copyToClipboard };
+  return {
+    isCopied,
+    isCopyFailed,
+    copyToClipboard,
+  };
 };

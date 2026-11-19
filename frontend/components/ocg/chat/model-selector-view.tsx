@@ -1,16 +1,8 @@
-"use client";
-
+import { ChevronDown, Cpu } from "@lucide/solid";
+import { createMemo, createUniqueId } from "solid-js";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Popover } from "@base-ui/react/popover";
-import { ChevronDown, Cpu, Folder } from "lucide-react";
-import { useId, type Ref } from "react";
+import { Select, SelectItem } from "@/components/ui/select";
+import { ariaState, assignRef, type Ref } from "@/lib/ui-state";
 import { useI18n } from "../i18n";
 import { useConversationError } from "./conversation-errors";
 
@@ -34,218 +26,199 @@ export type ModelSelectorViewProps = {
   effort: SelectorField;
 };
 
-export function ModelSelectorView({
-  status,
-  disabled,
-  loading,
-  error,
-  project,
-  provider,
-  model,
-  effort,
-  providerLabel,
-  defaultEffort,
-  triggerRef,
-}: ModelSelectorViewProps) {
-  const { t } = useI18n();
-  const id = useId();
-  const errorInHeader = useConversationError(error);
-  const providerName = provider.options.find((option) => option.value === provider.value)?.label;
-  const modelName = model.options.find((option) => option.value === model.value)?.label;
-  const effortName =
-    effort.value || `${t("chat.profileDefault")}${defaultEffort ? ` (${defaultEffort})` : ""}`;
-  const selectionLabel =
-    providerName && modelName
-      ? `${providerName} / ${modelName} / ${effortName}`
-      : t(loading ? "chat.modelsLoading" : "chat.noModels");
+export function ModelSelectorView(props: ModelSelectorViewProps) {
+  const i18n = useI18n();
+  const id = createUniqueId();
+  let trigger: HTMLButtonElement | undefined;
+  const errorInHeader = useConversationError(() => props.error);
+  const providerName = createMemo(
+    () => props.provider.options.find((option) => option.value === props.provider.value)?.label,
+  );
+  const modelName = createMemo(
+    () => props.model.options.find((option) => option.value === props.model.value)?.label,
+  );
+  const effortName = createMemo(
+    () =>
+      props.effort.value ||
+      `${i18n.t("chat.profileDefault")}${props.defaultEffort ? ` (${props.defaultEffort})` : ""}`,
+  );
+  const selectionLabel = createMemo(() =>
+    providerName() && modelName()
+      ? `${providerName()} / ${modelName()} / ${effortName()}`
+      : i18n.t(props.loading ? "chat.modelsLoading" : "chat.noModels"),
+  );
   const compactClass =
     "h-11 min-w-0 rounded-full border border-transparent bg-transparent px-2.5 text-sm text-muted-foreground transition-colors hover:bg-muted/65 hover:text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 pointer-fine:h-8";
   const selectClass =
     "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
 
   return (
-    <div className="w-full min-w-0">
-      <p id={id + "-status"} className="sr-only">
-        {status}
+    <div class="w-full min-w-0">
+      <p id={id + "-status"} class="sr-only">
+        {props.status}
       </p>
       <fieldset
         aria-describedby={id + "-status"}
-        aria-busy={loading}
-        className="flex min-w-0 items-center gap-1.5"
+        aria-busy={ariaState(props.loading)}
+        class="flex min-w-0 items-center gap-1.5"
       >
-        <legend className="sr-only">{t("chat.executionSettings")}</legend>
-        <div className="max-w-[45%] min-w-0 shrink">
+        <legend class="sr-only">{i18n.t("chat.executionSettings")}</legend>
+        <div class="max-w-[45%] min-w-0 shrink">
           <Select
-            value={project.value}
-            items={[{ value: "", label: project.placeholder }, ...project.options]}
-            disabled={project.disabled}
+            value={props.project.value}
+            items={[{ value: "", label: props.project.placeholder }, ...props.project.options]}
+            disabled={props.project.disabled}
             onValueChange={(next) => {
-              if (next !== null) project.onChange(next);
+              if (next !== null) props.project.onChange(next);
             }}
+            aria-label={i18n.t("chat.project")}
+            class={`${compactClass} max-w-full data-[size=default]:h-11 pointer-fine:data-[size=default]:h-8`}
           >
-            <SelectTrigger
-              aria-label={t("chat.project")}
-              className={`${compactClass} max-w-full data-[size=default]:h-11 pointer-fine:data-[size=default]:h-8`}
-            >
-              <Folder className="size-3.5 text-muted-foreground" aria-hidden="true" />
-              <SelectValue className="min-w-0 truncate" />
-            </SelectTrigger>
-            <SelectContent side="top" align="start">
-              <SelectItem value="">{project.placeholder}</SelectItem>
-              {project.options.map((option) => (
-                <SelectItem key={option.value} value={option.value}>
-                  {option.label}
-                </SelectItem>
-              ))}
-            </SelectContent>
+            <SelectItem value="">{props.project.placeholder}</SelectItem>
+            {props.project.options.map((option) => (
+              <SelectItem value={option.value}>{option.label}</SelectItem>
+            ))}
           </Select>
         </div>
-        <div className="min-w-0 flex-1">
-          <Popover.Root>
-            <Popover.Trigger
-              ref={triggerRef}
-              disabled={disabled}
-              aria-label={`${t("chat.executionSettings")} · ${selectionLabel}`}
-              title={selectionLabel}
-              className={`${compactClass} flex max-w-full items-center justify-between gap-2 text-left`}
-            >
-              <Cpu className="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-              <span className="truncate">
-                {providerName && modelName ? (
-                  <>
-                    <span className="text-muted-foreground">{providerName} / </span>
-                    <span className="font-medium">{modelName}</span>
-                    <span className="text-muted-foreground"> / {effortName}</span>
-                  </>
-                ) : (
-                  selectionLabel
-                )}
-              </span>
-              <ChevronDown className="size-4 shrink-0 opacity-50" aria-hidden="true" />
-            </Popover.Trigger>
-            <Popover.Portal>
-              <Popover.Positioner side="top" sideOffset={4} align="start" className="z-50">
-                <Popover.Popup className="grid max-h-(--available-height) w-72 max-w-[calc(100vw-2rem)] gap-3 overflow-y-auto rounded-xl border border-border bg-popover p-4 text-popover-foreground shadow-lg outline-none">
-                  <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
-                    {providerLabel ?? t("chat.provider")}
-                    <Select
-                      value={provider.value}
-                      items={
-                        provider.options.length
-                          ? provider.options
-                          : [
-                              {
-                                value: "",
-                                label: loading ? t("chat.modelsLoading") : t("chat.noModels"),
-                              },
-                            ]
-                      }
-                      disabled={disabled}
-                      onValueChange={(next) => {
-                        if (next !== null) provider.onChange(next);
-                      }}
-                    >
-                      <SelectTrigger
-                        aria-label={providerLabel ?? t("chat.provider")}
-                        className={selectClass}
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent alignItemWithTrigger={false}>
-                        {!provider.options.length && (
-                          <SelectItem value="">
-                            {loading ? t("chat.modelsLoading") : t("chat.noModels")}
-                          </SelectItem>
-                        )}
-                        {provider.options.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </label>
-                  <div className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
-                    <label htmlFor={id + "-model"}>{t("chat.model")}</label>
-                    <Select
-                      value={model.value}
-                      items={
-                        model.options.length
-                          ? model.options
-                          : [
-                              {
-                                value: "",
-                                label: loading ? t("chat.modelsLoading") : t("chat.noModels"),
-                              },
-                            ]
-                      }
-                      disabled={disabled}
-                      onValueChange={(next) => {
-                        if (next !== null) model.onChange(next);
-                      }}
-                    >
-                      <SelectTrigger
-                        id={id + "-model"}
-                        aria-label={t("chat.model")}
-                        className={selectClass}
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent alignItemWithTrigger={false}>
-                        {!model.options.length && (
-                          <SelectItem value="">
-                            {loading ? t("chat.modelsLoading") : t("chat.noModels")}
-                          </SelectItem>
-                        )}
-                        {model.options.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <label className="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
-                    {t("chat.effort")}
-                    <Select
-                      value={effort.value}
-                      items={[
+        <div class="min-w-0 flex-1">
+          <button
+            type="button"
+            popovertarget={id + "-settings"}
+            ref={(element) => {
+              trigger = element;
+              assignRef(props.triggerRef, element);
+            }}
+            disabled={props.disabled}
+            aria-label={`${i18n.t("chat.executionSettings")} · ${selectionLabel()}`}
+            title={selectionLabel()}
+            class={`${compactClass} flex max-w-full items-center justify-between gap-2 text-left`}
+          >
+            <Cpu class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+            <span class="truncate">
+              {providerName() && modelName() ? (
+                <>
+                  <span class="text-muted-foreground">{providerName()} / </span>
+                  <span class="font-medium">{modelName()}</span>
+                  <span class="text-muted-foreground"> / {effortName()}</span>
+                </>
+              ) : (
+                selectionLabel()
+              )}
+            </span>
+            <ChevronDown class="size-4 shrink-0 opacity-50" aria-hidden="true" />
+          </button>
+
+          <div
+            id={id + "-settings"}
+            popover="auto"
+            onBeforeToggle={(event) => {
+              if (event.newState !== "open" || !trigger) return;
+              const rect = trigger.getBoundingClientRect();
+              event.currentTarget.style.left = `${Math.max(8, Math.min(rect.left, window.innerWidth - 296))}px`;
+              event.currentTarget.style.bottom = `${window.innerHeight - rect.top + 4}px`;
+            }}
+            class="fixed m-0 top-auto z-50 open:grid max-h-(--available-height) w-72 max-w-[calc(100vw-2rem)] gap-3 overflow-y-auto rounded-xl border border-border bg-popover p-4 text-popover-foreground shadow-lg outline-none"
+          >
+            <label class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
+              {props.providerLabel ?? i18n.t("chat.provider")}
+              <Select
+                value={props.provider.value}
+                items={
+                  props.provider.options.length
+                    ? props.provider.options
+                    : [
                         {
                           value: "",
-                          label: `${t("chat.profileDefault")}${defaultEffort ? ` (${defaultEffort})` : ""}`,
+                          label: props.loading
+                            ? i18n.t("chat.modelsLoading")
+                            : i18n.t("chat.noModels"),
                         },
-                        ...effort.options,
-                      ]}
-                      disabled={disabled || !effort.options.length}
-                      onValueChange={(next) => {
-                        if (next !== null) effort.onChange(next);
-                      }}
-                    >
-                      <SelectTrigger aria-label={t("chat.effort")} className={selectClass}>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent alignItemWithTrigger={false}>
-                        <SelectItem value="">
-                          {t("chat.profileDefault")}
-                          {defaultEffort ? ` (${defaultEffort})` : ""}
-                        </SelectItem>
-                        {effort.options.map((option) => (
-                          <SelectItem key={option.value} value={option.value}>
-                            {option.label}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </label>
-                </Popover.Popup>
-              </Popover.Positioner>
-            </Popover.Portal>
-          </Popover.Root>
+                      ]
+                }
+                disabled={props.disabled}
+                onValueChange={(next) => {
+                  if (next !== null) props.provider.onChange(next);
+                }}
+                aria-label={props.providerLabel ?? i18n.t("chat.provider")}
+                class={selectClass}
+              >
+                {!props.provider.options.length && (
+                  <SelectItem value="">
+                    {props.loading ? i18n.t("chat.modelsLoading") : i18n.t("chat.noModels")}
+                  </SelectItem>
+                )}
+                {props.provider.options.map((option) => (
+                  <SelectItem value={option.value}>{option.label}</SelectItem>
+                ))}
+              </Select>
+            </label>
+            <div class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
+              <label for={id + "-model"}>{i18n.t("chat.model")}</label>
+              <Select
+                value={props.model.value}
+                items={
+                  props.model.options.length
+                    ? props.model.options
+                    : [
+                        {
+                          value: "",
+                          label: props.loading
+                            ? i18n.t("chat.modelsLoading")
+                            : i18n.t("chat.noModels"),
+                        },
+                      ]
+                }
+                disabled={props.disabled}
+                onValueChange={(next) => {
+                  if (next !== null) props.model.onChange(next);
+                }}
+                id={id + "-model"}
+                aria-label={i18n.t("chat.model")}
+                class={selectClass}
+              >
+                {!props.model.options.length && (
+                  <SelectItem value="">
+                    {props.loading ? i18n.t("chat.modelsLoading") : i18n.t("chat.noModels")}
+                  </SelectItem>
+                )}
+                {props.model.options.map((option) => (
+                  <SelectItem value={option.value}>{option.label}</SelectItem>
+                ))}
+              </Select>
+            </div>
+            <label class="flex min-w-0 flex-col gap-1 text-xs text-muted-foreground">
+              {i18n.t("chat.effort")}
+              <Select
+                value={props.effort.value}
+                items={[
+                  {
+                    value: "",
+                    label: `${i18n.t("chat.profileDefault")}${props.defaultEffort ? ` (${props.defaultEffort})` : ""}`,
+                  },
+                  ...props.effort.options,
+                ]}
+                disabled={props.disabled || !props.effort.options.length}
+                onValueChange={(next) => {
+                  if (next !== null) props.effort.onChange(next);
+                }}
+                aria-label={i18n.t("chat.effort")}
+                class={selectClass}
+              >
+                <SelectItem value="">
+                  {i18n.t("chat.profileDefault")}
+                  {props.defaultEffort ? ` (${props.defaultEffort})` : ""}
+                </SelectItem>
+                {props.effort.options.map((option) => (
+                  <SelectItem value={option.value}>{option.label}</SelectItem>
+                ))}
+              </Select>
+            </label>
+          </div>
         </div>
       </fieldset>
-      {error && !errorInHeader && (
-        <DismissibleNotice message={error} className="mt-2 break-words text-xs text-destructive">
-          {error}
+      {props.error && !errorInHeader() && (
+        <DismissibleNotice message={props.error} class="mt-2 break-words text-xs text-destructive">
+          {props.error}
         </DismissibleNotice>
       )}
     </div>

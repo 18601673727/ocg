@@ -1,25 +1,24 @@
-"use client";
-
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useState, type FormEvent } from "react";
-import { Check, Copy } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Textarea } from "@/components/ui/textarea";
-import { Pill } from "@/components/ocg/primitives";
+import { Check, Copy } from "@lucide/solid";
+import { createEffect, createMemo, createSignal } from "solid-js";
 import type { Project } from "@/components/ocg/contracts";
+import { Pill } from "@/components/ocg/primitives";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import type {
+  ApiClient,
   ProjectCommand,
   ProjectCreate,
   ProjectUpdate,
-  ApiClient,
 } from "@/components/ocg/runtime/api-client";
-import { Section, describeError, refusalText } from "./settings-parts";
-import { useI18n, type I18nKey } from "../i18n";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import { toCommandDrafts, toProjectCommands, type CommandDraft } from "./command-drafts";
+import { type FormEvent } from "@/lib/ui-state";
+import { type I18nKey, useI18n } from "../i18n";
+import { type CommandDraft, toCommandDrafts, toProjectCommands } from "./command-drafts";
 import { CommandEditor } from "./command-editor";
 import { ProjectDecisionConfigButton } from "./command-management";
+import { describeError, refusalText, Section } from "./settings-parts";
 
 const PROJECT_REFUSALS: Partial<Record<string, I18nKey>> = {
   project_root_invalid: "settings.projects.refusal.rootInvalid",
@@ -29,78 +28,80 @@ const PROJECT_REFUSALS: Partial<Record<string, I18nKey>> = {
   invalid_request: "settings.projects.refusal.invalidRequest",
 };
 
-function CopyRootButton({ project }: { project: Project }) {
-  const { t } = useI18n();
+function CopyRootButton(props: { project: Project }) {
+  const i18n = useI18n();
   const { isCopied, isCopyFailed, copyToClipboard } = useCopyToClipboard();
 
-  const label = isCopied
-    ? t("common.copied")
-    : isCopyFailed
-      ? t("common.copyFailed")
-      : t("common.copy");
+  const label = isCopied()
+    ? i18n.t("common.copied")
+    : isCopyFailed()
+      ? i18n.t("common.copyFailed")
+      : i18n.t("common.copy");
 
   return (
     <Button
       type="button"
       variant="ghost"
       size="xs"
-      className="shrink-0 px-1.5 tracking-normal normal-case"
-      aria-label={t("settings.projects.copyRootFor", { name: project.name })}
-      onClick={() => copyToClipboard(project.root)}
+      class="shrink-0 px-1.5 tracking-normal normal-case"
+      aria-label={i18n.t("settings.projects.copyRootFor", { name: props.project.name })}
+      onClick={() => copyToClipboard(props.project.root)}
     >
-      {isCopied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
+      {isCopied() ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
       <span role="status">{label}</span>
     </Button>
   );
 }
 
-export function ProjectsSection({ client }: { client: ApiClient }) {
-  const { t, locale } = useI18n();
-  const [projects, setProjects] = useState<Project[]>([]);
-  const [loadError, setLoadError] = useState<string | null>(null);
+export function ProjectsSection(props: { client: ApiClient }) {
+  const i18n = useI18n();
+  const [projects, setProjects] = createSignal<Project[]>([]);
+  const [loadError, setLoadError] = createSignal<string | null>(null);
 
-  const [editingProject, setEditingProject] = useState<Project | null>(null);
-  const [name, setName] = useState("");
-  const [root, setRoot] = useState("");
-  const [description, setDescription] = useState("");
-  const [commands, setCommands] = useState<CommandDraft[]>([]);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [editingProject, setEditingProject] = createSignal<Project | null>(null);
+  const [name, setName] = createSignal("");
+  const [root, setRoot] = createSignal("");
+  const [description, setDescription] = createSignal("");
+  const [commands, setCommands] = createSignal<CommandDraft[]>([]);
+  const [saving, setSaving] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
+  const [notice, setNotice] = createSignal<string | null>(null);
 
-  const loadProjects = useCallback(
-    (signal?: AbortSignal) =>
-      client
-        .readAllProjects(signal)
-        .then((loaded) => {
-          if (!signal?.aborted) {
-            setProjects(loaded);
-            setLoadError(null);
-          }
-        })
-        .catch((err: unknown) => {
-          if (!signal?.aborted) setLoadError(describeError(err, t));
-        }),
-    [client, t],
+  const loadProjects = (signal?: AbortSignal) =>
+    props.client
+      .readAllProjects(signal)
+      .then((loaded) => {
+        if (!signal?.aborted) {
+          setProjects(loaded);
+          setLoadError(null);
+        }
+      })
+      .catch((err: unknown) => {
+        if (!signal?.aborted) setLoadError(describeError(err, i18n.t));
+      });
+
+  createEffect(
+    () => [loadProjects],
+    () => {
+      const controller = new AbortController();
+      void loadProjects(controller.signal);
+      return () => controller.abort();
+    },
   );
 
-  useEffect(() => {
-    const controller = new AbortController();
-    void loadProjects(controller.signal);
-    return () => controller.abort();
-  }, [loadProjects]);
-
-  const managementChanged = useCallback((updated: Project) => {
+  const managementChanged = (updated: Project) => {
     setProjects((previous) =>
       previous.map((project) => (project.id === updated.id ? updated : project)),
     );
     setEditingProject(updated);
     setCommands(toCommandDrafts(updated.commands));
-  }, []);
-  const commandsDirty = editingProject
-    ? JSON.stringify(toProjectCommands(commands)) !==
-      JSON.stringify(toProjectCommands(toCommandDrafts(editingProject.commands)))
-    : true;
+  };
+  const commandsDirty = createMemo(() =>
+    editingProject()
+      ? JSON.stringify(toProjectCommands(commands())) !==
+        JSON.stringify(toProjectCommands(toCommandDrafts(editingProject()!.commands)))
+      : true,
+  );
 
   function resetForm() {
     setEditingProject(null);
@@ -112,7 +113,7 @@ export function ProjectsSection({ client }: { client: ApiClient }) {
   }
 
   function startEdit(project: Project) {
-    if (editingProject?.id === project.id) {
+    if (editingProject()?.id === project.id) {
       resetForm();
       return;
     }
@@ -131,35 +132,35 @@ export function ProjectsSection({ client }: { client: ApiClient }) {
     setError(null);
     setNotice(null);
 
-    const trimmedDesc = description.trim();
+    const trimmedDesc = description().trim();
     const finalDescription = trimmedDesc.length > 0 ? trimmedDesc : null;
-    const finalCommands: ProjectCommand[] = toProjectCommands(commands);
+    const finalCommands: ProjectCommand[] = toProjectCommands(commands());
 
     try {
-      if (editingProject) {
+      if (editingProject()) {
         const payload: ProjectUpdate = {
-          name: name.trim(),
+          name: name().trim(),
           description: finalDescription,
           commands: finalCommands,
         };
-        const updated = await client.updateProject(editingProject.id, payload);
+        const updated = await props.client.updateProject(editingProject()!.id, payload);
         setProjects((prev) => prev.map((p) => (p.id === updated.id ? updated : p)));
         resetForm();
-        setNotice(t("settings.projects.updatedNotice"));
+        setNotice(i18n.t("settings.projects.updatedNotice"));
       } else {
         const payload: ProjectCreate = {
-          name: name.trim(),
-          root: root.trim(),
+          name: name().trim(),
+          root: root().trim(),
           description: finalDescription,
           commands: finalCommands,
         };
-        const created = await client.createProject(payload);
+        const created = await props.client.createProject(payload);
         setProjects((prev) => [created, ...prev]);
         resetForm();
-        setNotice(t("settings.projects.createdNotice"));
+        setNotice(i18n.t("settings.projects.createdNotice"));
       }
     } catch (err) {
-      setError(refusalText(t, err, PROJECT_REFUSALS));
+      setError(refusalText(i18n.t, err, PROJECT_REFUSALS));
     } finally {
       setSaving(false);
     }
@@ -168,158 +169,154 @@ export function ProjectsSection({ client }: { client: ApiClient }) {
   return (
     <Section
       id="settings-projects"
-      title={t("settings.projects.title")}
-      description={t("settings.projects.description")}
+      title={i18n.t("settings.projects.title")}
+      description={i18n.t("settings.projects.description")}
     >
-      {loadError ? (
-        <DismissibleNotice message={loadError} className="py-2 text-sm text-destructive">
-          {loadError}
+      {loadError() ? (
+        <DismissibleNotice message={loadError()!} class="py-2 text-sm text-destructive">
+          {loadError()}
         </DismissibleNotice>
       ) : null}
 
       <form
         onSubmit={(e) => void handleSave(e)}
-        className="mb-2 flex flex-col gap-3 border-b border-border pb-4"
+        class="mb-2 flex flex-col gap-3 border-b border-border pb-4"
       >
-        <div className="flex items-center justify-between gap-2">
-          <h3 className="text-sm font-semibold">
-            {editingProject
-              ? t("settings.projects.editTitle", { id: editingProject.id })
-              : t("settings.projects.createTitle")}
+        <div class="flex items-center justify-between gap-2">
+          <h3 class="text-sm font-semibold">
+            {editingProject()
+              ? i18n.t("settings.projects.editTitle", { id: editingProject()!.id })
+              : i18n.t("settings.projects.createTitle")}
           </h3>
-          {editingProject ? (
+          {editingProject() ? (
             <Button type="button" variant="ghost" size="xs" onClick={resetForm}>
-              {t("settings.projects.cancelEdit")}
+              {i18n.t("settings.projects.cancelEdit")}
             </Button>
           ) : null}
         </div>
 
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-          <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-            {t("settings.projects.name")}
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+            {i18n.t("settings.projects.name")}
             <Input
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder={t("settings.projects.namePlaceholder")}
-              spellCheck={false}
+              value={name()}
+              onInput={(e) => setName(e.target.value)}
+              placeholder={i18n.t("settings.projects.namePlaceholder")}
+              spellcheck="false"
             />
           </label>
 
-          {editingProject ? (
-            <div className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-              <span>{t("settings.projects.root")}</span>
-              <span className="font-mono text-xs text-foreground py-2 break-all">
-                {editingProject.root}
+          {editingProject() ? (
+            <div class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+              <span>{i18n.t("settings.projects.root")}</span>
+              <span class="font-mono text-xs text-foreground py-2 break-all">
+                {editingProject()!.root}
               </span>
             </div>
           ) : (
-            <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-              {t("settings.projects.root")}
+            <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+              {i18n.t("settings.projects.root")}
               <Input
-                value={root}
-                onChange={(e) => setRoot(e.target.value)}
-                placeholder={t("settings.projects.rootPlaceholder")}
-                spellCheck={false}
+                value={root()}
+                onInput={(e) => setRoot(e.target.value)}
+                placeholder={i18n.t("settings.projects.rootPlaceholder")}
+                spellcheck="false"
               />
             </label>
           )}
 
-          <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground sm:col-span-2">
-            {t("settings.projects.descriptionLabel")}
+          <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground sm:col-span-2">
+            {i18n.t("settings.projects.descriptionLabel")}
             <Textarea
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder={t("settings.projects.descriptionPlaceholder")}
+              value={description()}
+              onInput={(e) => setDescription(e.target.value)}
+              placeholder={i18n.t("settings.projects.descriptionPlaceholder")}
               rows={2}
             />
           </label>
         </div>
 
         <CommandEditor
-          key={editingProject?.id ?? "new-project"}
-          commands={commands}
+          commands={commands()}
           onChange={setCommands}
-          disabled={saving}
+          disabled={saving()}
           managementAction={
             <ProjectDecisionConfigButton
-              client={client}
-              project={editingProject}
-              disabled={saving || commandsDirty}
+              client={props.client}
+              project={editingProject()}
+              disabled={saving() || commandsDirty()}
               onChanged={managementChanged}
             />
           }
         />
-        {!editingProject && (
-          <p className="text-xs text-muted-foreground">{t("commands.saveFirst")}</p>
+        {!editingProject() && (
+          <p class="text-xs text-muted-foreground">{i18n.t("commands.saveFirst")}</p>
         )}
-        {editingProject && commandsDirty && (
-          <p className="text-xs text-muted-foreground">{t("commands.saveChanges")}</p>
+        {editingProject() && commandsDirty() && (
+          <p class="text-xs text-muted-foreground">{i18n.t("commands.saveChanges")}</p>
         )}
 
-        {error ? (
-          <DismissibleNotice message={error} className="text-sm text-destructive">
-            {error}
+        {error() ? (
+          <DismissibleNotice message={error()!} class="text-sm text-destructive">
+            {error()}
           </DismissibleNotice>
         ) : null}
-        {notice ? (
-          <p role="status" className="text-sm text-emerald-700 dark:text-emerald-400">
-            {notice}
+        {notice() ? (
+          <p role="status" class="text-sm text-emerald-700 dark:text-emerald-400">
+            {notice()}
           </p>
         ) : null}
 
-        <div className="flex justify-end gap-2">
-          <Button type="submit" disabled={saving}>
-            {saving ? t("settings.projects.saving") : t("settings.projects.save")}
+        <div class="flex justify-end gap-2">
+          <Button type="submit" disabled={saving()}>
+            {saving() ? i18n.t("settings.projects.saving") : i18n.t("settings.projects.save")}
           </Button>
         </div>
       </form>
 
-      <div className="divide-y divide-border/70 py-2">
-        {projects.length === 0 ? (
-          <p className="py-2 text-sm text-muted-foreground">{t("settings.projects.empty")}</p>
+      <div class="divide-y divide-border/70 py-2">
+        {projects().length === 0 ? (
+          <p class="py-2 text-sm text-muted-foreground">{i18n.t("settings.projects.empty")}</p>
         ) : (
-          projects.map((project) => (
-            <div
-              key={project.id}
-              className="flex flex-col gap-2 py-3 sm:flex-row sm:items-start sm:justify-between"
-            >
-              <div className="min-w-0 space-y-1">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-sm font-semibold">{project.name}</span>
-                  <Pill tone="slate" className="text-xs normal-case">
+          projects().map((project) => (
+            <div class="flex flex-col gap-2 py-3 sm:flex-row sm:items-start sm:justify-between">
+              <div class="min-w-0 space-y-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="text-sm font-semibold">{project.name}</span>
+                  <Pill tone="slate" class="text-xs normal-case">
                     {project.id}
                   </Pill>
                 </div>
                 {project.description ? (
-                  <p className="text-xs text-muted-foreground">{project.description}</p>
+                  <p class="text-xs text-muted-foreground">{project.description}</p>
                 ) : null}
-                <div className="flex min-w-0 flex-wrap items-center gap-1">
-                  <p className="min-w-0 font-mono text-xs break-all text-muted-foreground">
+                <div class="flex min-w-0 flex-wrap items-center gap-1">
+                  <p class="min-w-0 font-mono text-xs break-all text-muted-foreground">
                     {project.root}
                   </p>
                   <CopyRootButton project={project} />
                 </div>
                 {project.commands.length > 0 ? (
-                  <details className="pt-1 text-xs text-muted-foreground">
-                    <summary className="cursor-pointer py-1 hover:text-foreground">
-                      {t("settings.projects.configuredCommands", {
+                  <details class="pt-1 text-xs text-muted-foreground">
+                    <summary class="cursor-pointer py-1 hover:text-foreground">
+                      {i18n.t("settings.projects.configuredCommands", {
                         count: project.commands.length,
                       })}
                     </summary>
-                    <div className="ocg-subtle-scrollbar mt-1 max-h-48 min-w-0 space-y-1 overflow-y-auto overscroll-contain rounded-md border border-border p-2">
+                    <div class="ocg-subtle-scrollbar mt-1 max-h-48 min-w-0 space-y-1 overflow-y-auto overscroll-contain rounded-md border border-border p-2">
                       {project.commands.map((cmd) => (
-                        <div key={cmd.name} className="font-mono break-all">
-                          <span className="font-semibold text-foreground">{cmd.name}</span>:{" "}
+                        <div class="font-mono break-all">
+                          <span class="font-semibold text-foreground">{cmd.name}</span>:{" "}
                           {cmd.argv.join(" ")}{" "}
-                          <span className="font-sans">
+                          <span class="font-sans">
                             ·{" "}
-                            {t(
+                            {i18n.t(
                               cmd.owner === "decision"
                                 ? "commands.ownerDecision"
                                 : "commands.ownerUser",
                             )}
                             {cmd.status !== "allowed"
-                              ? ` · ${t(cmd.status === "review" ? "commands.review" : "commands.blocked")}`
+                              ? ` · ${i18n.t(cmd.status === "review" ? "commands.review" : "commands.blocked")}`
                               : ""}
                           </span>
                         </div>
@@ -327,26 +324,26 @@ export function ProjectsSection({ client }: { client: ApiClient }) {
                     </div>
                   </details>
                 ) : (
-                  <p className="text-xs text-muted-foreground">
-                    {t("settings.projects.noCommands")}
+                  <p class="text-xs text-muted-foreground">
+                    {i18n.t("settings.projects.noCommands")}
                   </p>
                 )}
-                <p className="text-[11px] text-muted-foreground">
-                  {t("settings.projects.updatedAt", {
-                    time: new Date(project.updated_at_us / 1000).toLocaleString(locale),
+                <p class="text-[11px] text-muted-foreground">
+                  {i18n.t("settings.projects.updatedAt", {
+                    time: new Date(project.updated_at_us / 1000).toLocaleString(i18n.locale),
                   })}
                 </p>
               </div>
-              <div className="shrink-0">
+              <div class="shrink-0">
                 <Button
                   type="button"
                   variant="outline"
                   size="xs"
                   onClick={() => startEdit(project)}
                 >
-                  {editingProject?.id === project.id
-                    ? t("settings.projects.cancelEdit")
-                    : t("settings.projects.edit")}
+                  {editingProject()?.id === project.id
+                    ? i18n.t("settings.projects.cancelEdit")
+                    : i18n.t("settings.projects.edit")}
                 </Button>
               </div>
             </div>

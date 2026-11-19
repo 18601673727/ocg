@@ -1,16 +1,9 @@
-"use client";
-
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext } from "solid-js";
+import { type View } from "@/lib/ui-state";
 
 const RemoteLogout = createContext<(() => Promise<void>) | null>(null);
-export function SessionActions({
-  onSignOut,
-  children,
-}: {
-  onSignOut: () => Promise<void>;
-  children: ReactNode;
-}) {
-  return <RemoteLogout.Provider value={onSignOut}>{children}</RemoteLogout.Provider>;
+export function SessionActions(props: { onSignOut: () => Promise<void>; children: View }) {
+  return <RemoteLogout value={props.onSignOut}>{props.children}</RemoteLogout>;
 }
 export function useRemoteLogout() {
   return useContext(RemoteLogout);

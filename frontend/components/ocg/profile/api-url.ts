@@ -1,6 +1,4 @@
-"use client";
-
-import { useSyncExternalStore } from "react";
+import { createSubscription } from "@/lib/ui-state";
 
 export function isLoopbackApiUrl(raw: string): boolean {
   try {
@@ -38,8 +36,8 @@ export function isTrustedApiUrl(raw: string): boolean {
   }
 }
 
-export function useOcgApiUrl(): string | null {
-  const url = useSyncExternalStore(
+export function useOcgApiUrl() {
+  const url = createSubscription(
     (listener) => {
       window.addEventListener("popstate", listener);
       return () => window.removeEventListener("popstate", listener);
@@ -49,10 +47,9 @@ export function useOcgApiUrl(): string | null {
       if (!isLoopbackApiUrl(origin)) {
         return isTrustedApiUrl(origin) ? origin : null;
       }
-      const selected = process.env.NEXT_PUBLIC_OCG_API_URL ?? window.location.origin;
+      const selected = import.meta.env.PUBLIC_OCG_API_URL ?? origin;
       return selected && isLoopbackApiUrl(selected) ? selected.replace(/\/$/, "") : null;
     },
-    () => null,
   );
   return url;
 }

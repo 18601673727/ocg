@@ -1,53 +1,106 @@
-"use client";
+import { type JSX, Portal } from "@solidjs/web";
+import { createContext, createSignal, createUniqueId, onCleanup, Show, useContext } from "solid-js";
+import { composeButton, type View } from "@/lib/ui-state";
+import { cn } from "@/lib/utils";
 
-import { Tooltip as TooltipPrimitive } from "@base-ui/react/tooltip";
-import { cn } from "cn";
+type Trigger = { bounds: DOMRect; element: HTMLElement };
+const TooltipContext = createContext<{
+  id: string;
+  anchor: () => Trigger | null;
+  setAnchor: (target: Trigger | null) => void;
+}>();
 
-function TooltipProvider({ delay = 0, ...props }: TooltipPrimitive.Provider.Props) {
-  return <TooltipPrimitive.Provider data-slot="tooltip-provider" delay={delay} {...props} />;
+export function TooltipProvider(props: { children?: View; delay?: number }) {
+  return props.children;
 }
-
-function Tooltip({ ...props }: TooltipPrimitive.Root.Props) {
-  return <TooltipPrimitive.Root data-slot="tooltip" {...props} />;
-}
-
-function TooltipTrigger({ ...props }: TooltipPrimitive.Trigger.Props) {
-  return <TooltipPrimitive.Trigger data-slot="tooltip-trigger" {...props} />;
-}
-
-function TooltipContent({
-  className,
-  side = "top",
-  sideOffset = 4,
-  align = "center",
-  alignOffset = 0,
-  children,
-  ...props
-}: TooltipPrimitive.Popup.Props &
-  Pick<TooltipPrimitive.Positioner.Props, "align" | "alignOffset" | "side" | "sideOffset">) {
+export function Tooltip(props: { children?: View }) {
+  const [anchor, setAnchor] = createSignal<Trigger | null>(null);
   return (
-    <TooltipPrimitive.Portal>
-      <TooltipPrimitive.Positioner
-        align={align}
-        alignOffset={alignOffset}
-        side={side}
-        sideOffset={sideOffset}
-        className="isolate z-50"
-      >
-        <TooltipPrimitive.Popup
-          data-slot="tooltip-content"
-          className={cn(
-            "z-50 inline-flex w-fit max-w-xs origin-(--transform-origin) items-center gap-1.5 rounded-md bg-foreground px-3 py-1.5 text-xs text-background has-data-[slot=kbd]:pr-1.5 data-[side=bottom]:slide-in-from-top-2 data-[side=inline-end]:slide-in-from-left-2 data-[side=inline-start]:slide-in-from-right-2 data-[side=left]:slide-in-from-right-2 data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2 **:data-[slot=kbd]:relative **:data-[slot=kbd]:isolate **:data-[slot=kbd]:z-50 **:data-[slot=kbd]:rounded-sm data-[state=delayed-open]:animate-in data-[state=delayed-open]:fade-in-0 data-[state=delayed-open]:zoom-in-95 data-open:animate-in data-open:fade-in-0 data-open:zoom-in-95 data-closed:animate-out data-closed:fade-out-0 data-closed:zoom-out-95",
-            className,
-          )}
-          {...props}
-        >
-          {children}
-          <TooltipPrimitive.Arrow className="z-50 size-2.5 translate-y-[calc(-50%-2px)] rotate-45 rounded-none bg-foreground fill-foreground data-[side=bottom]:top-1 data-[side=inline-end]:top-1/2! data-[side=inline-end]:-left-1 data-[side=inline-end]:translate-x-[1.5px] data-[side=inline-end]:-translate-y-1/2 data-[side=inline-start]:top-1/2! data-[side=inline-start]:-right-1 data-[side=inline-start]:translate-x-[-1.5px] data-[side=inline-start]:-translate-y-1/2 data-[side=left]:top-1/2! data-[side=left]:-right-1 data-[side=left]:-translate-y-1/2 data-[side=right]:top-1/2! data-[side=right]:-left-1 data-[side=right]:-translate-y-1/2 data-[side=top]:-bottom-2.5" />
-        </TooltipPrimitive.Popup>
-      </TooltipPrimitive.Positioner>
-    </TooltipPrimitive.Portal>
+    <TooltipContext value={{ id: createUniqueId(), anchor, setAnchor }}>
+      {props.children}
+    </TooltipContext>
   );
 }
-
-export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider };
+export function TooltipTrigger(props: { render?: View; children?: View }) {
+  const state = useContext(TooltipContext);
+  const element = props.render ? (
+    composeButton(props.render, { children: props.children })
+  ) : (
+    <button type="button">{props.children}</button>
+  );
+  if (!(element instanceof HTMLElement) || !state) return element;
+  element.setAttribute("aria-describedby", state.id);
+  element.setAttribute("data-slot", "tooltip-trigger");
+  const open = () => state.setAnchor({ bounds: element.getBoundingClientRect(), element });
+  const close = () => state.setAnchor(null);
+  const events = [
+    ["pointerenter", open],
+    ["pointerleave", close],
+    ["focus", open],
+    ["blur", close],
+  ] as const;
+  for (const [event, listener] of events) element.addEventListener(event, listener);
+  onCleanup(() => {
+    for (const [event, listener] of events) element.removeEventListener(event, listener);
+  });
+  return element;
+}
+export function TooltipContent(
+  props: JSX.IntrinsicElements["div"] & {
+    side?: "top" | "bottom" | "left" | "right" | "inline-end" | "inline-start";
+    sideOffset?: number;
+    align?: "center" | "start" | "end";
+    alignOffset?: number;
+  },
+) {
+  const state = useContext(TooltipContext);
+  return (
+    <Show when={state?.anchor()}>
+      {(anchor) => {
+        const style = (): JSX.CSSProperties => {
+          const { bounds } = anchor();
+          const gap = props.sideOffset ?? 4;
+          if (props.side === "bottom")
+            return {
+              left: `${bounds.left + bounds.width / 2}px`,
+              top: `${bounds.bottom + gap}px`,
+              transform: "translateX(-50%)",
+            };
+          if (props.side === "left" || props.side === "inline-start")
+            return {
+              left: `${bounds.left - gap}px`,
+              top: `${bounds.top + bounds.height / 2}px`,
+              transform: "translate(-100%, -50%)",
+            };
+          if (props.side === "right" || props.side === "inline-end")
+            return {
+              left: `${bounds.right + gap}px`,
+              top: `${bounds.top + bounds.height / 2}px`,
+              transform: "translateY(-50%)",
+            };
+          return {
+            left: `${bounds.left + bounds.width / 2}px`,
+            top: `${bounds.top - gap}px`,
+            transform: "translate(-50%, -100%)",
+          };
+        };
+        return (
+          <Portal>
+            <div
+              id={state?.id}
+              role="tooltip"
+              data-slot="tooltip-content"
+              class={cn(
+                "pointer-events-none fixed z-[70] w-max max-w-xs rounded-md bg-foreground px-3 py-1.5 text-xs text-background",
+                props.class,
+              )}
+              style={style()}
+            >
+              {props.children}
+            </div>
+          </Portal>
+        );
+      }}
+    </Show>
+  );
+}

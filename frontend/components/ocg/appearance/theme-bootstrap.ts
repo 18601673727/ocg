@@ -1,6 +1,6 @@
 import { APPEARANCE_STORAGE_KEY, DEFAULT_APPEARANCE } from "./theme-domain";
 
-// Apply stored appearance before hydration with the defaults shared by the theme provider.
+// Apply stored appearance before rendering with the defaults shared by the theme provider.
 export const THEME_BOOTSTRAP_SCRIPT = `(function () {
   var fallback = ${JSON.stringify(DEFAULT_APPEARANCE)};
   var theme = fallback.theme;

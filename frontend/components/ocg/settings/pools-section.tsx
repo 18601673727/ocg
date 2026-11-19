@@ -1,15 +1,11 @@
-"use client";
-
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { Pill } from "@/components/ocg/primitives";
+import { createEffect, createMemo, createSignal } from "solid-js";
 import type { Pool } from "@/components/ocg/contracts";
+import { Pill } from "@/components/ocg/primitives";
+import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
+import type { ApiClient, PoolUpdate } from "@/components/ocg/runtime/api-client";
 import {
-  configurationIdentity,
   ApiError,
+  configurationIdentity,
   isExecutorConflict,
   type NativeAllocation,
   type NativeAllocationPhase,
@@ -17,9 +13,12 @@ import {
   type NativeExecutorChange,
   type NativePoolAllocations,
 } from "@/components/ocg/runtime/api-client";
-import type { PoolUpdate, ApiClient } from "@/components/ocg/runtime/api-client";
-import { Section, describeError, refusalText } from "./settings-parts";
-import { useI18n, type I18nKey } from "../i18n";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { elementRef } from "@/lib/ui-state";
+import { type I18nKey, useI18n } from "../i18n";
+import { describeError, refusalText, Section } from "./settings-parts";
 
 const POOL_REFUSALS: Partial<Record<string, I18nKey>> = {
   pool_not_found: "settings.pools.refusal.notFound",
@@ -46,10 +45,10 @@ type RowStale = "changed" | "updateUnconfirmed" | "archiveUnconfirmed";
 type StaleLock = { reason: RowStale; at: number };
 
 function useStaleRows() {
-  const locks = useRef<ReadonlyMap<string, StaleLock>>(new Map());
-  const clock = useRef(0);
-  const [view, setView] = useState<ReadonlyMap<string, RowStale>>(new Map());
-  const actions = useMemo(() => {
+  const locks = elementRef<ReadonlyMap<string, StaleLock>>(new Map());
+  const clock = elementRef(0);
+  const [view, setView] = createSignal<ReadonlyMap<string, RowStale>>(new Map());
+  const actions = createMemo(() => {
     const publish = (next: ReadonlyMap<string, StaleLock>) => {
       locks.current = next;
       setView(new Map([...next].map(([id, lock]) => [id, lock.reason])));
@@ -64,8 +63,8 @@ function useStaleRows() {
         if (kept.size !== locks.current.size) publish(kept);
       },
     };
-  }, []);
-  return [view, actions] as const;
+  });
+  return [view(), actions()] as const;
 }
 
 const POOL_STALE_TEXT: Record<RowStale, I18nKey> = {
@@ -214,15 +213,7 @@ function capabilityKey(capability: NativeExecutor["capabilities"][number]): stri
   return capability.protocol ?? capability.operation;
 }
 
-function ExecutorRow({
-  executor,
-  pool,
-  busy,
-  stale,
-  onUpdate,
-  onArchive,
-  onReload,
-}: {
+function ExecutorRow(props: {
   executor: NativeExecutor;
   pool: Pool | undefined;
   busy: boolean;
@@ -231,132 +222,147 @@ function ExecutorRow({
   onArchive: (executor: NativeExecutor) => Promise<ArchiveOutcome>;
   onReload: () => void;
 }) {
-  const { t } = useI18n();
-  const [confirmingArchive, setConfirmingArchive] = useState(false);
-  const [archiving, setArchiving] = useState(false);
-  const [archiveRefusal, setArchiveRefusal] = useState<string | null>(null);
-  const [name, setName] = useState<string | null>(null);
-  const [draft, setDraft] = useState<ReadonlySet<string> | null>(null);
-  const disabled = busy || stale !== undefined;
-  const current = new Set(executor.capabilities.map(capabilityKey));
-  const legacyOptions = executor.capabilities.flatMap((capability) => {
-    const key = capabilityKey(capability);
-    if (EXECUTOR_CAPABILITIES.some((option) => option.key === key)) return [];
-    return [{ key, label: `${key} (${t("settings.llm.executionUnavailable")})`, capability }];
-  });
-  const options = [...EXECUTOR_CAPABILITIES, ...legacyOptions];
-  const state = t(executor.enabled ? "settings.pools.enabled" : "settings.pools.disabled");
-  const nameValid = name !== null && name.trim() !== "" && name.trim() !== executor.name;
-  const draftValid =
-    draft !== null && (draft.size !== current.size || [...draft].some((key) => !current.has(key)));
+  const i18n = useI18n();
+  const [confirmingArchive, setConfirmingArchive] = createSignal(false);
+  const [archiving, setArchiving] = createSignal(false);
+  const [archiveRefusal, setArchiveRefusal] = createSignal<string | null>(null);
+  const [name, setName] = createSignal<string | null>(null);
+  const [draft, setDraft] = createSignal<ReadonlySet<string> | null>(null);
+  const disabled = createMemo(() => props.busy || props.stale !== undefined);
+  const current = new Set(props.executor.capabilities.map(capabilityKey));
+  const legacyOptions = createMemo(() =>
+    props.executor.capabilities.flatMap((capability) => {
+      const key = capabilityKey(capability);
+      if (EXECUTOR_CAPABILITIES.some((option) => option.key === key)) return [];
+      return [
+        { key, label: `${key} (${i18n.t("settings.llm.executionUnavailable")})`, capability },
+      ];
+    }),
+  );
+  const options = createMemo(() => [...EXECUTOR_CAPABILITIES, ...legacyOptions()]);
+  const state = createMemo(() =>
+    i18n.t(props.executor.enabled ? "settings.pools.enabled" : "settings.pools.disabled"),
+  );
+  const nameValid = createMemo(
+    () => name() !== null && name()!.trim() !== "" && name()!.trim() !== props.executor.name,
+  );
+  const draftValid = createMemo(
+    () =>
+      draft() !== null &&
+      (draft()!.size !== current.size || [...(draft() ?? [])].some((key) => !current.has(key))),
+  );
 
   return (
-    <div className="space-y-2 py-2 text-sm">
-      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
-        <div className="min-w-0 flex-1 space-y-1">
-          <div className="flex flex-wrap items-center gap-2">
-            <strong className="break-all">{executor.name}</strong>
-            <Pill tone={executor.enabled ? "emerald" : "amber"} className="text-xs normal-case">
-              {t("settings.pools.executorState", { state })}
+    <div class="space-y-2 py-2 text-sm">
+      <div class="flex flex-wrap items-center justify-between gap-x-6 gap-y-2">
+        <div class="min-w-0 flex-1 space-y-1">
+          <div class="flex flex-wrap items-center gap-2">
+            <strong class="break-all">{props.executor.name}</strong>
+            <Pill tone={props.executor.enabled ? "emerald" : "amber"} class="text-xs normal-case">
+              {i18n.t("settings.pools.executorState", { state: state() })}
             </Pill>
-            {pool ? (
-              <Pill tone={pool.enabled ? "emerald" : "amber"} className="text-xs normal-case">
-                {t("settings.pools.executorPoolState", {
-                  pool: pool.name,
-                  state: t(pool.enabled ? "settings.pools.enabled" : "settings.pools.disabled"),
+            {props.pool ? (
+              <Pill tone={props.pool.enabled ? "emerald" : "amber"} class="text-xs normal-case">
+                {i18n.t("settings.pools.executorPoolState", {
+                  pool: props.pool.name,
+                  state: i18n.t(
+                    props.pool.enabled ? "settings.pools.enabled" : "settings.pools.disabled",
+                  ),
                 })}
               </Pill>
             ) : (
-              <Pill tone="violet" className="text-xs normal-case">
-                {t("settings.pools.executorPoolElsewhere", {
-                  pool: executor.pool,
+              <Pill tone="violet" class="text-xs normal-case">
+                {i18n.t("settings.pools.executorPoolElsewhere", {
+                  pool: props.executor.pool,
                 })}
               </Pill>
             )}
           </div>
-          <div className="text-xs break-all text-muted-foreground">
-            {executor.id} · {executor.pool} ·{" "}
+          <div class="text-xs break-all text-muted-foreground">
+            {props.executor.id} · {props.executor.pool} ·{" "}
             {[...current]
-              .map((key) => legacyOptions.find((option) => option.key === key)?.label ?? key)
+              .map((key) => legacyOptions().find((option) => option.key === key)?.label ?? key)
               .join(", ")}
           </div>
         </div>
-        <div className="flex flex-wrap items-center justify-end gap-2">
+        <div class="flex flex-wrap items-center justify-end gap-2">
           <Button
             type="button"
             variant="outline"
             size="xs"
-            disabled={disabled}
-            onClick={() => void onUpdate(executor, { enabled: !executor.enabled })}
+            disabled={disabled()}
+            onClick={() =>
+              void props.onUpdate(props.executor, { enabled: !props.executor.enabled })
+            }
           >
-            {t(executor.enabled ? "settings.pools.disable" : "settings.pools.enable")}
+            {i18n.t(props.executor.enabled ? "settings.pools.disable" : "settings.pools.enable")}
           </Button>
           <Button
             type="button"
             variant="outline"
             size="xs"
-            disabled={disabled}
-            onClick={() => setName(name === null ? executor.name : null)}
+            disabled={disabled()}
+            onClick={() => setName(name() === null ? props.executor.name : null)}
           >
-            {t("settings.pools.executorRename")}
+            {i18n.t("settings.pools.executorRename")}
           </Button>
           <Button
             type="button"
             variant="outline"
             size="xs"
-            disabled={disabled}
-            onClick={() => setDraft(draft === null ? current : null)}
+            disabled={disabled()}
+            onClick={() => setDraft(draft() === null ? current : null)}
           >
-            {t("settings.pools.executorCapabilities")}
+            {i18n.t("settings.pools.executorCapabilities")}
           </Button>
           <Button
             type="button"
             variant="outline"
             size="xs"
-            disabled={disabled || archiving}
+            disabled={disabled() || archiving()}
             onClick={() => {
               setArchiveRefusal(null);
-              setConfirmingArchive(!confirmingArchive);
+              setConfirmingArchive(!confirmingArchive());
             }}
           >
-            {t("settings.pools.executorArchive")}
+            {i18n.t("settings.pools.executorArchive")}
           </Button>
         </div>
       </div>
-      {confirmingArchive || archiveRefusal ? (
+      {confirmingArchive() || archiveRefusal() ? (
         <div
           role="alertdialog"
-          aria-label={t("settings.pools.executorArchiveTitle")}
-          className="space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs"
+          aria-label={i18n.t("settings.pools.executorArchiveTitle")}
+          class="space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs"
         >
-          {confirmingArchive ? (
+          {confirmingArchive() ? (
             <>
-              <p className="font-semibold">{t("settings.pools.executorArchiveTitle")}</p>
-              <ul className="list-disc space-y-1 pl-4">
-                <li>{t("settings.pools.executorArchiveActiveList")}</li>
-                <li>{t("settings.pools.executorArchiveHistory")}</li>
-                <li>{t("settings.pools.executorArchiveNotStop")}</li>
-                <li>{t("settings.pools.executorArchiveNotRelease")}</li>
-                <li>{t("settings.pools.executorArchiveIrreversible")}</li>
+              <p class="font-semibold">{i18n.t("settings.pools.executorArchiveTitle")}</p>
+              <ul class="list-disc space-y-1 pl-4">
+                <li>{i18n.t("settings.pools.executorArchiveActiveList")}</li>
+                <li>{i18n.t("settings.pools.executorArchiveHistory")}</li>
+                <li>{i18n.t("settings.pools.executorArchiveNotStop")}</li>
+                <li>{i18n.t("settings.pools.executorArchiveNotRelease")}</li>
+                <li>{i18n.t("settings.pools.executorArchiveIrreversible")}</li>
               </ul>
             </>
           ) : null}
-          {archiveRefusal ? (
-            <p role="alert" className="text-destructive">
-              {archiveRefusal}
+          {archiveRefusal() ? (
+            <p role="alert" class="text-destructive">
+              {archiveRefusal()}
             </p>
           ) : null}
-          {confirmingArchive ? (
-            <div className="flex flex-wrap items-center gap-2">
+          {confirmingArchive() ? (
+            <div class="flex flex-wrap items-center gap-2">
               <Button
                 type="button"
                 variant="destructive"
                 size="xs"
-                disabled={disabled || archiving}
+                disabled={disabled() || archiving()}
                 onClick={() => {
                   setArchiving(true);
                   setArchiveRefusal(null);
-                  void onArchive(executor).then((outcome) => {
+                  void props.onArchive(props.executor).then((outcome) => {
                     setArchiving(false);
                     if (outcome.kind === "archived") return;
                     setArchiveRefusal(outcome.kind === "refused" ? outcome.text : null);
@@ -364,8 +370,8 @@ function ExecutorRow({
                   });
                 }}
               >
-                {t(
-                  archiving
+                {i18n.t(
+                  archiving()
                     ? "settings.pools.executorArchiving"
                     : "settings.pools.executorArchiveConfirm",
                 )}
@@ -374,10 +380,10 @@ function ExecutorRow({
                 type="button"
                 variant="outline"
                 size="xs"
-                disabled={archiving}
+                disabled={archiving()}
                 onClick={() => setConfirmingArchive(false)}
               >
-                {t("common.cancel")}
+                {i18n.t("common.cancel")}
               </Button>
             </div>
           ) : (
@@ -387,81 +393,81 @@ function ExecutorRow({
               size="xs"
               onClick={() => setArchiveRefusal(null)}
             >
-              {t("common.close")}
+              {i18n.t("common.close")}
             </Button>
           )}
         </div>
       ) : null}
-      {stale ? (
-        <div role="alert" className="flex flex-wrap items-center gap-2 text-xs">
-          <p className="text-destructive">{t(EXECUTOR_STALE_TEXT[stale])}</p>
-          <Button type="button" variant="outline" size="xs" onClick={onReload}>
-            {t("settings.pools.executorReload")}
+      {props.stale ? (
+        <div role="alert" class="flex flex-wrap items-center gap-2 text-xs">
+          <p class="text-destructive">{i18n.t(EXECUTOR_STALE_TEXT[props.stale])}</p>
+          <Button type="button" variant="outline" size="xs" onClick={props.onReload}>
+            {i18n.t("settings.pools.executorReload")}
           </Button>
         </div>
       ) : null}
-      {name !== null ? (
-        <div className="flex flex-wrap items-center gap-2">
+      {name() !== null ? (
+        <div class="flex flex-wrap items-center gap-2">
           <Input
-            aria-label={t("settings.pools.executorName")}
-            value={name}
-            disabled={disabled}
-            onChange={(event) => setName(event.target.value)}
+            aria-label={i18n.t("settings.pools.executorName")}
+            value={name()!}
+            disabled={disabled()}
+            onInput={(event) => setName(event.target.value)}
             onKeyDown={(event) => {
-              if (event.key === "Enter" && nameValid && !disabled) {
+              if (event.key === "Enter" && nameValid() && !disabled()) {
                 event.preventDefault();
-                void onUpdate(executor, { name: name.trim() });
+                void props.onUpdate(props.executor, { name: name()!.trim() });
               }
             }}
-            className="h-8 w-64 text-xs"
+            class="h-8 w-64 text-xs"
           />
           <Button
             type="button"
             size="xs"
-            disabled={disabled || !nameValid}
-            onClick={() => void onUpdate(executor, { name: name.trim() })}
+            disabled={disabled() || !nameValid()}
+            onClick={() => void props.onUpdate(props.executor, { name: name()!.trim() })}
           >
-            {t("settings.pools.executorSaveName")}
+            {i18n.t("settings.pools.executorSaveName")}
           </Button>
           <Button type="button" variant="outline" size="xs" onClick={() => setName(null)}>
-            {t("common.cancel")}
+            {i18n.t("common.cancel")}
           </Button>
         </div>
       ) : null}
-      {draft !== null ? (
-        <div className="flex flex-wrap items-center gap-3">
-          {options.map((option) => (
-            <label key={option.key} className="flex items-center gap-1.5 text-xs">
+      {draft() !== null ? (
+        <div class="flex flex-wrap items-center gap-3">
+          {options().map((option) => (
+            <label class="flex items-center gap-1.5 text-xs">
               <input
                 type="checkbox"
-                disabled={disabled}
-                checked={draft.has(option.key)}
+                disabled={disabled()}
+                checked={draft()!.has(option.key)}
                 onChange={(event) => {
-                  const next = new Set(draft);
+                  const next = new Set(draft());
                   if (event.target.checked) next.add(option.key);
                   else next.delete(option.key);
                   setDraft(next);
                 }}
               />
-              {option.label ?? t("settings.pools.operationDecision")}
+              {option.label ?? i18n.t("settings.pools.operationDecision")}
             </label>
           ))}
           <Button
             type="button"
             size="xs"
-            disabled={disabled || !draftValid}
+            disabled={disabled() || !draftValid()}
             onClick={() =>
-              void onUpdate(executor, {
-                capabilities: options
-                  .filter((option) => draft.has(option.key))
+              void props.onUpdate(props.executor, {
+                capabilities: options()
+                  .filter((option) => draft()!.has(option.key))
                   .map((option) => option.capability),
               })
             }
           >
-            {t("settings.pools.executorSaveCapabilities")}
+            {i18n.t("settings.pools.executorSaveCapabilities")}
           </Button>
           <Button type="button" variant="outline" size="xs" onClick={() => setDraft(null)}>
-            {t("common.cancel")}
+            {i18n.t("common.cancel")}
           </Button>
         </div>
       ) : null}
@@ -469,15 +475,7 @@ function ExecutorRow({
   );
 }
 
-function PoolRow({
-  pool,
-  onUpdate,
-  onArchive,
-  disabled,
-  stale,
-  reloading,
-  onReload,
-}: {
+function PoolRow(props: {
   pool: Pool;
   onUpdate: (pool: Pool, update: PoolUpdate) => Promise<void>;
   onArchive: (pool: Pool) => Promise<ArchiveOutcome>;
@@ -486,136 +484,142 @@ function PoolRow({
   reloading: boolean;
   onReload: () => void;
 }) {
-  const { t } = useI18n();
-  const [limit, setLimit] = useState(String(pool.capacity));
-  const [confirmingArchive, setConfirmingArchive] = useState(false);
-  const [archiving, setArchiving] = useState(false);
-  const [archiveRefusal, setArchiveRefusal] = useState<string | null>(null);
-  const locked = disabled || stale !== undefined;
+  const i18n = useI18n();
+  const [limit, setLimit] = createSignal(String(props.pool.capacity));
+  const [confirmingArchive, setConfirmingArchive] = createSignal(false);
+  const [archiving, setArchiving] = createSignal(false);
+  const [archiveRefusal, setArchiveRefusal] = createSignal<string | null>(null);
+  const locked = createMemo(() => props.disabled || props.stale !== undefined);
 
-  const parsed = Number(limit.trim());
-  const isIntegerGte1 = Number.isSafeInteger(parsed) && parsed >= 1 && /^\d+$/.test(limit.trim());
-  const isDifferent = isIntegerGte1 && parsed !== pool.capacity;
-  const saveDisabled = locked || !isIntegerGte1 || !isDifferent;
+  const parsed = createMemo(() => Number(limit().trim()));
+  const isIntegerGte1 = createMemo(
+    () => Number.isSafeInteger(parsed()) && parsed() >= 1 && /^\d+$/.test(limit().trim()),
+  );
+  const isDifferent = createMemo(() => isIntegerGte1() && parsed() !== props.pool.capacity);
+  const saveDisabled = createMemo(() => locked() || !isIntegerGte1() || !isDifferent());
 
   return (
-    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 py-3">
-      <div className="min-w-0 flex-1 space-y-1">
-        <div className="flex flex-wrap items-center gap-2">
+    <div class="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 py-3">
+      <div class="min-w-0 flex-1 space-y-1">
+        <div class="flex flex-wrap items-center gap-2">
           <Tooltip>
             <TooltipTrigger
-              render={
-                <button type="button" className="text-left text-sm font-semibold break-all" />
-              }
+              render={<button type="button" class="text-left text-sm font-semibold break-all" />}
             >
-              {pool.name}
+              {props.pool.name}
             </TooltipTrigger>
-            <TooltipContent className="max-w-none font-mono">{pool.id}</TooltipContent>
+            <TooltipContent class="max-w-none font-mono">{props.pool.id}</TooltipContent>
           </Tooltip>
-          <Pill tone={pool.enabled ? "emerald" : "amber"} className="text-xs normal-case">
-            {t(pool.enabled ? "settings.pools.enabled" : "settings.pools.disabled")}
+          <Pill tone={props.pool.enabled ? "emerald" : "amber"} class="text-xs normal-case">
+            {i18n.t(props.pool.enabled ? "settings.pools.enabled" : "settings.pools.disabled")}
           </Pill>
         </div>
       </div>
-      <div className="flex flex-wrap items-center justify-end gap-2">
-        <div className="flex items-center gap-1.5">
+      <div class="flex flex-wrap items-center justify-end gap-2">
+        <div class="flex items-center gap-1.5">
           <label
-            htmlFor={`pool-limit-${pool.id}`}
-            className="text-xs text-muted-foreground whitespace-nowrap"
+            for={`pool-limit-${props.pool.id}`}
+            class="text-xs text-muted-foreground whitespace-nowrap"
           >
-            {t("settings.pools.concurrencyLimit")}
+            {i18n.t("settings.pools.concurrencyLimit")}
           </label>
           <Input
-            id={`pool-limit-${pool.id}`}
+            id={`pool-limit-${props.pool.id}`}
             type="number"
             min={1}
             step={1}
-            value={limit}
-            onChange={(e) => setLimit(e.target.value)}
+            value={limit()}
+            onInput={(e) => setLimit(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !saveDisabled) {
+              if (e.key === "Enter" && !saveDisabled()) {
                 e.preventDefault();
-                void onUpdate(pool, { concurrency_limit: parsed });
+                void props.onUpdate(props.pool, { concurrency_limit: parsed() });
               }
             }}
-            disabled={locked}
-            className="h-8 w-20 text-xs"
+            disabled={locked()}
+            class="h-8 w-20 text-xs"
           />
           <Button
             type="button"
             variant="outline"
             size="xs"
-            disabled={saveDisabled}
-            onClick={() => void onUpdate(pool, { concurrency_limit: parsed })}
+            disabled={saveDisabled()}
+            onClick={() => void props.onUpdate(props.pool, { concurrency_limit: parsed() })}
           >
-            {t("settings.pools.saveLimit")}
+            {i18n.t("settings.pools.saveLimit")}
           </Button>
         </div>
         <Button
           type="button"
           variant="outline"
           size="xs"
-          disabled={locked}
-          onClick={() => void onUpdate(pool, { enabled: !pool.enabled })}
+          disabled={locked()}
+          onClick={() => void props.onUpdate(props.pool, { enabled: !props.pool.enabled })}
         >
-          {t(pool.enabled ? "settings.pools.disable" : "settings.pools.enable")}
+          {i18n.t(props.pool.enabled ? "settings.pools.disable" : "settings.pools.enable")}
         </Button>
         <Button
           type="button"
           variant="outline"
           size="xs"
-          disabled={locked || archiving}
+          disabled={locked() || archiving()}
           onClick={() => {
             setArchiveRefusal(null);
-            setConfirmingArchive(!confirmingArchive);
+            setConfirmingArchive(!confirmingArchive());
           }}
         >
-          {t("settings.pools.poolArchive")}
+          {i18n.t("settings.pools.poolArchive")}
         </Button>
       </div>
-      {stale ? (
-        <div role="alert" className="flex w-full flex-wrap items-center gap-2 text-xs">
-          <p className="text-destructive">{t(POOL_STALE_TEXT[stale])}</p>
-          <Button type="button" variant="outline" size="xs" disabled={reloading} onClick={onReload}>
-            {t("settings.pools.poolReload")}
+      {props.stale ? (
+        <div role="alert" class="flex w-full flex-wrap items-center gap-2 text-xs">
+          <p class="text-destructive">{i18n.t(POOL_STALE_TEXT[props.stale])}</p>
+          <Button
+            type="button"
+            variant="outline"
+            size="xs"
+            disabled={props.reloading}
+            onClick={props.onReload}
+          >
+            {i18n.t("settings.pools.poolReload")}
           </Button>
         </div>
       ) : null}
-      {confirmingArchive || archiveRefusal ? (
+      {confirmingArchive() || archiveRefusal() ? (
         <div
           role="alertdialog"
-          aria-label={t("settings.pools.poolArchiveTitle")}
-          className="w-full space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs"
+          aria-label={i18n.t("settings.pools.poolArchiveTitle")}
+          class="w-full space-y-2 rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs"
         >
-          {confirmingArchive ? (
+          {confirmingArchive() ? (
             <>
-              <p className="font-semibold">{t("settings.pools.poolArchiveTitle")}</p>
-              <ul className="list-disc space-y-1 pl-4">
-                <li>{t("settings.pools.poolArchiveChildren")}</li>
-                <li>{t("settings.pools.poolArchiveActiveList")}</li>
-                <li>{t("settings.pools.poolArchiveHistory")}</li>
-                <li>{t("settings.pools.poolArchiveNotStop")}</li>
-                <li>{t("settings.pools.poolArchiveNotRelease")}</li>
-                <li>{t("settings.pools.poolArchiveIrreversible")}</li>
+              <p class="font-semibold">{i18n.t("settings.pools.poolArchiveTitle")}</p>
+              <ul class="list-disc space-y-1 pl-4">
+                <li>{i18n.t("settings.pools.poolArchiveChildren")}</li>
+                <li>{i18n.t("settings.pools.poolArchiveActiveList")}</li>
+                <li>{i18n.t("settings.pools.poolArchiveHistory")}</li>
+                <li>{i18n.t("settings.pools.poolArchiveNotStop")}</li>
+                <li>{i18n.t("settings.pools.poolArchiveNotRelease")}</li>
+                <li>{i18n.t("settings.pools.poolArchiveIrreversible")}</li>
               </ul>
             </>
           ) : null}
-          {archiveRefusal ? (
-            <p role="alert" className="text-destructive">
-              {archiveRefusal}
+          {archiveRefusal() ? (
+            <p role="alert" class="text-destructive">
+              {archiveRefusal()}
             </p>
           ) : null}
-          {confirmingArchive ? (
-            <div className="flex flex-wrap items-center gap-2">
+          {confirmingArchive() ? (
+            <div class="flex flex-wrap items-center gap-2">
               <Button
                 type="button"
                 variant="destructive"
                 size="xs"
-                disabled={locked || archiving}
+                disabled={locked() || archiving()}
                 onClick={() => {
                   setArchiving(true);
                   setArchiveRefusal(null);
-                  void onArchive(pool).then((outcome) => {
+                  void props.onArchive(props.pool).then((outcome) => {
                     setArchiving(false);
                     if (outcome.kind === "archived") return;
                     setArchiveRefusal(outcome.kind === "refused" ? outcome.text : null);
@@ -623,18 +627,20 @@ function PoolRow({
                   });
                 }}
               >
-                {t(
-                  archiving ? "settings.pools.poolArchiving" : "settings.pools.poolArchiveConfirm",
+                {i18n.t(
+                  archiving()
+                    ? "settings.pools.poolArchiving"
+                    : "settings.pools.poolArchiveConfirm",
                 )}
               </Button>
               <Button
                 type="button"
                 variant="outline"
                 size="xs"
-                disabled={archiving}
+                disabled={archiving()}
                 onClick={() => setConfirmingArchive(false)}
               >
-                {t("common.cancel")}
+                {i18n.t("common.cancel")}
               </Button>
             </div>
           ) : (
@@ -644,7 +650,7 @@ function PoolRow({
               size="xs"
               onClick={() => setArchiveRefusal(null)}
             >
-              {t("common.close")}
+              {i18n.t("common.close")}
             </Button>
           )}
         </div>
@@ -653,19 +659,22 @@ function PoolRow({
   );
 }
 
-function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
-  const { t } = useI18n();
-  const [expanded, setExpanded] = useState(false);
-  const [snapshot, setSnapshot] = useState<NativePoolAllocations | null>(null);
-  const [items, setItems] = useState<{ allocation: NativeAllocation; read: number }[]>([]);
-  const [latestRead, setLatestRead] = useState(0);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const request = useRef<AbortController | null>(null);
-  const attempted = useRef<string | undefined>(undefined);
-  const reads = useRef(0);
+function PoolAllocations(props: { client: ApiClient; pool: Pool }) {
+  const i18n = useI18n();
+  const [expanded, setExpanded] = createSignal(false);
+  const [snapshot, setSnapshot] = createSignal<NativePoolAllocations | null>(null);
+  const [items, setItems] = createSignal<{ allocation: NativeAllocation; read: number }[]>([]);
+  const [latestRead, setLatestRead] = createSignal(0);
+  const [error, setError] = createSignal<string | null>(null);
+  const [loading, setLoading] = createSignal(false);
+  const request = elementRef<AbortController | null>(null);
+  const attempted = elementRef<string | undefined>(undefined);
+  const reads = elementRef(0);
 
-  useEffect(() => () => request.current?.abort(), []);
+  createEffect(
+    () => [],
+    () => () => request.current?.abort(),
+  );
 
   function load(after: string | undefined) {
     request.current?.abort();
@@ -674,8 +683,8 @@ function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
     attempted.current = after;
     setLoading(true);
     setError(null);
-    client
-      .readNativePoolAllocations(pool.id, { after, signal: controller.signal })
+    props.client
+      .readNativePoolAllocations(props.pool.id, { after, signal: controller.signal })
       .then((page) => {
         if (controller.signal.aborted) return;
         const read = ++reads.current;
@@ -696,7 +705,7 @@ function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
         });
       })
       .catch((reason: unknown) => {
-        if (!controller.signal.aborted) setError(refusalText(t, reason, ALLOCATION_REFUSALS));
+        if (!controller.signal.aborted) setError(refusalText(i18n.t, reason, ALLOCATION_REFUSALS));
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false);
@@ -704,7 +713,7 @@ function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
   }
 
   function toggle() {
-    if (expanded) {
+    if (expanded()) {
       request.current?.abort();
       setLoading(false);
       setExpanded(false);
@@ -714,125 +723,131 @@ function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
     load(undefined);
   }
 
-  const occupancy = snapshot?.occupancy;
-  const capacity = snapshot?.capacity ?? pool.capacity;
-  const indicator = !snapshot
-    ? t("settings.pools.capacityOnly", { capacity })
-    : occupancy?.available
-      ? t("settings.pools.capacityHeld", { held: occupancy.held, capacity })
-      : t("settings.pools.capacityHeldUnavailable", { capacity });
-  const overCapacity = occupancy?.available === true && occupancy.held > capacity;
+  const occupancy = createMemo(() => {
+    const data = snapshot()?.occupancy;
+    return data?.available ? data : undefined;
+  });
+  const capacity = createMemo(() => snapshot()?.capacity ?? props.pool.capacity);
+  const indicator = createMemo(() =>
+    !snapshot()
+      ? i18n.t("settings.pools.capacityOnly", { capacity: capacity() })
+      : occupancy()?.available
+        ? i18n.t("settings.pools.capacityHeld", { held: occupancy()!.held, capacity: capacity() })
+        : i18n.t("settings.pools.capacityHeldUnavailable", { capacity: capacity() }),
+  );
+  const overCapacity = createMemo(
+    () => occupancy()?.available === true && occupancy()!.held > capacity(),
+  );
 
   return (
-    <div className="space-y-2 pb-3 text-xs">
-      <div className="flex flex-wrap items-center gap-2">
+    <div class="space-y-2 pb-3 text-xs">
+      <div class="flex flex-wrap items-center gap-2">
         <Pill
-          tone={overCapacity ? "amber" : "slate"}
-          className="text-xs normal-case"
-          title={t("settings.pools.capacityHint")}
+          tone={overCapacity() ? "amber" : "slate"}
+          class="text-xs normal-case"
+          title={i18n.t("settings.pools.capacityHint")}
         >
-          {indicator}
+          {indicator()}
         </Pill>
-        {occupancy?.available ? (
-          <span className="text-muted-foreground">
-            {t("settings.pools.occupancyBreakdown", {
-              reserved: occupancy.reserved,
-              running: occupancy.running,
-              stopRequested: occupancy.stop_requested,
-              uncertain: occupancy.uncertain,
+        {occupancy()?.available ? (
+          <span class="text-muted-foreground">
+            {i18n.t("settings.pools.occupancyBreakdown", {
+              reserved: occupancy()!.reserved,
+              running: occupancy()!.running,
+              stopRequested: occupancy()!.stop_requested,
+              uncertain: occupancy()!.uncertain,
             })}
           </span>
         ) : null}
         <Button type="button" variant="outline" size="xs" onClick={toggle}>
-          {t(expanded ? "settings.pools.allocationsHide" : "settings.pools.allocationsShow")}
+          {i18n.t(expanded() ? "settings.pools.allocationsHide" : "settings.pools.allocationsShow")}
         </Button>
-        {expanded ? (
+        {expanded() ? (
           <Button
             type="button"
             variant="outline"
             size="xs"
-            disabled={loading}
+            disabled={loading()}
             onClick={() => load(undefined)}
           >
-            {t("settings.pools.allocationsRefresh")}
+            {i18n.t("settings.pools.allocationsRefresh")}
           </Button>
         ) : null}
       </div>
-      {expanded ? (
-        <div className="space-y-2">
-          {error ? (
-            <div className="flex flex-wrap items-center gap-2 text-destructive" role="alert">
-              <span>{error}</span>
+      {expanded() ? (
+        <div class="space-y-2">
+          {error() ? (
+            <div class="flex flex-wrap items-center gap-2 text-destructive" role="alert">
+              <span>{error()}</span>
               <Button
                 type="button"
                 variant="outline"
                 size="xs"
-                disabled={loading}
+                disabled={loading()}
                 onClick={() => load(attempted.current)}
               >
-                {t("common.retry")}
+                {i18n.t("common.retry")}
               </Button>
             </div>
           ) : null}
-          {snapshot && occupancy && !occupancy.available ? (
-            <p className="text-muted-foreground">{t("settings.pools.occupancyUnavailable")}</p>
+          {snapshot() && occupancy() && !occupancy()!.available ? (
+            <p class="text-muted-foreground">{i18n.t("settings.pools.occupancyUnavailable")}</p>
           ) : null}
-          {overCapacity ? (
-            <p className="text-muted-foreground">{t("settings.pools.overCapacity")}</p>
+          {overCapacity() ? (
+            <p class="text-muted-foreground">{i18n.t("settings.pools.overCapacity")}</p>
           ) : null}
-          {snapshot && snapshot.capacity !== pool.capacity ? (
-            <p className="text-muted-foreground">
-              {t("settings.pools.capacityChanged", {
-                capacity: pool.capacity,
+          {snapshot() && snapshot()!.capacity !== props.pool.capacity ? (
+            <p class="text-muted-foreground">
+              {i18n.t("settings.pools.capacityChanged", {
+                capacity: props.pool.capacity,
               })}
             </p>
           ) : null}
-          {loading && !snapshot ? (
-            <p className="text-muted-foreground">{t("common.loading")}</p>
+          {loading() && !snapshot() ? (
+            <p class="text-muted-foreground">{i18n.t("common.loading")}</p>
           ) : null}
-          {snapshot && !items.length && !error ? (
-            <p className="text-muted-foreground">{t("settings.pools.allocationsNone")}</p>
+          {snapshot() && !items().length && !error() ? (
+            <p class="text-muted-foreground">{i18n.t("settings.pools.allocationsNone")}</p>
           ) : null}
-          {items.some(({ read }) => read !== latestRead) ? (
-            <p className="text-muted-foreground">{t("settings.pools.allocationsPagesNote")}</p>
+          {items().some(({ read }) => read !== latestRead()) ? (
+            <p class="text-muted-foreground">{i18n.t("settings.pools.allocationsPagesNote")}</p>
           ) : null}
-          {items.length ? (
-            <ul className="divide-y divide-border/50 rounded border border-border/60">
-              {items.map(({ allocation, read }) => {
+          {items().length ? (
+            <ul class="divide-y divide-border/50 rounded border border-border/60">
+              {items().map(({ allocation, read }) => {
                 const phase = ALLOCATION_PHASE[allocation.phase];
-                const earlier = read !== latestRead;
+                const earlier = read !== latestRead();
                 return (
                   <li
-                    key={`${allocation.executor}.${allocation.job}`}
-                    className={`flex flex-wrap items-center gap-x-4 gap-y-1 px-2 py-1.5 ${
+                    class={`flex flex-wrap items-center gap-x-4 gap-y-1 px-2 py-1.5 ${
                       allocation.phase === "uncertain" && !earlier ? "bg-red-500/5" : ""
                     }`}
                   >
-                    <Pill tone={phase.tone} dot pulse={phase.pulse} className="text-xs normal-case">
-                      {t(phase.label)}
+                    <Pill tone={phase.tone} dot pulse={phase.pulse} class="text-xs normal-case">
+                      {i18n.t(phase.label)}
                     </Pill>
-                    <span className="break-all">
-                      <span className="text-muted-foreground">
-                        {t("settings.pools.allocationJob")}{" "}
+                    <span class="break-all">
+                      <span class="text-muted-foreground">
+                        {i18n.t("settings.pools.allocationJob")}{" "}
                       </span>
                       <code>{allocation.job}</code>
                     </span>
-                    <span className="break-all">
-                      <span className="text-muted-foreground">
-                        {t("settings.pools.allocationExecutor")}{" "}
+                    <span class="break-all">
+                      <span class="text-muted-foreground">
+                        {i18n.t("settings.pools.allocationExecutor")}{" "}
                       </span>
                       <code>{allocation.executor}</code>
                     </span>
-                    <span className="text-muted-foreground">
-                      {t(
+                    <span class="text-muted-foreground">
+                      {i18n.t(
                         earlier
                           ? "settings.pools.allocationEarlierRead"
                           : "settings.pools.allocationHolds",
                       )}
                     </span>
                     {allocation.phase === "uncertain" && !earlier ? (
-                      <span className="font-medium text-destructive">
-                        {t("settings.pools.allocationUnresolved")}
+                      <span class="font-medium text-destructive">
+                        {i18n.t("settings.pools.allocationUnresolved")}
                       </span>
                     ) : null}
                   </li>
@@ -840,15 +855,15 @@ function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
               })}
             </ul>
           ) : null}
-          {snapshot?.has_more ? (
+          {snapshot()?.has_more ? (
             <Button
               type="button"
               variant="outline"
               size="xs"
-              disabled={loading}
-              onClick={() => load(snapshot.next_after ?? undefined)}
+              disabled={loading()}
+              onClick={() => load(snapshot()!.next_after ?? undefined)}
             >
-              {loading ? t("common.loading") : t("settings.pools.allocationsMore")}
+              {loading() ? i18n.t("common.loading") : i18n.t("settings.pools.allocationsMore")}
             </Button>
           ) : null}
         </div>
@@ -857,127 +872,135 @@ function PoolAllocations({ client, pool }: { client: ApiClient; pool: Pool }) {
   );
 }
 
-export function PoolsSection({ client }: { client: ApiClient }) {
-  const { t } = useI18n();
-  const [pools, setPools] = useState<Pool[] | null>(null);
-  const [loadError, setLoadError] = useState<string | null>(null);
-  const [actionError, setActionError] = useState<string | null>(null);
-  const [updatingPoolId, setUpdatingPoolId] = useState<string | null>(null);
-  const [before, setBefore] = useState<string | undefined>();
-  const [previous, setPrevious] = useState<(string | undefined)[]>([]);
-  const [nextBefore, setNextBefore] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [poolName, setPoolName] = useState("");
-  const [poolCapacity, setPoolCapacity] = useState("1");
-  const poolIdentity = useRef<string | null>(null);
-  const executorIdentity = useRef<string | null>(null);
-  const [executorName, setExecutorName] = useState("");
-  const [executorPool, setExecutorPool] = useState("");
-  const [capability, setCapability] = useState("openai_chat_completions");
-  const [executors, setExecutors] = useState<NativeExecutor[]>([]);
-  const [executorBefore, setExecutorBefore] = useState<string | undefined>();
-  const [executorPrevious, setExecutorPrevious] = useState<(string | undefined)[]>([]);
-  const [executorNext, setExecutorNext] = useState<string | null>(null);
-  const [executorLoading, setExecutorLoading] = useState(false);
-  const [executorError, setExecutorError] = useState<string | null>(null);
-  const [failedExecutorPage, setFailedExecutorPage] = useState<{
+export function PoolsSection(props: { client: ApiClient }) {
+  const i18n = useI18n();
+  const [pools, setPools] = createSignal<Pool[] | null>(null);
+  const [loadError, setLoadError] = createSignal<string | null>(null);
+  const [actionError, setActionError] = createSignal<string | null>(null);
+  const [updatingPoolId, setUpdatingPoolId] = createSignal<string | null>(null);
+  const [before, setBefore] = createSignal<string | undefined>();
+  const [previous, setPrevious] = createSignal<(string | undefined)[]>([]);
+  const [nextBefore, setNextBefore] = createSignal<string | null>(null);
+  const [loading, setLoading] = createSignal(true);
+  const [poolName, setPoolName] = createSignal("");
+  const [poolCapacity, setPoolCapacity] = createSignal("1");
+  const poolIdentity = elementRef<string | null>(null);
+  const executorIdentity = elementRef<string | null>(null);
+  const [executorName, setExecutorName] = createSignal("");
+  const [executorPool, setExecutorPool] = createSignal("");
+  const [capability, setCapability] = createSignal("openai_chat_completions");
+  const [executors, setExecutors] = createSignal<NativeExecutor[]>([]);
+  const [executorBefore, setExecutorBefore] = createSignal<string | undefined>();
+  const [executorPrevious, setExecutorPrevious] = createSignal<(string | undefined)[]>([]);
+  const [executorNext, setExecutorNext] = createSignal<string | null>(null);
+  const [executorLoading, setExecutorLoading] = createSignal(false);
+  const [executorError, setExecutorError] = createSignal<string | null>(null);
+  const [failedExecutorPage, setFailedExecutorPage] = createSignal<{
     cursor: string | undefined;
     history: (string | undefined)[];
   } | null>(null);
-  const [creating, setCreating] = useState(false);
-  const [updatingExecutorId, setUpdatingExecutorId] = useState<string | null>(null);
+  const [creating, setCreating] = createSignal(false);
+  const [updatingExecutorId, setUpdatingExecutorId] = createSignal<string | null>(null);
   const [staleExecutors, executorStale] = useStaleRows();
-  const executorUpdating = useRef(false);
-  const executorRequest = useRef<AbortController | null>(null);
-  const [failedPage, setFailedPage] = useState<{
+  const executorUpdating = elementRef(false);
+  const executorRequest = elementRef<AbortController | null>(null);
+  const [failedPage, setFailedPage] = createSignal<{
     cursor: string | undefined;
     history: (string | undefined)[];
   } | null>(null);
-  const request = useRef<AbortController | null>(null);
+  const request = elementRef<AbortController | null>(null);
   const [stalePools, poolStale] = useStaleRows();
-  const poolMutating = useRef(false);
-  const archivedPools = useRef(new Set<string>());
-  const hasPoolPage = pools !== null;
+  const poolMutating = elementRef(false);
+  const archivedPools = elementRef(new Set<string>());
+  const hasPoolPage = createMemo(() => pools() !== null);
 
-  const loadPools = useCallback(
-    async (cursor: string | undefined, history: (string | undefined)[], signal: AbortSignal) => {
-      const sentAt = poolStale.sendRead();
-      try {
-        const page = await client.readPools({ before: cursor, signal });
-        if (!signal.aborted) {
-          setPools(page.pools);
-          poolStale.readSucceeded(sentAt);
-          setBefore(cursor);
-          setPrevious(history);
-          setNextBefore(page.next_before);
-          setLoadError(null);
-          setFailedPage(null);
-        }
-      } catch (err: unknown) {
-        if (!signal.aborted) {
-          setLoadError(describeError(err, t));
-          setFailedPage({ cursor, history });
-        }
-      } finally {
-        if (!signal.aborted) setLoading(false);
+  const loadPools = async (
+    cursor: string | undefined,
+    history: (string | undefined)[],
+    signal: AbortSignal,
+  ) => {
+    const sentAt = poolStale.sendRead();
+    try {
+      const page = await props.client.readPools({ before: cursor, signal });
+      if (!signal.aborted) {
+        setPools(page.pools);
+        poolStale.readSucceeded(sentAt);
+        setBefore(cursor);
+        setPrevious(history);
+        setNextBefore(page.next_before);
+        setLoadError(null);
+        setFailedPage(null);
       }
+    } catch (err: unknown) {
+      if (!signal.aborted) {
+        setLoadError(describeError(err, i18n.t));
+        setFailedPage({ cursor, history });
+      }
+    } finally {
+      if (!signal.aborted) setLoading(false);
+    }
+  };
+
+  createEffect(
+    () => [loadPools],
+    () => {
+      const controller = new AbortController();
+      request.current = controller;
+      void Promise.resolve().then(() => {
+        if (!controller.signal.aborted) {
+          setLoading(true);
+          return loadPools(undefined, [], controller.signal);
+        }
+      });
+      return () => request.current?.abort();
     },
-    [client, t, poolStale],
   );
 
-  useEffect(() => {
-    const controller = new AbortController();
-    request.current = controller;
-    void Promise.resolve().then(() => {
-      if (!controller.signal.aborted) {
-        setLoading(true);
-        return loadPools(undefined, [], controller.signal);
+  const loadExecutors = async (
+    cursor: string | undefined,
+    history: (string | undefined)[],
+    signal: AbortSignal,
+  ) => {
+    const sentAt = executorStale.sendRead();
+    try {
+      const page = await props.client.readNativeExecutors({
+        before: cursor,
+        signal,
+      });
+      if (!signal.aborted) {
+        setExecutors(page.executors);
+        executorStale.readSucceeded(sentAt);
+        setExecutorBefore(cursor);
+        setExecutorPrevious(history);
+        setExecutorNext(page.next_before);
+        setExecutorError(null);
+        setFailedExecutorPage(null);
       }
-    });
-    return () => request.current?.abort();
-  }, [loadPools]);
+    } catch (error) {
+      if (!signal.aborted) {
+        setExecutorError(describeError(error, i18n.t));
+        setFailedExecutorPage({ cursor, history });
+      }
+    } finally {
+      if (!signal.aborted) setExecutorLoading(false);
+    }
+  };
 
-  const loadExecutors = useCallback(
-    async (cursor: string | undefined, history: (string | undefined)[], signal: AbortSignal) => {
-      const sentAt = executorStale.sendRead();
-      try {
-        const page = await client.readNativeExecutors({
-          before: cursor,
-          signal,
-        });
-        if (!signal.aborted) {
-          setExecutors(page.executors);
-          executorStale.readSucceeded(sentAt);
-          setExecutorBefore(cursor);
-          setExecutorPrevious(history);
-          setExecutorNext(page.next_before);
-          setExecutorError(null);
-          setFailedExecutorPage(null);
+  createEffect(
+    () => [hasPoolPage(), loadExecutors],
+    () => {
+      if (!hasPoolPage()) return;
+      const controller = new AbortController();
+      executorRequest.current = controller;
+      void Promise.resolve().then(() => {
+        if (!controller.signal.aborted) {
+          setExecutorLoading(true);
+          return loadExecutors(undefined, [], controller.signal);
         }
-      } catch (error) {
-        if (!signal.aborted) {
-          setExecutorError(describeError(error, t));
-          setFailedExecutorPage({ cursor, history });
-        }
-      } finally {
-        if (!signal.aborted) setExecutorLoading(false);
-      }
+      });
+      return () => executorRequest.current?.abort();
     },
-    [client, t, executorStale],
   );
-
-  useEffect(() => {
-    if (!hasPoolPage) return;
-    const controller = new AbortController();
-    executorRequest.current = controller;
-    void Promise.resolve().then(() => {
-      if (!controller.signal.aborted) {
-        setExecutorLoading(true);
-        return loadExecutors(undefined, [], controller.signal);
-      }
-    });
-    return () => executorRequest.current?.abort();
-  }, [hasPoolPage, loadExecutors]);
 
   function navigateExecutors(cursor: string | undefined, history: (string | undefined)[]) {
     executorRequest.current?.abort();
@@ -993,32 +1016,37 @@ export function PoolsSection({ client }: { client: ApiClient }) {
     try {
       const id = poolIdentity.current ?? configurationIdentity();
       poolIdentity.current = id;
-      await client.createNativePool(id, poolName.trim(), Number(poolCapacity));
+      await props.client.createNativePool(id, poolName().trim(), Number(poolCapacity()));
       poolIdentity.current = null;
       setPoolName("");
       setPoolCapacity("1");
       navigate(undefined, []);
     } catch (error) {
-      setActionError(refusalText(t, error, NATIVE_CREATE_REFUSALS));
+      setActionError(refusalText(i18n.t, error, NATIVE_CREATE_REFUSALS));
     } finally {
       setCreating(false);
     }
   }
 
   async function createExecutor() {
-    const option = EXECUTOR_CAPABILITIES.find(({ key }) => key === capability);
+    const option = EXECUTOR_CAPABILITIES.find(({ key }) => key === capability());
     if (!option) return;
     setActionError(null);
     setCreating(true);
     try {
       const id = executorIdentity.current ?? configurationIdentity();
       executorIdentity.current = id;
-      await client.createNativeExecutor(id, executorPool, executorName.trim(), option.capability);
+      await props.client.createNativeExecutor(
+        id,
+        executorPool(),
+        executorName().trim(),
+        option.capability,
+      );
       executorIdentity.current = null;
       setExecutorName("");
       navigateExecutors(undefined, []);
     } catch (error) {
-      setActionError(refusalText(t, error, NATIVE_CREATE_REFUSALS));
+      setActionError(refusalText(i18n.t, error, NATIVE_CREATE_REFUSALS));
     } finally {
       setCreating(false);
     }
@@ -1033,7 +1061,7 @@ export function PoolsSection({ client }: { client: ApiClient }) {
     setActionError(null);
     setUpdatingExecutorId(executor.id);
     try {
-      const updated = await client.updateNativeExecutor(executor, change);
+      const updated = await props.client.updateNativeExecutor(executor, change);
       setExecutors((previous) => previous.map((item) => (item.id === updated.id ? updated : item)));
       return true;
     } catch (error) {
@@ -1041,8 +1069,8 @@ export function PoolsSection({ client }: { client: ApiClient }) {
       if (stale) executorStale.mark(executor.id, stale);
       setActionError(
         stale === "updateUnconfirmed"
-          ? t("settings.pools.refusal.executorUpdateUnconfirmed")
-          : refusalText(t, error, EXECUTOR_REFUSALS),
+          ? i18n.t("settings.pools.refusal.executorUpdateUnconfirmed")
+          : refusalText(i18n.t, error, EXECUTOR_REFUSALS),
       );
       return false;
     } finally {
@@ -1054,24 +1082,24 @@ export function PoolsSection({ client }: { client: ApiClient }) {
   async function handleExecutorArchive(executor: NativeExecutor): Promise<ArchiveOutcome> {
     if (executorStale.has(executor.id)) return { kind: "unconfirmed" };
     if (executorUpdating.current)
-      return { kind: "refused", text: t("settings.pools.executorBusy") };
+      return { kind: "refused", text: i18n.t("settings.pools.executorBusy") };
     executorUpdating.current = true;
     setActionError(null);
     setUpdatingExecutorId(executor.id);
     try {
-      await client.archiveNativeExecutor(executor.id, executor.revision);
+      await props.client.archiveNativeExecutor(executor.id, executor.revision);
       setExecutors((current) => current.filter((item) => item.id !== executor.id));
-      navigateExecutors(executorBefore, executorPrevious);
+      navigateExecutors(executorBefore(), executorPrevious());
       return { kind: "archived" };
     } catch (error) {
       if (outcomeUnconfirmed(error)) {
         executorStale.mark(executor.id, "archiveUnconfirmed");
-        setActionError(t("settings.pools.refusal.executorArchiveUnconfirmed"));
+        setActionError(i18n.t("settings.pools.refusal.executorArchiveUnconfirmed"));
         return { kind: "unconfirmed" };
       }
       if (error instanceof ApiError && ARCHIVE_STALE_CODES.has(error.code))
         executorStale.mark(executor.id, "changed");
-      return { kind: "refused", text: refusalText(t, error, EXECUTOR_REFUSALS) };
+      return { kind: "refused", text: refusalText(i18n.t, error, EXECUTOR_REFUSALS) };
     } finally {
       executorUpdating.current = false;
       setUpdatingExecutorId(null);
@@ -1089,26 +1117,26 @@ export function PoolsSection({ client }: { client: ApiClient }) {
   async function handlePoolArchive(pool: Pool): Promise<ArchiveOutcome> {
     if (poolStale.has(pool.id)) return { kind: "unconfirmed" };
     if (archivedPools.current.has(pool.id)) return { kind: "archived" };
-    if (poolMutating.current) return { kind: "refused", text: t("settings.pools.poolBusy") };
+    if (poolMutating.current) return { kind: "refused", text: i18n.t("settings.pools.poolBusy") };
     poolMutating.current = true;
     setActionError(null);
     setUpdatingPoolId(pool.id);
     try {
-      await client.archiveNativePool(pool.id, pool.revision);
+      await props.client.archiveNativePool(pool.id, pool.revision);
       archivedPools.current.add(pool.id);
       setPools((current) => current?.filter((item) => item.id !== pool.id) ?? null);
-      navigate(before, previous);
+      navigate(before(), previous());
       return { kind: "archived" };
     } catch (error) {
       if (outcomeUnconfirmed(error)) {
         poolStale.mark(pool.id, "archiveUnconfirmed");
-        setActionError(t("settings.pools.refusal.poolArchiveUnconfirmed"));
+        setActionError(i18n.t("settings.pools.refusal.poolArchiveUnconfirmed"));
         return { kind: "unconfirmed" };
       }
-      const text = refusalText(t, error, POOL_ARCHIVE_REFUSALS);
+      const text = refusalText(i18n.t, error, POOL_ARCHIVE_REFUSALS);
       if (error instanceof ApiError && POOL_ARCHIVE_STALE_CODES.has(error.code)) {
         poolStale.mark(pool.id, "changed");
-        navigate(before, previous);
+        navigate(before(), previous());
         setActionError(text);
       }
       return { kind: "refused", text };
@@ -1125,15 +1153,15 @@ export function PoolsSection({ client }: { client: ApiClient }) {
     setActionError(null);
     setUpdatingPoolId(pool.id);
     try {
-      const updated = await client.updatePool(pool.id, pool.revision, update);
+      const updated = await props.client.updatePool(pool.id, pool.revision, update);
       setPools((prev) => prev?.map((p) => (p.id === updated.id ? updated : p)) ?? null);
     } catch (err) {
       const stale = poolUpdateStale(err);
       if (stale) poolStale.mark(pool.id, stale);
       setActionError(
         stale === "updateUnconfirmed"
-          ? t("settings.pools.refusal.poolUpdateUnconfirmed")
-          : refusalText(t, err, POOL_REFUSALS),
+          ? i18n.t("settings.pools.refusal.poolUpdateUnconfirmed")
+          : refusalText(i18n.t, err, POOL_REFUSALS),
       );
     } finally {
       poolMutating.current = false;
@@ -1141,244 +1169,240 @@ export function PoolsSection({ client }: { client: ApiClient }) {
     }
   }
 
-  const emptyPage = pools?.length === 0 && !loading && !loadError;
+  const emptyPage = createMemo(() => pools()?.length === 0 && !loading() && !loadError());
 
   return (
     <Section
       id="settings-pools"
-      title={t("settings.pools.title")}
-      description={t("settings.pools.description")}
+      title={i18n.t("settings.pools.title")}
+      description={i18n.t("settings.pools.description")}
     >
-      {loadError ? (
-        <DismissibleNotice message={loadError} className="py-2 text-sm text-destructive">
-          {loadError}
+      {loadError() ? (
+        <DismissibleNotice message={loadError()!} class="py-2 text-sm text-destructive">
+          {loadError()}
         </DismissibleNotice>
       ) : null}
-      {loadError ? (
+      {loadError() ? (
         <Button
           type="button"
           variant="outline"
           size="xs"
-          disabled={loading}
+          disabled={loading()}
           onClick={() => {
-            if (failedPage) navigate(failedPage.cursor, failedPage.history);
+            if (failedPage()) navigate(failedPage()!.cursor, failedPage()!.history);
           }}
         >
-          {t("common.retry")}
+          {i18n.t("common.retry")}
         </Button>
       ) : null}
-      {actionError ? (
-        <DismissibleNotice message={actionError} className="py-2 text-sm text-destructive">
-          {actionError}
+      {actionError() ? (
+        <DismissibleNotice message={actionError()!} class="py-2 text-sm text-destructive">
+          {actionError()}
         </DismissibleNotice>
       ) : null}
 
-      {hasPoolPage ? (
-        <div className="flex flex-wrap items-end gap-2">
-          <label className="text-xs">
-            {t("settings.pools.nativeName")}
-            <Input value={poolName} onChange={(event) => setPoolName(event.target.value)} />
+      {hasPoolPage() ? (
+        <div class="flex flex-wrap items-end gap-2">
+          <label class="text-xs">
+            {i18n.t("settings.pools.nativeName")}
+            <Input value={poolName()} onInput={(event) => setPoolName(event.target.value)} />
           </label>
-          <label className="text-xs">
-            {t("settings.pools.concurrencyLimit")}
+          <label class="text-xs">
+            {i18n.t("settings.pools.concurrencyLimit")}
             <Input
               type="number"
               min={1}
               max={4294967295}
-              value={poolCapacity}
-              onChange={(event) => setPoolCapacity(event.target.value)}
+              value={poolCapacity()}
+              onInput={(event) => setPoolCapacity(event.target.value)}
             />
           </label>
           <Button
             type="button"
             size="xs"
-            disabled={creating || !poolName.trim()}
+            disabled={creating() || !poolName().trim()}
             onClick={() => void createPool()}
           >
-            {t("settings.pools.nativeCreate")}
+            {i18n.t("settings.pools.nativeCreate")}
           </Button>
         </div>
       ) : null}
 
       <TooltipProvider delay={100}>
-        <div className="divide-y divide-border/70 py-2">
-          {emptyPage && before === undefined && nextBefore === null ? (
-            <p className="py-2 text-sm text-muted-foreground">{t("settings.pools.empty")}</p>
+        <div class="divide-y divide-border/70 py-2">
+          {emptyPage() && before() === undefined && nextBefore() === null ? (
+            <p class="py-2 text-sm text-muted-foreground">{i18n.t("settings.pools.empty")}</p>
           ) : null}
-          {emptyPage && nextBefore !== null ? (
-            <p className="py-2 text-sm text-muted-foreground">{t("settings.pools.emptyPage")}</p>
+          {emptyPage() && nextBefore() !== null ? (
+            <p class="py-2 text-sm text-muted-foreground">{i18n.t("settings.pools.emptyPage")}</p>
           ) : null}
-          {emptyPage && before !== undefined && nextBefore === null ? (
-            <p className="py-2 text-sm text-muted-foreground">
-              {t("settings.pools.emptyLastPage")}
+          {emptyPage() && before() !== undefined && nextBefore() === null ? (
+            <p class="py-2 text-sm text-muted-foreground">
+              {i18n.t("settings.pools.emptyLastPage")}
             </p>
           ) : null}
-          {pools?.map((pool) => (
-            <div key={pool.id}>
+          {pools()?.map((pool) => (
+            <div>
               <PoolRow
-                key={`${pool.id}-${pool.revision}`}
                 pool={pool}
                 onUpdate={handleUpdate}
                 onArchive={handlePoolArchive}
-                disabled={updatingPoolId !== null}
+                disabled={updatingPoolId() !== null}
                 stale={stalePools.get(pool.id)}
-                reloading={loading}
+                reloading={loading()}
                 onReload={() => {
                   setActionError(null);
-                  navigate(before, previous);
+                  navigate(before(), previous());
                 }}
               />
-              <PoolAllocations client={client} pool={pool} />
+              <PoolAllocations client={props.client} pool={pool} />
             </div>
           ))}
         </div>
       </TooltipProvider>
 
-      <div className="flex gap-2 py-2">
+      <div class="flex gap-2 py-2">
         <Button
           type="button"
           variant="outline"
           size="xs"
-          disabled={loading || previous.length === 0}
-          onClick={() => navigate(previous[previous.length - 1], previous.slice(0, -1))}
+          disabled={loading() || previous().length === 0}
+          onClick={() => navigate(previous()[previous().length - 1], previous().slice(0, -1))}
         >
-          {t("settings.pools.previousPage")}
+          {i18n.t("settings.pools.previousPage")}
         </Button>
         <Button
           type="button"
           variant="outline"
           size="xs"
-          disabled={loading || nextBefore === null}
+          disabled={loading() || nextBefore() === null}
           onClick={() => {
-            if (nextBefore !== null) navigate(nextBefore, [...previous, before]);
+            if (nextBefore() !== null) navigate(nextBefore()!, [...previous(), before()]);
           }}
         >
-          {loading ? t("common.loading") : t("settings.pools.nextPage")}
+          {loading() ? i18n.t("common.loading") : i18n.t("settings.pools.nextPage")}
         </Button>
       </div>
 
-      {hasPoolPage ? (
-        <div className="space-y-3 border-t border-border/70 pt-3">
-          <h3 className="font-semibold">{t("settings.pools.executors")}</h3>
-          {executorError ? (
-            <DismissibleNotice message={executorError} className="text-sm text-destructive">
-              {executorError}
+      {hasPoolPage() ? (
+        <div class="space-y-3 border-t border-border/70 pt-3">
+          <h3 class="font-semibold">{i18n.t("settings.pools.executors")}</h3>
+          {executorError() ? (
+            <DismissibleNotice message={executorError()!} class="text-sm text-destructive">
+              {executorError()}
             </DismissibleNotice>
           ) : null}
-          {executorError && failedExecutorPage ? (
+          {executorError() && failedExecutorPage() ? (
             <Button
               type="button"
               size="xs"
               variant="outline"
               onClick={() =>
-                navigateExecutors(failedExecutorPage.cursor, failedExecutorPage.history)
+                navigateExecutors(failedExecutorPage()!.cursor, failedExecutorPage()!.history)
               }
             >
-              {t("common.retry")}
+              {i18n.t("common.retry")}
             </Button>
           ) : null}
-          <div className="divide-y divide-border/70">
-            {executors.map((executor) => (
+          <div class="divide-y divide-border/70">
+            {executors().map((executor) => (
               <ExecutorRow
-                key={`${executor.id}-${executor.revision}`}
                 executor={executor}
-                pool={pools?.find((pool) => pool.id === executor.pool)}
-                busy={updatingExecutorId !== null}
+                pool={pools()?.find((pool) => pool.id === executor.pool)}
+                busy={updatingExecutorId() !== null}
                 stale={staleExecutors.get(executor.id)}
                 onUpdate={handleExecutorUpdate}
                 onArchive={handleExecutorArchive}
                 onReload={() => {
                   setActionError(null);
-                  navigateExecutors(executorBefore, executorPrevious);
+                  navigateExecutors(executorBefore(), executorPrevious());
                 }}
               />
             ))}
-            {!executors.length && !executorLoading && !executorError ? (
-              <p className="text-sm text-muted-foreground">{t("settings.pools.executorEmpty")}</p>
+            {!executors().length && !executorLoading() && !executorError() ? (
+              <p class="text-sm text-muted-foreground">{i18n.t("settings.pools.executorEmpty")}</p>
             ) : null}
           </div>
-          <div className="flex gap-2">
+          <div class="flex gap-2">
             <Button
               type="button"
               size="xs"
               variant="outline"
-              disabled={executorLoading || !executorPrevious.length}
+              disabled={executorLoading() || !executorPrevious().length}
               onClick={() =>
                 navigateExecutors(
-                  executorPrevious[executorPrevious.length - 1],
-                  executorPrevious.slice(0, -1),
+                  executorPrevious()[executorPrevious().length - 1],
+                  executorPrevious().slice(0, -1),
                 )
               }
             >
-              {t("settings.pools.previousPage")}
+              {i18n.t("settings.pools.previousPage")}
             </Button>
             <Button
               type="button"
               size="xs"
               variant="outline"
-              disabled={executorLoading || executorNext === null}
+              disabled={executorLoading() || executorNext() === null}
               onClick={() => {
-                if (executorNext !== null)
-                  navigateExecutors(executorNext, [...executorPrevious, executorBefore]);
+                if (executorNext() !== null)
+                  navigateExecutors(executorNext()!, [...executorPrevious(), executorBefore()]);
               }}
             >
-              {t("settings.pools.nextPage")}
+              {i18n.t("settings.pools.nextPage")}
             </Button>
           </div>
-          <div className="flex flex-wrap items-end gap-2">
-            <label className="text-xs">
-              {t("settings.pools.executorName")}
+          <div class="flex flex-wrap items-end gap-2">
+            <label class="text-xs">
+              {i18n.t("settings.pools.executorName")}
               <Input
-                value={executorName}
-                onChange={(event) => setExecutorName(event.target.value)}
+                value={executorName()}
+                onInput={(event) => setExecutorName(event.target.value)}
               />
             </label>
-            <label className="text-xs">
-              {t("settings.pools.executorPool")}
+            <label class="text-xs">
+              {i18n.t("settings.pools.executorPool")}
               <select
-                className="block h-9 rounded border bg-background px-2"
-                value={executorPool}
+                class="block h-9 rounded border bg-background px-2"
+                value={executorPool()}
                 onChange={(event) => setExecutorPool(event.target.value)}
               >
                 <option value="">—</option>
-                {executorPool && !pools?.some((pool) => pool.id === executorPool) ? (
-                  <option value={executorPool}>{executorPool}</option>
+                {executorPool() && !pools()?.some((pool) => pool.id === executorPool()) ? (
+                  <option value={executorPool()}>{executorPool()}</option>
                 ) : null}
-                {pools?.map((pool) => (
-                  <option key={pool.id} value={pool.id}>
+                {pools()?.map((pool) => (
+                  <option value={pool.id}>
                     {pool.name} · {pool.id}
                   </option>
                 ))}
               </select>
             </label>
-            <label className="text-xs">
-              {t("settings.pools.executorCapability")}
+            <label class="text-xs">
+              {i18n.t("settings.pools.executorCapability")}
               <select
-                className="block h-9 rounded border bg-background px-2"
-                value={capability}
+                class="block h-9 rounded border bg-background px-2"
+                value={capability()}
                 onChange={(event) => setCapability(event.target.value)}
               >
                 {EXECUTOR_CAPABILITIES.map(({ key, label }) => (
-                  <option key={key} value={key}>
-                    {label ?? t("settings.pools.operationDecision")}
-                  </option>
+                  <option value={key}>{label ?? i18n.t("settings.pools.operationDecision")}</option>
                 ))}
               </select>
             </label>
             <Button
               type="button"
               size="xs"
-              disabled={creating || !executorName.trim() || !executorPool}
+              disabled={creating() || !executorName().trim() || !executorPool()}
               onClick={() => void createExecutor()}
             >
-              {t("settings.pools.executorCreate")}
+              {i18n.t("settings.pools.executorCreate")}
             </Button>
           </div>
         </div>
       ) : null}
 
-      <p className="border-t border-border/70 py-2 text-xs text-muted-foreground">
-        {t("settings.pools.note")}
+      <p class="border-t border-border/70 py-2 text-xs text-muted-foreground">
+        {i18n.t("settings.pools.note")}
       </p>
     </Section>
   );

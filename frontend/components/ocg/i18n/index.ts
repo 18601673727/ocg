@@ -1,25 +1,25 @@
-export { I18nProvider, useI18n, useT, type TranslateFn } from "./context";
+export { I18nProvider, type TranslateFn, useI18n, useT } from "./context";
+export {
+  type Dictionary,
+  dictionaries,
+  en,
+  formatTemplate,
+  type I18nKey,
+  zh,
+} from "./dictionaries";
+export { LanguageSwitcher } from "./language-switcher";
 export {
   DEFAULT_LOCALE,
-  LOCALES,
+  detectLocale,
+  isLocale,
   LOCALE_LABEL,
   LOCALE_SHORT_LABEL,
   LOCALE_STORAGE_KEY,
-  detectLocale,
-  isLocale,
+  LOCALES,
+  type Locale,
   readStoredLocale,
   resolveLocale,
-  type Locale,
 } from "./locale";
-export {
-  dictionaries,
-  en,
-  zh,
-  formatTemplate,
-  type Dictionary,
-  type I18nKey,
-} from "./dictionaries";
-export { LanguageSwitcher } from "./language-switcher";
 export { LOCALE_BOOTSTRAP_SCRIPT } from "./locale-bootstrap";
 
 import type { TranslateFn } from "./context";

@@ -1,6 +1,5 @@
-"use client";
-
-import { useMemo, useSyncExternalStore } from "react";
+import { createMemo } from "solid-js";
+import { createSubscription } from "@/lib/ui-state";
 
 const key = "ocg.sidebar.pinned";
 const event = "ocg-sidebar-pins";
@@ -27,10 +26,10 @@ function subscribe(changed: () => void) {
 }
 
 export function usePinnedConversations() {
-  const raw = useSyncExternalStore(subscribe, read, () => "[]");
-  const pinned = useMemo(() => {
+  const raw = createSubscription(subscribe, read);
+  const pinned = createMemo(() => {
     try {
-      const value: unknown = JSON.parse(raw);
+      const value: unknown = JSON.parse(raw());
       return new Set<string>(
         Array.isArray(value)
           ? value.filter((item): item is string => typeof item === "string")
@@ -39,20 +38,18 @@ export function usePinnedConversations() {
     } catch {
       return new Set<string>();
     }
-  }, [raw]);
-  return {
-    pinned,
-    toggle(id: string) {
-      const next = new Set(pinned);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      fallback = JSON.stringify([...next]);
-      try {
-        window.localStorage.setItem(key, fallback);
-      } catch {
-        storageUnavailable = true;
-      }
-      window.dispatchEvent(new Event(event));
-    },
-  };
+  });
+  function toggle(id: string) {
+    const next = new Set(pinned());
+    if (next.has(id)) next.delete(id);
+    else next.add(id);
+    fallback = JSON.stringify([...next]);
+    try {
+      window.localStorage.setItem(key, fallback);
+    } catch {
+      storageUnavailable = true;
+    }
+    window.dispatchEvent(new Event(event));
+  }
+  return createMemo(() => ({ pinned: pinned(), toggle }));
 }

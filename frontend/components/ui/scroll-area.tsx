@@ -1,50 +1,32 @@
-"use client";
+import type { JSX } from "@solidjs/web";
+import { splitProps } from "@/lib/ui-state";
 
-import type { ComponentProps } from "react";
-import { ScrollArea as ScrollAreaPrimitive } from "@base-ui/react/scroll-area";
-import { cn } from "cn";
+import { cn } from "@/lib/utils";
 
-type ScrollAreaPartProps = ComponentProps<"div"> & {
+type Part = JSX.IntrinsicElements["div"] & {
   [attribute: `data-${string}`]: string | number | boolean | undefined;
 };
 
-function ScrollArea({
-  className,
-  children,
-  viewportProps,
-  contentProps,
-  ...props
-}: ScrollAreaPrimitive.Root.Props & {
-  viewportProps?: Omit<ScrollAreaPrimitive.Viewport.Props & ScrollAreaPartProps, "children">;
-  contentProps?: Omit<ScrollAreaPrimitive.Content.Props & ScrollAreaPartProps, "children">;
-}) {
-  const { className: viewportClassName, ...viewportRest } = viewportProps ?? {};
-  const { className: contentClassName, ...contentRest } = contentProps ?? {};
-
+export function ScrollArea(props: Part & { viewportProps?: Part; contentProps?: Part }) {
+  const [local, rest] = splitProps(props, ["class", "children", "viewportProps", "contentProps"]);
   return (
-    <ScrollAreaPrimitive.Root
+    <div
       data-slot="scroll-area"
-      className={cn("min-h-0 min-w-0 overflow-hidden", className)}
-      {...props}
+      {...rest}
+      class={cn("min-h-0 min-w-0 overflow-hidden", local.class)}
     >
-      <ScrollAreaPrimitive.Viewport
+      <div
+        {...local.viewportProps}
         data-slot="scroll-area-viewport"
-        {...viewportRest}
-        className={cn("h-full max-h-[inherit] w-full", viewportClassName)}
+        class={cn(
+          "ocg-subtle-scrollbar h-full max-h-[inherit] w-full overflow-auto",
+          local.viewportProps?.class,
+        )}
       >
-        <ScrollAreaPrimitive.Content
-          data-slot="scroll-area-content"
-          {...contentRest}
-          className={contentClassName}
-        >
-          {children}
-        </ScrollAreaPrimitive.Content>
-      </ScrollAreaPrimitive.Viewport>
-      <ScrollAreaPrimitive.Scrollbar orientation="vertical" className="flex w-1.5 touch-none p-px">
-        <ScrollAreaPrimitive.Thumb className="relative flex-1 rounded-full bg-muted-foreground/30" />
-      </ScrollAreaPrimitive.Scrollbar>
-    </ScrollAreaPrimitive.Root>
+        <div {...local.contentProps} data-slot="scroll-area-content">
+          {local.children}
+        </div>
+      </div>
+    </div>
   );
 }
-
-export { ScrollArea };

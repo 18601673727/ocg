@@ -1,12 +1,10 @@
-"use client";
-
-import { type ComponentProps, useId, useMemo, useState } from "react";
+import { CheckIcon, CopyIcon } from "@lucide/solid";
 import { cva, type VariantProps } from "class-variance-authority";
 import { diffLines } from "diff";
-import { CheckIcon, CopyIcon } from "lucide-react";
 import parseDiff from "parse-diff";
-
+import { createMemo, createSignal, createUniqueId } from "solid-js";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
+import { ariaState, type ElementProps, splitProps } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
 
 type DiffLineType = "add" | "del" | "normal" | "marker";
@@ -251,40 +249,54 @@ function getFileExtension(filename?: string | undefined): string {
   return ext.toUpperCase();
 }
 
-function DiffViewerFileBadge({ filename }: { filename?: string | undefined }) {
-  const ext = getFileExtension(filename);
-  if (!ext) return null;
-
+function DiffViewerFileBadge(props: { filename?: string | undefined }) {
+  const ext = createMemo(() => getFileExtension(props.filename));
   return (
-    <span
-      data-slot="diff-viewer-file-badge"
-      className="border-foreground/15 text-muted-foreground/70 inline-flex h-4 shrink-0 items-center border px-1 text-[9px] leading-none font-medium tracking-wide"
-    >
-      {ext}
+    <>
+      {(() => {
+        if (!ext()) return null;
+
+        return (
+          <span
+            data-slot="diff-viewer-file-badge"
+            class="border-foreground/15 text-muted-foreground/70 inline-flex h-4 shrink-0 items-center border px-1 text-[9px] leading-none font-medium tracking-wide"
+          >
+            {ext()}
+          </span>
+        );
+      })()}
+    </>
+  );
+}
+
+function DiffViewerStats(props: { additions: number; deletions: number }) {
+  return (
+    <span data-slot="diff-viewer-stats" class="flex shrink-0 gap-1.5 text-[11px] tabular-nums">
+      <span class="text-green-600 dark:text-green-400">+{props.additions}</span>
+      <span class="text-red-600 dark:text-red-400">−{props.deletions}</span>
     </span>
   );
 }
 
-function DiffViewerStats({ additions, deletions }: { additions: number; deletions: number }) {
+function DiffViewerFile(viewProps: ElementProps<"div">) {
+  const [, props] = splitProps(viewProps, ["class"]);
+
+  return <div data-slot="diff-viewer-file" class={cn(viewProps.class)} {...props} />;
+}
+
+function DiffViewerContent(viewProps: ElementProps<"div">) {
+  const [, props] = splitProps(viewProps, ["class"]);
+
   return (
-    <span data-slot="diff-viewer-stats" className="flex shrink-0 gap-1.5 text-[11px] tabular-nums">
-      <span className="text-green-600 dark:text-green-400">+{additions}</span>
-      <span className="text-red-600 dark:text-red-400">−{deletions}</span>
-    </span>
+    <div
+      data-slot="diff-viewer-content"
+      class={cn("overflow-x-auto", viewProps.class)}
+      {...props}
+    />
   );
 }
 
-function DiffViewerFile({ className, ...props }: ComponentProps<"div">) {
-  return <div data-slot="diff-viewer-file" className={cn(className)} {...props} />;
-}
-
-function DiffViewerContent({ className, ...props }: ComponentProps<"div">) {
-  return (
-    <div data-slot="diff-viewer-content" className={cn("overflow-x-auto", className)} {...props} />
-  );
-}
-
-interface DiffViewerHeaderProps extends ComponentProps<"div"> {
+interface DiffViewerHeaderProps extends ElementProps<"div"> {
   oldName?: string | undefined;
   newName?: string | undefined;
   additions?: number | undefined;
@@ -295,172 +307,188 @@ interface DiffViewerHeaderProps extends ComponentProps<"div"> {
   copyable?: boolean | undefined;
 }
 
-function DiffViewerHeader({
-  oldName,
-  newName,
-  additions = 0,
-  deletions = 0,
-  showIcon = false,
-  showStats = true,
-  copyText,
-  copyable = true,
-  className,
-  ...props
-}: DiffViewerHeaderProps) {
+function DiffViewerHeader(viewProps: DiffViewerHeaderProps) {
+  const [, props] = splitProps(viewProps, [
+    "oldName",
+    "newName",
+    "additions",
+    "deletions",
+    "showIcon",
+    "showStats",
+    "copyText",
+    "copyable",
+    "class",
+  ]);
+
   const { isCopied, copyToClipboard } = useCopyToClipboard({
     copiedDuration: 1500,
   });
 
-  if (!oldName && !newName) return null;
-
-  const displayName = newName || oldName;
-
   return (
-    <div
-      data-slot="diff-viewer-header"
-      className={cn(
-        "border-foreground/10 text-muted-foreground flex h-9 items-center gap-2 border-b ps-3.5 pe-3 text-[11px] font-medium tracking-wide",
-        className,
-      )}
-      {...props}
-    >
-      {showIcon && <DiffViewerFileBadge filename={displayName} />}
-      <span className="min-w-0 flex-1 truncate">
-        {oldName && newName && oldName !== newName ? (
-          <>
-            <span className="text-muted-foreground/60">{oldName}</span>
-            <span className="text-muted-foreground/50">{" → "}</span>
-            <span className="text-foreground/80">{newName}</span>
-          </>
-        ) : (
-          displayName
-        )}
-      </span>
-      {showStats && (additions > 0 || deletions > 0) && (
-        <DiffViewerStats additions={additions} deletions={deletions} />
-      )}
-      {copyable && copyText && (
-        <button
-          type="button"
-          aria-label={`Copy diff of ${displayName}`}
-          onClick={() => copyToClipboard(copyText)}
-          className="text-muted-foreground hover:text-foreground grid size-6 shrink-0 place-items-center rounded-sm transition-colors motion-reduce:transition-none"
-        >
-          {isCopied ? <CheckIcon className="size-3.5" /> : <CopyIcon className="size-3.5" />}
-        </button>
-      )}
-    </div>
+    <>
+      {(() => {
+        if (!viewProps.oldName && !viewProps.newName) return null;
+
+        const displayName = createMemo(() => viewProps.newName || viewProps.oldName);
+
+        return (
+          <div
+            data-slot="diff-viewer-header"
+            class={cn(
+              "border-foreground/10 text-muted-foreground flex h-9 items-center gap-2 border-b ps-3.5 pe-3 text-[11px] font-medium tracking-wide",
+              viewProps.class,
+            )}
+            {...props}
+          >
+            {(viewProps.showIcon === undefined ? false : viewProps.showIcon) && (
+              <DiffViewerFileBadge filename={displayName()} />
+            )}
+            <span class="min-w-0 flex-1 truncate">
+              {viewProps.oldName && viewProps.newName && viewProps.oldName !== viewProps.newName ? (
+                <>
+                  <span class="text-muted-foreground/60">{viewProps.oldName}</span>
+                  <span class="text-muted-foreground/50">{" → "}</span>
+                  <span class="text-foreground/80">{viewProps.newName}</span>
+                </>
+              ) : (
+                displayName()
+              )}
+            </span>
+            {(viewProps.showStats === undefined ? true : viewProps.showStats) &&
+              ((viewProps.additions === undefined ? 0 : viewProps.additions) > 0 ||
+                (viewProps.deletions === undefined ? 0 : viewProps.deletions) > 0) && (
+                <DiffViewerStats
+                  additions={viewProps.additions === undefined ? 0 : viewProps.additions}
+                  deletions={viewProps.deletions === undefined ? 0 : viewProps.deletions}
+                />
+              )}
+            {(viewProps.copyable === undefined ? true : viewProps.copyable) &&
+              viewProps.copyText && (
+                <button
+                  type="button"
+                  aria-label={`Copy diff of ${displayName()}`}
+                  onClick={() => copyToClipboard(viewProps.copyText!)}
+                  class="text-muted-foreground hover:text-foreground grid size-6 shrink-0 place-items-center rounded-sm transition-colors motion-reduce:transition-none"
+                >
+                  {isCopied() ? <CheckIcon class="size-3.5" /> : <CopyIcon class="size-3.5" />}
+                </button>
+              )}
+          </div>
+        );
+      })()}
+    </>
   );
 }
 
-interface DiffViewerLineProps extends ComponentProps<"div"> {
+interface DiffViewerLineProps extends ElementProps<"div"> {
   line: ParsedLine;
   showLineNumbers?: boolean | undefined;
 }
 
-function DiffViewerLine({
-  line,
-  showLineNumbers = true,
-  className,
-  ...props
-}: DiffViewerLineProps) {
-  const indicator =
-    line.type === "add" ? "+" : line.type === "del" ? "-" : line.type === "marker" ? "" : " ";
+function DiffViewerLine(viewProps: DiffViewerLineProps) {
+  const [, props] = splitProps(viewProps, ["line", "showLineNumbers", "class"]);
+
+  const indicator = createMemo(() =>
+    viewProps.line.type === "add"
+      ? "+"
+      : viewProps.line.type === "del"
+        ? "-"
+        : viewProps.line.type === "marker"
+          ? ""
+          : " ",
+  );
 
   return (
     <div
       data-slot="diff-viewer-line"
-      data-type={line.type}
-      className={cn(diffLineVariants({ type: line.type }), className)}
+      data-type={viewProps.line.type}
+      class={cn(diffLineVariants({ type: viewProps.line.type }), viewProps.class)}
       {...props}
     >
-      {showLineNumbers && (
+      {(viewProps.showLineNumbers === undefined ? true : viewProps.showLineNumbers) && (
         <span
           data-slot="diff-viewer-line-number"
-          className="text-muted-foreground/40 w-10 shrink-0 px-2 text-end tabular-nums select-none"
+          class="text-muted-foreground/40 w-10 shrink-0 px-2 text-end tabular-nums select-none"
         >
-          {line.type === "marker"
+          {viewProps.line.type === "marker"
             ? ""
-            : line.type === "del"
-              ? line.oldLineNumber
-              : line.type === "add"
-                ? line.newLineNumber
-                : line.oldLineNumber}
+            : viewProps.line.type === "del"
+              ? viewProps.line.oldLineNumber
+              : viewProps.line.type === "add"
+                ? viewProps.line.newLineNumber
+                : viewProps.line.oldLineNumber}
         </span>
       )}
       <span
         data-slot="diff-viewer-indicator"
-        className={cn(
+        class={cn(
           "w-4 shrink-0 text-center select-none",
-          diffLineTextVariants({ type: line.type }),
+          diffLineTextVariants({ type: viewProps.line.type }),
         )}
       >
-        {indicator}
+        {indicator()}
       </span>
-      <span data-slot="diff-viewer-content" className="flex-1 pe-3.5 break-all whitespace-pre-wrap">
-        {line.content}
+      <span data-slot="diff-viewer-content" class="flex-1 pe-3.5 break-all whitespace-pre-wrap">
+        {viewProps.line.content}
       </span>
     </div>
   );
 }
 
-interface DiffViewerSplitLineProps extends ComponentProps<"div"> {
+interface DiffViewerSplitLineProps extends ElementProps<"div"> {
   pair: SplitLinePair;
   showLineNumbers?: boolean | undefined;
 }
 
-function DiffViewerSplitLine({
-  pair,
-  showLineNumbers = true,
-  className,
-  ...props
-}: DiffViewerSplitLineProps) {
-  const { left, right } = pair;
+function DiffViewerSplitLine(viewProps: DiffViewerSplitLineProps) {
+  const [, props] = splitProps(viewProps, ["pair", "showLineNumbers", "class"]);
+
+  const { left, right } = viewProps.pair;
 
   return (
-    <div data-slot="diff-viewer-split-line" className={cn("flex", className)} {...props}>
+    <div data-slot="diff-viewer-split-line" class={cn("flex", viewProps.class)} {...props}>
       <div
         data-slot="diff-viewer-split-left"
         data-type={left?.type ?? "empty"}
-        className={cn(
+        class={cn(
           "border-foreground/10 flex w-1/2 border-e",
           diffLineVariants({ type: left?.type ?? "empty" }),
         )}
       >
-        {showLineNumbers && (
-          <span className="text-muted-foreground/40 w-10 shrink-0 px-2 text-end tabular-nums select-none">
+        {(viewProps.showLineNumbers === undefined ? true : viewProps.showLineNumbers) && (
+          <span class="text-muted-foreground/40 w-10 shrink-0 px-2 text-end tabular-nums select-none">
             {left?.oldLineNumber ?? ""}
           </span>
         )}
         <span
-          className={cn(
+          class={cn(
             "w-4 shrink-0 text-center select-none",
             diffLineTextVariants({ type: left?.type ?? "empty" }),
           )}
         >
           {left ? (left.type === "del" ? "-" : left.type === "marker" ? "" : " ") : ""}
         </span>
-        <span className="flex-1 pe-3.5 break-all whitespace-pre-wrap">{left?.content ?? ""}</span>
+        <span class="flex-1 pe-3.5 break-all whitespace-pre-wrap">{left?.content ?? ""}</span>
       </div>
       <div
         data-slot="diff-viewer-split-right"
         data-type={right?.type ?? "empty"}
-        className={cn("flex w-1/2", diffLineVariants({ type: right?.type ?? "empty" }))}
+        class={cn("flex w-1/2", diffLineVariants({ type: right?.type ?? "empty" }))}
       >
-        {showLineNumbers && (
-          <span className="text-muted-foreground/40 w-10 shrink-0 px-2 text-end tabular-nums select-none">
+        {(viewProps.showLineNumbers === undefined ? true : viewProps.showLineNumbers) && (
+          <span class="text-muted-foreground/40 w-10 shrink-0 px-2 text-end tabular-nums select-none">
             {right?.newLineNumber ?? ""}
           </span>
         )}
         <span
-          className={cn(
+          class={cn(
             "w-4 shrink-0 text-center select-none",
             diffLineTextVariants({ type: right?.type ?? "empty" }),
           )}
         >
           {right ? (right.type === "add" ? "+" : right.type === "marker" ? "" : " ") : ""}
         </span>
-        <span className="flex-1 pe-3.5 break-all whitespace-pre-wrap">{right?.content ?? ""}</span>
+        <span class="flex-1 pe-3.5 break-all whitespace-pre-wrap">{right?.content ?? ""}</span>
       </div>
     </div>
   );
@@ -477,65 +505,58 @@ interface DiffViewerFileContentProps {
   maxCollapsedLines: number | undefined;
 }
 
-function DiffViewerFileContent({
-  file,
-  splitLinePairs,
-  viewMode,
-  showLineNumbers,
-  showIcon,
-  showStats,
-  copyable,
-  maxCollapsedLines,
-}: DiffViewerFileContentProps) {
-  const [isExpanded, setIsExpanded] = useState(false);
-  const contentId = useId();
-  const renderedLineCount = viewMode === "split" ? splitLinePairs.length : file.lines.length;
-  const isCollapsible =
-    maxCollapsedLines !== undefined &&
-    maxCollapsedLines >= 0 &&
-    renderedLineCount > maxCollapsedLines;
-  const isCollapsed = isCollapsible && !isExpanded;
-  const visibleLineCount = isCollapsed ? maxCollapsedLines : renderedLineCount;
+function DiffViewerFileContent(props: DiffViewerFileContentProps) {
+  const [isExpanded, setIsExpanded] = createSignal(false);
+  const contentId = createUniqueId();
+  const renderedLineCount = createMemo(() =>
+    props.viewMode === "split" ? props.splitLinePairs.length : props.file.lines.length,
+  );
+  const isCollapsible = createMemo(
+    () =>
+      props.maxCollapsedLines !== undefined &&
+      props.maxCollapsedLines >= 0 &&
+      renderedLineCount() > props.maxCollapsedLines,
+  );
+  const isCollapsed = createMemo(() => isCollapsible() && !isExpanded());
+  const visibleLineCount = createMemo(() =>
+    isCollapsed() ? props.maxCollapsedLines : renderedLineCount(),
+  );
 
   return (
-    <DiffViewerFile className="border-foreground/10 [contain-intrinsic-size:auto_240px] [content-visibility:auto] not-first:border-t">
+    <DiffViewerFile class="border-foreground/10 [contain-intrinsic-size:auto_240px] [content-visibility:auto] not-first:border-t">
       <DiffViewerHeader
-        oldName={file.oldName}
-        newName={file.newName}
-        additions={file.additions}
-        deletions={file.deletions}
-        showIcon={showIcon}
-        showStats={showStats}
-        copyText={formatUnifiedDiff(file)}
-        copyable={copyable}
+        oldName={props.file.oldName}
+        newName={props.file.newName}
+        additions={props.file.additions}
+        deletions={props.file.deletions}
+        showIcon={props.showIcon}
+        showStats={props.showStats}
+        copyText={formatUnifiedDiff(props.file)}
+        copyable={props.copyable}
       />
-      <DiffViewerContent id={contentId} className="py-2">
-        {viewMode === "split"
-          ? splitLinePairs
-              .slice(0, visibleLineCount)
+      <DiffViewerContent id={contentId} class="py-2">
+        {props.viewMode === "split"
+          ? props.splitLinePairs
+              .slice(0, visibleLineCount())
               .map((pair, pairIndex) => (
-                <DiffViewerSplitLine
-                  key={pairIndex}
-                  pair={pair}
-                  showLineNumbers={showLineNumbers}
-                />
+                <DiffViewerSplitLine pair={pair} showLineNumbers={props.showLineNumbers} />
               ))
-          : file.lines
-              .slice(0, visibleLineCount)
+          : props.file.lines
+              .slice(0, visibleLineCount())
               .map((line, lineIndex) => (
-                <DiffViewerLine key={lineIndex} line={line} showLineNumbers={showLineNumbers} />
+                <DiffViewerLine line={line} showLineNumbers={props.showLineNumbers} />
               ))}
       </DiffViewerContent>
-      {isCollapsible && (
-        <div className="border-foreground/10 flex border-t px-3.5 py-1.5">
+      {isCollapsible() && (
+        <div class="border-foreground/10 flex border-t px-3.5 py-1.5">
           <button
             type="button"
-            aria-expanded={!isCollapsed}
+            aria-expanded={ariaState(!isCollapsed())}
             aria-controls={contentId}
             onClick={() => setIsExpanded((expanded) => !expanded)}
-            className="text-muted-foreground hover:text-foreground text-[11px] font-medium transition-colors motion-reduce:transition-none"
+            class="text-muted-foreground hover:text-foreground text-[11px] font-medium transition-colors motion-reduce:transition-none"
           >
-            {isCollapsed ? `Show all ${renderedLineCount} lines` : "Show less"}
+            {isCollapsed() ? `Show all ${renderedLineCount()} lines` : "Show less"}
           </button>
         </div>
       )}
@@ -554,40 +575,26 @@ export type DiffViewerProps = VariantProps<typeof diffViewerVariants> & {
   showStats?: boolean | undefined;
   copyable?: boolean | undefined;
   maxCollapsedLines?: number | undefined;
-  className?: string | undefined;
+  class?: string | undefined;
 };
 
-function DiffViewer({
-  code,
-  patch,
-  oldFile,
-  newFile,
-  viewMode = "unified",
-  showLineNumbers = true,
-  showIcon = false,
-  showStats = true,
-  copyable = true,
-  maxCollapsedLines,
-  variant,
-  size,
-  className,
-}: DiffViewerProps) {
-  const diffPatch = patch ?? code;
-  const oldContent = oldFile?.content;
-  const oldName = oldFile?.name;
-  const newContent = newFile?.content;
-  const newName = newFile?.name;
+function DiffViewer(props: DiffViewerProps) {
+  const diffPatch = createMemo(() => props.patch ?? props.code);
+  const oldContent = createMemo(() => props.oldFile?.content);
+  const oldName = createMemo(() => props.oldFile?.name);
+  const newContent = createMemo(() => props.newFile?.content);
+  const newName = createMemo(() => props.newFile?.name);
 
-  const parsedFiles = useMemo<ParsedFile[]>(() => {
-    if (diffPatch) {
-      return parsePatch(diffPatch);
+  const parsedFiles = createMemo<ParsedFile[]>(() => {
+    if (diffPatch()) {
+      return parsePatch(diffPatch()!);
     }
-    if (oldContent !== undefined && newContent !== undefined) {
-      const { lines, hunks, additions, deletions } = computeDiff(oldContent, newContent);
+    if (oldContent() !== undefined && newContent() !== undefined) {
+      const { lines, hunks, additions, deletions } = computeDiff(oldContent()!, newContent()!);
       return [
         {
-          oldName,
-          newName,
+          oldName: oldName(),
+          newName: newName(),
           lines,
           hunks,
           additions,
@@ -596,68 +603,74 @@ function DiffViewer({
       ];
     }
     return [];
-  }, [diffPatch, oldContent, oldName, newContent, newName]);
+  });
 
-  const splitLinePairs = useMemo<SplitLinePair[][]>(() => {
-    if (viewMode !== "split") return [];
-    return parsedFiles.map((file) => pairLinesForSplit(file.lines));
-  }, [parsedFiles, viewMode]);
-
-  if (parsedFiles.length === 0) {
-    return (
-      <pre
-        data-slot="diff-viewer"
-        className={cn(
-          "border-foreground/10 bg-foreground/[0.025] dark:bg-foreground/[0.04] text-muted-foreground border px-3.5 py-3 font-mono text-xs",
-          className,
-        )}
-      >
-        No diff content provided
-      </pre>
-    );
-  }
+  const splitLinePairs = createMemo<SplitLinePair[][]>(() => {
+    if ((props.viewMode === undefined ? "unified" : props.viewMode) !== "split") return [];
+    return parsedFiles().map((file) => pairLinesForSplit(file.lines));
+  });
 
   return (
-    <div
-      data-slot="diff-viewer"
-      data-view-mode={viewMode}
-      data-variant={variant ?? "default"}
-      data-size={size ?? "default"}
-      className={cn(diffViewerVariants({ variant, size }), className)}
-    >
-      {parsedFiles.map((file, fileIndex) => (
-        <DiffViewerFileContent
-          key={fileIndex}
-          file={file}
-          splitLinePairs={splitLinePairs[fileIndex] ?? []}
-          viewMode={viewMode}
-          showLineNumbers={showLineNumbers}
-          showIcon={showIcon}
-          showStats={showStats}
-          copyable={copyable}
-          maxCollapsedLines={maxCollapsedLines}
-        />
-      ))}
-    </div>
+    <>
+      {(() => {
+        if (parsedFiles().length === 0) {
+          return (
+            <pre
+              data-slot="diff-viewer"
+              class={cn(
+                "border-foreground/10 bg-foreground/[0.025] dark:bg-foreground/[0.04] text-muted-foreground border px-3.5 py-3 font-mono text-xs",
+                props.class,
+              )}
+            >
+              No diff content provided
+            </pre>
+          );
+        }
+
+        return (
+          <div
+            data-slot="diff-viewer"
+            data-view-mode={props.viewMode === undefined ? "unified" : props.viewMode}
+            data-variant={props.variant ?? "default"}
+            data-size={props.size ?? "default"}
+            class={cn(
+              diffViewerVariants({ variant: props.variant, size: props.size }),
+              props.class,
+            )}
+          >
+            {parsedFiles().map((file, fileIndex) => (
+              <DiffViewerFileContent
+                file={file}
+                splitLinePairs={splitLinePairs()[fileIndex] ?? []}
+                viewMode={props.viewMode === undefined ? "unified" : props.viewMode}
+                showLineNumbers={props.showLineNumbers === undefined ? true : props.showLineNumbers}
+                showIcon={props.showIcon === undefined ? false : props.showIcon}
+                showStats={props.showStats === undefined ? true : props.showStats}
+                copyable={props.copyable === undefined ? true : props.copyable}
+                maxCollapsedLines={props.maxCollapsedLines}
+              />
+            ))}
+          </div>
+        );
+      })()}
+    </>
   );
 }
 
-DiffViewer.displayName = "DiffViewer";
-
-export type { ParsedLine, ParsedFile, SplitLinePair };
+export type { ParsedFile, ParsedLine, SplitLinePair };
 
 export {
+  computeDiff,
   DiffViewer,
-  DiffViewerFile,
-  DiffViewerHeader,
   DiffViewerContent,
+  DiffViewerFile,
+  DiffViewerFileBadge,
+  DiffViewerHeader,
   DiffViewerLine,
   DiffViewerSplitLine,
-  DiffViewerFileBadge,
   DiffViewerStats,
-  diffViewerVariants,
-  diffLineVariants,
   diffLineTextVariants,
+  diffLineVariants,
+  diffViewerVariants,
   parsePatch,
-  computeDiff,
 };

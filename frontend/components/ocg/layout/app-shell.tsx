@@ -1,79 +1,73 @@
-"use client";
-
+import { ArrowLeft, PanelRight } from "@lucide/solid";
+import { createEffect, createMemo, createSignal, Loading, lazy, Show } from "solid-js";
+import { FloatingIconButton } from "@/components/ocg/chat/ui/tooltip-icon-button";
 import type * as Api from "@/components/ocg/contracts/api";
-
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
-import { useCallback, useEffect, useRef, useState } from "react";
-import dynamic from "next/dynamic";
-import { ArrowLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
-import { FloatingIconButton } from "@/components/assistant-ui/elements/tooltip-icon-button";
+import { elementRef, shallowSelector } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
-import { OcgSidebar } from "../sidebar/ocg-sidebar";
-import { OcgTopbar } from "../topbar/ocg-topbar";
-import { WorkspaceHome } from "./workspace-home";
-import { useOcgRuntime } from "../runtime/runtime-context";
 import {
-  MUTABLE_CONTEXT_KEY,
-  bindComposerContext,
-  confirmMutableComposerNavigation,
-} from "../chat/mutable-composer";
-import type { ApiClient } from "../runtime/api-client";
-import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
-import { useI18n } from "../i18n";
-import { PageTitleVisibilityContext } from "./page-title";
-import { JobDetailsContext } from "../job/job-details-context";
-import { JobDetailsDialog } from "../job/job-details-dialog";
-import {
-  ConversationErrorsProvider,
   ConversationErrorScope,
+  ConversationErrorsProvider,
   useConversationErrors,
 } from "../chat/conversation-errors";
+import {
+  bindComposerContext,
+  confirmMutableComposerNavigation,
+  MUTABLE_CONTEXT_KEY,
+} from "../chat/mutable-composer";
+import { useI18n } from "../i18n";
+import { JobDetailsContext } from "../job/job-details-context";
+import { JobDetailsDialog } from "../job/job-details-dialog";
+import type { ApiClient } from "../runtime/api-client";
+import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context";
+import {
+  parseSettingsPath,
+  type SettingsSection,
+  settingsPath,
+} from "../settings/settings-sections";
+import { OcgSidebar } from "../sidebar/ocg-sidebar";
+import { OcgTopbar } from "../topbar/ocg-topbar";
 import type { RuntimeStatus } from "../types";
 import {
   conversationAncestors,
   conversationPath,
   parseConversationPath,
 } from "./conversation-path";
-import {
-  parseSettingsPath,
-  settingsPath,
-  type SettingsSection,
-} from "../settings/settings-sections";
+import { PageTitleVisibilityContext } from "./page-title";
+import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
+import { WorkspaceHome } from "./workspace-home";
+import { WorkspaceNavigation } from "./workspace-link";
 
 function SurfaceLoading() {
-  const { t } = useI18n();
+  const i18n = useI18n();
   return (
-    <p role="status" className="m-auto text-sm text-muted-foreground">
-      {t("common.loading")}
+    <p role="status" class="m-auto text-sm text-muted-foreground">
+      {i18n.t("common.loading")}
     </p>
   );
 }
 
-const ChatInspector = dynamic(
-  () => import("../chat/chat-inspector").then((module) => module.ChatInspector),
-  { loading: SurfaceLoading },
+const ChatInspector = lazy(() =>
+  import("../chat/chat-inspector").then((module) => ({ default: module.ChatInspector })),
 );
-const ChatScreen = dynamic(
-  () => import("../chat/chat-screen").then((module) => module.ChatScreen),
-  { loading: SurfaceLoading },
+const ChatScreen = lazy(() =>
+  import("../chat/chat-screen").then((module) => ({ default: module.ChatScreen })),
 );
-const JobsSurface = dynamic(
-  () => import("../job/jobs-surface").then((module) => module.JobsSurface),
-  { loading: SurfaceLoading },
+const JobsSurface = lazy(() =>
+  import("../job/jobs-surface").then((module) => ({ default: module.JobsSurface })),
 );
-const ObservationsSurface = dynamic(
-  () => import("../dashboard/observations-surface").then((module) => module.ObservationsSurface),
-  { loading: SurfaceLoading },
+const ObservationsSurface = lazy(() =>
+  import("../dashboard/observations-surface").then((module) => ({
+    default: module.ObservationsSurface,
+  })),
 );
-const LogsSurface = dynamic(
-  () => import("../dashboard/logs-surface").then((module) => module.LogsSurface),
-  { loading: SurfaceLoading },
+const LogsSurface = lazy(() =>
+  import("../dashboard/logs-surface").then((module) => ({ default: module.LogsSurface })),
 );
-const SettingsSurface = dynamic(
-  () => import("../settings/settings-surface").then((module) => module.SettingsSurface),
-  { loading: SurfaceLoading },
+const SettingsSurface = lazy(() =>
+  import("../settings/settings-surface").then((module) => ({ default: module.SettingsSurface })),
 );
 
 export type { WorkspaceView } from "./view-domain";
@@ -84,7 +78,7 @@ function currentLocation() {
   const settingsSection = parseSettingsPath(url.pathname);
   const requested =
     url.searchParams.get("view") ??
-    (settingsSection ? "settings" : url.pathname.slice(1).replace(/\.html$/, ""));
+    (settingsSection ? "settings" : url.pathname.replace(/^\/|\/$/g, "").replace(/\.html$/, ""));
   const job = url.searchParams.get("job");
   const chain = parseConversationPath(url.pathname);
   return {
@@ -116,268 +110,327 @@ export function AppShell(props: AppShellProps) {
   );
 }
 
-function AppShellContent({
-  client,
-  health,
-  sessionExpiresAtUs,
-  signingOut,
-  signOutError,
-  onSignOut,
-}: AppShellProps) {
+function AppShellContent(props: AppShellProps) {
   const runtime = useOcgRuntime();
-  const { t } = useI18n();
-  const [location, setLocation] = useState(currentLocation);
-  const lastLocationUrl = useRef(window.location.href);
-  const [detailJob, setDetailJob] = useState(() =>
-    location.view === "jobs" ? location.job : null,
+  const i18n = useI18n();
+  const [location, setLocation] = createSignal(currentLocation());
+  const lastLocationUrl = elementRef(window.location.href);
+  const [detailJob, setDetailJob] = createSignal(
+    (() => (location().view === "jobs" ? location().job : null))(),
   );
-  const [sessionId, setSessionId] = useState("");
-  const restoreMutableOnce = useRef(false);
-  const [ancestors, setAncestors] = useState<string[]>([]);
-  const [collapsed, setCollapsed] = useState(false);
-  const [mobile, setMobile] = useState(false);
-  useEffect(() => {
-    if (!mobile) return;
-    const desktop = window.matchMedia("(min-width: 48rem)");
-    const closeOnDesktop = () => {
-      if (desktop.matches) setMobile(false);
-    };
-    desktop.addEventListener("change", closeOnDesktop);
-    return () => desktop.removeEventListener("change", closeOnDesktop);
-  }, [mobile]);
-  const [inspectorOpen, setInspectorOpen] = useState(false);
-  const [planningFocus, setPlanningFocus] = useState<{ sessionId: string; decisionId: string }>();
-  const [openedJob, setOpenedJob] = useState<string | null>(null);
-  const opening =
-    location.view === "chat" &&
-    location.job !== null &&
-    Boolean(runtime.client.openConversation) &&
-    openedJob !== location.job;
-  const [attempt, setAttempt] = useState(0);
-  const [pageTitleInView, setPageTitleInView] = useState(true);
-  const session = runtime.snapshot.sessions.find((session) => session.id === sessionId);
-  const inspectorAvailable = Boolean(
-    session?.sessionId && (runtime.snapshot.messagesBySession[session.id]?.length ?? 0) > 0,
+  const [sessionId, setSessionId] = createSignal("");
+  const restoreMutableOnce = elementRef(false);
+  const [ancestors, setAncestors] = createSignal<string[]>([]);
+  const [collapsed, setCollapsed] = createSignal(false);
+  const [mobile, setMobile] = createSignal(false);
+  createEffect(
+    () => [mobile()],
+    () => {
+      if (!mobile()) return;
+      const desktop = window.matchMedia("(min-width: 48rem)");
+      const closeOnDesktop = () => {
+        if (desktop.matches) setMobile(false);
+      };
+      desktop.addEventListener("change", closeOnDesktop);
+      return () => desktop.removeEventListener("change", closeOnDesktop);
+    },
+  );
+  const [inspectorOpen, setInspectorOpen] = createSignal(false);
+  const [planningFocus, setPlanningFocus] = createSignal<{
+    sessionId: string;
+    decisionId: string;
+  }>();
+  const [openedJob, setOpenedJob] = createSignal<string | null>(null);
+  const opening = createMemo(
+    () =>
+      location().view === "chat" &&
+      location().job !== null &&
+      Boolean(runtime.client.openConversation) &&
+      openedJob() !== location().job,
+  );
+  const [attempt, setAttempt] = createSignal(0);
+  const [pageTitleInView, setPageTitleInView] = createSignal(true);
+  const sessions = useOcgRuntimeSnapshot((snapshot) => snapshot.sessions);
+  const status = useOcgRuntimeSnapshot((snapshot) => snapshot.status);
+  const conversationList = useOcgRuntimeSnapshot((snapshot) => snapshot.conversationList);
+  const session = createMemo(() => sessions().find((session) => session.id === sessionId()));
+  const inspectorAvailable = useOcgRuntimeSnapshot((snapshot) =>
+    Boolean(session()?.sessionId && (snapshot.messagesBySession[session()!.id]?.length ?? 0) > 0),
+  );
+  const inspectorMessages = useOcgRuntimeSnapshot((snapshot) =>
+    location().view === "chat" && inspectorOpen() && session()
+      ? snapshot.messagesBySession[session()!.id]
+      : undefined,
   );
   const errors = useConversationErrors();
   const report = errors?.report;
   const transfer = errors?.transfer;
-  const conversationKey = sessionId || location.job || "new";
-  const observedStatus = useRef<RuntimeStatus | null>(null);
-  const activeConversation = useRef(conversationKey);
-  const currentLocationRef = useRef({ location, sessionId });
-  const listedConversations = useRef(new Set<string>()); // Listed IDs already identify conversations.
-  useEffect(() => {
-    currentLocationRef.current = { location, sessionId };
-  });
-  useEffect(() => {
-    for (const listed of runtime.snapshot.sessions)
-      if (listed.conversationId) listedConversations.current.add(listed.conversationId);
-  }, [runtime.snapshot.sessions]);
-  useEffect(() => {
-    if (restoreMutableOnce.current || location.view !== "chat" || location.job || sessionId) return;
-    restoreMutableOnce.current = true;
-    let context: string | null;
-    try {
-      context =
-        sessionStorage.getItem(MUTABLE_CONTEXT_KEY) ?? localStorage.getItem(MUTABLE_CONTEXT_KEY);
-    } catch {
-      return;
-    }
-    if (!context) return;
-    void client
-      .currentMutableJob(context)
-      .then(async () => {
-        if (
-          currentLocationRef.current.sessionId ||
-          currentLocationRef.current.location.view !== "chat" ||
-          currentLocationRef.current.location.job
-        )
-          return;
-        const restored = await runtime.createSession({
-          workType: "research",
-          title: t("sidebar.newChat"),
-        });
-        if (
-          currentLocationRef.current.sessionId ||
-          currentLocationRef.current.location.view !== "chat" ||
-          currentLocationRef.current.location.job
-        )
-          return;
-        bindComposerContext(restored.id, context);
-        setSessionId(restored.id);
-      })
-      .catch(() => {});
-  }, [client, location.view, location.job, sessionId, runtime, t]);
-  useEffect(() => {
-    activeConversation.current = conversationKey;
-  }, [conversationKey]);
+  const conversationKey = createMemo(() => sessionId() || location().job || "new");
+  const observedStatus = elementRef<RuntimeStatus | null>(null);
+  const activeConversation = elementRef(conversationKey());
+  const currentLocationRef = elementRef({ location: location(), sessionId: sessionId() });
+  const listedConversations = elementRef(new Set<string>()); // Listed IDs already identify conversations.
+  createEffect(
+    () => [location(), sessionId()],
+    () => {
+      currentLocationRef.current = { location: location(), sessionId: sessionId() };
+    },
+  );
+  createEffect(
+    () => [sessions()],
+    () => {
+      for (const listed of sessions())
+        if (listed.conversationId) listedConversations.current.add(listed.conversationId);
+    },
+  );
+  createEffect(
+    () => [props.client, location().view, location().job, sessionId(), runtime, i18n.t],
+    () => {
+      if (restoreMutableOnce.current || location().view !== "chat" || location().job || sessionId())
+        return;
+      restoreMutableOnce.current = true;
+      let context: string | null;
+      try {
+        context =
+          sessionStorage.getItem(MUTABLE_CONTEXT_KEY) ?? localStorage.getItem(MUTABLE_CONTEXT_KEY);
+      } catch {
+        return;
+      }
+      if (!context) return;
+      void props.client
+        .currentMutableJob(context)
+        .then(async () => {
+          if (
+            currentLocationRef.current.sessionId ||
+            currentLocationRef.current.location.view !== "chat" ||
+            currentLocationRef.current.location.job
+          )
+            return;
+          const restored = await runtime.createSession({
+            workType: "research",
+            title: i18n.t("sidebar.newChat"),
+          });
+          if (
+            currentLocationRef.current.sessionId ||
+            currentLocationRef.current.location.view !== "chat" ||
+            currentLocationRef.current.location.job
+          )
+            return;
+          bindComposerContext(restored.id, context);
+          setSessionId(restored.id);
+        })
+        .catch(() => {});
+    },
+  );
+  createEffect(
+    () => [conversationKey()],
+    () => {
+      activeConversation.current = conversationKey();
+    },
+  );
 
-  useEffect(() => {
-    if (location.view === "chat" && location.job)
-      void import("../chat/chat-screen").catch(() => {});
-  }, [location.view, location.job]);
+  createEffect(
+    () => [location().view, location().job],
+    () => {
+      if (location().view === "chat" && location().job)
+        void import("../chat/chat-screen").catch(() => {});
+    },
+  );
 
-  useEffect(() => {
-    const status = runtime.snapshot.status;
-    if (observedStatus.current === status) return;
-    observedStatus.current = status;
-    if (location.view === "chat" && status.state === "failed" && status.detail) {
-      const owner = status.sessionId ?? conversationKey;
-      report?.(owner, status.detail);
-    }
-  }, [runtime.snapshot.status, runtime.client, conversationKey, location.view, report, t]);
-  const closeInspector = useCallback(() => {
+  createEffect(
+    () => [status(), conversationKey(), location().view, report],
+    () => {
+      if (observedStatus.current === status()) return;
+      observedStatus.current = status();
+      if (location().view === "chat" && status().state === "failed" && status().detail) {
+        const owner = status().sessionId ?? conversationKey();
+        report?.(owner, status().detail);
+      }
+    },
+  );
+  const closeInspector = () => {
     setInspectorOpen(false);
     setPlanningFocus(undefined);
     requestAnimationFrame(() => {
       const trigger =
-        planningFocus?.sessionId === sessionId
-          ? document.getElementById(`planning-notice-${planningFocus.decisionId}`)
+        planningFocus()?.sessionId === sessionId()
+          ? document.getElementById(`planning-notice-${planningFocus()!.decisionId}`)
           : null;
       (trigger ?? document.getElementById("chat-inspector-toggle"))?.focus();
     });
-  }, [planningFocus, sessionId]);
+  };
 
-  useEffect(() => {
-    if (!inspectorOpen || location.view !== "chat" || detailJob !== null) return;
-    if (planningFocus?.sessionId !== sessionId)
-      document.getElementById("chat-inspector-close")?.focus();
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") closeInspector();
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [inspectorOpen, location.view, detailJob, closeInspector, planningFocus, sessionId]);
+  createEffect(
+    () => [
+      inspectorOpen(),
+      location().view,
+      detailJob(),
+      closeInspector,
+      planningFocus(),
+      sessionId(),
+    ],
+    () => {
+      if (!inspectorOpen() || location().view !== "chat" || detailJob() !== null) return;
+      if (planningFocus()?.sessionId !== sessionId())
+        document.getElementById("chat-inspector-close")?.focus();
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "Escape") closeInspector();
+      };
+      window.addEventListener("keydown", onKeyDown);
+      return () => window.removeEventListener("keydown", onKeyDown);
+    },
+  );
 
-  useEffect(() => {
-    const pop = () => {
-      void (async () => {
-        if (!(await confirmMutableComposerNavigation())) {
-          window.history.replaceState(window.history.state, "", lastLocationUrl.current);
-          return;
-        }
-        const next = currentLocation();
-        if (sessionId.startsWith("draft-")) {
-          void runtime.deleteSession(sessionId).catch((cause) => report?.(sessionId, cause));
-        }
-        setLocation(next);
-        lastLocationUrl.current = window.location.href;
-        setDetailJob(next.view === "jobs" ? next.job : null);
-        if (next.view !== "settings") setSessionId("");
-      })();
-    };
-    window.addEventListener("popstate", pop);
-    return () => window.removeEventListener("popstate", pop);
-  }, [runtime, sessionId, report]);
-
-  useEffect(() => {
-    if (!location.job || location.view !== "chat" || !runtime.client.openConversation) return;
-    let alive = true;
-    void (async () => {
-      const chain = await conversationAncestors(
-        (id) =>
-          listedConversations.current.has(id)
-            ? Promise.resolve(id)
-            : client.resolveConversation(id),
-        location.job!,
-      );
-      if (location.chain && conversationPath(chain) !== conversationPath(location.chain))
-        throw new Error(t("chat.child.invalidPath"));
-      if (!alive) return;
-      const id = await runtime.client.openConversation!(location.job!);
-      if (alive) {
-        transfer?.(location.job!, id);
-        setSessionId(id);
-        setAncestors(chain);
-        if (location.chain || chain.length > 1)
-          window.history.replaceState(null, "", conversationPath(chain));
-      }
-    })()
-      .catch((cause) => {
-        if (alive)
-          report?.(activeConversation.current, cause, {
-            label: t("app.retryLoading"),
-            run: () => setAttempt((value) => value + 1),
-          });
-      })
-      .finally(() => {
-        if (alive) setOpenedJob(location.job);
-      });
-    return () => {
-      alive = false;
-      setOpenedJob(null);
-    };
-  }, [
-    location.job,
-    location.view,
-    location.chain,
-    runtime.client,
-    client,
-    attempt,
-    report,
-    transfer,
-    t,
-  ]);
-
-  useEffect(() => {
-    if (
-      location.view === "chat" &&
-      !location.chain &&
-      ancestors.length <= 1 &&
-      !opening &&
-      session?.sessionId
-    ) {
-      window.history.replaceState(null, "", `/?job=${session.sessionId}`);
+  const applyLocation = () => {
+    const next = currentLocation();
+    if (sessionId().startsWith("draft-") && next.view !== "settings") {
+      void runtime.deleteSession(sessionId()).catch((cause) => report?.(sessionId(), cause));
     }
-  }, [location.view, location.chain, ancestors.length, opening, session?.sessionId]);
+    setLocation(next);
+    lastLocationUrl.current = window.location.href;
+    setDetailJob(next.view === "jobs" ? next.job : null);
+    setMobile(false);
+    if (next.view !== "settings") setSessionId("");
+  };
 
-  const discardEmptyDraft = useCallback(
-    (keep?: string) => {
-      if (sessionId.startsWith("draft-") && sessionId !== keep) {
-        void runtime.deleteSession(sessionId).catch((cause) => report?.(sessionId, cause));
+  const navigateHref = (href: string) => {
+    if (href === window.location.href) return;
+    void confirmMutableComposerNavigation().then((allowed) => {
+      if (!allowed) return;
+      window.history.pushState(null, "", href);
+      applyLocation();
+    });
+  };
+
+  createEffect(
+    () => [applyLocation],
+    () => {
+      const pop = () => {
+        void confirmMutableComposerNavigation().then((allowed) => {
+          if (allowed) applyLocation();
+          else window.history.replaceState(window.history.state, "", lastLocationUrl.current);
+        });
+      };
+      window.addEventListener("popstate", pop);
+      return () => window.removeEventListener("popstate", pop);
+    },
+  );
+
+  createEffect(
+    () => [
+      location().job,
+      location().view,
+      location().chain,
+      runtime.client,
+      props.client,
+      attempt(),
+      report,
+      transfer,
+      i18n.t,
+    ],
+    () => {
+      if (!location().job || location().view !== "chat" || !runtime.client.openConversation) return;
+      let alive = true;
+      void (async () => {
+        const chain = await conversationAncestors(
+          (id) =>
+            listedConversations.current.has(id)
+              ? Promise.resolve(id)
+              : props.client.resolveConversation(id),
+          location().job!,
+        );
+        if (location().chain && conversationPath(chain) !== conversationPath(location().chain!))
+          throw new Error(i18n.t("chat.child.invalidPath"));
+        if (!alive) return;
+        const id = await runtime.client.openConversation!(location().job!);
+        if (alive) {
+          transfer?.(location().job!, id);
+          setSessionId(id);
+          setAncestors(chain);
+          if (location().chain || chain.length > 1)
+            window.history.replaceState(null, "", conversationPath(chain));
+        }
+      })()
+        .catch((cause) => {
+          if (alive)
+            report?.(activeConversation.current, cause, {
+              label: i18n.t("app.retryLoading"),
+              run: () => setAttempt((value) => value + 1),
+            });
+        })
+        .finally(() => {
+          if (alive) setOpenedJob(location().job);
+        });
+      return () => {
+        alive = false;
+        setOpenedJob(null);
+      };
+    },
+  );
+
+  createEffect(
+    () => [location().view, location().chain, ancestors().length, opening(), session()?.sessionId],
+    () => {
+      if (
+        location().view === "chat" &&
+        !location().chain &&
+        ancestors().length <= 1 &&
+        !opening() &&
+        session()?.sessionId
+      ) {
+        window.history.replaceState(null, "", `/?job=${session()!.sessionId}`);
       }
     },
-    [runtime, sessionId, report],
   );
 
-  const goDirect = useCallback(
-    (view: WorkspaceView, job: string | null = null, keepDraft?: string, keepAncestors = false) => {
-      if (!isReachableView(view)) return;
-      discardEmptyDraft(keepDraft);
-      const query = new URLSearchParams();
-      if (job) query.set("job", job);
-      const path = view === "chat" ? "/" : `/${view}`;
-      const href = `${path}${query.size ? `?${query}` : ""}`;
-      window.history.pushState(null, "", href);
-      lastLocationUrl.current = window.location.href;
-      setLocation({ view, job, chain: null, settingsSection: "models" });
-      if (!keepAncestors) setAncestors([]);
-      setMobile(false);
-    },
-    [discardEmptyDraft],
-  );
-  const go = useCallback(
-    (view: WorkspaceView, job: string | null = null, keepDraft?: string, keepAncestors = false) => {
-      void confirmMutableComposerNavigation().then((allowed) => {
-        if (allowed) goDirect(view, job, keepDraft, keepAncestors);
-      });
-    },
-    [goDirect],
-  );
+  const discardEmptyDraft = (keep?: string) => {
+    if (sessionId().startsWith("draft-") && sessionId() !== keep) {
+      void runtime.deleteSession(sessionId()).catch((cause) => report?.(sessionId(), cause));
+    }
+  };
 
-  const goSettings = useCallback((section: SettingsSection) => {
+  const goDirect = (
+    view: WorkspaceView,
+    job: string | null = null,
+    keepDraft?: string,
+    keepAncestors = false,
+  ) => {
+    if (!isReachableView(view)) return;
+    discardEmptyDraft(keepDraft);
+    const query = new URLSearchParams();
+    if (job) query.set("job", job);
+    const path = view === "chat" ? "/" : `/${view}`;
+    const href = `${path}${query.size ? `?${query}` : ""}`;
+    window.history.pushState(null, "", href);
+    lastLocationUrl.current = window.location.href;
+    setLocation({ view, job, chain: null, settingsSection: "models" });
+    if (!keepAncestors) setAncestors([]);
+    setMobile(false);
+  };
+  const go = (
+    view: WorkspaceView,
+    job: string | null = null,
+    keepDraft?: string,
+    keepAncestors = false,
+  ) => {
+    void confirmMutableComposerNavigation().then((allowed) => {
+      if (allowed) goDirect(view, job, keepDraft, keepAncestors);
+    });
+  };
+
+  const goSettings = (section: SettingsSection) => {
     const path = settingsPath(section);
     if (window.location.pathname === path) return;
     window.history.pushState(null, "", path);
     lastLocationUrl.current = window.location.href;
     setLocation({ view: "settings", job: null, chain: null, settingsSection: section });
-  }, []);
+  };
 
   function openNestedConversation(job: string) {
     void confirmMutableComposerNavigation().then((allowed) => {
       if (!allowed) return;
-      if (!ancestors.length && session?.conversationId) setAncestors([session.conversationId]);
+      const conversationId = session()?.conversationId;
+      if (!ancestors().length && conversationId) setAncestors([conversationId]);
       setSessionId("");
       goDirect("chat", job, undefined, true);
     });
@@ -385,7 +438,7 @@ function AppShellContent({
 
   function closeJobDetails() {
     setDetailJob(null);
-    if (location.view === "jobs" && location.job) {
+    if (location().view === "jobs" && location().job) {
       const url = new URL(window.location.href);
       url.searchParams.delete("job");
       window.history.replaceState(
@@ -393,14 +446,14 @@ function AppShellContent({
         "",
         `${url.pathname}${url.search}${url.hash}`,
       );
-      setLocation({ ...location, job: null });
+      setLocation({ ...location(), job: null });
     }
   }
 
-  const newChat = useCallback(async () => {
+  const newChat = async () => {
     const session = await runtime.createSession({
       workType: "research",
-      title: t("sidebar.newChat"),
+      title: i18n.t("sidebar.newChat"),
     });
     if (!(await confirmMutableComposerNavigation())) {
       await runtime.deleteSession(session.id);
@@ -408,24 +461,31 @@ function AppShellContent({
     }
     setSessionId(session.id);
     goDirect("chat", null, session.id);
-  }, [runtime, goDirect, t]);
+  };
 
-  const runningSessionIds = new Set(
-    runtime.snapshot.sessions
-      .filter((session) =>
-        (runtime.snapshot.messagesBySession[session.id] ?? []).some(
-          (message) => message.status === "pending" || message.status === "streaming",
+  const runningSessionIds = useOcgRuntimeSnapshot(
+    shallowSelector(
+      (snapshot) =>
+        new Set(
+          snapshot.sessions
+            .filter((session) =>
+              snapshot.messagesBySession[session.id]?.some(
+                (message) => message.status === "pending" || message.status === "streaming",
+              ),
+            )
+            .map((session) => session.id),
         ),
-      )
-      .map((session) => session.id),
+    ),
   );
-  const listedSessions = runtime.snapshot.sessions
-    .filter((session) => runtime.client.isListedConversation?.(session.id) ?? true)
-    .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  const listedSessions = createMemo(() =>
+    sessions()
+      .filter((session) => runtime.client.isListedConversation?.(session.id) ?? true)
+      .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+  );
   function selectSession(id: string) {
     void confirmMutableComposerNavigation().then((allowed) => {
       if (!allowed) return;
-      const selected = runtime.snapshot.sessions.find((session) => session.id === id);
+      const selected = sessions().find((session) => session.id === id);
       setSessionId(id);
       goDirect("chat", selected?.sessionId ?? null, id);
     });
@@ -439,21 +499,21 @@ function AppShellContent({
       goDirect("chat");
     });
   }
-  const sidebar = (
+  const sidebar = createMemo(() => (
     <OcgSidebar
-      conversationList={runtime.snapshot.conversationList}
+      conversationList={conversationList()}
       onRetryConversations={
         runtime.client.retryConversations ? () => runtime.client.retryConversations!() : undefined
       }
-      sessions={listedSessions}
-      runningSessionIds={runningSessionIds}
-      api={client}
-      activeAncestors={ancestors}
+      sessions={listedSessions()}
+      runningSessionIds={runningSessionIds()}
+      api={props.client}
+      activeAncestors={ancestors()}
       onOpenConversation={(job) => void openNestedConversation(job)}
-      activeSessionId={sessionId}
-      collapsed={!mobile && collapsed}
-      drawer={mobile}
-      onToggle={() => (mobile ? setMobile(false) : setCollapsed((value) => !value))}
+      activeSessionId={sessionId()}
+      collapsed={!mobile() && collapsed()}
+      drawer={mobile()}
+      onToggle={() => (mobile() ? setMobile(false) : setCollapsed((value) => !value))}
       onSelect={selectSession}
       onNewChat={() => void newChat()}
       onHome={goHome}
@@ -463,211 +523,221 @@ function AppShellContent({
           : undefined
       }
       onRenameChild={async (conversation, title) => {
-        const child = runtime.snapshot.sessions.find(
-          (item) => item.conversationId === conversation,
-        );
+        const child = sessions().find((item) => item.conversationId === conversation);
         if (child && runtime.client.renameSession) {
           await runtime.client.renameSession(child.id, title);
         } else {
-          await client.editConversation(conversation, { title: title.trim() });
+          await props.client.editConversation(conversation, { title: title.trim() });
         }
       }}
       onHide={
         runtime.client.hideSession
           ? async (id) => {
-              if (id === sessionId && !(await confirmMutableComposerNavigation())) return;
+              if (id === sessionId() && !(await confirmMutableComposerNavigation())) return;
               await runtime.client.hideSession!(id);
-              if (id === sessionId) {
+              if (id === sessionId()) {
                 setSessionId("");
                 goDirect("chat");
               }
             }
           : undefined
       }
-      runtimeStatus={runtime.snapshot.status}
-      activeView={location.view}
+      runtimeStatus={status()}
+      activeView={location().view}
       onNavigate={(view) => go(view)}
       onSettingsClick={() => go("settings")}
     />
-  );
+  ));
 
   return (
-    <JobDetailsContext.Provider value={setDetailJob}>
-      <ConversationErrorScope value={location.view === "chat" ? conversationKey : null}>
-        <div data-ocg-app-shell className="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
-          <aside
-            className={cn(
-              "hidden shrink-0 border-r border-sidebar-border bg-sidebar md:flex",
-              collapsed ? "w-16" : "w-72",
-            )}
-          >
-            {!mobile && sidebar}
-          </aside>
-          <Dialog open={mobile} onOpenChange={setMobile}>
-            <DialogContent
-              showCloseButton={false}
-              finalFocus={() => document.getElementById("workspace-navigation-trigger")}
-              className="inset-y-0 left-0 flex h-dvh w-72 max-w-[calc(100%-1.5rem)] translate-x-0 translate-y-0 flex-col gap-0 rounded-none bg-sidebar p-0 sm:max-w-72"
+    <WorkspaceNavigation value={navigateHref}>
+      <JobDetailsContext value={setDetailJob}>
+        <ConversationErrorScope
+          value={() => (location().view === "chat" ? conversationKey() : null)}
+        >
+          <div data-ocg-app-shell class="flex h-dvh min-h-0 w-full overflow-hidden bg-background">
+            <aside
+              class={cn(
+                "hidden shrink-0 border-r border-sidebar-border bg-sidebar md:flex",
+                collapsed() ? "w-16" : "w-72",
+              )}
             >
-              <DialogTitle className="sr-only">{t("nav.workspaceNavigation")}</DialogTitle>
-              {mobile && sidebar}
-            </DialogContent>
-          </Dialog>
-          <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-            <OcgTopbar
-              session={location.view === "chat" ? session : undefined}
-              activeView={location.view}
-              titleVisible={location.view === "chat" || !pageTitleInView}
-              onOpenMobileSidebar={() => setMobile(true)}
-              onHome={goHome}
-              inspectorToggle={
-                location.view === "chat" && inspectorAvailable && !inspectorOpen ? (
-                  <Button
-                    id="chat-inspector-toggle"
-                    type="button"
-                    variant="ghost"
-                    size="icon"
-                    className="size-11 shrink-0 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted"
-                    aria-label={t("topbar.expandInspector")}
-                    title={t("topbar.expandInspector")}
-                    aria-expanded={false}
-                    aria-controls="chat-inspector"
-                    onClick={() => setInspectorOpen(true)}
-                  >
-                    <PanelRight className="size-4" />
-                  </Button>
-                ) : undefined
-              }
-            />
-            {signOutError && (
-              <DismissibleNotice message={signOutError} className="px-5 text-sm text-destructive">
-                {signOutError}
-              </DismissibleNotice>
-            )}
-            <PageTitleVisibilityContext.Provider value={setPageTitleInView}>
-              <main
-                key={location.view}
-                className={cn(
-                  "flex min-h-0 flex-1 flex-col",
-                  location.view === "chat"
-                    ? "overflow-hidden"
-                    : "ocg-subtle-scrollbar overflow-y-auto overscroll-contain",
-                )}
+              {!mobile() && sidebar()}
+            </aside>
+            <Dialog open={mobile()} onOpenChange={setMobile}>
+              <DialogContent
+                showCloseButton={false}
+                finalFocus={() => document.getElementById("workspace-navigation-trigger")}
+                class="inset-y-0 left-0 flex h-dvh w-72 max-w-[calc(100%-1.5rem)] translate-x-0 translate-y-0 flex-col gap-0 rounded-none bg-sidebar p-0 sm:max-w-72"
               >
-                {location.view === "chat" ? (
-                  <>
-                    {opening ? (
-                      <p role="status" className="m-auto text-sm text-muted-foreground">
-                        {t("app.loadingConversation")}
-                      </p>
-                    ) : session ? (
-                      <div className="flex min-h-0 flex-1 flex-col">
-                        <ChatScreen
-                          key={session.id}
-                          onOpenConversation={(job) => void openNestedConversation(job)}
-                          onOpenPlanningDecision={(decisionId) => {
-                            setPlanningFocus({ sessionId: session.id, decisionId });
-                            setInspectorOpen(true);
-                          }}
-                          backButton={
-                            ancestors.length > 1 ? (
-                              <FloatingIconButton
-                                type="button"
-                                tooltip={t("chat.child.back")}
-                                aria-label={t("chat.child.back")}
-                                onClick={() => {
-                                  void confirmMutableComposerNavigation().then((allowed) => {
-                                    if (!allowed) return;
-                                    window.history.pushState(
-                                      null,
-                                      "",
-                                      conversationPath(ancestors.slice(0, -1)),
-                                    );
-                                    lastLocationUrl.current = window.location.href;
-                                    setSessionId("");
-                                    setLocation(currentLocation());
-                                  });
+                <DialogTitle class="sr-only">{i18n.t("nav.workspaceNavigation")}</DialogTitle>
+                {mobile() && sidebar()}
+              </DialogContent>
+            </Dialog>
+            <div class="relative flex min-h-0 min-w-0 flex-1 flex-col">
+              <OcgTopbar
+                session={location().view === "chat" ? session() : undefined}
+                activeView={location().view}
+                titleVisible={location().view === "chat" || !pageTitleInView()}
+                onOpenMobileSidebar={() => setMobile(true)}
+                onHome={goHome}
+                inspectorToggle={
+                  location().view === "chat" && inspectorAvailable() && !inspectorOpen() ? (
+                    <Button
+                      id="chat-inspector-toggle"
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      class="size-11 shrink-0 rounded-full bg-muted/80 shadow-sm backdrop-blur-sm hover:bg-muted"
+                      aria-label={i18n.t("topbar.expandInspector")}
+                      title={i18n.t("topbar.expandInspector")}
+                      aria-expanded="false"
+                      aria-controls="chat-inspector"
+                      onClick={() => setInspectorOpen(true)}
+                    >
+                      <PanelRight class="size-4" />
+                    </Button>
+                  ) : undefined
+                }
+              />
+              {props.signOutError && (
+                <DismissibleNotice
+                  message={props.signOutError}
+                  class="px-5 text-sm text-destructive"
+                >
+                  {props.signOutError}
+                </DismissibleNotice>
+              )}
+              <PageTitleVisibilityContext value={setPageTitleInView}>
+                <main
+                  class={cn(
+                    "flex min-h-0 flex-1 flex-col",
+                    location().view === "chat"
+                      ? "overflow-hidden"
+                      : "ocg-subtle-scrollbar overflow-y-auto overscroll-contain",
+                  )}
+                >
+                  <Loading fallback={<SurfaceLoading />}>
+                    {location().view === "chat" ? (
+                      <>
+                        {opening() ? (
+                          <p role="status" class="m-auto text-sm text-muted-foreground">
+                            {i18n.t("app.loadingConversation")}
+                          </p>
+                        ) : session() ? (
+                          <Show when={session()?.id} keyed>
+                            <div class="flex min-h-0 flex-1 flex-col">
+                              <ChatScreen
+                                onOpenConversation={(job) => void openNestedConversation(job)}
+                                onOpenPlanningDecision={(decisionId) => {
+                                  setPlanningFocus({ sessionId: session()!.id, decisionId });
+                                  setInspectorOpen(true);
                                 }}
-                              >
-                                <ArrowLeft />
-                              </FloatingIconButton>
-                            ) : undefined
-                          }
-                          session={session}
-                        />
-                      </div>
-                    ) : (
-                      <WorkspaceHome
-                        sessions={listedSessions}
-                        onSelect={selectSession}
-                        onNewChat={() => void newChat()}
-                        onNavigate={go}
+                                backButton={
+                                  ancestors().length > 1 ? (
+                                    <FloatingIconButton
+                                      type="button"
+                                      tooltip={i18n.t("chat.child.back")}
+                                      aria-label={i18n.t("chat.child.back")}
+                                      onClick={() => {
+                                        void confirmMutableComposerNavigation().then((allowed) => {
+                                          if (!allowed) return;
+                                          window.history.pushState(
+                                            null,
+                                            "",
+                                            conversationPath(ancestors().slice(0, -1)),
+                                          );
+                                          lastLocationUrl.current = window.location.href;
+                                          setSessionId("");
+                                          setLocation(currentLocation());
+                                        });
+                                      }}
+                                    >
+                                      <ArrowLeft />
+                                    </FloatingIconButton>
+                                  ) : undefined
+                                }
+                                session={session()!}
+                              />
+                            </div>
+                          </Show>
+                        ) : (
+                          <WorkspaceHome
+                            sessions={listedSessions()}
+                            onSelect={selectSession}
+                            onNewChat={() => void newChat()}
+                            onNavigate={go}
+                          />
+                        )}
+                      </>
+                    ) : null}
+                    {location().view === "jobs" && (
+                      <JobsSurface
+                        client={props.client}
+                        active
+                        job={detailJob()}
+                        onJob={setDetailJob}
+                        onOpenChat={(job) => {
+                          setSessionId("");
+                          go("chat", job);
+                        }}
                       />
                     )}
-                  </>
-                ) : null}
-                {location.view === "jobs" && (
-                  <JobsSurface
-                    client={client}
-                    active
-                    job={detailJob}
-                    onJob={setDetailJob}
-                    onOpenChat={(job) => {
-                      setSessionId("");
-                      go("chat", job);
-                    }}
-                  />
-                )}
-                {(location.view === "usage" || location.view === "health") && (
-                  <ObservationsSurface
-                    key={location.view}
-                    client={client}
-                    kind={location.view}
-                    health={health}
-                    onJob={setDetailJob}
-                  />
-                )}
-                {location.view === "logs" && <LogsSurface client={client} />}
-                {location.view === "settings" && (
-                  <SettingsSurface
-                    client={client}
-                    sessionExpiresAtUs={sessionExpiresAtUs}
-                    signingOut={signingOut}
-                    onSignOut={onSignOut}
-                    section={location.settingsSection}
-                    onNavigate={goSettings}
-                  />
-                )}
-              </main>
-            </PageTitleVisibilityContext.Provider>
+                    {(location().view === "usage" || location().view === "health") && (
+                      <ObservationsSurface
+                        client={props.client}
+                        kind={location().view === "health" ? "health" : "usage"}
+                        health={props.health}
+                        onJob={setDetailJob}
+                      />
+                    )}
+                    {location().view === "logs" && <LogsSurface client={props.client} />}
+                    {location().view === "settings" && (
+                      <SettingsSurface
+                        client={props.client}
+                        sessionExpiresAtUs={props.sessionExpiresAtUs}
+                        signingOut={props.signingOut}
+                        onSignOut={props.onSignOut}
+                        section={location().settingsSection}
+                        onNavigate={goSettings}
+                      />
+                    )}
+                  </Loading>
+                </main>
+              </PageTitleVisibilityContext>
+            </div>
+            {location().view === "chat" && inspectorAvailable() && inspectorOpen() && (
+              <Loading fallback={<SurfaceLoading />}>
+                <ChatInspector
+                  session={session()}
+                  messages={inspectorMessages() ?? []}
+                  planningFocus={
+                    planningFocus()?.sessionId === session()?.id ? planningFocus() : undefined
+                  }
+                  onClose={closeInspector}
+                  onOpenJob={setDetailJob}
+                />
+              </Loading>
+            )}
           </div>
-          {location.view === "chat" && inspectorAvailable && inspectorOpen && (
-            <ChatInspector
-              session={session}
-              messages={session ? (runtime.snapshot.messagesBySession[session.id] ?? []) : []}
-              planningFocus={planningFocus?.sessionId === session?.id ? planningFocus : undefined}
-              onClose={closeInspector}
-              onOpenJob={setDetailJob}
-            />
-          )}
-        </div>
-        <JobDetailsDialog
-          client={client}
-          job={detailJob}
-          onJob={(job) => {
-            if (job === null) closeJobDetails();
-            else setDetailJob(job);
-          }}
-          onOpenChat={(job) => {
-            void confirmMutableComposerNavigation().then((allowed) => {
-              if (!allowed) return;
-              setDetailJob(null);
-              setSessionId("");
-              goDirect("chat", job);
-            });
-          }}
-        />
-      </ConversationErrorScope>
-    </JobDetailsContext.Provider>
+          <JobDetailsDialog
+            client={props.client}
+            job={detailJob()}
+            onJob={(job) => {
+              if (job === null) closeJobDetails();
+              else setDetailJob(job);
+            }}
+            onOpenChat={(job) => {
+              void confirmMutableComposerNavigation().then((allowed) => {
+                if (!allowed) return;
+                setDetailJob(null);
+                setSessionId("");
+                goDirect("chat", job);
+              });
+            }}
+          />
+        </ConversationErrorScope>
+      </JobDetailsContext>
+    </WorkspaceNavigation>
   );
 }

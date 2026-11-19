@@ -1,14 +1,13 @@
-"use client";
-
-import { ChevronsUpDown, LogOut, SlidersHorizontal, User } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import { ChevronsUpDown, LogOut, SlidersHorizontal, User } from "@lucide/solid";
+import { createMemo } from "solid-js";
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
 
 export type AccountMenuProps = {
@@ -20,73 +19,65 @@ export type AccountMenuProps = {
   onOpenChange?: (open: boolean) => void;
 };
 
-export function AccountMenu({
-  email,
-  onLogout,
-  onSettingsClick,
-  variant = "expanded",
-  open,
-  onOpenChange,
-}: AccountMenuProps) {
-  const { t } = useI18n();
-  const label = email ?? t("sidebar.localAccount");
-  const rail = variant === "rail";
+export function AccountMenu(props: AccountMenuProps) {
+  const i18n = useI18n();
+  const label = createMemo(() => props.email ?? i18n.t("sidebar.localAccount"));
+  const rail = createMemo(
+    () => (props.variant === undefined ? "expanded" : props.variant) === "rail",
+  );
 
   return (
-    <DropdownMenu open={open} onOpenChange={onOpenChange}>
+    <DropdownMenu open={props.open} onOpenChange={props.onOpenChange}>
       <DropdownMenuTrigger asChild>
-        {rail ? (
+        {rail() ? (
           <button
             type="button"
-            aria-label={t("sidebar.account")}
-            title={label}
-            className="flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+            aria-label={i18n.t("sidebar.account")}
+            title={label()}
+            class="flex size-9 items-center justify-center rounded-md border border-transparent text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
           >
-            <User className="size-4" aria-hidden="true" />
+            <User class="size-4" aria-hidden="true" />
           </button>
         ) : (
           <button
             type="button"
-            aria-label={t("sidebar.account")}
-            title={label}
-            className="flex w-full min-w-0 items-center gap-3 rounded-lg px-2 py-1.5 text-left outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring/50"
+            aria-label={i18n.t("sidebar.account")}
+            title={label()}
+            class="flex w-full min-w-0 items-center gap-3 rounded-lg px-2 py-1.5 text-left outline-none transition-colors hover:bg-sidebar-accent focus-visible:ring-2 focus-visible:ring-ring/50"
           >
-            <span className="grid size-8 shrink-0 place-items-center rounded-lg border border-sidebar-border bg-card">
-              <User className="size-4 text-muted-foreground" aria-hidden="true" />
+            <span class="grid size-8 shrink-0 place-items-center rounded-lg border border-sidebar-border bg-card">
+              <User class="size-4 text-muted-foreground" aria-hidden="true" />
             </span>
             <span
-              className={cn(
+              class={cn(
                 "min-w-0 flex-1 truncate font-medium text-sidebar-foreground",
                 TYPOGRAPHY_SCALE.body_sm,
               )}
             >
-              {label}
+              {label()}
             </span>
-            <ChevronsUpDown
-              className="size-3.5 shrink-0 text-muted-foreground"
-              aria-hidden="true"
-            />
+            <ChevronsUpDown class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
           </button>
         )}
       </DropdownMenuTrigger>
       <DropdownMenuContent
         align="start"
-        className={
-          rail
+        class={
+          rail()
             ? "fixed top-auto right-auto bottom-3 left-18 mt-0 w-64"
             : "top-auto right-0 bottom-full left-0 mb-1 mt-0"
         }
       >
-        {onLogout && (
-          <DropdownMenuItem className="gap-2" onSelect={onLogout}>
-            <LogOut className="size-3.5 shrink-0" aria-hidden="true" />
-            {t("sidebar.logout")}
+        {props.onLogout && (
+          <DropdownMenuItem class="gap-2" onSelect={props.onLogout}>
+            <LogOut class="size-3.5 shrink-0" aria-hidden="true" />
+            {i18n.t("sidebar.logout")}
           </DropdownMenuItem>
         )}
-        {onSettingsClick && (
-          <DropdownMenuItem className="gap-2" onSelect={onSettingsClick}>
-            <SlidersHorizontal className="size-3.5 shrink-0" aria-hidden="true" />
-            {t("sidebar.openSettings")}
+        {props.onSettingsClick && (
+          <DropdownMenuItem class="gap-2" onSelect={props.onSettingsClick}>
+            <SlidersHorizontal class="size-3.5 shrink-0" aria-hidden="true" />
+            {i18n.t("sidebar.openSettings")}
           </DropdownMenuItem>
         )}
       </DropdownMenuContent>

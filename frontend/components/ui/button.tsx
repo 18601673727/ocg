@@ -1,6 +1,7 @@
-import { Button as ButtonPrimitive } from "@base-ui/react/button";
+import type { JSX } from "@solidjs/web";
 import { cva, type VariantProps } from "class-variance-authority";
 import { cn } from "cn";
+import { splitProps } from "@/lib/ui-state";
 
 const buttonVariants = cva(
   "group/button inline-flex shrink-0 items-center justify-center rounded-md border border-transparent bg-clip-padding text-sm font-medium whitespace-nowrap transition-colors outline-none select-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/55 active:not-aria-[haspopup]:translate-y-px disabled:pointer-events-none disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-2 aria-invalid:ring-destructive/20 dark:aria-invalid:border-destructive/50 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-3.5",
@@ -39,17 +40,16 @@ const buttonVariants = cva(
   },
 );
 
-function Button({
-  className,
-  variant = "default",
-  size = "default",
-  ...props
-}: ButtonPrimitive.Props & VariantProps<typeof buttonVariants>) {
+function Button(
+  props: JSX.ButtonHTMLAttributes<HTMLButtonElement> & VariantProps<typeof buttonVariants>,
+) {
+  const [local, rest] = splitProps(props, ["class", "variant", "size", "type"]);
   return (
-    <ButtonPrimitive
+    <button
+      type={local.type ?? "button"}
       data-slot="button"
-      className={cn(buttonVariants({ variant, size, className }))}
-      {...props}
+      class={cn(buttonVariants({ variant: local.variant, size: local.size, class: local.class }))}
+      {...rest}
     />
   );
 }

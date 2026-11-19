@@ -1,5 +1,10 @@
 allowBuilds:
   esbuild: true
   fsevents: true
-  sharp: false
-  unrs-resolver: false
+minimumReleaseAgeExclude:
+  - "@rsbuild/plugin-solid@2.1.0"
+  - "@solidjs/signals@2.0.2"
+  - "@solidjs/web@2.0.2"
+  - solid-js@2.0.2
+  - solid-loader@0.1.1
+  - "@lucide/solid@1.76.0"

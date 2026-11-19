@@ -1339,6 +1339,8 @@ export const en = {
 } as const;
 
 export type I18nKey = keyof typeof en;
+export type TranslateVars = Record<string, string | number>;
+export type TranslateFn = (key: I18nKey, vars?: TranslateVars) => string;
 
 export type Dictionary = Record<I18nKey, string>;
 
@@ -2611,7 +2613,7 @@ export const dictionaries: Record<Locale, Dictionary> = {
   "zh-CN": zh,
 };
 
-export function formatTemplate(template: string, vars?: Record<string, string | number>): string {
+export function formatTemplate(template: string, vars?: TranslateVars): string {
   if (!vars) return template;
   return template.replace(/\{(\w+)\}/g, (match, name: string) => {
     const value = vars[name];

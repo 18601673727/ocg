@@ -1,49 +1,47 @@
-import type { ComponentProps, ReactNode } from "react";
 import { Input } from "@/components/ui/input";
+import { type ElementProps, splitProps, type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
 import type { LlmProfile } from "../contracts";
-import { ApiError } from "../runtime/api-client";
 import type { I18nKey, TranslateFn } from "../i18n";
+import { ApiError } from "../runtime/api-client";
 
-export function ApiKeyInput({ className, ...props }: Omit<ComponentProps<"input">, "type">) {
+export function ApiKeyInput(viewProps: Omit<ElementProps<"input">, "type">) {
+  const [, props] = splitProps(viewProps, ["class"]);
+
   return (
     <Input
       {...props}
       type="text"
-      className={cn("[&:not(:placeholder-shown)]:[-webkit-text-security:disc]", className)}
-      autoComplete="off"
-      autoCapitalize="none"
-      autoCorrect="off"
-      spellCheck={false}
+      class={cn("[&:not(:placeholder-shown)]:[-webkit-text-security:disc]", viewProps.class)}
+      autocomplete="off"
+      autocapitalize="none"
+      autocorrect="off"
+      spellcheck="false"
     />
   );
 }
 
-export function Section({
-  id,
-  title,
-  description,
-  action,
-  children,
-}: {
+export function Section(props: {
   id: string;
   title: string;
   description: string;
-  action?: ReactNode;
-  children: ReactNode;
+  action?: View;
+  children: View;
 }) {
   return (
-    <section aria-labelledby={id} className="rounded-xl border border-border bg-card p-4 sm:p-6">
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
-        <div className="min-w-0 flex-[1_1_15rem]">
-          <h2 id={id} className="text-lg font-semibold tracking-tight">
-            {title}
+    <section aria-labelledby={props.id} class="rounded-xl border border-border bg-card p-4 sm:p-6">
+      <div class="flex flex-wrap items-start justify-between gap-3 border-b border-border pb-4">
+        <div class="min-w-0 flex-[1_1_15rem]">
+          <h2 id={props.id} class="text-lg font-semibold tracking-tight">
+            {props.title}
           </h2>
-          <p className="mt-1 max-w-prose text-sm leading-6 text-muted-foreground">{description}</p>
+          <p class="mt-1 max-w-prose text-sm leading-6 text-muted-foreground">
+            {props.description}
+          </p>
         </div>
-        {action}
+        {props.action}
       </div>
-      <div className="space-y-4 pt-4">{children}</div>
+      <div class="space-y-4 pt-4">{props.children}</div>
     </section>
   );
 }

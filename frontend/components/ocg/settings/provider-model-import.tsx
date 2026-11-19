@@ -1,9 +1,6 @@
-"use client";
-
-import { useEffect, useMemo, useState } from "react";
-import { RefreshCw, Trash2 } from "lucide-react";
+import { RefreshCw, Trash2 } from "@lucide/solid";
+import { createEffect, createMemo, createSignal } from "solid-js";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import {
   Dialog,
   DialogContent,
@@ -12,159 +9,171 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import { Input } from "@/components/ui/input";
+import { ariaState } from "@/lib/ui-state";
 import type { ProfilesSnapshot } from "../contracts";
 import type { ProviderModel } from "../contracts/api";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
-import { ProtocolSelect, type LlmProtocol } from "./protocol-select";
-import { ApiKeyInput, describeError } from "./settings-parts";
+import type { ApiClient } from "../runtime/api-client";
+import { draftsToInputs, type HeaderDraft, type HeaderDraftError } from "./header-drafts";
 import { HeadersEditor } from "./headers-editor";
-import { type HeaderDraft, type HeaderDraftError, draftsToInputs } from "./header-drafts";
+import { type LlmProtocol, ProtocolSelect } from "./protocol-select";
+import { ApiKeyInput, describeError } from "./settings-parts";
 
 function sourceName(name: string) {
   return name.replace(/\s+provider\s*$/i, "");
 }
 
-export function ProviderModelImport({
-  client,
-  snapshot,
-  onImported,
-}: {
+export function ProviderModelImport(props: {
   client: ApiClient;
   snapshot: ProfilesSnapshot | null;
   onImported: (message: string) => void;
 }) {
-  return <ImportContent client={client} snapshot={snapshot} onImported={onImported} />;
+  return (
+    <ImportContent client={props.client} snapshot={props.snapshot} onImported={props.onImported} />
+  );
 }
 
-function ImportContent({
-  client,
-  snapshot,
-  onImported,
-}: {
+function ImportContent(props: {
   client: ApiClient;
   snapshot: ProfilesSnapshot | null;
   onImported: (message: string) => void;
 }) {
-  const { t } = useI18n();
-  const providers = snapshot?.providers ?? [];
-  const [sourceChoice, setSourceChoice] = useState<string>();
-  const sourceId = sourceChoice ?? providers[0]?.id ?? "new";
-  const [newName, setNewName] = useState("");
-  const [newProtocol, setNewProtocol] = useState<LlmProtocol>("openai_chat_completions");
-  const [newEndpoint, setNewEndpoint] = useState("");
-  const [newSecret, setNewSecret] = useState("");
-  const [newHeaders, setNewHeaders] = useState<HeaderDraft[]>([]);
-  const newHeaderRequest = draftsToInputs(newHeaders);
-  const newHeaderError: HeaderDraftError | undefined =
-    "error" in newHeaderRequest ? newHeaderRequest.error : undefined;
-  const newHeaderInputs = "inputs" in newHeaderRequest ? newHeaderRequest.inputs : [];
-  const [newReference] = useState(
-    () => `OCG_IMPORT_${crypto.randomUUID().replaceAll("-", "").toUpperCase()}_API_KEY`,
+  const i18n = useI18n();
+  const providers = createMemo(() => props.snapshot?.providers ?? []);
+  const [sourceChoice, setSourceChoice] = createSignal<string>();
+  const sourceId = createMemo(() => sourceChoice() ?? providers()[0]?.id ?? "new");
+  const [newName, setNewName] = createSignal("");
+  const [newProtocol, setNewProtocol] = createSignal<LlmProtocol>("openai_chat_completions");
+  const [newEndpoint, setNewEndpoint] = createSignal("");
+  const [newSecret, setNewSecret] = createSignal("");
+  const [newHeaders, setNewHeaders] = createSignal<HeaderDraft[]>([]);
+  const newHeaderRequest = createMemo(() => draftsToInputs(newHeaders()));
+  const newHeaderError = createMemo<HeaderDraftError | undefined>(() => {
+    const request = newHeaderRequest();
+    return "error" in request ? request.error : undefined;
+  });
+  const newHeaderInputs = createMemo(() => {
+    const request = newHeaderRequest();
+    return "inputs" in request ? request.inputs : [];
+  });
+  const [newReference] = createSignal(
+    (() => `OCG_IMPORT_${crypto.randomUUID().replaceAll("-", "").toUpperCase()}_API_KEY`)(),
   );
-  const newConnection =
-    sourceId === "new" && newName.trim() && newEndpoint.trim() && !newHeaderError
+  const newConnection = createMemo(() =>
+    sourceId() === "new" && newName().trim() && newEndpoint().trim() && !newHeaderError!()
       ? {
-          protocol: newProtocol,
-          name: newName.trim(),
-          endpoint: newEndpoint.trim(),
-          ...(newSecret.trim()
-            ? { credential: newSecret.trim(), credential_ref: newReference }
+          protocol: newProtocol(),
+          name: newName().trim(),
+          endpoint: newEndpoint().trim(),
+          ...(newSecret().trim()
+            ? { credential: newSecret().trim(), credential_ref: newReference() }
             : {}),
-          ...(newHeaderInputs.length > 0 ? { headers: newHeaderInputs } : {}),
+          ...(newHeaderInputs().length > 0 ? { headers: newHeaderInputs() } : {}),
         }
-      : null;
-  const provider = providers.find((entry) => entry.id === sourceId);
-  const [models, setModels] = useState<ProviderModel[]>([]);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [query, setQuery] = useState("");
-  const [revision, setRevision] = useState(0);
-  const [loading, setLoading] = useState(Boolean(provider?.endpoint));
-  const [saving, setSaving] = useState(false);
-  const [removing, setRemoving] = useState<ProfilesSnapshot["providers"][number] | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [removeError, setRemoveError] = useState<string | null>(null);
-  const [result, setResult] = useState<string | null>(null);
-  const endpoint = sourceId === "new" ? newConnection?.endpoint : provider?.endpoint;
-  const protocol = sourceId === "new" ? newConnection?.protocol : provider?.protocol;
-  const credentialRef = sourceId === "new" ? undefined : provider?.credential_ref;
-  const credential = sourceId === "new" ? newConnection?.credential : undefined;
-  const headers = sourceId === "new" ? newConnection?.headers : undefined;
-  const savedProfile = sourceId === "new" ? undefined : provider?.profile_ids[0];
-  const headersKey = JSON.stringify(headers ?? null);
-  const canDiscover = sourceId !== "new" || newConnection !== null;
-  useEffect(() => {
-    if (!endpoint || !canDiscover) return;
-    const controller = new AbortController();
-    let active = true;
-    const timer = setTimeout(
-      () => {
-        setLoading(true);
-        void client
-          .discoverProviderModels(
-            {
-              endpoint,
-              protocol,
-              credential_ref: credentialRef,
-              credential,
-              ...(headers ? { headers } : {}),
-              ...(savedProfile ? { profile_id: savedProfile } : {}),
-            },
-            controller.signal,
-          )
-          .then((answer) => {
-            if (active)
-              setModels(
-                [...new Map(answer.models.map((model) => [model.id, model])).values()].sort(
-                  (a, b) => a.id.localeCompare(b.id),
-                ),
-              );
-          })
-          .catch((reason) => {
-            if (active) setError(describeError(reason, t));
-          })
-          .finally(() => {
-            if (active) setLoading(false);
-          });
-      },
-      sourceId === "new" ? 500 : 0,
-    );
-    return () => {
-      active = false;
-      clearTimeout(timer);
-      controller.abort();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    canDiscover,
-    client,
-    credential,
-    credentialRef,
-    endpoint,
-    headersKey,
-    protocol,
-    revision,
-    savedProfile,
-    sourceId,
-    t,
-  ]);
-  const existing = new Set(provider?.models ?? []);
-  const importable = models.filter((model) => !existing.has(model.id));
-  const matching = useMemo(
-    () =>
-      models.filter((model) =>
-        model.id.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()),
-      ),
-    [models, query],
+      : null,
+  );
+  const provider = createMemo(() => providers().find((entry) => entry.id === sourceId()));
+  const [models, setModels] = createSignal<ProviderModel[]>([]);
+  const [selected, setSelected] = createSignal<Set<string>>(new Set());
+  const [query, setQuery] = createSignal("");
+  const [revision, setRevision] = createSignal(0);
+  const [loading, setLoading] = createSignal(Boolean(provider()?.endpoint));
+  const [saving, setSaving] = createSignal(false);
+  const [removing, setRemoving] = createSignal<ProfilesSnapshot["providers"][number] | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [removeError, setRemoveError] = createSignal<string | null>(null);
+  const [result, setResult] = createSignal<string | null>(null);
+  const endpoint = createMemo(() =>
+    sourceId() === "new" ? newConnection()?.endpoint : provider()?.endpoint,
+  );
+  const protocol = createMemo(() =>
+    sourceId() === "new" ? newConnection()?.protocol : provider()?.protocol,
+  );
+  const credentialRef = createMemo(() =>
+    sourceId() === "new" ? undefined : provider()?.credential_ref,
+  );
+  const credential = createMemo(() =>
+    sourceId() === "new" ? newConnection()?.credential : undefined,
+  );
+  const headers = createMemo(() => (sourceId() === "new" ? newConnection()?.headers : undefined));
+  const savedProfile = createMemo(() =>
+    sourceId() === "new" ? undefined : provider()?.profile_ids[0],
+  );
+  const headersKey = createMemo(() => JSON.stringify(headers() ?? null));
+  const canDiscover = createMemo(() => sourceId() !== "new" || newConnection() !== null);
+  createEffect(
+    () => [
+      canDiscover(),
+      props.client,
+      credential(),
+      credentialRef(),
+      endpoint(),
+      headersKey(),
+      protocol(),
+      revision(),
+      savedProfile(),
+      sourceId(),
+      i18n.t,
+    ],
+    () => {
+      if (!endpoint() || !canDiscover()) return;
+      const controller = new AbortController();
+      let active = true;
+      const timer = setTimeout(
+        () => {
+          setLoading(true);
+          void props.client
+            .discoverProviderModels(
+              {
+                endpoint: endpoint()!,
+                protocol: protocol(),
+                credential_ref: credentialRef(),
+                credential: credential(),
+                ...(headers() ? { headers: headers() } : {}),
+                ...(savedProfile() ? { profile_id: savedProfile() } : {}),
+              },
+              controller.signal,
+            )
+            .then((answer) => {
+              if (active)
+                setModels(
+                  [...new Map(answer.models.map((model) => [model.id, model])).values()].sort(
+                    (a, b) => a.id.localeCompare(b.id),
+                  ),
+                );
+            })
+            .catch((reason) => {
+              if (active) setError(describeError(reason, i18n.t));
+            })
+            .finally(() => {
+              if (active) setLoading(false);
+            });
+        },
+        sourceId() === "new" ? 500 : 0,
+      );
+      return () => {
+        active = false;
+        clearTimeout(timer);
+        controller.abort();
+      };
+    },
+  );
+  const existing = new Set(provider()?.models ?? []);
+  const importable = createMemo(() => models().filter((model) => !existing.has(model.id)));
+  const matching = createMemo(() =>
+    models().filter((model) =>
+      model.id.toLocaleLowerCase().includes(query().trim().toLocaleLowerCase()),
+    ),
   );
   function selectSource(id: string) {
     setSourceChoice(id);
     setModels([]);
-    setSelected(new Set());
+    setSelected(new Set<string>());
     setQuery("");
     setError(null);
     setResult(null);
-    setLoading(Boolean(providers.find((entry) => entry.id === id)?.endpoint));
+    setLoading(Boolean(providers().find((entry) => entry.id === id)?.endpoint));
     setRevision((value) => value + 1);
   }
   function refreshSource(id: string) {
@@ -173,30 +182,30 @@ function ImportContent({
   function changeNewConnection(update: () => void) {
     update();
     setModels([]);
-    setSelected(new Set());
+    setSelected(new Set<string>());
     setLoading(false);
     setError(null);
     setResult(null);
   }
   async function save() {
-    const source = sourceId === "new" ? newConnection : provider?.profile_ids[0];
+    const source = sourceId() === "new" ? newConnection() : provider()?.profile_ids[0];
     if (!source) return;
     setSaving(true);
     setError(null);
     try {
-      const answer = await client.importModels(
+      const answer = await props.client.importModels(
         source,
-        importable.filter((model) => selected.has(model.id)),
+        importable().filter((model) => selected().has(model.id)),
         ["chat"],
       );
-      const message = t("settings.llm.imported", {
+      const message = i18n.t("settings.llm.imported", {
         created: answer.created,
         existing: answer.existing,
       });
       setResult(message);
-      setSelected(new Set());
-      onImported(message);
-      if (sourceId === "new") {
+      setSelected(new Set<string>());
+      props.onImported(message);
+      if (sourceId() === "new") {
         setNewName("");
         setNewEndpoint("");
         setNewSecret("");
@@ -204,100 +213,100 @@ function ImportContent({
         setModels([]);
       }
     } catch (reason) {
-      setError(describeError(reason, t));
+      setError(describeError(reason, i18n.t));
     } finally {
       setSaving(false);
     }
   }
   return (
-    <div className="flex h-[70dvh] min-h-[32rem] flex-col gap-6">
+    <div class="flex h-[70dvh] min-h-[32rem] flex-col gap-6">
       <Dialog
-        open={removing !== null}
+        open={removing() !== null}
         onOpenChange={(open) => {
-          if (!open && !saving) setRemoving(null);
+          if (!open && !saving()) setRemoving(null);
         }}
       >
-        <DialogContent showCloseButton={!saving}>
+        <DialogContent showCloseButton={!saving()}>
           <DialogHeader>
-            <DialogTitle>{t("settings.llm.removeSourceTitle")}</DialogTitle>
+            <DialogTitle>{i18n.t("settings.llm.removeSourceTitle")}</DialogTitle>
             <DialogDescription>
-              {t("settings.llm.removeSourceDescription", {
-                name: removing ? sourceName(removing.name) : "",
+              {i18n.t("settings.llm.removeSourceDescription", {
+                name: removing() ? sourceName(removing()!.name) : "",
               })}
             </DialogDescription>
           </DialogHeader>
-          {removeError && (
-            <p role="alert" className="text-sm text-destructive">
-              {removeError}
+          {removeError() && (
+            <p role="alert" class="text-sm text-destructive">
+              {removeError()}
             </p>
           )}
           <DialogFooter>
-            <Button variant="outline" disabled={saving} onClick={() => setRemoving(null)}>
-              {t("common.cancel")}
+            <Button variant="outline" disabled={saving()} onClick={() => setRemoving(null)}>
+              {i18n.t("common.cancel")}
             </Button>
             <Button
               variant="destructive"
-              disabled={saving}
+              disabled={saving()}
               onClick={() => {
-                if (!removing) return;
+                if (!removing()) return;
                 setSaving(true);
                 setRemoveError(null);
-                void client
-                  .removeProvider(removing.id)
+                void props.client
+                  .removeProvider(removing()!.id)
                   .then(() => {
-                    if (sourceId === removing.id) selectSource("new");
+                    if (sourceId() === removing()!.id) selectSource("new");
                     setRemoving(null);
-                    onImported(t("settings.llm.sourceRemoved"));
+                    props.onImported(i18n.t("settings.llm.sourceRemoved"));
                   })
-                  .catch((reason) => setRemoveError(describeError(reason, t)))
+                  .catch((reason) => setRemoveError(describeError(reason, i18n.t)))
                   .finally(() => setSaving(false));
               }}
             >
-              {saving ? t("settings.saving") : t("common.remove")}
+              {saving() ? i18n.t("settings.saving") : i18n.t("common.remove")}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      <div className="grid min-h-0 flex-1 grid-cols-[14rem_minmax(0,1fr)] gap-5 overflow-hidden">
+      <div class="grid min-h-0 flex-1 grid-cols-[14rem_minmax(0,1fr)] gap-5 overflow-hidden">
         <div
           role="group"
-          aria-label={t("settings.llm.provider")}
-          className="ocg-subtle-scrollbar flex min-h-0 min-w-0 flex-col gap-2 overflow-y-auto overscroll-contain border-r border-border pr-4"
+          aria-label={i18n.t("settings.llm.provider")}
+          class="ocg-subtle-scrollbar flex min-h-0 min-w-0 flex-col gap-2 overflow-y-auto overscroll-contain border-r border-border pr-4"
         >
-          {providers.map((entry) => {
+          {providers().map((entry) => {
             const id = entry.id;
-            const refreshing = sourceId === id && loading;
+            const refreshing = sourceId() === id && loading();
             return (
-              <div key={id} className="flex min-w-0 items-center gap-1">
+              <div class="flex min-w-0 items-center gap-1">
                 <Button
-                  variant={entry === provider ? "selected" : "outline"}
+                  variant={entry === provider() ? "selected" : "outline"}
                   size="sm"
-                  aria-pressed={entry === provider}
-                  disabled={saving}
-                  className="h-auto min-h-9 min-w-0 flex-1 justify-start py-2 whitespace-normal text-left"
+                  aria-pressed={ariaState(entry === provider())}
+                  disabled={saving()}
+                  class="h-auto min-h-9 min-w-0 flex-1 justify-start py-2 whitespace-normal text-left"
                   onClick={() => {
                     setNewSecret("");
                     selectSource(id);
                   }}
                 >
-                  <span className="min-w-0 break-words">{sourceName(entry.name)}</span>
+                  <span class="min-w-0 break-words">{sourceName(entry.name)}</span>
                 </Button>
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  aria-label={t("settings.llm.fetchModels")}
-                  title={t("settings.llm.fetchModels")}
-                  disabled={saving || refreshing || !entry.endpoint}
+                  aria-label={i18n.t("settings.llm.fetchModels")}
+                  title={i18n.t("settings.llm.fetchModels")}
+                  disabled={saving() || refreshing || !entry.endpoint}
                   onClick={() => refreshSource(id)}
                 >
-                  <RefreshCw className={refreshing ? "animate-spin" : undefined} />
+                  <RefreshCw class={refreshing ? "animate-spin" : undefined} />
                 </Button>
                 <Button
                   variant="ghost"
                   size="icon-xs"
-                  aria-label={t("settings.llm.removeSource")}
-                  title={t("settings.llm.removeSource")}
-                  disabled={saving}
+                  aria-label={i18n.t("settings.llm.removeSource")}
+                  title={i18n.t("settings.llm.removeSource")}
+                  disabled={saving()}
                   onClick={() => {
                     setRemoveError(null);
                     setRemoving(entry);
@@ -309,122 +318,117 @@ function ImportContent({
             );
           })}
           <Button
-            variant={sourceId === "new" ? "selected" : "outline"}
+            variant={sourceId() === "new" ? "selected" : "outline"}
             size="sm"
-            aria-pressed={sourceId === "new"}
-            disabled={saving}
+            aria-pressed={ariaState(sourceId() === "new")}
+            disabled={saving()}
             onClick={() => selectSource("new")}
           >
-            {t("settings.llm.newProvider")}
+            {i18n.t("settings.llm.newProvider")}
           </Button>
         </div>
-        <div className="flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden">
-          {sourceId === "new" && (
-            <div className="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-2">
+        <div class="flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden">
+          {sourceId() === "new" && (
+            <div class="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-2">
               <ProtocolSelect
-                value={newProtocol}
-                disabled={saving}
+                value={newProtocol()}
+                disabled={saving()}
                 onChange={(value) => changeNewConnection(() => setNewProtocol(value))}
               />
-              <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                {t("settings.llm.provider")}
+              <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                {i18n.t("settings.llm.provider")}
                 <Input
-                  value={newName}
-                  disabled={saving}
-                  onChange={(event) => changeNewConnection(() => setNewName(event.target.value))}
+                  value={newName()}
+                  disabled={saving()}
+                  onInput={(event) => changeNewConnection(() => setNewName(event.target.value))}
                   placeholder="Provider"
-                  autoComplete="off"
+                  autocomplete="off"
                 />
               </label>
-              <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                {t("settings.llm.importEndpoint")}
+              <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                {i18n.t("settings.llm.importEndpoint")}
                 <Input
-                  value={newEndpoint}
-                  disabled={saving}
-                  onChange={(event) =>
-                    changeNewConnection(() => setNewEndpoint(event.target.value))
-                  }
+                  value={newEndpoint()}
+                  disabled={saving()}
+                  onInput={(event) => changeNewConnection(() => setNewEndpoint(event.target.value))}
                   placeholder="https://api.example.com/v1"
-                  spellCheck={false}
-                  autoComplete="off"
+                  spellcheck="false"
+                  autocomplete="off"
                 />
               </label>
-              <label className="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                {t("settings.llm.apiKey")}
+              <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                {i18n.t("settings.llm.apiKey")}
                 <ApiKeyInput
-                  value={newSecret}
-                  disabled={saving}
+                  value={newSecret()}
+                  disabled={saving()}
                   onChange={(event) => changeNewConnection(() => setNewSecret(event.target.value))}
                 />
               </label>
-              <div className="sm:col-span-2">
+              <div class="sm:col-span-2">
                 <HeadersEditor
-                  legend={t("headers.title")}
-                  hint={t("headers.connectionHint")}
-                  value={newHeaders}
+                  legend={i18n.t("headers.title")}
+                  hint={i18n.t("headers.connectionHint")}
+                  value={newHeaders()}
                   onChange={(next) => changeNewConnection(() => setNewHeaders(next))}
-                  disabled={saving}
+                  disabled={saving()}
                   allowSecret
-                  error={newHeaderError}
+                  error={newHeaderError!()}
                 />
               </div>
             </div>
           )}
-          {sourceId !== "new" && provider && !provider.endpoint ? (
-            <p className="text-sm text-muted-foreground">
-              {t("settings.llm.discoveryEndpointRequired")}
+          {sourceId() !== "new" && provider() && !provider()!.endpoint ? (
+            <p class="text-sm text-muted-foreground">
+              {i18n.t("settings.llm.discoveryEndpointRequired")}
             </p>
           ) : null}
           <Input
-            aria-label={t("settings.llm.searchModels")}
-            placeholder={t("settings.llm.searchModels")}
-            value={query}
-            disabled={saving}
-            onChange={(event) => setQuery(event.target.value)}
+            aria-label={i18n.t("settings.llm.searchModels")}
+            placeholder={i18n.t("settings.llm.searchModels")}
+            value={query()}
+            disabled={saving()}
+            onInput={(event) => setQuery(event.target.value)}
           />
-          <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <div class="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
             <Button
               variant="ghost"
               size="xs"
-              disabled={saving || !selected.size}
-              onClick={() => setSelected(new Set())}
+              disabled={saving() || !selected().size}
+              onClick={() => setSelected(new Set<string>())}
             >
-              {t("settings.llm.clearSelection")}
+              {i18n.t("settings.llm.clearSelection")}
             </Button>
             <Button
-              className="ml-auto"
-              disabled={saving || loading || !selected.size}
+              class="ml-auto"
+              disabled={saving() || loading() || !selected().size}
               onClick={() => void save()}
             >
-              {saving
-                ? t("settings.llm.importing")
-                : t("settings.llm.importSelected", {
-                    selected: selected.size,
-                    total: importable.length,
+              {saving()
+                ? i18n.t("settings.llm.importing")
+                : i18n.t("settings.llm.importSelected", {
+                    selected: selected().size,
+                    total: importable().length,
                   })}
             </Button>
           </div>
           <div
-            aria-busy={loading}
-            className="ocg-subtle-scrollbar min-h-24 min-w-0 flex-1 overflow-y-auto overscroll-contain rounded-md border border-border"
+            aria-busy={ariaState(loading())}
+            class="ocg-subtle-scrollbar min-h-24 min-w-0 flex-1 overflow-y-auto overscroll-contain rounded-md border border-border"
           >
-            {loading ? (
-              <p role="status" className="p-3 text-muted-foreground">
-                {t("settings.llm.fetching")}
+            {loading() ? (
+              <p role="status" class="p-3 text-muted-foreground">
+                {i18n.t("settings.llm.fetching")}
               </p>
-            ) : matching.length === 0 ? (
-              <p className="p-3 text-muted-foreground">{t("settings.llm.noModels")}</p>
+            ) : matching().length === 0 ? (
+              <p class="p-3 text-muted-foreground">{i18n.t("settings.llm.noModels")}</p>
             ) : (
-              matching.map((model) => (
-                <label
-                  key={model.id}
-                  className="flex cursor-pointer items-start gap-3 border-b border-border/50 p-3 last:border-b-0 hover:bg-muted/40 has-disabled:cursor-default has-disabled:text-muted-foreground"
-                >
+              matching().map((model) => (
+                <label class="flex cursor-pointer items-start gap-3 border-b border-border/50 p-3 last:border-b-0 hover:bg-muted/40 has-disabled:cursor-default has-disabled:text-muted-foreground">
                   <input
                     type="checkbox"
-                    className="mt-0.5 size-4 shrink-0 accent-primary"
-                    checked={existing.has(model.id) || selected.has(model.id)}
-                    disabled={saving || existing.has(model.id)}
+                    class="mt-0.5 size-4 shrink-0 accent-primary"
+                    checked={existing.has(model.id) || selected().has(model.id)}
+                    disabled={saving() || existing.has(model.id)}
                     onChange={() =>
                       setSelected((current) => {
                         const next = new Set(current);
@@ -433,22 +437,22 @@ function ImportContent({
                       })
                     }
                   />
-                  <span className="min-w-0 flex-1 break-all">
+                  <span class="min-w-0 flex-1 break-all">
                     {model.id}
-                    <span className="mt-1 block text-xs text-muted-foreground">
-                      {t("chat.effort")}:{" "}
+                    <span class="mt-1 block text-xs text-muted-foreground">
+                      {i18n.t("chat.effort")}:{" "}
                       {model.reasoning_efforts === null
-                        ? t("settings.llm.effortsUnknown")
-                        : model.reasoning_efforts.join(" / ") || t("chat.effortUnsupported")}
+                        ? i18n.t("settings.llm.effortsUnknown")
+                        : model.reasoning_efforts.join(" / ") || i18n.t("chat.effortUnsupported")}
                     </span>
                     {model.context_window ? (
-                      <span className="mt-1 block text-xs text-muted-foreground">
+                      <span class="mt-1 block text-xs text-muted-foreground">
                         {model.context_window.toLocaleString()} Token
                       </span>
                     ) : null}
                   </span>
                   {existing.has(model.id) && (
-                    <span className="shrink-0 text-xs">{t("settings.llm.alreadyAdded")}</span>
+                    <span class="shrink-0 text-xs">{i18n.t("settings.llm.alreadyAdded")}</span>
                   )}
                 </label>
               ))
@@ -456,14 +460,14 @@ function ImportContent({
           </div>
         </div>
       </div>
-      {error && (
-        <p role="alert" className="break-words text-sm text-destructive">
-          {error}
+      {error() && (
+        <p role="alert" class="break-words text-sm text-destructive">
+          {error()}
         </p>
       )}
-      {result && (
-        <p role="status" className="text-sm text-emerald-700 dark:text-emerald-400">
-          {result}
+      {result() && (
+        <p role="status" class="text-sm text-emerald-700 dark:text-emerald-400">
+          {result()}
         </p>
       )}
     </div>

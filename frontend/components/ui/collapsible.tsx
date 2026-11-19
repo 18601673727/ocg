@@ -1,17 +1,71 @@
-"use client";
+import type { JSX } from "@solidjs/web";
+import { createContext, createSignal, useContext } from "solid-js";
+import { ariaState, handleEvent, splitProps } from "@/lib/ui-state";
 
-import { Collapsible as CollapsiblePrimitive } from "@base-ui/react/collapsible";
+type Disclosure = {
+  open: () => boolean;
+  toggle: () => void;
+};
+const DisclosureContext = createContext<Disclosure>();
 
-function Collapsible({ ...props }: CollapsiblePrimitive.Root.Props) {
-  return <CollapsiblePrimitive.Root data-slot="collapsible" {...props} />;
+export type CollapsibleProps = JSX.IntrinsicElements["div"] & {
+  open?: boolean;
+  defaultOpen?: boolean;
+  onOpenChange?: (open: boolean, details: { reason: "trigger-press" }) => void;
+};
+
+export function Collapsible(props: CollapsibleProps) {
+  const [local, rest] = splitProps(props, ["open", "defaultOpen", "onOpenChange", "children"]);
+  const [expanded, setExpanded] = createSignal(local.defaultOpen ?? false);
+  const open = () => local.open ?? expanded();
+  function toggle() {
+    const next = !open();
+    if (local.open === undefined) setExpanded(next);
+    local.onOpenChange?.(next, { reason: "trigger-press" });
+  }
+  return (
+    <DisclosureContext value={{ open, toggle }}>
+      <div
+        data-slot="collapsible"
+        data-open={open() || undefined}
+        data-closed={!open() || undefined}
+        {...rest}
+      >
+        {local.children}
+      </div>
+    </DisclosureContext>
+  );
 }
 
-function CollapsibleTrigger({ ...props }: CollapsiblePrimitive.Trigger.Props) {
-  return <CollapsiblePrimitive.Trigger data-slot="collapsible-trigger" {...props} />;
+export function CollapsibleTrigger(props: JSX.IntrinsicElements["button"]) {
+  const disclosure = useContext(DisclosureContext);
+  const [local, rest] = splitProps(props, ["onClick", "type"]);
+  return (
+    <button
+      type={local.type ?? "button"}
+      data-slot="collapsible-trigger"
+      data-open={disclosure?.open() || undefined}
+      aria-expanded={ariaState(disclosure?.open() ?? false)}
+      {...rest}
+      onClick={(event) => {
+        handleEvent(local.onClick, event);
+        if (!event.defaultPrevented) disclosure?.toggle();
+      }}
+    />
+  );
 }
 
-function CollapsibleContent({ ...props }: CollapsiblePrimitive.Panel.Props) {
-  return <CollapsiblePrimitive.Panel data-slot="collapsible-content" {...props} />;
+export function CollapsibleContent(
+  props: JSX.IntrinsicElements["div"] & { keepMounted?: boolean },
+) {
+  const disclosure = useContext(DisclosureContext);
+  const [, rest] = splitProps(props, ["keepMounted"]);
+  return (
+    <div
+      data-slot="collapsible-content"
+      data-open={disclosure?.open() || undefined}
+      hidden={!disclosure?.open()}
+      {...rest}
+    />
+  );
 }
-
-export { Collapsible, CollapsibleTrigger, CollapsibleContent };

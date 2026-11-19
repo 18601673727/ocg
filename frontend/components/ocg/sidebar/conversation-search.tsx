@@ -1,13 +1,6 @@
-"use client";
-
-import { useCallback, useEffect, useId, useMemo, useRef, useState, type ReactElement } from "react";
-import { MessageSquare, Search, X } from "lucide-react";
-import { cn } from "@/lib/utils";
-import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import { MessageSquare, Search, X } from "@lucide/solid";
+import { createEffect, createMemo, createSignal, createUniqueId } from "solid-js";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { Skeleton } from "@/components/ui/skeleton";
 import {
   Dialog,
   DialogClose,
@@ -17,19 +10,25 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
-import type { ChatSession } from "../types";
+import { Input } from "@/components/ui/input";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import { Skeleton } from "@/components/ui/skeleton";
+import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
+import { ariaState, bindElementRef, elementRef, type View } from "@/lib/ui-state";
+import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
+import { SELECTED_ROW } from "../primitives/selection";
 import type { ApiClient } from "../runtime/api-client";
+import type { ChatSession } from "../types";
 import {
   appendSearchResults,
   conversationSearchMatches,
   type SearchConversation,
   type SearchMatch,
 } from "./conversation-search-results";
-import { SELECTED_ROW } from "../primitives/selection";
 
 export type ConversationSearchProps = {
-  trigger: ReactElement;
+  trigger: View;
   sessions: readonly ChatSession[];
   activeSessionId: string;
   onSelect: (id: string) => void;
@@ -39,32 +38,25 @@ export type ConversationSearchProps = {
   onRetryConversations?: () => void;
 };
 
-export function ConversationSearch({
-  trigger,
-  sessions,
-  activeSessionId,
-  onSelect,
-  onOpenConversation,
-  api,
-  conversationList,
-  onRetryConversations,
-}: ConversationSearchProps) {
-  const { t } = useI18n();
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const [serverResults, setServerResults] = useState<readonly SearchConversation[] | null>(null);
-  const [nextBefore, setNextBefore] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [failed, setFailed] = useState(false);
-  const [before, setBefore] = useState<string | undefined>();
-  const [attempt, setAttempt] = useState(0);
-  const [highlightedId, setHighlightedId] = useState<string | null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const listId = useId();
-  const hintId = useId();
-  const needle = query.trim();
+export function ConversationSearch(props: ConversationSearchProps) {
+  const i18n = useI18n();
+  const [open, setOpen] = createSignal(false);
+  const [query, setQuery] = createSignal("");
+  const [serverResults, setServerResults] = createSignal<readonly SearchConversation[] | null>(
+    null,
+  );
+  const [nextBefore, setNextBefore] = createSignal<string | null>(null);
+  const [loading, setLoading] = createSignal(false);
+  const [failed, setFailed] = createSignal(false);
+  const [before, setBefore] = createSignal<string | undefined>();
+  const [attempt, setAttempt] = createSignal(0);
+  const [highlightedId, setHighlightedId] = createSignal<string | null>(null);
+  const inputRef = elementRef<HTMLInputElement>(null);
+  const listId = createUniqueId();
+  const hintId = createUniqueId();
+  const needle = createMemo(() => query().trim());
 
-  const changeOpen = useCallback((next: boolean) => {
+  const changeOpen = (next: boolean) => {
     setOpen(next);
     if (!next) {
       setQuery("");
@@ -75,231 +67,249 @@ export function ConversationSearch({
       setBefore(undefined);
       setHighlightedId(null);
     }
-  }, []);
+  };
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (
-        event.defaultPrevented ||
-        event.isComposing ||
-        event.repeat ||
-        event.altKey ||
-        event.shiftKey ||
-        !(event.metaKey || event.ctrlKey) ||
-        event.key.toLowerCase() !== "k"
-      )
-        return;
-      if (!open && document.querySelector('[role="dialog"]')) return;
-      event.preventDefault();
-      changeOpen(!open);
-    };
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-  }, [open, changeOpen]);
+  createEffect(
+    () => [open(), changeOpen],
+    () => {
+      const onKeyDown = (event: KeyboardEvent) => {
+        if (
+          event.defaultPrevented ||
+          event.isComposing ||
+          event.repeat ||
+          event.altKey ||
+          event.shiftKey ||
+          !(event.metaKey || event.ctrlKey) ||
+          event.key.toLowerCase() !== "k"
+        )
+          return;
+        if (!open() && document.querySelector('[role="dialog"]')) return;
+        event.preventDefault();
+        changeOpen(!open());
+      };
+      window.addEventListener("keydown", onKeyDown);
+      return () => window.removeEventListener("keydown", onKeyDown);
+    },
+  );
 
-  useEffect(() => {
-    if (!open || !api || !needle) return;
-    let cancelled = false;
-    const controller = new AbortController();
-    const timer = setTimeout(
-      () => {
-        setLoading(true);
-        setFailed(false);
-        void api
-          .searchConversations({ query: needle, before, limit: 50, signal: controller.signal })
-          .then((answer) => {
-            if (cancelled) return;
-            setServerResults((previous) =>
-              appendSearchResults(before ? (previous ?? []) : [], answer.conversations),
-            );
-            setNextBefore(answer.has_more ? answer.next_before : null);
-          })
-          .catch(() => {
-            if (!cancelled) setFailed(true);
-          })
-          .finally(() => {
-            if (!cancelled) setLoading(false);
-          });
-      },
-      before === undefined ? 200 : 0,
-    );
-    return () => {
-      cancelled = true;
-      clearTimeout(timer);
-      controller.abort();
-    };
-  }, [open, api, needle, before, attempt]);
+  createEffect(
+    () => [open(), props.api, needle(), before(), attempt()],
+    () => {
+      if (!open() || !props.api || !needle()) return;
+      let cancelled = false;
+      const controller = new AbortController();
+      const timer = setTimeout(
+        () => {
+          setLoading(true);
+          setFailed(false);
+          void props
+            .api!.searchConversations({
+              query: needle(),
+              before: before(),
+              limit: 50,
+              signal: controller.signal,
+            })
+            .then((answer) => {
+              if (cancelled) return;
+              setServerResults((previous) =>
+                appendSearchResults(before() ? (previous ?? []) : [], answer.conversations),
+              );
+              setNextBefore(answer.has_more ? answer.next_before : null);
+            })
+            .catch(() => {
+              if (!cancelled) setFailed(true);
+            })
+            .finally(() => {
+              if (!cancelled) setLoading(false);
+            });
+        },
+        before() === undefined ? 200 : 0,
+      );
+      return () => {
+        cancelled = true;
+        clearTimeout(timer);
+        controller.abort();
+      };
+    },
+  );
 
-  const untitledLabel = t("sidebar.newChat");
-  const matches = useMemo<readonly SearchMatch[]>(() => {
-    if (!needle) return sessions;
-    if (serverResults) return conversationSearchMatches(sessions, serverResults);
-    const lowered = needle.toLowerCase();
-    return sessions.filter((session) =>
+  const untitledLabel = i18n.t("sidebar.newChat");
+  const matches = createMemo<readonly SearchMatch[]>(() => {
+    if (!needle()) return props.sessions;
+    if (serverResults()) return conversationSearchMatches(props.sessions, serverResults()!);
+    const lowered = needle().toLowerCase();
+    return props.sessions.filter((session) =>
       (session.title || untitledLabel).toLowerCase().includes(lowered),
     );
-  }, [sessions, needle, serverResults, untitledLabel]);
+  });
 
-  const highlightedIndex = matches.findIndex((match) => match.id === highlightedId);
-  const highlightedOption =
-    highlightedIndex >= 0 ? `${listId}-option-${highlightedIndex}` : undefined;
-  useEffect(() => {
-    if (open && highlightedOption)
-      document.getElementById(highlightedOption)?.scrollIntoView({ block: "nearest" });
-  }, [open, highlightedOption]);
+  const highlightedIndex = createMemo(() =>
+    matches().findIndex((match) => match.id === highlightedId()),
+  );
+  const highlightedOption = createMemo(() =>
+    highlightedIndex() >= 0 ? `${listId}-option-${highlightedIndex()}` : undefined,
+  );
+  createEffect(
+    () => [open(), highlightedOption()],
+    () => {
+      if (open() && highlightedOption())
+        document.getElementById(highlightedOption()!)?.scrollIntoView({ block: "nearest" });
+    },
+  );
 
   const close = () => setOpen(false);
   const select = (match: SearchMatch) => {
     close();
-    if (match.conversation && onOpenConversation) onOpenConversation(match.conversation);
-    else onSelect(match.id);
+    if (match.conversation && props.onOpenConversation)
+      props.onOpenConversation(match.conversation);
+    else props.onSelect(match.id);
   };
 
   return (
-    <Dialog open={open} onOpenChange={changeOpen}>
-      <DialogTrigger render={trigger} />
+    <Dialog open={open()} onOpenChange={changeOpen}>
+      <DialogTrigger render={props.trigger} />
       <DialogContent
-        initialFocus={inputRef}
+        initialFocus={() => inputRef.current}
         showCloseButton={false}
-        className="flex max-h-[min(36rem,85dvh)] flex-col gap-0 p-0"
+        class="flex max-h-[min(36rem,85dvh)] flex-col gap-0 p-0"
       >
-        <DialogHeader className="gap-0 border-b border-border px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-3 sm:px-6">
-          <div className="flex items-center gap-2">
-            <DialogTitle className="min-w-0 flex-1 truncate font-sans normal-case tracking-normal">
-              {t("sidebar.searchConversations")}
+        <DialogHeader class="gap-0 border-b border-border px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-3 sm:px-6">
+          <div class="flex items-center gap-2">
+            <DialogTitle class="min-w-0 flex-1 truncate font-sans normal-case tracking-normal">
+              {i18n.t("sidebar.searchConversations")}
             </DialogTitle>
             <DialogClose
-              render={<Button variant="ghost" size="icon-sm" aria-label={t("common.close")} />}
+              render={<Button variant="ghost" size="icon-sm" aria-label={i18n.t("common.close")} />}
             >
               <X aria-hidden="true" />
             </DialogClose>
           </div>
-          <DialogDescription>{t("sidebar.searchConversationsBody")}</DialogDescription>
+          <DialogDescription>{i18n.t("sidebar.searchConversationsBody")}</DialogDescription>
         </DialogHeader>
 
-        <div className="px-4 pt-3 pb-2 sm:px-6">
-          <div className="relative">
+        <div class="px-4 pt-3 pb-2 sm:px-6">
+          <div class="relative">
             <Search
-              className="pointer-events-none absolute top-3 left-3 size-4 text-muted-foreground"
+              class="pointer-events-none absolute top-3 left-3 size-4 text-muted-foreground"
               aria-hidden="true"
             />
             <Input
-              ref={inputRef}
+              ref={bindElementRef(inputRef)}
               type="search"
               role="combobox"
-              placeholder={t("sidebar.searchChats")}
-              aria-label={t("sidebar.searchChatsLabel")}
+              placeholder={i18n.t("sidebar.searchChats")}
+              aria-label={i18n.t("sidebar.searchChatsLabel")}
               aria-autocomplete="list"
-              aria-expanded={true}
+              aria-expanded="true"
               aria-controls={listId}
-              aria-activedescendant={highlightedOption}
+              aria-activedescendant={highlightedOption()}
               aria-describedby={hintId}
-              value={query}
-              onChange={(event) => {
+              value={query()}
+              onInput={(event) => {
                 setQuery(event.target.value);
                 setHighlightedId(null);
-                if (event.target.value.trim() === needle) return;
+                if (event.target.value.trim() === needle()) return;
                 setServerResults(null);
                 setNextBefore(null);
                 setFailed(false);
-                setLoading(Boolean(api && event.target.value.trim()));
+                setLoading(Boolean(props.api && event.target.value.trim()));
                 setBefore(undefined);
               }}
               onKeyDown={(event) => {
-                if (event.nativeEvent.isComposing) return;
+                if (event.isComposing) return;
                 if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-                  if (!matches.length) return;
+                  if (!matches().length) return;
                   event.preventDefault();
                   const next =
-                    highlightedIndex < 0
+                    highlightedIndex() < 0
                       ? event.key === "ArrowDown"
                         ? 0
-                        : matches.length - 1
+                        : matches().length - 1
                       : Math.max(
                           0,
                           Math.min(
-                            matches.length - 1,
-                            highlightedIndex + (event.key === "ArrowDown" ? 1 : -1),
+                            matches().length - 1,
+                            highlightedIndex() + (event.key === "ArrowDown" ? 1 : -1),
                           ),
                         );
-                  setHighlightedId(matches[next].id);
+                  setHighlightedId(matches()[next].id);
                 } else if (event.key === "Enter") {
                   event.preventDefault();
-                  const match = matches[highlightedIndex < 0 ? 0 : highlightedIndex];
+                  const match = matches()[highlightedIndex() < 0 ? 0 : highlightedIndex()];
                   if (match) select(match);
                 }
               }}
-              className="h-11 pl-9 text-base sm:h-10 sm:text-sm"
+              class="h-11 pl-9 text-base sm:h-10 sm:text-sm"
             />
           </div>
-          <span id={hintId} className="sr-only">
-            {t("sidebar.searchKeyboardHint")}
+          <span id={hintId} class="sr-only">
+            {i18n.t("sidebar.searchKeyboardHint")}
           </span>
         </div>
 
         <ScrollArea
-          className="flex min-h-0 flex-1 flex-col"
+          class="flex min-h-0 flex-1 flex-col"
           viewportProps={{
-            className: "ocg-subtle-scrollbar min-h-0 flex-1",
-            style: { overflowX: "hidden" },
+            class: "ocg-subtle-scrollbar min-h-0 flex-1",
+            style: { "overflow-x": "hidden" },
           }}
           contentProps={{
-            className: "px-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6",
-            style: { minWidth: 0, width: "100%" },
+            class: "px-4 pb-[max(1rem,env(safe-area-inset-bottom))] sm:px-6",
+            style: { "min-width": `${0}px`, width: "100%" },
           }}
         >
-          {loading && (
-            <p role="status" className="px-2 py-2 text-sm text-muted-foreground">
-              {t("common.loading")}
+          {loading() && (
+            <p role="status" class="px-2 py-2 text-sm text-muted-foreground">
+              {i18n.t("common.loading")}
             </p>
           )}
-          {failed && (
-            <div role="alert" className="px-2 py-2 text-sm text-destructive">
-              <p>{t("sidebar.searchFailed")}</p>
+          {failed() && (
+            <div role="alert" class="px-2 py-2 text-sm text-destructive">
+              <p>{i18n.t("sidebar.searchFailed")}</p>
               <Button
                 variant="outline"
                 size="sm"
-                disabled={loading}
+                disabled={loading()}
                 onClick={() => {
                   setLoading(true);
                   setAttempt((value) => value + 1);
                 }}
               >
-                {t("common.retry")}
+                {i18n.t("common.retry")}
               </Button>
             </div>
           )}
           <ul
             id={listId}
-            aria-busy={loading}
+            aria-busy={ariaState(loading())}
             role="listbox"
-            aria-label={t("nav.chatSessions")}
-            className="flex flex-col gap-px pb-2"
+            aria-label={i18n.t("nav.chatSessions")}
+            class="flex flex-col gap-px pb-2"
           >
-            {matches.map((session, index) => {
-              const active = session.id === activeSessionId;
-              const highlighted = index === highlightedIndex;
+            {matches().map((session, index) => {
+              const active = session.id === props.activeSessionId;
+              const highlighted = index === highlightedIndex();
               return (
-                <li key={session.id} role="presentation">
+                <li role="presentation">
                   <button
                     id={`${listId}-option-${index}`}
                     type="button"
                     role="option"
-                    tabIndex={-1}
-                    aria-selected={highlighted}
+                    tabindex={-1}
+                    aria-selected={ariaState(highlighted)}
                     aria-current={active ? "page" : undefined}
                     onClick={() => select(session)}
-                    className={cn(
+                    class={cn(
                       "flex w-full min-w-0 items-center gap-2 rounded-md border border-transparent px-2 py-2 text-left",
                       TYPOGRAPHY_SCALE.body_sm,
                       "transition-colors",
-                      highlighted || (active && highlightedIndex < 0)
+                      highlighted || (active && highlightedIndex() < 0)
                         ? cn(SELECTED_ROW, "font-medium")
                         : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
                     )}
                   >
-                    <MessageSquare className="size-3.5 shrink-0" aria-hidden="true" />
-                    <span className="line-clamp-2 min-w-0 flex-1 break-words">
+                    <MessageSquare class="size-3.5 shrink-0" aria-hidden="true" />
+                    <span class="line-clamp-2 min-w-0 flex-1 break-words">
                       {session.title || untitledLabel}
                     </span>
                   </button>
@@ -307,67 +317,64 @@ export function ConversationSearch({
               );
             })}
           </ul>
-          {matches.length === 0 &&
-            !loading &&
-            !failed &&
-            !nextBefore &&
-            (sessions.length === 0 ? (
-              conversationList === "loading" ? (
-                <div className="flex flex-col gap-1 py-2">
+          {matches().length === 0 &&
+            !loading() &&
+            !failed() &&
+            !nextBefore() &&
+            (props.sessions.length === 0 ? (
+              props.conversationList === "loading" ? (
+                <div class="flex flex-col gap-1 py-2">
                   {Array.from({ length: 5 }, (_, i) => (
-                    <Skeleton key={`search-skeleton-${i}`} className="h-8 w-full rounded-md" />
+                    <Skeleton class="h-8 w-full rounded-md" />
                   ))}
                 </div>
-              ) : conversationList === "failed" ? (
+              ) : props.conversationList === "failed" ? (
                 <div
                   role="alert"
-                  className="flex items-center justify-between gap-2 rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive"
+                  class="flex items-center justify-between gap-2 rounded-lg border border-destructive/20 bg-destructive/10 px-3 py-2 text-xs text-destructive"
                 >
-                  <span className="truncate">{t("sidebar.loadFailed")}</span>
-                  {onRetryConversations && (
+                  <span class="truncate">{i18n.t("sidebar.loadFailed")}</span>
+                  {props.onRetryConversations && (
                     <Button
                       variant="outline"
                       size="sm"
-                      className="h-7 shrink-0 px-2 text-xs"
-                      onClick={onRetryConversations}
+                      class="h-7 shrink-0 px-2 text-xs"
+                      onClick={props.onRetryConversations}
                     >
-                      {t("common.retry")}
+                      {i18n.t("common.retry")}
                     </Button>
                   )}
                 </div>
               ) : (
                 <p
                   role="status"
-                  className={cn(
+                  class={cn(
                     "px-2 py-6 text-center text-muted-foreground",
                     TYPOGRAPHY_SCALE.caption,
                   )}
                 >
-                  {t("sidebar.searchNoConversations")}
+                  {i18n.t("sidebar.searchNoConversations")}
                 </p>
               )
             ) : (
               <p
                 role="status"
-                className={cn(
-                  "px-2 py-6 text-center text-muted-foreground",
-                  TYPOGRAPHY_SCALE.caption,
-                )}
+                class={cn("px-2 py-6 text-center text-muted-foreground", TYPOGRAPHY_SCALE.caption)}
               >
-                {t("sidebar.noSearchMatches")}
+                {i18n.t("sidebar.noSearchMatches")}
               </p>
             ))}
-          {nextBefore && (
+          {nextBefore() && (
             <Button
               variant="outline"
               size="sm"
-              disabled={loading || failed}
+              disabled={loading() || failed()}
               onClick={() => {
                 setLoading(true);
-                setBefore(nextBefore ?? undefined);
+                setBefore(nextBefore() ?? undefined);
               }}
             >
-              {t("sidebar.searchMore")}
+              {i18n.t("sidebar.searchMore")}
             </Button>
           )}
         </ScrollArea>

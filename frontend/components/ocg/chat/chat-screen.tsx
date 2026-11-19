@@ -1,39 +1,35 @@
-"use client";
-
+import { ChevronRight } from "@lucide/solid";
 import {
+  type Component,
   createContext,
+  createEffect,
+  createMemo,
+  createSignal,
+  Show,
   useContext,
-  useEffect,
-  useCallback,
-  useMemo,
-  useState,
-  type FC,
-  type ReactNode,
-} from "react";
-import { AssistantMessage, Thread } from "@/components/assistant-ui/elements/thread.aui";
-import { useAuiState } from "@assistant-ui/react";
-import { ChevronRight } from "lucide-react";
-import { OcgAssistantProvider } from "../runtime/assistant-ui-provider";
-import { useOcgRuntime } from "../runtime/runtime-context";
-import { ConversationChildrenStrip, ConversationCardStrip } from "./chat-view";
-import { WorkspaceToolFallback } from "./workspace-tool";
+} from "solid-js";
+import { shallowSelector, type View } from "@/lib/ui-state";
+import type { ChatModelSelection } from "../contracts";
+import { useI18n } from "../i18n";
 import { TaskStatus } from "../job/task-status";
+import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context";
+import type { ChatSession } from "../types";
+import { ConversationCardStrip, ConversationChildrenStrip } from "./chat-view";
+import { ContextTranscript } from "./context-transcript";
 import { ConversationArtifacts } from "./conversation-artifacts";
+import { ConversationView, useConversationView, useThreadMessage } from "./conversation-view";
+import { DecisionDetails } from "./decision-details";
 import { FileChanges } from "./file-changes";
 import { readModelPreference, writeModelPreference } from "./model-preference";
-import { useI18n } from "../i18n";
-import type { ChatSession } from "../types";
-import type { ChatModelSelection } from "../contracts";
-import { ContextTranscript } from "./context-transcript";
-import { MutableComposer, contextForSession } from "./mutable-composer";
-import { DecisionDetails } from "./decision-details";
+import { contextForSession, MutableComposer } from "./mutable-composer";
 import { planningBlocker } from "./planning-decision";
+import { AssistantMessage, Thread } from "./thread";
 
 export interface ChatScreenProps {
   session: ChatSession;
   onOpenConversation: (conversation: string) => void;
   onOpenPlanningDecision: (decisionId: string) => void;
-  backButton?: ReactNode;
+  backButton?: View;
 }
 
 type ChatComposerContextValue = {
@@ -46,205 +42,242 @@ type ChatComposerContextValue = {
 
 const ChatComposerContext = createContext<ChatComposerContextValue | null>(null);
 
-const ChatComposerSlot: FC = () => {
+const ChatComposerSlot: Component = () => {
   const value = useContext(ChatComposerContext);
   const { api } = useOcgRuntime();
-  const [model, setModel] = useState<"checking" | "mutable" | "error">("checking");
-  const [probeError, setProbeError] = useState("");
-  const [composerContext, setComposerContext] = useState("");
-  const [probedSession, setProbedSession] = useState("");
+  const [model, setModel] = createSignal<"checking" | "mutable" | "error">("checking");
+  const [probeError, setProbeError] = createSignal("");
+  const [composerContext, setComposerContext] = createSignal("");
+  const [probedSession, setProbedSession] = createSignal("");
   const sessionId = value?.session.id;
   const conversationId = value?.session.conversationId;
-  useEffect(() => {
-    if (!api || !sessionId) return;
-    const abort = new AbortController();
-    void Promise.resolve()
-      .then(() => {
-        setModel("checking");
-        return contextForSession(sessionId, conversationId);
-      })
-      .then((context) => {
-        if (!abort.signal.aborted) setComposerContext(context);
-        return api.currentMutableJob(context, abort.signal);
-      })
-      .then(() => {
-        if (!abort.signal.aborted) {
+  createEffect(
+    () => [api, sessionId],
+    () => {
+      if (!api || !sessionId) return;
+      const abort = new AbortController();
+      void Promise.resolve()
+        .then(() => {
+          setModel("checking");
+          return contextForSession(sessionId, conversationId);
+        })
+        .then((context) => {
+          if (!abort.signal.aborted) setComposerContext(context);
+          return api.currentMutableJob(context, abort.signal);
+        })
+        .then(() => {
+          if (!abort.signal.aborted) {
+            setProbedSession(sessionId);
+            setModel("mutable");
+          }
+        })
+        .catch((error: unknown) => {
+          if (abort.signal.aborted) return;
           setProbedSession(sessionId);
-          setModel("mutable");
-        }
-      })
-      .catch((error: unknown) => {
-        if (abort.signal.aborted) return;
-        setProbedSession(sessionId);
-        setProbeError(error instanceof Error ? error.message : String(error));
-        setModel("error");
-      });
-    return () => abort.abort();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, sessionId]);
+          setProbeError(error instanceof Error ? error.message : String(error));
+          setModel("error");
+        });
+      return () => abort.abort();
+    },
+  );
   if (!value) return null;
-  if (model === "checking" || probedSession !== sessionId)
-    return <p role="status">Checking Composer availability…</p>;
-  if (model === "error") return <p role="alert">Composer unavailable: {probeError}</p>;
   return (
-    <MutableComposer
-      key={value.session.id}
-      sessionId={value.session.id}
-      conversation={value.session.conversationId}
-      project={value.session.projectId}
-      context={composerContext}
-      selection={value.selection}
-      onSelectionChange={value.setSelection}
-      onPreference={value.onPreference}
-    />
+    <>
+      {(() => {
+        if (model() === "checking" || probedSession() !== sessionId)
+          return <p role="status">Checking Composer availability…</p>;
+        if (model() === "error") return <p role="alert">Composer unavailable: {probeError()}</p>;
+        return (
+          <MutableComposer
+            sessionId={value.session.id}
+            conversation={value.session.conversationId}
+            project={value.session.projectId}
+            context={composerContext()}
+            selection={value.selection}
+            onSelectionChange={value.setSelection}
+            onPreference={value.onPreference}
+          />
+        );
+      })()}
+    </>
   );
 };
 
-const Welcome: FC = () => {
-  const { t } = useI18n();
+const Welcome: Component = () => {
+  const i18n = useI18n();
   return (
-    <header className="aui-thread-welcome-root mb-4 sm:mb-5">
-      <h2 className="text-3xl font-semibold tracking-tight sm:text-4xl">{t("chat.newThread")}</h2>
+    <header class="aui-thread-welcome-root mb-4 sm:mb-5">
+      <h2 class="text-3xl font-semibold tracking-tight sm:text-4xl">{i18n.t("chat.newThread")}</h2>
     </header>
   );
 };
 
 function MessageFileChanges() {
-  const value = useContext(ChatComposerContext);
-  const id = useAuiState((state) => state.message.id);
-  const { snapshot } = useOcgRuntime();
-  const messages = value ? (snapshot.messagesBySession[value.session.id] ?? []) : [];
-  const message = messages.find((message) => message.id === id);
-  if (message?.decision)
-    return (
-      <section className="my-3 rounded-lg border p-3" aria-label="Decision">
-        <DecisionDetails decision={message.decision} message={message} />
-      </section>
-    );
-  if (
-    !message?.jobId ||
-    messages.findLast((item) => item.role === "assistant" && item.jobId === message.jobId)?.id !==
-      id
-  )
-    return null;
-  const calls = messages
-    .filter((item) => item.jobId === message.jobId)
-    .flatMap((item) => item.toolCalls ?? []);
-  const job = message.jobId;
-  return <FileChanges changes={calls.map((call) => ({ job, call }))} />;
+  const record = useThreadMessage();
+  const { byJob } = useConversationView();
+  const job = createMemo(() => record().jobId);
+  const jobMessages = createMemo(
+    () => {
+      const id = job();
+      return id ? byJob().get(id) : undefined;
+    },
+    {
+      equals: (left, right) =>
+        left === right ||
+        Boolean(
+          left &&
+            right &&
+            left.length === right.length &&
+            left.every((entry, index) => entry === right[index]),
+        ),
+    },
+  );
+  return (
+    <Show
+      when={record().decision}
+      fallback={
+        <Show
+          when={
+            job() &&
+            jobMessages()?.findLast((entry) => entry.role === "assistant")?.id === record().id
+          }
+        >
+          <FileChanges
+            changes={(jobMessages() ?? []).flatMap((item) =>
+              (item.toolCalls ?? []).map((call) => ({ job: job()!, call })),
+            )}
+          />
+        </Show>
+      }
+    >
+      {(decision) => (
+        <section class="my-3 rounded-lg border p-3" aria-label="Decision">
+          <DecisionDetails decision={decision()} message={record()} />
+        </section>
+      )}
+    </Show>
+  );
 }
 
 function PlanningDecisionNotice() {
-  const value = useContext(ChatComposerContext);
-  const id = useAuiState((state) => state.message.id);
-  const { snapshot } = useOcgRuntime();
+  const composer = useContext(ChatComposerContext);
+  const message = useThreadMessage();
   const { t } = useI18n();
-  if (!value) return null;
-  const message = snapshot.messagesBySession[value.session.id]?.find((item) => item.id === id);
-  if (!message?.jobId) return null;
-  const decisionId = message.jobId;
-  const reason = t("planning.blocked", { reason: planningBlocker(t, message) });
+  const reason = createMemo(() => t("planning.blocked", { reason: planningBlocker(t, message()) }));
   return (
-    <div className="flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
-      <span className="min-w-0 truncate" title={reason} role="status">
-        {reason}
-      </span>
-      <button
-        id={`planning-notice-${decisionId}`}
-        type="button"
-        className="inline-flex shrink-0 items-center gap-1 rounded-sm py-1 text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
-        aria-controls="chat-inspector"
-        onClick={() => value.onOpenPlanningDecision(decisionId)}
-      >
-        {t("planning.openExecution")}
-        <ChevronRight aria-hidden="true" className="size-3" />
-      </button>
-    </div>
+    <Show when={message().jobId}>
+      {(id) => (
+        <div class="flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
+          <span class="min-w-0 truncate" title={reason()} role="status">
+            {reason()}
+          </span>
+          <button
+            id={`planning-notice-${id()}`}
+            type="button"
+            class="inline-flex shrink-0 items-center gap-1 rounded-sm py-1 text-primary underline-offset-4 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+            aria-controls="chat-inspector"
+            onClick={() => composer?.onOpenPlanningDecision(id())}
+          >
+            {t("planning.openExecution")}
+            <ChevronRight aria-hidden="true" class="size-3" />
+          </button>
+        </div>
+      )}
+    </Show>
   );
 }
 
 function ChatAssistantMessage() {
-  const planning = useAuiState((state) => state.message.metadata.custom.planningTarget);
-  return planning ? <PlanningDecisionNotice /> : <AssistantMessage />;
+  const message = useThreadMessage();
+  return (
+    <Show
+      when={message().planningTarget}
+      fallback={<AssistantMessage footer={<MessageFileChanges />} />}
+    >
+      <PlanningDecisionNotice />
+    </Show>
+  );
 }
 
-const THREAD_COMPONENTS = {
-  AssistantMessage: ChatAssistantMessage,
-  Composer: ChatComposerSlot,
-  Welcome,
-  ToolFallback: WorkspaceToolFallback,
-  MessageFooter: MessageFileChanges,
-};
-
-export const ChatScreen: FC<ChatScreenProps> = ({
-  session,
-  onOpenConversation,
-  onOpenPlanningDecision,
-  backButton,
-}) => {
-  const runtime = useOcgRuntime();
-  const [selection, setSelection] = useState<ChatModelSelection | undefined>(() => {
-    if (session.llmProfile) {
-      return {
-        model: session.model ?? "",
-        effort: session.reasoningEffort ?? null,
-        agentProfile: session.agentProfile,
-        llmProfile: session.llmProfile,
-      };
-    }
-    return readModelPreference(session.projectId, session.conversationId ?? session.id);
-  });
-  useEffect(() => {
-    if (session.conversationId && selection)
-      writeModelPreference(session.projectId, session.conversationId, selection);
-  }, [session.conversationId, session.projectId, selection]);
-  const messages = runtime.snapshot.messagesBySession[session.id] ?? [];
-  const planMessage = messages.findLast(
-    (message) => message.role === "assistant" && message.taskPlan,
+export const ChatScreen: Component<ChatScreenProps> = (props) => {
+  const [selection, setSelection] = createSignal<ChatModelSelection | undefined>(
+    (() => {
+      if (props.session.llmProfile) {
+        return {
+          model: props.session.model ?? "",
+          effort: props.session.reasoningEffort ?? null,
+          agentProfile: props.session.agentProfile,
+          llmProfile: props.session.llmProfile,
+        };
+      }
+      return readModelPreference(
+        props.session.projectId,
+        props.session.conversationId ?? props.session.id,
+      );
+    })(),
+  );
+  createEffect(
+    () => [props.session.conversationId, props.session.projectId, selection()],
+    () => {
+      if (props.session.conversationId && selection())
+        writeModelPreference(props.session.projectId, props.session.conversationId, selection()!);
+    },
+  );
+  const selectedPlanPlanJobId = useOcgRuntimeSnapshot(
+    shallowSelector((snapshot) => {
+      const message = snapshot.messagesBySession[props.session.id]?.findLast(
+        (item) => item.role === "assistant" && item.taskPlan,
+      );
+      return { plan: message?.taskPlan, planJobId: message?.jobId };
+    }),
   );
 
-  const onPreference = useCallback(
-    (next: ChatModelSelection) =>
-      writeModelPreference(session.projectId, session.conversationId ?? session.id, next),
-    [session.id, session.projectId, session.conversationId],
-  );
-  const composerValue = useMemo<ChatComposerContextValue>(
-    () => ({ session, selection, setSelection, onPreference, onOpenPlanningDecision }),
-    [session, selection, onPreference, onOpenPlanningDecision],
-  );
+  const onPreference = (next: ChatModelSelection) =>
+    writeModelPreference(
+      props.session.projectId,
+      props.session.conversationId ?? props.session.id,
+      next,
+    );
+  const composerValue: ChatComposerContextValue = {
+    get session() {
+      return props.session;
+    },
+    get selection() {
+      return selection();
+    },
+    setSelection,
+    onPreference,
+    onOpenPlanningDecision: (id) => props.onOpenPlanningDecision(id),
+  };
   return (
-    <OcgAssistantProvider sessionId={session.id} projectId={session.projectId ?? ""}>
-      <ChatComposerContext.Provider value={composerValue}>
-        <div className="flex h-full min-h-0 w-full flex-col">
+    <ConversationView sessionId={props.session.id}>
+      <ChatComposerContext value={composerValue}>
+        <div class="flex h-full min-h-0 w-full flex-col">
           <Thread
-            components={THREAD_COMPONENTS}
-            footerAction={backButton}
-            autoFocus
+            Assistant={ChatAssistantMessage}
+            Composer={ChatComposerSlot}
+            Welcome={Welcome}
+            footerAction={props.backButton}
             afterMessages={
               <>
-                <ContextTranscript
-                  key={`context:${session.id}`}
-                  conversation={session.conversationId}
-                />
-                {planMessage && <TaskStatus key={planMessage.jobId} plan={planMessage.taskPlan} />}
-                <ConversationArtifacts key={`artifacts:${session.id}`} sessionId={session.id} />
+                <ContextTranscript conversation={props.session.conversationId} />
+                {selectedPlanPlanJobId().plan && <TaskStatus plan={selectedPlanPlanJobId().plan} />}
+                <ConversationArtifacts sessionId={props.session.id} />
                 <ConversationCardStrip
-                  key={`cards:${session.id}`}
-                  turn={session.sessionId}
-                  conversationId={session.conversationId}
-                  onOpen={onOpenConversation}
+                  turn={props.session.sessionId}
+                  conversationId={props.session.conversationId}
+                  onOpen={props.onOpenConversation}
                 />
                 <ConversationChildrenStrip
-                  key={session.id}
-                  turn={session.sessionId}
-                  plan={planMessage?.taskPlan}
-                  onOpen={onOpenConversation}
+                  turn={props.session.sessionId}
+                  plan={selectedPlanPlanJobId().plan}
+                  onOpen={props.onOpenConversation}
                 />
               </>
             }
           />
         </div>
-      </ChatComposerContext.Provider>
-    </OcgAssistantProvider>
+      </ChatComposerContext>
+    </ConversationView>
   );
 };

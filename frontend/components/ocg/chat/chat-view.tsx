@@ -1,49 +1,44 @@
-"use client";
-
-import { useEffect, useRef, useState } from "react";
-import { Pause, Play, Square, X } from "lucide-react";
+import { Pause, Play, Square, X } from "@lucide/solid";
+import { createEffect, createMemo, createSignal } from "solid-js";
+import { ElicitationForm } from "@/components/ocg/chat/ui/elicitation-form";
 import { Button } from "@/components/ui/button";
+import { elementRef } from "@/lib/ui-state";
+import type { ChildConversation, ConversationCard, TaskPlan } from "../contracts";
 import { useI18n } from "../i18n";
+import { type ApiClient, ApiError } from "../runtime/api-client";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { ApiError, type ApiClient } from "../runtime/api-client";
-import type { ConversationCard, ChildConversation, TaskPlan } from "../contracts";
-import { useConversationError } from "./conversation-errors";
 import { ApprovalRequest } from "./approval-request";
-import { ElicitationForm } from "@/components/assistant-ui/elements/elicitation-form";
-import { outputDisplayText } from "./job-transcript-model";
+import { useConversationError } from "./conversation-errors";
 import { DispatchSelectionCard } from "./dispatch-selection-card";
+import { outputDisplayText } from "./job-transcript-model";
 
 function useConversation(turn?: string) {
   const { api } = useOcgRuntime();
-  const [conversation, setConversation] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
+  const [conversation, setConversation] = createSignal<string | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
   useConversationError(error);
-  useEffect(() => {
-    if (!api || !turn) return;
-    const controller = new AbortController();
-    void api
-      .readJob(turn, controller.signal)
-      .then((record) => {
-        if (!controller.signal.aborted)
-          setConversation(record.kind === "conversation" ? record.id : record.conversation);
-      })
-      .catch((cause) => {
-        if (!controller.signal.aborted)
-          setError(cause instanceof Error ? cause.message : String(cause));
-      });
-    return () => controller.abort();
-  }, [api, turn]);
-  return { conversation, error };
+  createEffect(
+    () => [api, turn],
+    () => {
+      if (!api || !turn) return;
+      const controller = new AbortController();
+      void api
+        .readJob(turn, controller.signal)
+        .then((record) => {
+          if (!controller.signal.aborted)
+            setConversation(record.kind === "conversation" ? record.id : record.conversation);
+        })
+        .catch((cause) => {
+          if (!controller.signal.aborted)
+            setError(cause instanceof Error ? cause.message : String(cause));
+        });
+      return () => controller.abort();
+    },
+  );
+  return { conversation: conversation(), error: error() };
 }
 
-function ChildConversationCard({
-  child,
-  agentName,
-  api,
-  pending,
-  onOpen,
-  onAct,
-}: {
+function ChildConversationCard(props: {
   child: ChildConversation;
   agentName?: string;
   api: ApiClient;
@@ -51,190 +46,208 @@ function ChildConversationCard({
   onOpen: (conversation: string) => void;
   onAct: (child: ChildConversation, action: "stop" | "close" | "hold" | "unhold") => Promise<void>;
 }) {
-  const { t, locale } = useI18n();
-  const [detail, setDetail] = useState<Awaited<ReturnType<ApiClient["readJobDetails"]>> | null>(
+  const i18n = useI18n();
+  const [detail, setDetail] = createSignal<Awaited<ReturnType<ApiClient["readJobDetails"]>> | null>(
     null,
   );
-  const [model, setModel] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [modelError, setModelError] = useState<string | null>(null);
-  useConversationError(error, child.id);
-  useConversationError(modelError, child.id);
-  const phase = child.recurrence?.phase;
-  const due = child.recurrence?.due_us;
-  useEffect(() => {
-    const controller = new AbortController();
-    void api
-      .readJobDetails(child.id, controller.signal)
-      .then((result) => {
-        if (!controller.signal.aborted) {
-          setDetail(result);
-          setError(null);
-        }
-      })
-      .catch((cause) => {
-        if (!controller.signal.aborted)
-          setError(cause instanceof Error ? cause.message : String(cause));
-      });
-    return () => controller.abort();
-  }, [api, child.id, child.state, phase, due]);
-  useEffect(() => {
-    const controller = new AbortController();
-    void api
-      .readConversationTurns(child.id, undefined, 1, controller.signal)
-      .then((result) => {
-        if (!controller.signal.aborted) {
-          setModel(result.turns[0]?.input.configuration?.model ?? null);
-          setModelError(null);
-        }
-      })
-      .catch((cause) => {
-        if (!controller.signal.aborted)
-          setModelError(cause instanceof Error ? cause.message : String(cause));
-      });
-    return () => controller.abort();
-  }, [api, child.id, child.state, child.job_state, phase, due]);
-  const state = detail?.settlement.state;
-  const status =
-    state && state !== "unsettled" ? t(`state.${state}`) : t(`chat.child.${child.state}`);
-  const title = child.title || t("chat.child.untitled");
-  const summary = outputDisplayText(detail?.result)
-    .trim()
-    .split(/\n+/)[0]
-    ?.replace(/^#{1,6}\s*/, "")
-    .replace(/[*`]/g, "")
-    .slice(0, 240);
+  const [model, setModel] = createSignal<string | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [modelError, setModelError] = createSignal<string | null>(null);
+  useConversationError(error, () => props.child.id);
+  useConversationError(modelError, () => props.child.id);
+  const phase = createMemo(() => props.child.recurrence?.phase);
+  const due = createMemo(() => props.child.recurrence?.due_us);
+  createEffect(
+    () => [props.api, props.child.id, props.child.state, phase(), due()],
+    () => {
+      const controller = new AbortController();
+      void props.api
+        .readJobDetails(props.child.id, controller.signal)
+        .then((result) => {
+          if (!controller.signal.aborted) {
+            setDetail(result);
+            setError(null);
+          }
+        })
+        .catch((cause) => {
+          if (!controller.signal.aborted)
+            setError(cause instanceof Error ? cause.message : String(cause));
+        });
+      return () => controller.abort();
+    },
+  );
+  createEffect(
+    () => [props.api, props.child.id, props.child.state, props.child.job_state, phase(), due()],
+    () => {
+      const controller = new AbortController();
+      void props.api
+        .readConversationTurns(props.child.id, undefined, 1, controller.signal)
+        .then((result) => {
+          if (!controller.signal.aborted) {
+            setModel(result.turns[0]?.input.configuration?.model ?? null);
+            setModelError(null);
+          }
+        })
+        .catch((cause) => {
+          if (!controller.signal.aborted)
+            setModelError(cause instanceof Error ? cause.message : String(cause));
+        });
+      return () => controller.abort();
+    },
+  );
+  const state = createMemo(() => detail()?.settlement.state);
+  const status = createMemo(() => {
+    const current = state();
+    return current && current !== "unsettled"
+      ? i18n.t(`state.${current}`)
+      : i18n.t(`chat.child.${props.child.state}`);
+  });
+  const title = createMemo(() => props.child.title || i18n.t("chat.child.untitled"));
+  const summary = createMemo(() =>
+    outputDisplayText(detail()?.result)
+      .trim()
+      .split(/\n+/)[0]
+      ?.replace(/^#{1,6}\s*/, "")
+      .replace(/[*`]/g, "")
+      .slice(0, 240),
+  );
   return (
     <div
-      className="relative flex w-72 max-w-full shrink-0 flex-col rounded-xl border border-border bg-muted/20 p-3 text-xs transition-colors hover:border-primary/50 focus-within:border-primary/50"
+      class="relative flex w-72 max-w-full shrink-0 flex-col rounded-xl border border-border bg-muted/20 p-3 text-xs transition-colors hover:border-primary/50 focus-within:border-primary/50"
       data-slot="conversation-child-card"
     >
       <button
         type="button"
-        className="absolute inset-0 rounded-xl text-left focus-visible:outline-2 focus-visible:outline-ring"
-        onClick={() => onOpen(child.id)}
-        aria-label={t("chat.child.openNamed", { title })}
-        title={`${t("chat.child.conversationId")}\n${child.id}\n${t("chat.agent")}\n${child.agent ?? "—"}`}
+        class="absolute inset-0 rounded-xl text-left focus-visible:outline-2 focus-visible:outline-ring"
+        onClick={() => props.onOpen(props.child.id)}
+        aria-label={i18n.t("chat.child.openNamed", { title: title() })}
+        title={`${i18n.t("chat.child.conversationId")}\n${props.child.id}\n${i18n.t("chat.agent")}\n${props.child.agent ?? "—"}`}
       />
-      <div className="pointer-events-none space-y-2">
-        <span className="line-clamp-2 font-medium" title={child.title}>
-          {title}
+      <div class="pointer-events-none space-y-2">
+        <span class="line-clamp-2 font-medium" title={props.child.title}>
+          {title()}
         </span>
-        <span className="block text-muted-foreground">
-          {agentName || t("chat.agent")}
-          {model ? ` · ${model}` : ""} · {status}
-          {child.on_hold ? ` · ${t(`chat.child.hold.${child.on_hold.by.kind}`)}` : ""}
+        <span class="block text-muted-foreground">
+          {props.agentName || i18n.t("chat.agent")}
+          {model() ? ` · ${model()}` : ""} · {status()}
+          {props.child.on_hold
+            ? ` · ${i18n.t(`chat.child.hold.${props.child.on_hold.by.kind}`)}`
+            : ""}
         </span>
-        <span className="line-clamp-3 text-muted-foreground">
-          {summary ||
-            detail?.unknown_reason ||
-            t(child.state === "settled" ? "chat.child.noResult" : "chat.child.pendingResult")}
+        <span class="line-clamp-3 text-muted-foreground">
+          {summary() ||
+            detail()?.unknown_reason ||
+            i18n.t(
+              props.child.state === "settled" ? "chat.child.noResult" : "chat.child.pendingResult",
+            )}
         </span>
       </div>
-      {child.recurrence && (
-        <p className="pointer-events-none mt-2 text-muted-foreground">
-          {t("chat.child.every", { seconds: child.recurrence.interval_s })} ·{" "}
-          {t(`chat.child.${child.recurrence.phase}`)}
-          {child.recurrence.due_us !== null
-            ? ` · ${new Date(child.recurrence.due_us / 1000).toLocaleString(locale)}`
+      {props.child.recurrence && (
+        <p class="pointer-events-none mt-2 text-muted-foreground">
+          {i18n.t("chat.child.every", { seconds: props.child.recurrence.interval_s })} ·{" "}
+          {i18n.t(`chat.child.${props.child.recurrence.phase}`)}
+          {props.child.recurrence.due_us !== null
+            ? ` · ${new Date(props.child.recurrence.due_us / 1000).toLocaleString(i18n.locale)}`
             : ""}
         </p>
       )}
-      <div className="relative mt-auto flex w-fit gap-1 pt-2">
+      <div class="relative mt-auto flex w-fit gap-1 pt-2">
         <Button
           size="icon-xs"
           variant="ghost"
-          title={t("chat.child.stop")}
-          aria-label={t("chat.child.stop")}
-          disabled={pending || child.state !== "open"}
-          onClick={() => void onAct(child, "stop")}
+          title={i18n.t("chat.child.stop")}
+          aria-label={i18n.t("chat.child.stop")}
+          disabled={props.pending || props.child.state !== "open"}
+          onClick={() => void props.onAct(props.child, "stop")}
         >
           <Square aria-hidden="true" />
         </Button>
         <Button
           size="icon-xs"
           variant="ghost"
-          title={t("common.close")}
-          aria-label={t("common.close")}
-          disabled={pending || child.state !== "open"}
-          onClick={() => void onAct(child, "close")}
+          title={i18n.t("common.close")}
+          aria-label={i18n.t("common.close")}
+          disabled={props.pending || props.child.state !== "open"}
+          onClick={() => void props.onAct(props.child, "close")}
         >
           <X aria-hidden="true" />
         </Button>
         <Button
           size="icon-xs"
           variant="ghost"
-          title={t(child.on_hold ? "chat.child.unhold" : "chat.child.hold")}
-          aria-label={t(child.on_hold ? "chat.child.unhold" : "chat.child.hold")}
-          disabled={pending || child.state !== "open"}
-          onClick={() => void onAct(child, child.on_hold ? "unhold" : "hold")}
+          title={i18n.t(props.child.on_hold ? "chat.child.unhold" : "chat.child.hold")}
+          aria-label={i18n.t(props.child.on_hold ? "chat.child.unhold" : "chat.child.hold")}
+          disabled={props.pending || props.child.state !== "open"}
+          onClick={() => void props.onAct(props.child, props.child.on_hold ? "unhold" : "hold")}
         >
-          {child.on_hold ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}
+          {props.child.on_hold ? <Play aria-hidden="true" /> : <Pause aria-hidden="true" />}
         </Button>
       </div>
     </div>
   );
 }
 
-export function ConversationChildrenStrip({
-  turn,
-  plan,
-  onOpen,
-}: {
+export function ConversationChildrenStrip(props: {
   turn?: string;
   plan?: TaskPlan | null;
   onOpen: (conversation: string) => void;
 }) {
   const { api } = useOcgRuntime();
-  const { t } = useI18n();
-  const { conversation } = useConversation(turn);
-  const [children, setChildren] = useState<ChildConversation[]>([]);
-  const [hasMore, setHasMore] = useState(false);
-  const [pages, setPages] = useState(1);
-  const [revision, setRevision] = useState(0);
-  const [pending, setPending] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [agentNames, setAgentNames] = useState<Record<string, string>>({});
+  const i18n = useI18n();
+  const { conversation } = useConversation(props.turn);
+  const [children, setChildren] = createSignal<ChildConversation[]>([]);
+  const [hasMore, setHasMore] = createSignal(false);
+  const [pages, setPages] = createSignal(1);
+  const [revision, setRevision] = createSignal(0);
+  const [pending, setPending] = createSignal<string | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
+  const [agentNames, setAgentNames] = createSignal<Record<string, string>>({});
   useConversationError(error);
-  const lock = useRef(false);
-  const hasChildren = children.length > 0;
-  useEffect(() => {
-    if (!api || !hasChildren) return;
-    const controller = new AbortController();
-    const refresh = () => {
-      void api
-        .readProfiles(controller.signal)
-        .then((profiles) => {
-          if (!controller.signal.aborted)
-            setAgentNames(
-              Object.fromEntries(profiles.agent_profiles.map((agent) => [agent.id, agent.name])),
-            );
-        })
-        .catch((cause) => {
-          if (!controller.signal.aborted)
-            setError(cause instanceof Error ? cause.message : String(cause));
-        });
-    };
-    refresh();
-    const unsubscribe = api.onProfilesChanged(refresh);
-    return () => {
-      controller.abort();
-      unsubscribe();
-    };
-  }, [api, hasChildren]);
-  useEffect(() => {
-    if (!api || !conversation) return;
-    return api.subscribeChildren(
-      conversation,
-      pages,
-      (reply) => {
-        setChildren(reply.children.filter((child) => child.origin !== "system"));
-        setHasMore(reply.has_more);
-        setError(null);
-      },
-      (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
-    );
-  }, [api, conversation, pages, revision]);
+  const lock = elementRef(false);
+  const hasChildren = createMemo(() => children().length > 0);
+  createEffect(
+    () => [api, hasChildren()],
+    () => {
+      if (!api || !hasChildren()) return;
+      const controller = new AbortController();
+      const refresh = () => {
+        void api
+          .readProfiles(controller.signal)
+          .then((profiles) => {
+            if (!controller.signal.aborted)
+              setAgentNames(
+                Object.fromEntries(profiles.agent_profiles.map((agent) => [agent.id, agent.name])),
+              );
+          })
+          .catch((cause) => {
+            if (!controller.signal.aborted)
+              setError(cause instanceof Error ? cause.message : String(cause));
+          });
+      };
+      refresh();
+      const unsubscribe = api.onProfilesChanged(refresh);
+      return () => {
+        controller.abort();
+        unsubscribe();
+      };
+    },
+  );
+  createEffect(
+    () => [api, conversation, pages(), revision()],
+    () => {
+      if (!api || !conversation) return;
+      return api.subscribeChildren(
+        conversation,
+        pages(),
+        (reply) => {
+          setChildren(reply.children.filter((child) => child.origin !== "system"));
+          setHasMore(reply.has_more);
+          setError(null);
+        },
+        (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+      );
+    },
+  );
 
   async function act(child: ChildConversation, action: "stop" | "close" | "hold" | "unhold") {
     if (!api || lock.current) return;
@@ -254,140 +267,145 @@ export function ConversationChildrenStrip({
       setPending(null);
     }
   }
-  if (!api || (!children.length && !hasMore)) return null;
-  const stepOrder = new Map(plan?.steps.map((step, index) => [step.conversation, index]));
-  const orderedChildren = [...children].sort(
-    (left, right) =>
-      (stepOrder.get(left.id) ?? stepOrder.size) - (stepOrder.get(right.id) ?? stepOrder.size) ||
-      left.id.localeCompare(right.id),
-  );
   return (
-    <section
-      className="min-w-0 max-w-full py-2"
-      aria-label={t("chat.children")}
-      data-slot="conversation-child-cards"
-    >
-      <div className="ocg-subtle-scrollbar flex flex-nowrap items-stretch gap-3 overflow-x-auto overscroll-x-contain pb-2">
-        {orderedChildren.map((child) => (
-          <ChildConversationCard
-            key={child.id}
-            child={child}
-            agentName={child.agent ? agentNames[child.agent] : undefined}
-            api={api}
-            pending={pending !== null}
-            onOpen={onOpen}
-            onAct={act}
-          />
-        ))}
-        {hasMore && (
-          <Button
-            size="sm"
-            variant="ghost"
-            className="shrink-0 self-center"
-            onClick={() => setPages((value) => value + 1)}
+    <>
+      {(() => {
+        if (!api || (!children().length && !hasMore())) return null;
+        const stepOrder = new Map(
+          props.plan?.steps.map((step, index) => [step.conversation, index]),
+        );
+        const orderedChildren = createMemo(() =>
+          [...children()].sort(
+            (left, right) =>
+              (stepOrder.get(left.id) ?? stepOrder.size) -
+                (stepOrder.get(right.id) ?? stepOrder.size) || left.id.localeCompare(right.id),
+          ),
+        );
+        return (
+          <section
+            class="min-w-0 max-w-full py-2"
+            aria-label={i18n.t("chat.children")}
+            data-slot="conversation-child-cards"
           >
-            {t("chat.child.more")}
-          </Button>
-        )}
-      </div>
-    </section>
+            <div class="ocg-subtle-scrollbar flex flex-nowrap items-stretch gap-3 overflow-x-auto overscroll-x-contain pb-2">
+              {orderedChildren().map((child) => (
+                <ChildConversationCard
+                  child={child}
+                  agentName={child.agent ? agentNames()[child.agent] : undefined}
+                  api={api}
+                  pending={pending() !== null}
+                  onOpen={props.onOpen}
+                  onAct={act}
+                />
+              ))}
+              {hasMore() && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  class="shrink-0 self-center"
+                  onClick={() => setPages((value) => value + 1)}
+                >
+                  {i18n.t("chat.child.more")}
+                </Button>
+              )}
+            </div>
+          </section>
+        );
+      })()}
+    </>
   );
 }
 
-function ConversationQuestion({
-  question,
-  disabled,
-  answer,
-  dismiss,
-}: {
+function ConversationQuestion(props: {
   question: string;
   disabled: boolean;
   answer: (text: string) => void;
   dismiss: () => void;
 }) {
-  const { t } = useI18n();
-  const [text, setText] = useState("");
+  const i18n = useI18n();
+  const [text, setText] = createSignal("");
   return (
     <ElicitationForm
       state="request"
-      className="max-w-none"
-      server={t("chat.card.question")}
+      class="max-w-none"
+      server={i18n.t("chat.card.question")}
       requestLabel=""
-      message={question}
+      message={props.question}
       fields={[
         {
           name: "answer",
-          label: t("chat.card.answer"),
+          label: i18n.t("chat.card.answer"),
           kind: "multiline",
-          placeholder: t("chat.card.answerPlaceholder"),
-          value: text,
+          placeholder: i18n.t("chat.card.answerPlaceholder"),
+          value: text(),
           required: true,
         },
       ]}
-      disabled={disabled}
+      disabled={props.disabled}
       onFieldChange={(_, value) => setText(value)}
-      onAccept={() => answer(text)}
-      onDecline={dismiss}
-      acceptLabel={t("chat.card.answer")}
-      declineLabel={t("chat.card.dismiss")}
+      onAccept={() => props.answer(text())}
+      onDecline={props.dismiss}
+      acceptLabel={i18n.t("chat.card.answer")}
+      declineLabel={i18n.t("chat.card.dismiss")}
     />
   );
 }
 
-export function ConversationCardStrip({
-  turn,
-  conversationId,
-  onOpen,
-}: {
+export function ConversationCardStrip(props: {
   turn?: string;
   conversationId?: string;
   onOpen: (conversation: string) => void;
 }) {
   const { api, client } = useOcgRuntime();
-  const { t } = useI18n();
-  const { conversation: loadedConversation } = useConversation(conversationId ? undefined : turn);
-  const conversation = conversationId ?? loadedConversation;
-  const [cards, setCards] = useState<ConversationCard[]>([]);
-  const [revision, setRevision] = useState(0);
-  const [pending, setPending] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const i18n = useI18n();
+  const { conversation: loadedConversation } = useConversation(
+    props.conversationId ? undefined : props.turn,
+  );
+  const conversation = createMemo(() => props.conversationId ?? loadedConversation);
+  const [cards, setCards] = createSignal<ConversationCard[]>([]);
+  const [revision, setRevision] = createSignal(0);
+  const [pending, setPending] = createSignal(false);
+  const [error, setError] = createSignal<string | null>(null);
   useConversationError(error);
-  const lock = useRef(false);
-  const actionVersion = useRef(0);
-  useEffect(() => {
-    if (!api || !conversation) return;
-    const controller = new AbortController();
-    let reading = false;
-    const refresh = async () => {
-      if (reading) return;
-      reading = true;
-      try {
-        const version = actionVersion.current;
-        const reply = await api.readCards(conversation, controller.signal);
-        if (!controller.signal.aborted && !lock.current && version === actionVersion.current) {
-          setCards(reply.cards);
-          setError(null);
+  const lock = elementRef(false);
+  const actionVersion = elementRef(0);
+  createEffect(
+    () => [api, conversation(), revision()],
+    () => {
+      if (!api || !conversation()) return;
+      const controller = new AbortController();
+      let reading = false;
+      const refresh = async () => {
+        if (reading) return;
+        reading = true;
+        try {
+          const version = actionVersion.current;
+          const reply = await api.readCards(conversation()!, controller.signal);
+          if (!controller.signal.aborted && !lock.current && version === actionVersion.current) {
+            setCards(reply.cards);
+            setError(null);
+          }
+        } catch (cause) {
+          if (!controller.signal.aborted)
+            setError(cause instanceof Error ? cause.message : String(cause));
+        } finally {
+          reading = false;
         }
-      } catch (cause) {
-        if (!controller.signal.aborted)
-          setError(cause instanceof Error ? cause.message : String(cause));
-      } finally {
-        reading = false;
-      }
-    };
-    const unsubscribe = api.subscribeCatalog(
-      () => void refresh(),
-      (cause) => {
-        if (!controller.signal.aborted)
-          setError(cause instanceof Error ? cause.message : String(cause));
-      },
-    );
-    void refresh();
-    return () => {
-      controller.abort();
-      unsubscribe();
-    };
-  }, [api, conversation, revision]);
+      };
+      const unsubscribe = api.subscribeCatalog(
+        () => void refresh(),
+        (cause) => {
+          if (!controller.signal.aborted)
+            setError(cause instanceof Error ? cause.message : String(cause));
+        },
+      );
+      void refresh();
+      return () => {
+        controller.abort();
+        unsubscribe();
+      };
+    },
+  );
 
   async function act(
     card: ConversationCard,
@@ -429,9 +447,9 @@ export function ConversationCardStrip({
       } else {
         setError(
           cause instanceof ApiError && cause.code === "command_list_bytes"
-            ? t("chat.card.commandBytes")
+            ? i18n.t("chat.card.commandBytes")
             : cause instanceof ApiError && cause.code === "command_list_full"
-              ? t("chat.card.commandCapacity")
+              ? i18n.t("chat.card.commandCapacity")
               : cause instanceof Error
                 ? cause.message
                 : String(cause),
@@ -444,7 +462,7 @@ export function ConversationCardStrip({
     }
   }
   const groups = new Map<string, { parent: string | null; cards: ConversationCard[] }>();
-  for (const card of cards) {
+  for (const card of cards()) {
     let group = groups.get(card.conversation);
     if (!group) {
       group = { parent: card.parent, cards: [] };
@@ -452,40 +470,38 @@ export function ConversationCardStrip({
     }
     group.parent = card.parent;
     group.cards.push(card);
-    if (card.parent && card.parent !== conversation && !groups.has(card.parent))
-      groups.set(card.parent, { parent: conversation, cards: [] });
+    if (card.parent && card.parent !== conversation() && !groups.has(card.parent))
+      groups.set(card.parent, { parent: conversation(), cards: [] });
   }
   function renderGroup(id: string, ancestors: Set<string>) {
     if (ancestors.has(id)) return null;
     const group = groups.get(id);
     if (!group) return null;
     const visited = new Set(ancestors).add(id);
-    const isCurrent = id === conversation;
+    const isCurrent = id === conversation();
     return (
-      <div key={id} className="flex flex-col gap-3" data-conversation={id}>
+      <div class="flex flex-col gap-3" data-conversation={id}>
         {!isCurrent && (
-          <div className="flex items-center gap-1.5">
+          <div class="flex items-center gap-1.5">
             <Button
               size="xs"
               variant="ghost"
-              className="h-6 font-mono text-xs text-muted-foreground hover:text-foreground"
-              onClick={() => onOpen(id)}
+              class="h-6 font-mono text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => props.onOpen(id)}
             >
               {id}
             </Button>
           </div>
         )}
         {group.cards.map((card) => {
-          const key = `${card.kind}:${card.approval.join(":")}`;
           const reject = () => void act(card, { decision: "reject" });
           if (card.kind === "approval") {
             return (
               <ApprovalRequest
-                key={key}
                 tool={card.tool}
                 arguments={card.arguments}
                 assessment={card.assessment}
-                disabled={pending}
+                disabled={pending()}
                 onApprove={() => void act(card, { decision: "approve" })}
                 onReject={reject}
               />
@@ -494,9 +510,8 @@ export function ConversationCardStrip({
           if (card.kind === "question") {
             return (
               <ConversationQuestion
-                key={key}
                 question={card.question}
-                disabled={pending}
+                disabled={pending()}
                 answer={(text) => void act(card, { answer: text })}
                 dismiss={reject}
               />
@@ -504,29 +519,26 @@ export function ConversationCardStrip({
           }
           if (!api) return null;
           return (
-            <div
-              className="w-full rounded-xl border border-border bg-card p-4 text-xs shadow-xs"
-              key={key}
-            >
-              <div className="mb-2 flex items-center justify-between gap-2">
-                <span className="text-sm font-medium text-foreground">
-                  {t("chat.card.dispatch")}
+            <div class="w-full rounded-xl border border-border bg-card p-4 text-xs shadow-xs">
+              <div class="mb-2 flex items-center justify-between gap-2">
+                <span class="text-sm font-medium text-foreground">
+                  {i18n.t("chat.card.dispatch")}
                 </span>
               </div>
               <DispatchSelectionCard
                 client={api}
                 arguments={card.arguments}
-                disabled={pending}
+                disabled={pending()}
                 onSelect={(selection) => void act(card, { answer: JSON.stringify(selection) })}
               />
               <Button
                 size="xs"
                 variant="outline"
-                className="mt-3"
-                disabled={pending}
+                class="mt-3"
+                disabled={pending()}
                 onClick={reject}
               >
-                {t("chat.card.dismiss")}
+                {i18n.t("chat.card.dismiss")}
               </Button>
             </div>
           );
@@ -534,25 +546,31 @@ export function ConversationCardStrip({
         {[...groups]
           .filter(([child, value]) => child !== id && value.parent === id)
           .map(([child]) => (
-            <div key={child} className="ml-3 flex flex-col gap-3 border-l-2 border-border/60 pl-3">
+            <div class="ml-3 flex flex-col gap-3 border-l-2 border-border/60 pl-3">
               {renderGroup(child, visited)}
             </div>
           ))}
       </div>
     );
   }
-  if (!api || !cards.length) return null;
   return (
-    <section
-      className="w-full py-2"
-      aria-label={t("chat.card.cards")}
-      data-slot="conversation-cards"
-    >
-      <div className="flex flex-col gap-3">
-        {[...groups]
-          .filter(([, group]) => !group.parent || !groups.has(group.parent))
-          .map(([id]) => renderGroup(id, new Set()))}
-      </div>
-    </section>
+    <>
+      {(() => {
+        if (!api || !cards().length) return null;
+        return (
+          <section
+            class="w-full py-2"
+            aria-label={i18n.t("chat.card.cards")}
+            data-slot="conversation-cards"
+          >
+            <div class="flex flex-col gap-3">
+              {[...groups]
+                .filter(([, group]) => !group.parent || !groups.has(group.parent))
+                .map(([id]) => renderGroup(id, new Set()))}
+            </div>
+          </section>
+        );
+      })()}
+    </>
   );
 }

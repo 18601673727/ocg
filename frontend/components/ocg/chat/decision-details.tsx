@@ -1,76 +1,81 @@
+import { createMemo } from "solid-js";
 import type { NativeDecisionTurn } from "../contracts/conversations";
 import { useI18n } from "../i18n";
 import { executionDetail, executionLabel } from "../runtime/job-status";
 import type { ChatMessage } from "../types";
 
-export function DecisionDetails({
-  decision,
-  message,
-  full = false,
-}: {
+export function DecisionDetails(props: {
   decision: NativeDecisionTurn;
   message: ChatMessage;
   full?: boolean;
 }) {
-  const { t } = useI18n();
-  const { request, result } = decision;
+  const i18n = useI18n();
+  const { request, result } = props.decision;
   const callerState = (
-    <pre className="overflow-x-auto whitespace-pre-wrap">
-      {JSON.stringify(request.state, null, 2)}
-    </pre>
+    <pre class="overflow-x-auto whitespace-pre-wrap">{JSON.stringify(request.state, null, 2)}</pre>
   );
-  const failure = decision.failure ?? (full ? message.failureReason : undefined);
+  const failure = createMemo(
+    () =>
+      props.decision.failure ??
+      ((props.full === undefined ? false : props.full) ? props.message.failureReason : undefined),
+  );
   return (
     <>
       <strong>Decision · {request.question.kind.replaceAll("_", " ")}</strong>
-      <p className="mt-2 whitespace-pre-wrap">{request.question.prompt}</p>
+      <p class="mt-2 whitespace-pre-wrap">{request.question.prompt}</p>
       {request.question.options?.map((option) => (
-        <p key={option.id}>
+        <p>
           {option.id}: {option.description}
         </p>
       ))}
       {request.question.levels?.map((level) => (
-        <p key={level.value}>
+        <p>
           {level.value}: {level.description}
         </p>
       ))}
-      {full ? (
+      {(props.full === undefined ? false : props.full) ? (
         <div>
-          <strong>{t("planning.callerState")}</strong>
+          <strong>{i18n.t("planning.callerState")}</strong>
           {callerState}
         </div>
       ) : (
-        <details className="mt-2">
+        <details class="mt-2">
           <summary>Caller state</summary>
           {callerState}
         </details>
       )}
       {result ? (
         <>
-          <strong>{full ? t("planning.result") : "Result"}</strong>
-          <pre className="overflow-x-auto whitespace-pre-wrap">
-            {JSON.stringify(full ? result : result.outcome, null, 2)}
+          <strong>
+            {(props.full === undefined ? false : props.full) ? i18n.t("planning.result") : "Result"}
+          </strong>
+          <pre class="overflow-x-auto whitespace-pre-wrap">
+            {JSON.stringify(
+              (props.full === undefined ? false : props.full) ? result : result.outcome,
+              null,
+              2,
+            )}
           </pre>
         </>
       ) : (
-        <div className="mt-2" role="status">
+        <div class="mt-2" role="status">
           <p>
             <strong>
-              {message.execution
-                ? executionLabel(t, message.execution)
-                : message.status === "pending"
+              {props.message.execution
+                ? executionLabel(i18n.t, props.message.execution)
+                : props.message.status === "pending"
                   ? "Pending"
-                  : `Job ${message.status}`}
+                  : `Job ${props.message.status}`}
             </strong>
-            {failure ? ` · ${failure}` : ""}
+            {failure() ? ` · ${failure()}` : ""}
           </p>
-          {message.execution && executionDetail(t, message.execution) && (
-            <p className="text-muted-foreground">{executionDetail(t, message.execution)}</p>
+          {props.message.execution && executionDetail(i18n.t, props.message.execution) && (
+            <p class="text-muted-foreground">{executionDetail(i18n.t, props.message.execution)}</p>
           )}
-          {message.status === "unknown" &&
-            message.failureReason === undefined &&
-            !(message.execution && executionDetail(t, message.execution)) && (
-              <p className="text-muted-foreground">
+          {props.message.status === "unknown" &&
+            props.message.failureReason === undefined &&
+            !(props.message.execution && executionDetail(i18n.t, props.message.execution)) && (
+              <p class="text-muted-foreground">
                 The outcome could not be established; it is not reported as stopped.
               </p>
             )}

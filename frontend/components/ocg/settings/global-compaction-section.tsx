@@ -1,137 +1,134 @@
-"use client";
-
-import Link from "next/link";
-
-import { useEffect, useState } from "react";
+import { createEffect, createSignal } from "solid-js";
+import { WorkspaceLink } from "@/components/ocg/layout/workspace-link";
+import { Button } from "@/components/ui/button";
 import type { ProfilesSnapshot } from "../contracts";
 import type { GlobalCompactionSettings } from "../contracts/api";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
-import { Section, describeError } from "./settings-parts";
-import { Button } from "@/components/ui/button";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
+import type { ApiClient } from "../runtime/api-client";
 import { CompactionPolicyFields } from "./compaction-policy-fields";
+import { describeError, Section } from "./settings-parts";
 
-export function GlobalCompactionSection({
-  client,
-  profiles,
-}: {
+export function GlobalCompactionSection(props: {
   client: ApiClient;
   profiles: ProfilesSnapshot | null;
 }) {
-  const { t } = useI18n();
-  const [draft, setDraft] = useState<GlobalCompactionSettings>();
+  const i18n = useI18n();
+  const [draft, setDraft] = createSignal<GlobalCompactionSettings>();
   const [active, setActive] =
-    useState<Awaited<ReturnType<ApiClient["readActiveSystemSettings"]>>>();
-  const [configError, setConfigError] = useState<string>();
-  const [error, setError] = useState<string>();
-  const [saved, setSaved] = useState(false);
-  const [busy, setBusy] = useState(false);
-  useEffect(() => {
-    const controller = new AbortController();
-    void client.readActiveSystemSettings(controller.signal).then(
-      (value) => {
-        if (!controller.signal.aborted) setActive(value);
-      },
-      (cause) => {
-        if (!controller.signal.aborted) setConfigError(describeError(cause, t));
-      },
-    );
-    void client.readGlobalCompactionSettings(controller.signal).then(
-      (value) => {
-        if (!controller.signal.aborted) setDraft(value);
-      },
-      (cause) => {
-        if (!controller.signal.aborted) setError(describeError(cause, t));
-      },
-    );
-    return () => controller.abort();
-  }, [client, t]);
+    createSignal<Awaited<ReturnType<ApiClient["readActiveSystemSettings"]>>>();
+  const [configError, setConfigError] = createSignal<string>();
+  const [error, setError] = createSignal<string>();
+  const [saved, setSaved] = createSignal(false);
+  const [busy, setBusy] = createSignal(false);
+  createEffect(
+    () => [props.client, i18n.t],
+    () => {
+      const controller = new AbortController();
+      void props.client.readActiveSystemSettings(controller.signal).then(
+        (value) => {
+          if (!controller.signal.aborted) setActive(value);
+        },
+        (cause) => {
+          if (!controller.signal.aborted) setConfigError(describeError(cause, i18n.t));
+        },
+      );
+      void props.client.readGlobalCompactionSettings(controller.signal).then(
+        (value) => {
+          if (!controller.signal.aborted) setDraft(value);
+        },
+        (cause) => {
+          if (!controller.signal.aborted) setError(describeError(cause, i18n.t));
+        },
+      );
+      return () => controller.abort();
+    },
+  );
   return (
     <>
       <Section
         id="settings-global-compaction"
-        title={t("context.globalTitle")}
-        description={t("context.globalDescription")}
+        title={i18n.t("context.globalTitle")}
+        description={i18n.t("context.globalDescription")}
       >
-        {error && <DismissibleNotice message={error} />}
-        {draft && profiles ? (
+        {error() && <DismissibleNotice message={error()!} />}
+        {draft() && props.profiles ? (
           <form
-            className="space-y-4 py-4"
+            class="space-y-4 py-4"
             onSubmit={(event) => {
               event.preventDefault();
               setBusy(true);
               setError(undefined);
               setSaved(false);
-              void client
-                .saveGlobalCompactionSettings(draft)
+              void props.client
+                .saveGlobalCompactionSettings(draft()!)
                 .then(
                   (value) => {
                     setDraft(value);
                     setSaved(true);
                   },
-                  (cause) => setError(describeError(cause, t)),
+                  (cause) => setError(describeError(cause, i18n.t)),
                 )
                 .finally(() => setBusy(false));
             }}
           >
-            <label className="flex items-center gap-2 text-sm">
+            <label class="flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
-                disabled={busy}
-                checked={draft.prediction_enabled}
+                disabled={busy()}
+                checked={draft()!.prediction_enabled}
                 onChange={(event) => {
                   setSaved(false);
-                  setDraft({ ...draft, prediction_enabled: event.target.checked });
+                  setDraft({ ...draft()!, prediction_enabled: event.target.checked });
                 }}
               />
-              {t("context.predictionDefault")}
+              {i18n.t("context.predictionDefault")}
             </label>
-            <p className="text-sm text-muted-foreground">
-              {t("context.configurePredictor")}{" "}
-              <Link className="underline" href="/settings/projects">
-                {t("settings.nav.projects")}
-              </Link>
+            <p class="text-sm text-muted-foreground">
+              {i18n.t("context.configurePredictor")}{" "}
+              <WorkspaceLink class="underline" href="/settings/projects">
+                {i18n.t("settings.nav.projects")}
+              </WorkspaceLink>
             </p>
             <CompactionPolicyFields
-              value={draft.policy}
+              value={draft()!.policy}
               onChange={(policy) => {
                 if (policy) {
                   setSaved(false);
-                  setDraft({ ...draft, policy });
+                  setDraft({ ...draft()!, policy });
                 }
               }}
-              profiles={profiles}
-              disabled={busy}
+              profiles={props.profiles}
+              disabled={busy()}
             />
-            {saved && (
-              <p role="status" className="text-sm">
-                {t("context.saved")}
+            {saved() && (
+              <p role="status" class="text-sm">
+                {i18n.t("context.saved")}
               </p>
             )}
-            <Button type="submit" disabled={busy}>
-              {busy ? t("context.saving") : t("common.save")}
+            <Button type="submit" disabled={busy()}>
+              {busy() ? i18n.t("context.saving") : i18n.t("common.save")}
             </Button>
           </form>
         ) : (
-          !error && (
-            <p role="status" className="py-4 text-sm">
-              {t("common.loading")}
+          !error() && (
+            <p role="status" class="py-4 text-sm">
+              {i18n.t("common.loading")}
             </p>
           )
         )}
       </Section>
       <Section
         id="settings-active-configuration"
-        title={t("context.activeConfiguration")}
-        description={t("context.activeConfigurationHint")}
+        title={i18n.t("context.activeConfiguration")}
+        description={i18n.t("context.activeConfigurationHint")}
       >
-        {configError && <DismissibleNotice message={configError} />}
-        {active && (
-          <div className="space-y-3 py-4">
-            <p className="break-all font-mono text-xs text-muted-foreground">{active.path}</p>
-            <pre className="overflow-x-auto rounded-md bg-muted p-3 text-xs leading-6">
-              {active.content}
+        {configError() && <DismissibleNotice message={configError()!} />}
+        {active() && (
+          <div class="space-y-3 py-4">
+            <p class="break-all font-mono text-xs text-muted-foreground">{active()!.path}</p>
+            <pre class="overflow-x-auto rounded-md bg-muted p-3 text-xs leading-6">
+              {active()!.content}
             </pre>
           </div>
         )}

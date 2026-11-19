@@ -1,39 +1,39 @@
+import {
+  jobTranscript,
+  type PartialToolBoundary,
+  TranscriptAccumulator,
+  type TranscriptTurn,
+} from "../chat/job-transcript-model";
 import type {
   ChatImage,
   ChatImageUploadRequest,
   ChatModelSelection,
   ConversationTurn,
-  JobDetails,
   Job,
+  JobDetails,
   Output,
   ProviderResponse,
   ToolCall,
 } from "../contracts";
+import { ContractError, materializeUserEntries } from "../contracts";
+import { fileSnapshots } from "../markdown/file-snapshot";
 import type { ChatMessage, ChatSession, OcgRuntimeEvent } from "../types";
-import { RuntimeClientBase } from "./runtime-client-base";
-import type { CreateSessionInput } from "./runtime-types";
 import {
-  readTranscriptEvidence,
-  readOutputWindow,
   type ApiClient,
   type JobStreamSubscription,
+  readOutputWindow,
+  readTranscriptEvidence,
 } from "./api-client";
-import {
-  jobTranscript,
-  TranscriptAccumulator,
-  type PartialToolBoundary,
-  type TranscriptTurn,
-} from "../chat/job-transcript-model";
-import { fileSnapshots } from "../markdown/source-snapshot";
-import { nativeExecutionStatus, reconcileJob, taskPlanActive } from "./job-status";
-import { ContractError, materializeUserEntries } from "../contracts";
 import { pageTurns } from "./history-page";
+import { nativeExecutionStatus, reconcileJob, taskPlanActive } from "./job-status";
 import {
   mergeOutputHistory,
   type OutputHistory,
   type OutputSequence,
   type OutputView,
 } from "./output-history";
+import { RuntimeClientBase } from "./runtime-client-base";
+import type { CreateSessionInput } from "./runtime-types";
 
 const TURN_PAGE_SIZE = 20;
 const CATALOG_REFRESH_DELAY_MS = 750;
@@ -246,6 +246,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       arguments?: readonly unknown[];
       transcript?: TranscriptTurn[];
     }
+  >();
+  private readonly messageProjections = new WeakMap<
+    Turn,
+    { inputs: readonly unknown[]; messages: ChatMessage[] }
   >();
   private readonly roots = new Map<string, string>();
   private listedRoots = new Set<string>();
@@ -938,6 +942,160 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     );
   }
 
+  private projectMessages(turn: Turn): ChatMessage[] {
+    if (turn.native_decision) {
+      const state = turn.job.settlement.state;
+      return [
+        {
+          id: `${turn.job.id}:decision`,
+          jobId: turn.job.id,
+          commandId: turn.job.id,
+          role: "assistant" as const,
+          content: "",
+          decision: turn.native_decision,
+          planningTarget: turn.planning_target,
+          failureReason: turn.unknownReason ?? undefined,
+          status: state === "unsettled" ? ("pending" as const) : state,
+          execution: nativeExecutionStatus(turn.job.execution_phase, turn.details),
+          createdAt: new Date(turn.job.created_at_us / 1000).toISOString(),
+        },
+      ];
+    }
+    const entries = materializeUserEntries(turn.entries ?? []);
+    const queued =
+      turn.job.previous !== null &&
+      turn.job.started_at_us === null &&
+      turn.job.settlement.state === "unsettled";
+    const inputs: ChatMessage[] = entries.map((entry) => ({
+      agentInstruction: entry.kind === "agent_message",
+      intermediate: entry.kind === "agent_message",
+      queued: entry.kind === "user_message" && queued,
+      withdrawn: entry.withdrawn,
+      queueHistory: entry.history,
+      id: `${turn.job.id}:entry:${entry.seq}`,
+      jobId: turn.job.id,
+      commandId: turn.job.id,
+      role: entry.kind === "agent_message" ? "assistant" : "user",
+      content: entry.text ?? "",
+      status: "completed",
+      createdAt: new Date(entry.at_us / 1000).toISOString(),
+      images: entry.attachments.flatMap((id) => this.images.get(id) ?? []),
+    }));
+    const boundary: ChatMessage[] = turn.compaction
+      ? [
+          {
+            id: `${turn.job.id}:compaction`,
+            jobId: turn.job.id,
+            commandId: turn.job.id,
+            role: "assistant",
+            content: "",
+            status: "completed",
+            intermediate: true,
+            createdAt: new Date(turn.compaction.at_us / 1000).toISOString(),
+            compaction: turn.compaction,
+          },
+        ]
+      : [];
+    const withdrawnBeforeStart =
+      turn.job.started_at_us === null &&
+      turn.job.settlement.state === "cancelled" &&
+      entries.length > 0 &&
+      entries.every((entry) => entry.withdrawn) &&
+      !turn.outputs.length &&
+      !turn.tools.length &&
+      !turn.responses.length;
+    const projected = this.projectTurn(turn);
+    const transcript = withdrawnBeforeStart ? [] : projected.transcript;
+    return [
+      ...boundary,
+      ...inputs,
+      ...transcript.map((message) => ({
+        id: message.id,
+        jobId: turn.job.id,
+        commandId: turn.job.id,
+        role: message.role,
+        content: message.content,
+        status: message.status,
+        intermediate: message.intermediate,
+        activity: turn.details?.activity,
+        taskPlan: turn.details?.task_plan,
+        execution: nativeExecutionStatus(
+          turn.job.execution_phase,
+          turn.details,
+          turnCanRetry(turn),
+        ),
+        createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
+        ...(message.role === "user"
+          ? { images: turn.input.attachments.flatMap((id) => this.images.get(id) ?? []) }
+          : {
+              toolCalls: [...(message.tools ?? [])],
+              reasoning: message.reasoning,
+              sourceSnapshots: message.intermediate
+                ? undefined
+                : fileSnapshots(projected.result?.value),
+              reasoningDurationMs: message.reasoningDurationMs,
+              failureReason: message.intermediate
+                ? undefined
+                : (turn.error ??
+                  turn.toolError ??
+                  message.detail ??
+                  (message.status === "unknown"
+                    ? (turn.details?.allocation?.holds_capacity
+                        ? "Execution outcome uncertain; ownership is held and capacity is not released."
+                        : turn.job.stop_confirmed_at_us === null
+                          ? "Outcome unknown; stop is not yet confirmed."
+                          : "Execution stopped; final outcome unknown.") +
+                      (turn.unknownReason ? ` ${turn.unknownReason}` : "")
+                    : undefined)),
+              failureAt:
+                !message.intermediate &&
+                !turn.error &&
+                !turn.toolError &&
+                message.status !== "completed" &&
+                message.status !== "streaming" &&
+                message.status !== "pending" &&
+                turn.job.settlement.settled_at_us !== null
+                  ? turn.job.settlement.settled_at_us / 1000
+                  : undefined,
+            }),
+      })),
+    ];
+  }
+
+  private messagesForTurn(turn: Turn): ChatMessage[] {
+    // OutputHistory grows in place, so its length is part of the projection inputs.
+    const inputs = [
+      turn.job,
+      turn.input,
+      turn.details,
+      turn.entries,
+      turn.outputs,
+      turn.outputs.length,
+      turn.tools,
+      turn.responses,
+      turn.partialToolBoundaries,
+      turn.compaction,
+      turn.content_kind,
+      turn.native_decision,
+      turn.planning_target,
+      turn.error,
+      turn.toolError,
+      turn.unknownReason,
+      ...Array.from(turnAttachments(turn), (id) => this.images.get(id)),
+    ];
+    const cached = this.messageProjections.get(turn);
+    if (
+      cached &&
+      cached.inputs.length === inputs.length &&
+      inputs.every((input, index) => input === cached.inputs[index])
+    ) {
+      return cached.messages;
+    }
+    const messages = this.projectMessages(turn);
+    this.messageProjections.set(turn, { inputs, messages });
+    return messages;
+  }
+
   private publish(sessionId: string) {
     if (this.disposed || !this.getSnapshot().sessions.some((session) => session.id === sessionId))
       return;
@@ -948,125 +1106,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           (a.input.submitted_at_us ?? a.job.created_at_us) -
             (b.input.submitted_at_us ?? b.job.created_at_us) || a.job.id.localeCompare(b.job.id),
       );
-    const messages: ChatMessage[] = turns.flatMap((turn) => {
-      if (turn.native_decision) {
-        const state = turn.job.settlement.state;
-        return [
-          {
-            id: `${turn.job.id}:decision`,
-            jobId: turn.job.id,
-            commandId: turn.job.id,
-            role: "assistant" as const,
-            content: "",
-            decision: turn.native_decision,
-            planningTarget: turn.planning_target,
-            failureReason: turn.unknownReason ?? undefined,
-            status: state === "unsettled" ? ("pending" as const) : state,
-            execution: nativeExecutionStatus(turn.job.execution_phase, turn.details),
-            createdAt: new Date(turn.job.created_at_us / 1000).toISOString(),
-          },
-        ];
-      }
-      const entries = materializeUserEntries(turn.entries ?? []);
-      const queued =
-        turn.job.previous !== null &&
-        turn.job.started_at_us === null &&
-        turn.job.settlement.state === "unsettled";
-      const inputs: ChatMessage[] = entries.map((entry) => ({
-        agentInstruction: entry.kind === "agent_message",
-        intermediate: entry.kind === "agent_message",
-        queued: entry.kind === "user_message" && queued,
-        withdrawn: entry.withdrawn,
-        queueHistory: entry.history,
-        id: `${turn.job.id}:entry:${entry.seq}`,
-        jobId: turn.job.id,
-        commandId: turn.job.id,
-        role: entry.kind === "agent_message" ? "assistant" : "user",
-        content: entry.text ?? "",
-        status: "completed",
-        createdAt: new Date(entry.at_us / 1000).toISOString(),
-        images: entry.attachments.flatMap((id) => this.images.get(id) ?? []),
-      }));
-      const boundary: ChatMessage[] = turn.compaction
-        ? [
-            {
-              id: `${turn.job.id}:compaction`,
-              jobId: turn.job.id,
-              commandId: turn.job.id,
-              role: "assistant",
-              content: "",
-              status: "completed",
-              intermediate: true,
-              createdAt: new Date(turn.compaction.at_us / 1000).toISOString(),
-              compaction: turn.compaction,
-            },
-          ]
-        : [];
-      const withdrawnBeforeStart =
-        turn.job.started_at_us === null &&
-        turn.job.settlement.state === "cancelled" &&
-        entries.length > 0 &&
-        entries.every((entry) => entry.withdrawn) &&
-        !turn.outputs.length &&
-        !turn.tools.length &&
-        !turn.responses.length;
-      const projected = this.projectTurn(turn);
-      const transcript = withdrawnBeforeStart ? [] : projected.transcript;
-      return [
-        ...boundary,
-        ...inputs,
-        ...transcript.map((message) => ({
-          id: message.id,
-          jobId: turn.job.id,
-          commandId: turn.job.id,
-          role: message.role,
-          content: message.content,
-          status: message.status,
-          intermediate: message.intermediate,
-          activity: turn.details?.activity,
-          taskPlan: turn.details?.task_plan,
-          execution: nativeExecutionStatus(
-            turn.job.execution_phase,
-            turn.details,
-            turnCanRetry(turn),
-          ),
-          createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
-          ...(message.role === "user"
-            ? { images: turn.input.attachments.flatMap((id) => this.images.get(id) ?? []) }
-            : {
-                toolCalls: [...(message.tools ?? [])],
-                reasoning: message.reasoning,
-                sourceSnapshots: message.intermediate
-                  ? undefined
-                  : fileSnapshots(projected.result?.value),
-                reasoningDurationMs: message.reasoningDurationMs,
-                failureReason: message.intermediate
-                  ? undefined
-                  : (turn.error ??
-                    turn.toolError ??
-                    message.detail ??
-                    (message.status === "unknown"
-                      ? (turn.details?.allocation?.holds_capacity
-                          ? "Execution outcome uncertain; ownership is held and capacity is not released."
-                          : turn.job.stop_confirmed_at_us === null
-                            ? "Outcome unknown; stop is not yet confirmed."
-                            : "Execution stopped; final outcome unknown.") +
-                        (turn.unknownReason ? ` ${turn.unknownReason}` : "")
-                      : undefined)),
-                failureAt:
-                  !message.intermediate &&
-                  !turn.error &&
-                  !turn.toolError &&
-                  message.status !== "completed" &&
-                  message.status !== "streaming" &&
-                  message.status !== "pending" &&
-                  turn.job.settlement.settled_at_us !== null
-                    ? turn.job.settlement.settled_at_us / 1000
-                    : undefined,
-              }),
-        })),
-      ];
-    });
+    const messages = turns.flatMap((turn) => this.messagesForTurn(turn));
     this.emit({ type: "conversation.history-loaded", sessionId, messages });
     const queue = turns
       .filter(

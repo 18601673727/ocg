@@ -1,18 +1,5 @@
-"use client";
-
-import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  ComposerPrimitive,
-  unstable_useSlashCommandAdapter,
-  useAui,
-  type Unstable_SlashCommand,
-} from "@assistant-ui/react";
-import { Cpu, Paperclip } from "lucide-react";
-import { Button } from "@/components/ui/button";
-import {
-  AttachmentTile,
-  AttachmentTileRemove,
-} from "@/components/assistant-ui/elements/attachment.aui";
+import { createEffect, createMemo, createSignal, For, Show } from "solid-js";
+import { AttachmentTile, AttachmentTileRemove } from "@/components/ocg/chat/ui/attachment";
 import {
   Composer,
   ComposerActions,
@@ -21,13 +8,14 @@ import {
   ComposerBar,
   ComposerSend,
   ComposerToolbar,
-} from "@/components/assistant-ui/elements/composer";
-import { ComposerTriggerPopover } from "@/components/assistant-ui/elements/composer-trigger-popover.aui";
-import { useOcgRuntime } from "../runtime/runtime-context";
-import { ApiError, type MutableJob, type MutableJobInput } from "../runtime/api-client";
-import type { ChatModelSelection, ChatImage } from "../contracts";
-import { ModelSelector, type ModelImageSupport } from "./model-selector";
+} from "@/components/ocg/chat/ui/composer";
+import { Button } from "@/components/ui/button";
+import { bindElementRef, elementRef } from "@/lib/ui-state";
+import type { ChatImage, ChatModelSelection } from "../contracts";
 import { useI18n } from "../i18n";
+import { ApiError, type MutableJob, type MutableJobInput } from "../runtime/api-client";
+import { useOcgRuntime } from "../runtime/runtime-context";
+import { type ModelImageSupport, ModelSelector } from "./model-selector";
 
 export const MUTABLE_CONTEXT_KEY = "ocg.mutable-composer.context.v1";
 const QUEUED_KEY = "ocg.mutable-composer.queued.v1";
@@ -35,7 +23,6 @@ const UNFINISHED_KEY = "ocg.mutable-composer.unfinished.v1";
 const PENDING_KEY = "ocg.mutable-composer.pending-submission.v1";
 const AUTOSAVE_DELAY_MS = 1500;
 const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-const SHORTCUT_ICONS = { attach: Paperclip, model: Cpu };
 const contexts = new Map<string, string>();
 let navigationGuard: (() => Promise<boolean>) | null = null;
 export async function confirmMutableComposerNavigation(): Promise<boolean> {
@@ -224,20 +211,11 @@ function hasDraftContent(input: MutableJobInput) {
   return input.text.trim().length > 0 || input.attachments.length > 0;
 }
 
-export function MutableComposer({
-  sessionId,
-  context,
-  conversation,
-  project,
-  selection,
-  onSelectionChange,
-  onPreference,
-}: Props) {
+export function MutableComposer(props: Props) {
   const { api, client } = useOcgRuntime();
-  const aui = useAui();
-  const { t } = useI18n();
-  const work = useRef<Work>({
-    context,
+  const i18n = useI18n();
+  const work = elementRef<Work>({
+    context: props.context,
     job: null,
     desired: empty(),
     initial: null,
@@ -246,109 +224,130 @@ export function MutableComposer({
     conflict: false,
     promise: null,
   });
-  const autosaveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const draftBeforeQueueEdit = useRef<{
+  const autosaveTimer = elementRef<ReturnType<typeof setTimeout> | null>(null);
+  const draftBeforeQueueEdit = elementRef<{
     work: Work;
     images: ChatImage[];
     selection?: ChatModelSelection;
   } | null>(null);
-  const scope = useRef({ conversation, project: selection?.project ?? project });
-  scope.current = { conversation, project: selection?.project ?? project };
-  const alive = useRef(true);
-  const [input, setInput] = useState<MutableJobInput>(empty);
-  const [confirmed, setConfirmed] = useState<MutableJob | null>(null);
-  const [ready, setReady] = useState(false);
-  const [status, setStatus] = useState("Loading saved Job…");
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const busyRef = useRef(false);
-  const [uncertain, setUncertain] = useState(false);
-  const [conflict, setConflict] = useState(false);
-  const [uploading, setUploading] = useState(0);
-  const [dragActive, setDragActive] = useState(false);
-  const [pendingImages, setPendingImages] = useState<PendingImage[]>([]);
-  const pendingImagesRef = useRef<PendingImage[]>([]);
-  const uploadTask = useRef<Promise<void> | null>(null);
-  const uncertainRef = useRef(false);
-  uncertainRef.current = uncertain;
-  const [images, setImages] = useState<ChatImage[]>([]);
-  const [queued, setQueued] = useState<MutableJob[]>([]);
-  const [unfinished, setUnfinished] = useState<MutableJob[]>([]);
-  const [editingQueue, setEditingQueue] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-  const modelTriggerRef = useRef<HTMLButtonElement>(null);
-  const explicitSelection = useRef(false);
-  const [support, setSupport] = useState<ModelImageSupport | null>(null);
-  const imageSupport = useCallback((value: ModelImageSupport) => setSupport(value), []);
-  const [queuedLoading, setQueuedLoading] = useState(false);
-  const inputDisabled = !ready || busy || conflict || uncertain;
-  const canAttach = !inputDisabled && uploading === 0 && Boolean(support?.supported);
-  const sendDisabled =
-    inputDisabled ||
-    pendingImages.length > 0 ||
-    (!editingQueue && !input.text.trim() && !input.attachments.length);
-  const commands: Unstable_SlashCommand[] = [];
-  if (canAttach) {
-    commands.push({
-      id: "attach",
-      icon: "attach",
-      description: t("chat.composer.attachImage"),
-      execute: () => executeShortcut(() => inputRef.current?.click()),
-    });
-  }
-  if (!inputDisabled && selection?.llmProfile) {
-    commands.push({
-      id: "model",
-      icon: "model",
-      description: t("chat.executionSettings"),
-      execute: () => executeShortcut(() => modelTriggerRef.current?.click()),
-    });
-  }
-  const slash = unstable_useSlashCommandAdapter({
-    commands,
-    removeOnExecute: true,
-    iconMap: SHORTCUT_ICONS,
+  const scope = elementRef({
+    conversation: props.conversation,
+    project: props.selection?.project ?? props.project,
   });
-  useEffect(() => {
-    if (aui.composer.getState().text !== input.text) aui.composer.setText(input.text);
-  }, [aui, input.text]);
-
-  useEffect(() => {
-    const beforeUnload = (event: BeforeUnloadEvent) => {
-      if (
-        !work.current.dirty &&
-        !work.current.promise &&
-        !pendingImagesRef.current.length &&
-        !uncertainRef.current &&
-        !busyRef.current
-      )
-        return;
-      event.preventDefault();
-      event.returnValue = "";
-    };
-    window.addEventListener("beforeunload", beforeUnload);
-    return () => window.removeEventListener("beforeunload", beforeUnload);
-  }, []);
-
-  const loadImages = useCallback(
-    async (ids: string[]) => {
-      if (!api) return [];
-      return Promise.all(
-        ids.map(async (id) => {
-          const item = await api.readAttachment(id);
-          if (!item.available) throw new Error(`Attachment ${id} is unavailable.`);
-          return {
-            id,
-            name: item.display_name ?? "Image",
-            media_type: item.mime,
-            url: api.attachmentContentUrl(id),
-          };
-        }),
-      );
+  createEffect(
+    () => ({
+      conversation: props.conversation,
+      project: props.selection?.project ?? props.project,
+    }),
+    (scopeNow) => {
+      scope.current = scopeNow;
     },
-    [api],
   );
-  const refreshQueue = useCallback(async () => {
+  const alive = elementRef(true);
+  const [input, setInput] = createSignal<MutableJobInput>(empty);
+  const [confirmed, setConfirmed] = createSignal<MutableJob | null>(null);
+  const [ready, setReady] = createSignal(false);
+  const [status, setStatus] = createSignal("Loading saved Job…");
+  const [error, setError] = createSignal<string | null>(null);
+  const [busy, setBusy] = createSignal(false);
+  const busyRef = elementRef(false);
+  const [uncertain, setUncertain] = createSignal(false);
+  const [conflict, setConflict] = createSignal(false);
+  const [uploading, setUploading] = createSignal(0);
+  const [dragActive, setDragActive] = createSignal(false);
+  const [pendingImages, setPendingImages] = createSignal<PendingImage[]>([]);
+  const pendingImagesRef = elementRef<PendingImage[]>([]);
+  const uploadTask = elementRef<Promise<void> | null>(null);
+  const uncertainRef = elementRef(false);
+  createEffect(uncertain, (value) => {
+    uncertainRef.current = value;
+  });
+  const [images, setImages] = createSignal<ChatImage[]>([]);
+  const [queued, setQueued] = createSignal<MutableJob[]>([]);
+  const [unfinished, setUnfinished] = createSignal<MutableJob[]>([]);
+  const [editingQueue, setEditingQueue] = createSignal(false);
+  const inputRef = elementRef<HTMLInputElement>(null);
+  const modelTriggerRef = elementRef<HTMLButtonElement>(null);
+  const explicitSelection = elementRef(false);
+  const [support, setSupport] = createSignal<ModelImageSupport | null>(null);
+  const imageSupport = (value: ModelImageSupport) => setSupport(value);
+  const [queuedLoading, setQueuedLoading] = createSignal(false);
+  const inputDisabled = createMemo(() => !ready() || busy() || conflict() || uncertain());
+  const canAttach = createMemo(
+    () => !inputDisabled() && uploading() === 0 && Boolean(support()?.supported),
+  );
+  const sendDisabled = createMemo(
+    () =>
+      inputDisabled() ||
+      pendingImages().length > 0 ||
+      (!editingQueue() && !input().text.trim() && !input().attachments.length),
+  );
+  const [shortcutIndex, setShortcutIndex] = createSignal(0);
+  const [shortcutDismissed, setShortcutDismissed] = createSignal("");
+  const shortcuts = createMemo(() => {
+    const match = /(?:^|\s)\/([^\s/]*)$/.exec(input().text);
+    if (!match || input().text === shortcutDismissed()) return [];
+    const query = match[1].toLowerCase();
+    const available = [
+      {
+        key: "attach",
+        label: i18n.t("chat.composer.attachImage"),
+        enabled: canAttach(),
+        action: () => inputRef.current?.click(),
+      },
+      {
+        key: "model",
+        label: i18n.t("chat.executionSettings"),
+        enabled: !inputDisabled() && !!props.selection?.llmProfile,
+        action: () => modelTriggerRef.current?.click(),
+      },
+    ];
+    return available.filter(
+      ({ key, label, enabled }) =>
+        enabled && (key.startsWith(query) || label.toLowerCase().includes(query)),
+    );
+  });
+  function runShortcut(shortcut: ReturnType<typeof shortcuts>[number]) {
+    changeText(input().text.replace(/(?:^|\s)\/[^\s/]*$/, ""));
+    shortcut.action();
+  }
+
+  createEffect(
+    () => [],
+    () => {
+      const beforeUnload = (event: BeforeUnloadEvent) => {
+        if (
+          !work.current.dirty &&
+          !work.current.promise &&
+          !pendingImagesRef.current.length &&
+          !uncertainRef.current &&
+          !busyRef.current
+        )
+          return;
+        event.preventDefault();
+        event.returnValue = "";
+      };
+      window.addEventListener("beforeunload", beforeUnload);
+      return () => window.removeEventListener("beforeunload", beforeUnload);
+    },
+  );
+
+  const loadImages = async (ids: string[]) => {
+    if (!api) return [];
+    return Promise.all(
+      ids.map(async (id) => {
+        const item = await api.readAttachment(id);
+        if (!item.available) throw new Error(`Attachment ${id} is unavailable.`);
+        return {
+          id,
+          name: item.display_name ?? "Image",
+          media_type: item.mime,
+          url: api.attachmentContentUrl(id),
+        };
+      }),
+    );
+  };
+  const refreshQueue = async () => {
     if (!api) return;
     const results = await Promise.allSettled(
       queuedPointers().map(({ context, job }) => api.readMutableJob(context, job)),
@@ -367,8 +366,8 @@ export function MutableComposer({
     );
     if (results.some((result) => result.status === "rejected"))
       setError("Some queued Jobs could not be loaded. Retry to see their latest state.");
-  }, [api]);
-  const refreshUnfinished = useCallback(async () => {
+  };
+  const refreshUnfinished = async () => {
     if (!api) return;
     const results = await Promise.allSettled(
       unfinishedContexts().map((item) => api.currentMutableJob(item)),
@@ -387,229 +386,231 @@ export function MutableComposer({
     );
     if (results.some((result) => result.status === "rejected"))
       setError("Some unfinished Jobs could not be loaded. Retry to see their latest state.");
-  }, [api]);
-  useEffect(() => {
-    alive.current = true;
-    if (!api) return;
-    let cancelled = false;
-    void (async () => {
-      try {
-        const pendingText = localStorage.getItem(pendingKey(context));
-        const pending: {
-          context: string;
-          job: string;
-          revision: number;
-          fingerprint: string;
-        } | null = pendingText ? JSON.parse(pendingText) : null;
-        let job = await api.currentMutableJob(context);
-        if (pending?.context === context) {
-          const submitted = await api.readMutableJob(context, pending.job);
-          if (
-            (submitted.phase === "queued" ||
-              submitted.phase === "executing" ||
-              submitted.phase === "completed") &&
-            (await inputFingerprint(submitted.input)) === pending.fingerprint
-          ) {
-            savePointer({ context, job: submitted.id });
-            bindComposerContext(sessionId, context, submitted.conversation);
-            if (!client.presentMutableJob)
-              throw new Error("The submitted Job cannot yet be opened in history.");
-            await client.presentMutableJob(sessionId, submitted);
-            forgetUnfinished(context);
-            localStorage.removeItem(pendingKey(context));
-            clearGlobalContext(context);
-            work.current.context = rotateContext(sessionId, submitted.conversation);
-            job = null;
-          } else if (
-            submitted.phase === "unsubmitted" &&
-            submitted.revision === pending.revision &&
-            (await inputFingerprint(submitted.input)) === pending.fingerprint
-          ) {
-            job = submitted;
-            setUncertain(true);
-          } else {
-            job = submitted;
-            work.current.conflict = true;
-            setConflict(true);
-            setError(
-              "The pending submission no longer matches the saved revision. Reconcile it before editing.",
-            );
+  };
+  createEffect(
+    () => [api, props.context, loadImages, refreshQueue, refreshUnfinished],
+    () => {
+      alive.current = true;
+      if (!api) return;
+      let cancelled = false;
+      void (async () => {
+        try {
+          const pendingText = localStorage.getItem(pendingKey(props.context));
+          const pending: {
+            context: string;
+            job: string;
+            revision: number;
+            fingerprint: string;
+          } | null = pendingText ? JSON.parse(pendingText) : null;
+          let job = await api.currentMutableJob(props.context);
+          if (pending?.context === props.context) {
+            const submitted = await api.readMutableJob(props.context, pending.job);
+            if (
+              (submitted.phase === "queued" ||
+                submitted.phase === "executing" ||
+                submitted.phase === "completed") &&
+              (await inputFingerprint(submitted.input)) === pending.fingerprint
+            ) {
+              savePointer({ context: props.context, job: submitted.id });
+              bindComposerContext(props.sessionId, props.context, submitted.conversation);
+              if (!client.presentMutableJob)
+                throw new Error("The submitted Job cannot yet be opened in history.");
+              await client.presentMutableJob(props.sessionId, submitted);
+              forgetUnfinished(props.context);
+              localStorage.removeItem(pendingKey(props.context));
+              clearGlobalContext(props.context);
+              work.current.context = rotateContext(props.sessionId, submitted.conversation);
+              job = null;
+            } else if (
+              submitted.phase === "unsubmitted" &&
+              submitted.revision === pending.revision &&
+              (await inputFingerprint(submitted.input)) === pending.fingerprint
+            ) {
+              job = submitted;
+              setUncertain(true);
+            } else {
+              job = submitted;
+              work.current.conflict = true;
+              setConflict(true);
+              setError(
+                "The pending submission no longer matches the saved revision. Reconcile it before editing.",
+              );
+            }
           }
-        }
-        if (cancelled) return;
-        if (job) {
-          if (scope.current.conversation && job.conversation !== scope.current.conversation)
-            throw new Error(
-              "The saved Job belongs to another conversation. Open that conversation to continue editing it.",
-            );
-          if (job.phase === "unsubmitted") rememberUnfinished(context);
-          const restored = await loadImages(job.input.attachments);
           if (cancelled) return;
-          work.current.job = job;
-          work.current.desired = job.input;
-          setInput(job.input);
-          setConfirmed(job);
-          setImages(restored);
-          if (job.input.configuration)
-            onSelectionChange({
-              model: "",
-              effort: job.input.configuration.reasoning_effort,
-              llmProfile: job.input.configuration.llm_profile,
-              agentProfile: job.input.configuration.agent_profile ?? undefined,
-              project: job.project ?? undefined,
-            });
+          if (job) {
+            if (scope.current.conversation && job.conversation !== scope.current.conversation)
+              throw new Error(
+                "The saved Job belongs to another conversation. Open that conversation to continue editing it.",
+              );
+            if (job.phase === "unsubmitted") rememberUnfinished(props.context);
+            const restored = await loadImages(job.input.attachments);
+            if (cancelled) return;
+            work.current.job = job;
+            work.current.desired = job.input;
+            setInput(job.input);
+            setConfirmed(job);
+            setImages(restored);
+            if (job.input.configuration)
+              props.onSelectionChange({
+                model: "",
+                effort: job.input.configuration.reasoning_effort,
+                llmProfile: job.input.configuration.llm_profile,
+                agentProfile: job.input.configuration.agent_profile ?? undefined,
+                project: job.project ?? undefined,
+              });
+          }
+          setReady(true);
+          setStatus(job ? "Saved" : "New Job");
+          await refreshQueue();
+          await refreshUnfinished();
+        } catch (cause) {
+          if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
         }
-        setReady(true);
-        setStatus(job ? "Saved" : "New Job");
-        await refreshQueue();
-        await refreshUnfinished();
-      } catch (cause) {
-        if (!cancelled) setError(cause instanceof Error ? cause.message : String(cause));
-      }
-    })();
-    return () => {
-      cancelled = true;
-      alive.current = false;
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [api, context, loadImages, refreshQueue, refreshUnfinished]);
+      })();
+      return () => {
+        cancelled = true;
+        alive.current = false;
+      };
+    },
+  );
 
-  const cancelAutosave = useCallback(() => {
+  const cancelAutosave = () => {
     if (autosaveTimer.current === null) return;
     clearTimeout(autosaveTimer.current);
     autosaveTimer.current = null;
-  }, []);
-  useEffect(() => cancelAutosave, [cancelAutosave]);
-
-  const flush = useCallback(
-    async function flushWork(autosave = false): Promise<void> {
-      if (!autosave) cancelAutosave();
-      else if (!alive.current || autosaveTimer.current !== null) return;
-      const state = work.current;
-      if (state.promise) {
-        await state.promise;
-        if (work.current === state && state.dirty) await flushWork(autosave);
-        return;
-      }
-      if (!state.dirty || state.conflict) return;
-      const run = async () => {
-        while (state.dirty && !state.conflict) {
-          if (alive.current) {
-            setStatus("Saving…");
-            setError(null);
-          }
-          try {
-            if (!state.job) {
-              state.initial ??= structuredClone(state.desired);
-              state.association ??= scope.current.conversation
-                ? { conversation: scope.current.conversation }
-                : scope.current.project
-                  ? { project: scope.current.project }
-                  : {};
-              try {
-                state.job = await api.createMutableJob(
-                  state.context,
-                  state.initial,
-                  `create-${state.context}`,
-                  state.association,
-                );
-              } catch (cause) {
-                const existing = await api.currentMutableJob(state.context).catch(() => null);
-                if (!existing) throw cause;
-                state.job = existing;
-              }
-              if (
-                state.job.revision !== 1 ||
-                !same(state.job.input, state.initial) ||
-                (state.association.conversation &&
-                  state.job.conversation !== state.association.conversation) ||
-                (!state.association.conversation &&
-                  state.job.project !== (state.association.project ?? null))
-              ) {
-                throw new ApiError("mutable_job_conflict", 409, false);
-              }
-              rememberUnfinished(state.context);
-            } else if (isEmptyDraft(state.job, state.desired, pendingImagesRef.current)) {
-              const id = state.job.id;
-              try {
-                await api.discardMutableJob(state.context, id, state.job.revision);
-              } catch (cause) {
-                if (
-                  cause instanceof ApiError &&
-                  cause.status >= 400 &&
-                  cause.status < 500 &&
-                  cause.status !== 404
-                ) {
-                  throw cause;
-                }
-                const current = await api.currentMutableJob(state.context).catch(() => undefined);
-                if (current !== null) throw cause;
-              }
-              forgetUnfinished(state.context);
-              state.context = rotateContext(sessionId, scope.current.conversation);
-              state.job = null;
-              state.initial = null;
-              state.association = null;
-              if (alive.current) setUnfinished((jobs) => jobs.filter((job) => job.id !== id));
-            } else if (!same(state.job.input, state.desired)) {
-              state.job = await api.updateMutableJob(
-                state.context,
-                state.job.id,
-                state.job.revision,
-                structuredClone(state.desired),
-              );
-            }
-            state.dirty = state.job
-              ? !same(state.job.input, state.desired) ||
-                isEmptyDraft(state.job, state.desired, pendingImagesRef.current)
-              : hasDraftContent(state.desired);
-            if (alive.current) {
-              setConfirmed(state.job);
-              setStatus(
-                state.dirty
-                  ? autosave
-                    ? "Waiting to save…"
-                    : "Saving…"
-                  : state.job
-                    ? "Saved"
-                    : "New Job",
-              );
-            }
-            if (autosave) break;
-          } catch (cause) {
-            if (
-              cause instanceof ApiError &&
-              cause.status === 409 &&
-              cause.code !== "unsupported_execution_context"
-            ) {
-              state.conflict = true;
-              if (alive.current) setConflict(true);
-              if (state.job) {
-                const latest = await api
-                  .readMutableJob(state.context, state.job.id)
-                  .catch(() => null);
-                if (latest && alive.current) setConfirmed(latest);
-              }
-              if (alive.current)
-                setError(
-                  "The saved Job changed elsewhere. Your local edits are not saved. Load the saved version before continuing.",
-                );
-            } else if (alive.current)
-              setError(cause instanceof Error ? cause.message : String(cause));
-            if (alive.current) setStatus("Local changes not saved");
-            throw cause;
-          }
-        }
-      };
-      state.promise = run().finally(() => {
-        state.promise = null;
-      });
-      await state.promise;
-    },
-    [api, cancelAutosave, sessionId],
+  };
+  createEffect(
+    () => [cancelAutosave],
+    () => cancelAutosave,
   );
 
-  const scheduleAutosave = useCallback(() => {
+  const flush = async function flushWork(autosave = false): Promise<void> {
+    if (!autosave) cancelAutosave();
+    else if (!alive.current || autosaveTimer.current !== null) return;
+    const state = work.current;
+    if (state.promise) {
+      await state.promise;
+      if (work.current === state && state.dirty) await flushWork(autosave);
+      return;
+    }
+    if (!state.dirty || state.conflict) return;
+    const run = async () => {
+      while (state.dirty && !state.conflict) {
+        if (alive.current) {
+          setStatus("Saving…");
+          setError(null);
+        }
+        try {
+          if (!state.job) {
+            state.initial ??= structuredClone(state.desired);
+            state.association ??= scope.current.conversation
+              ? { conversation: scope.current.conversation }
+              : scope.current.project
+                ? { project: scope.current.project }
+                : {};
+            try {
+              state.job = await api.createMutableJob(
+                state.context,
+                state.initial,
+                `create-${state.context}`,
+                state.association,
+              );
+            } catch (cause) {
+              const existing = await api.currentMutableJob(state.context).catch(() => null);
+              if (!existing) throw cause;
+              state.job = existing;
+            }
+            if (
+              state.job.revision !== 1 ||
+              !same(state.job.input, state.initial) ||
+              (state.association.conversation &&
+                state.job.conversation !== state.association.conversation) ||
+              (!state.association.conversation &&
+                state.job.project !== (state.association.project ?? null))
+            ) {
+              throw new ApiError("mutable_job_conflict", 409, false);
+            }
+            rememberUnfinished(state.context);
+          } else if (isEmptyDraft(state.job, state.desired, pendingImagesRef.current)) {
+            const id = state.job.id;
+            try {
+              await api.discardMutableJob(state.context, id, state.job.revision);
+            } catch (cause) {
+              if (
+                cause instanceof ApiError &&
+                cause.status >= 400 &&
+                cause.status < 500 &&
+                cause.status !== 404
+              ) {
+                throw cause;
+              }
+              const current = await api.currentMutableJob(state.context).catch(() => undefined);
+              if (current !== null) throw cause;
+            }
+            forgetUnfinished(state.context);
+            state.context = rotateContext(props.sessionId, scope.current.conversation);
+            state.job = null;
+            state.initial = null;
+            state.association = null;
+            if (alive.current) setUnfinished((jobs) => jobs.filter((job) => job.id !== id));
+          } else if (!same(state.job.input, state.desired)) {
+            state.job = await api.updateMutableJob(
+              state.context,
+              state.job.id,
+              state.job.revision,
+              structuredClone(state.desired),
+            );
+          }
+          state.dirty = state.job
+            ? !same(state.job.input, state.desired) ||
+              isEmptyDraft(state.job, state.desired, pendingImagesRef.current)
+            : hasDraftContent(state.desired);
+          if (alive.current) {
+            setConfirmed(state.job);
+            setStatus(
+              state.dirty
+                ? autosave
+                  ? "Waiting to save…"
+                  : "Saving…"
+                : state.job
+                  ? "Saved"
+                  : "New Job",
+            );
+          }
+          if (autosave) break;
+        } catch (cause) {
+          if (
+            cause instanceof ApiError &&
+            cause.status === 409 &&
+            cause.code !== "unsupported_execution_context"
+          ) {
+            state.conflict = true;
+            if (alive.current) setConflict(true);
+            if (state.job) {
+              const latest = await api
+                .readMutableJob(state.context, state.job.id)
+                .catch(() => null);
+              if (latest && alive.current) setConfirmed(latest);
+            }
+            if (alive.current)
+              setError(
+                "The saved Job changed elsewhere. Your local edits are not saved. Load the saved version before continuing.",
+              );
+          } else if (alive.current)
+            setError(cause instanceof Error ? cause.message : String(cause));
+          if (alive.current) setStatus("Local changes not saved");
+          throw cause;
+        }
+      }
+    };
+    state.promise = run().finally(() => {
+      state.promise = null;
+    });
+    await state.promise;
+  };
+
+  const scheduleAutosave = () => {
     cancelAutosave();
     const state = work.current;
     if (state.conflict || uncertainRef.current) return;
@@ -623,48 +624,54 @@ export function MutableComposer({
       autosaveTimer.current = null;
       void flush(true).catch(() => {});
     }, AUTOSAVE_DELAY_MS);
-  }, [cancelAutosave, flush]);
-  useEffect(() => {
-    const state = work.current;
-    if (ready && isEmptyDraft(state.job, state.desired, pendingImagesRef.current))
-      scheduleAutosave();
-  }, [ready, scheduleAutosave]);
-  useEffect(() => {
-    const guard = async () => {
-      const timeout = () => new Promise<void>((resolve) => setTimeout(resolve, 2000));
-      if (uploadTask.current) await Promise.race([uploadTask.current.catch(() => {}), timeout()]);
-      if (
-        !busyRef.current &&
-        !work.current.conflict &&
-        (work.current.dirty || work.current.promise)
-      ) {
-        await Promise.race([flush().catch(() => {}), timeout()]);
-      }
-      if (
-        !work.current.dirty &&
-        !work.current.promise &&
-        !pendingImagesRef.current.length &&
-        !uncertainRef.current &&
-        !busyRef.current
-      )
-        return true;
-      return window.confirm(
-        "Some input or images are not confirmed saved, or submission is still unresolved. Leave anyway? Your unsaved changes may be lost.",
-      );
-    };
-    navigationGuard = guard;
-    return () => {
-      if (navigationGuard === guard) navigationGuard = null;
-    };
-  }, [flush]);
-  useEffect(
+  };
+  createEffect(
+    () => [ready(), scheduleAutosave],
+    () => {
+      const state = work.current;
+      if (ready() && isEmptyDraft(state.job, state.desired, pendingImagesRef.current))
+        scheduleAutosave();
+    },
+  );
+  createEffect(
+    () => [flush],
+    () => {
+      const guard = async () => {
+        const timeout = () => new Promise<void>((resolve) => setTimeout(resolve, 2000));
+        if (uploadTask.current) await Promise.race([uploadTask.current.catch(() => {}), timeout()]);
+        if (
+          !busyRef.current &&
+          !work.current.conflict &&
+          (work.current.dirty || work.current.promise)
+        ) {
+          await Promise.race([flush().catch(() => {}), timeout()]);
+        }
+        if (
+          !work.current.dirty &&
+          !work.current.promise &&
+          !pendingImagesRef.current.length &&
+          !uncertainRef.current &&
+          !busyRef.current
+        )
+          return true;
+        return window.confirm(
+          "Some input or images are not confirmed saved, or submission is still unresolved. Leave anyway? Your unsaved changes may be lost.",
+        );
+      };
+      navigationGuard = guard;
+      return () => {
+        if (navigationGuard === guard) navigationGuard = null;
+      };
+    },
+  );
+  createEffect(
+    () => [],
     () => () => {
       for (const pending of pendingImagesRef.current) URL.revokeObjectURL(pending.url);
     },
-    [],
   );
   function change(next: MutableJobInput) {
-    if (busyRef.current || uncertain) return;
+    if (busyRef.current || uncertain()) return;
     const state = work.current;
     if (same(state.desired, next)) return;
     state.desired = next;
@@ -678,12 +685,8 @@ export function MutableComposer({
     change({
       ...work.current.desired,
       text,
-      configuration: work.current.desired.configuration ?? config(selection),
+      configuration: work.current.desired.configuration ?? config(props.selection),
     });
-  }
-  function executeShortcut(action: () => void) {
-    changeText(aui.composer.getState().text);
-    action();
   }
   function setPending(next: PendingImage[]) {
     pendingImagesRef.current = next;
@@ -717,7 +720,7 @@ export function MutableComposer({
           state.desired = {
             ...state.desired,
             attachments: [...state.desired.attachments, image.id],
-            configuration: state.desired.configuration ?? config(selection),
+            configuration: state.desired.configuration ?? config(props.selection),
           };
           state.dirty = true;
           void flush().catch(() => {});
@@ -727,7 +730,7 @@ export function MutableComposer({
         change({
           ...work.current.desired,
           attachments: [...work.current.desired.attachments, image.id],
-          configuration: work.current.desired.configuration ?? config(selection),
+          configuration: work.current.desired.configuration ?? config(props.selection),
         });
       } catch (cause) {
         setPending(
@@ -750,7 +753,7 @@ export function MutableComposer({
     });
   }
   function selectImages(files: readonly File[]) {
-    if (!files.length || !canAttach || uploadTask.current) return;
+    if (!files.length || !canAttach() || uploadTask.current) return;
     if (
       work.current.desired.attachments.length + pendingImagesRef.current.length + files.length >
       8
@@ -772,7 +775,7 @@ export function MutableComposer({
       busyRef.current ||
       pendingImagesRef.current.length ||
       work.current.conflict ||
-      uncertain
+      uncertain()
     )
       return;
     busyRef.current = true;
@@ -783,19 +786,19 @@ export function MutableComposer({
       const state = work.current;
       if (!state.job || state.dirty || state.conflict)
         throw new Error("Save the Job before sending.");
-      if (editingQueue) {
+      if (editingQueue()) {
         const draft = draftBeforeQueueEdit.current;
         if (!client.presentMutableJob)
           throw new Error("The saved Job cannot yet be opened in history.");
         if (!draft) throw new Error("The original draft could not be restored.");
-        await client.presentMutableJob(sessionId, state.job);
+        await client.presentMutableJob(props.sessionId, state.job);
         work.current = draft.work;
         draftBeforeQueueEdit.current = null;
         setEditingQueue(false);
         setInput(draft.work.desired);
         setConfirmed(draft.work.job);
         setImages(draft.images);
-        onSelectionChange(draft.selection);
+        props.onSelectionChange(draft.selection);
         await refreshQueue();
         setStatus("Saved queued Job");
         return;
@@ -850,10 +853,10 @@ export function MutableComposer({
       }
       if (result.phase !== "queued" && result.phase !== "executing" && result.phase !== "completed")
         throw new Error(`Job is ${result.phase}; input has not been cleared.`);
-      bindComposerContext(sessionId, state.context, result.conversation);
+      bindComposerContext(props.sessionId, state.context, result.conversation);
       try {
         if (!client.presentMutableJob) throw new Error("History is unavailable.");
-        await client.presentMutableJob(sessionId, result);
+        await client.presentMutableJob(props.sessionId, result);
       } catch (cause) {
         setUncertain(true);
         throw new Error(
@@ -864,7 +867,7 @@ export function MutableComposer({
       forgetUnfinished(state.context);
       localStorage.removeItem(pendingKey(state.context));
       clearGlobalContext(state.context);
-      const next = rotateContext(sessionId, result.conversation);
+      const next = rotateContext(props.sessionId, result.conversation);
       state.context = next;
       state.job = null;
       state.initial = null;
@@ -923,7 +926,7 @@ export function MutableComposer({
         throw new Error(`Job is ${result.phase}; input has not been cleared.`);
       if (!client.presentMutableJob)
         throw new Error("The Job was submitted, but history is unavailable. Retry reconciliation.");
-      await client.presentMutableJob(sessionId, result);
+      await client.presentMutableJob(props.sessionId, result);
       savePointer({ context: pending.context, job: result.id });
       forgetUnfinished(pending.context);
       if (!same(result.input, work.current.desired))
@@ -933,7 +936,7 @@ export function MutableComposer({
       localStorage.removeItem(pendingKey(pending.context));
       clearGlobalContext(pending.context);
       const state = work.current;
-      state.context = rotateContext(sessionId, result.conversation);
+      state.context = rotateContext(props.sessionId, result.conversation);
       state.job = null;
       state.initial = null;
       state.association = null;
@@ -957,10 +960,10 @@ export function MutableComposer({
     if (
       !api ||
       busyRef.current ||
-      uncertain ||
+      uncertain() ||
       work.current.conflict ||
       pendingImagesRef.current.length ||
-      editingQueue
+      editingQueue()
     ) {
       return;
     }
@@ -970,12 +973,16 @@ export function MutableComposer({
     try {
       await flush();
       const latest = await api.readMutableJob(job.context, job.id);
-      if (conversation && latest.conversation !== conversation)
+      if (props.conversation && latest.conversation !== props.conversation)
         throw new Error("This Job belongs to another conversation.");
       if (latest.phase !== "queued")
         throw new Error(`This Job is ${latest.phase} and can no longer be edited.`);
       const restored = await loadImages(latest.input.attachments);
-      draftBeforeQueueEdit.current = { work: work.current, images, selection };
+      draftBeforeQueueEdit.current = {
+        work: work.current,
+        images: images(),
+        selection: props.selection,
+      };
       work.current = {
         context: latest.context,
         job: latest,
@@ -993,7 +1000,7 @@ export function MutableComposer({
       setStatus("Editing queued Job");
       setError(null);
       if (latest.input.configuration)
-        onSelectionChange({
+        props.onSelectionChange({
           model: "",
           effort: latest.input.configuration.reasoning_effort,
           llmProfile: latest.input.configuration.llm_profile,
@@ -1012,11 +1019,11 @@ export function MutableComposer({
     if (
       !api ||
       busyRef.current ||
-      uncertain ||
+      uncertain() ||
       work.current.dirty ||
       work.current.promise ||
       pendingImagesRef.current.length ||
-      editingQueue
+      editingQueue()
     )
       return;
     if (
@@ -1032,7 +1039,7 @@ export function MutableComposer({
       if (result.phase !== "cancelled") throw new Error("The Job cancellation was not confirmed.");
       forgetQueued(job.id);
       await refreshQueue();
-      if (client.presentMutableJob) await client.presentMutableJob(sessionId, result);
+      if (client.presentMutableJob) await client.presentMutableJob(props.sessionId, result);
       setStatus("Unsupported queued Job cancelled; its history is preserved.");
       setError(null);
     } catch (cause) {
@@ -1055,7 +1062,7 @@ export function MutableComposer({
     try {
       const job = await api.readMutableJob(work.current.context, work.current.job.id);
       const restored = await loadImages(job.input.attachments);
-      const unsavedImages = images.filter(
+      const unsavedImages = images().filter(
         (image) =>
           work.current.desired.attachments.includes(image.id) &&
           !job.input.attachments.includes(image.id),
@@ -1092,10 +1099,10 @@ export function MutableComposer({
     if (
       !api ||
       busyRef.current ||
-      uncertain ||
-      conflict ||
+      uncertain() ||
+      conflict() ||
       pendingImagesRef.current.length ||
-      editingQueue
+      editingQueue()
     )
       return;
     busyRef.current = true;
@@ -1103,7 +1110,7 @@ export function MutableComposer({
     try {
       await flush();
       const latest = await api.readMutableJob(job.context, job.id);
-      if (conversation && latest.conversation !== conversation)
+      if (props.conversation && latest.conversation !== props.conversation)
         throw new Error("This Job belongs to another conversation.");
       if (latest.phase !== "unsubmitted")
         throw new Error(`This Job is ${latest.phase} and is no longer unsubmitted.`);
@@ -1114,7 +1121,7 @@ export function MutableComposer({
       state.desired = latest.input;
       state.initial = null;
       state.dirty = false;
-      bindComposerContext(sessionId, latest.context, conversation);
+      bindComposerContext(props.sessionId, latest.context, props.conversation);
       setInput(latest.input);
       setConfirmed(latest);
       setImages(restored);
@@ -1122,7 +1129,7 @@ export function MutableComposer({
       if (isEmptyDraft(latest, latest.input, pendingImagesRef.current)) scheduleAutosave();
       setError(null);
       if (latest.input.configuration)
-        onSelectionChange({
+        props.onSelectionChange({
           model: "",
           effort: latest.input.configuration.reasoning_effort,
           llmProfile: latest.input.configuration.llm_profile,
@@ -1137,21 +1144,23 @@ export function MutableComposer({
     }
   }
   return (
-    <Composer className="max-w-none space-y-2">
-      {unfinished.some((job) => job.id !== confirmed?.id) && (
-        <div aria-label="Unsubmitted Jobs" className="space-y-1 text-sm">
-          {unfinished
-            .filter((job) => job.id !== confirmed?.id)
+    <Composer class="max-w-none space-y-2">
+      {unfinished().some((job) => job.id !== confirmed()?.id) && (
+        <div role="group" aria-label="Unsubmitted Jobs" class="space-y-1 text-sm">
+          {unfinished()
+            .filter((job) => job.id !== confirmed()?.id)
             .map((job) => (
-              <div key={job.id} className="flex items-center gap-2">
-                <span className="min-w-0 flex-1 truncate">
+              <div class="flex items-center gap-2">
+                <span class="min-w-0 flex-1 truncate">
                   Unsubmitted: {job.input.text || "Image Job"}
                 </span>
                 <Button
                   type="button"
                   size="xs"
                   variant="outline"
-                  disabled={busy || uncertain || conflict || uploading > 0 || editingQueue}
+                  disabled={
+                    busy() || uncertain() || conflict() || uploading() > 0 || editingQueue()
+                  }
                   onClick={() => void openUnfinished(job)}
                 >
                   Open
@@ -1160,12 +1169,12 @@ export function MutableComposer({
             ))}
         </div>
       )}
-      {queued.length > 0 && (
-        <div aria-label="Queued Jobs" className="space-y-1 text-sm">
-          {queued.map((job) => (
-            <div key={job.id} className="flex items-center gap-2">
+      {queued().length > 0 && (
+        <div role="group" aria-label="Queued Jobs" class="space-y-1 text-sm">
+          {queued().map((job) => (
+            <div class="flex items-center gap-2">
               <span
-                className="min-w-0 flex-1 truncate"
+                class="min-w-0 flex-1 truncate"
                 title={
                   job.autonomous_loopback_eligibility &&
                   !job.autonomous_loopback_eligibility.eligible
@@ -1186,10 +1195,10 @@ export function MutableComposer({
                 variant="outline"
                 disabled={
                   job.phase !== "queued" ||
-                  queuedLoading ||
-                  inputDisabled ||
-                  pendingImages.length > 0 ||
-                  editingQueue
+                  queuedLoading() ||
+                  inputDisabled() ||
+                  pendingImages().length > 0 ||
+                  editingQueue()
                 }
                 onClick={() => void editQueued(job)}
               >
@@ -1201,7 +1210,11 @@ export function MutableComposer({
                   size="xs"
                   variant="outline"
                   disabled={
-                    job.phase !== "queued" || queuedLoading || busy || uncertain || editingQueue
+                    job.phase !== "queued" ||
+                    queuedLoading() ||
+                    busy() ||
+                    uncertain() ||
+                    editingQueue()
                   }
                   onClick={() => void cancelUnsupported(job)}
                 >
@@ -1212,262 +1225,291 @@ export function MutableComposer({
           ))}
         </div>
       )}
-      <ComposerPrimitive.TriggerPopoverRoot>
-        <ComposerPrimitive.Root
-          className="aui-composer-root relative"
-          onSubmit={(event) => {
-            event.preventDefault();
-            if (!sendDisabled) void send();
-          }}
-          onDragOver={(event) => {
-            if (!event.dataTransfer.types.includes("Files")) return;
-            event.preventDefault();
-            event.dataTransfer.dropEffect = canAttach ? "copy" : "none";
-            if (canAttach) setDragActive(true);
-          }}
-          onDragLeave={(event) => {
-            if (
-              event.relatedTarget instanceof Node &&
-              event.currentTarget.contains(event.relatedTarget)
-            )
-              return;
-            setDragActive(false);
-          }}
-          onDrop={(event) => {
-            setDragActive(false);
-            if (!event.dataTransfer.files.length) return;
-            event.preventDefault();
-            selectImages(
-              Array.from(event.dataTransfer.files).filter((file) =>
-                IMAGE_TYPES.includes(file.type),
-              ),
-            );
-          }}
+
+      <form
+        class="aui-composer-root relative"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (!sendDisabled()) void send();
+        }}
+        onDragOver={(event) => {
+          if (!event.dataTransfer || !event.dataTransfer.types.includes("Files")) return;
+          event.preventDefault();
+          event.dataTransfer.dropEffect = canAttach() ? "copy" : "none";
+          if (canAttach()) setDragActive(true);
+        }}
+        onDragLeave={(event) => {
+          if (
+            event.relatedTarget instanceof Node &&
+            event.currentTarget.contains(event.relatedTarget)
+          )
+            return;
+          setDragActive(false);
+        }}
+        onDrop={(event) => {
+          setDragActive(false);
+          if (!event.dataTransfer || !event.dataTransfer.files.length) return;
+          event.preventDefault();
+          selectImages(
+            Array.from(event.dataTransfer.files).filter((file) => IMAGE_TYPES.includes(file.type)),
+          );
+        }}
+      >
+        <ComposerBar
+          dragActive={dragActive() && canAttach()}
+          class="border-border shadow-sm focus-within:border-ring/50"
         >
-          <ComposerBar
-            dragActive={dragActive && canAttach}
-            className="border-border shadow-sm focus-within:border-ring/50"
-          >
-            <ComposerAttachments className="aui-composer-attachments px-2 pt-1 empty:hidden">
-              {images.map((image) => (
-                <AttachmentTile
-                  key={image.id}
-                  src={image.url}
-                  name={image.name}
-                  isComposer
-                  remove={
+          <ComposerAttachments class="aui-composer-attachments px-2 pt-1 empty:hidden">
+            {images().map((image) => (
+              <AttachmentTile
+                src={image.url}
+                name={image.name}
+                isComposer
+                remove={
+                  <AttachmentTileRemove
+                    name={image.name}
+                    disabled={busy() || uncertain() || conflict()}
+                    onClick={() => {
+                      setImages((old) => old.filter((item) => item.id !== image.id));
+                      change({
+                        ...work.current.desired,
+                        attachments: work.current.desired.attachments.filter(
+                          (id) => id !== image.id,
+                        ),
+                      });
+                    }}
+                  />
+                }
+              />
+            ))}
+            {pendingImages().map((item) => (
+              <AttachmentTile
+                src={item.url}
+                name={item.file.name}
+                isComposer
+                isUploading={!item.failed}
+                isError={item.failed}
+                errorMessage={item.failed ? "Upload failed" : undefined}
+                remove={
+                  item.failed && (
                     <AttachmentTileRemove
-                      name={image.name}
-                      disabled={busy || uncertain || conflict}
+                      name={item.file.name}
                       onClick={() => {
-                        setImages((old) => old.filter((item) => item.id !== image.id));
-                        change({
-                          ...work.current.desired,
-                          attachments: work.current.desired.attachments.filter(
-                            (id) => id !== image.id,
-                          ),
-                        });
+                        setPending(pendingImagesRef.current.filter((entry) => entry !== item));
+                        URL.revokeObjectURL(item.url);
                       }}
                     />
-                  }
-                />
-              ))}
-              {pendingImages.map((item) => (
-                <AttachmentTile
-                  key={item.url}
-                  src={item.url}
-                  name={item.file.name}
-                  isComposer
-                  isUploading={!item.failed}
-                  isError={item.failed}
-                  errorMessage={item.failed ? "Upload failed" : undefined}
-                  remove={
-                    item.failed && (
-                      <AttachmentTileRemove
-                        name={item.file.name}
-                        onClick={() => {
-                          setPending(pendingImagesRef.current.filter((entry) => entry !== item));
-                          URL.revokeObjectURL(item.url);
-                        }}
-                      />
-                    )
-                  }
-                />
-              ))}
-            </ComposerAttachments>
-            <ComposerPrimitive.Input
-              id="mutable-job-input"
-              data-slot="composer-input"
-              className="aui-composer-input max-h-48 min-h-11 w-full resize-none overflow-y-auto bg-transparent px-3 py-2 text-base leading-6 caret-primary outline-none placeholder:text-muted-foreground"
-              placeholder={t("aui.composerPlaceholder")}
-              aria-label={t("aui.composerLabel")}
-              rows={1}
-              maxRows={8}
-              value={input.text}
-              disabled={inputDisabled}
-              submitMode="none"
-              cancelOnEscape={false}
-              addAttachmentOnPaste={false}
-              onChange={(event) => changeText(event.currentTarget.value)}
-              onPaste={(event) => {
-                if (!canAttach) return;
-                const images = Array.from(event.clipboardData.files).filter((file) =>
-                  IMAGE_TYPES.includes(file.type),
-                );
-                if (!images.length) return;
-                event.preventDefault();
-                selectImages(images);
-              }}
-            />
-            <input
-              ref={inputRef}
-              type="file"
-              accept={IMAGE_TYPES.join(",")}
-              multiple
-              hidden
-              onChange={(event) => {
-                selectImages(Array.from(event.target.files ?? []));
-                event.target.value = "";
-              }}
-            />
-            {pendingImages.some((item) => item.failed) && (
-              <div role="alert" className="text-xs text-destructive">
-                Image upload failed.{" "}
-                <Button
-                  type="button"
-                  size="xs"
-                  variant="ghost"
-                  disabled={busy || uploading > 0}
-                  onClick={() => {
-                    const retry = pendingImagesRef.current
-                      .filter((item) => item.failed)
-                      .map((item) => ({ ...item, failed: false }));
-                    setPending([
-                      ...pendingImagesRef.current.filter((item) => !item.failed),
-                      ...retry,
-                    ]);
-                    startUploads(retry);
-                  }}
-                >
-                  Retry upload
-                </Button>
-              </div>
-            )}
-            <ComposerToolbar className="gap-2">
-              <ComposerAttachButton
-                aria-label={t("chat.composer.attachImage")}
-                title={t("chat.composer.attachImage")}
-                className="shrink-0"
-                disabled={!canAttach}
-                onClick={() => inputRef.current?.click()}
+                  )
+                }
               />
-              <div
-                className="min-w-0 flex-1"
-                onPointerDownCapture={() => {
-                  explicitSelection.current = true;
-                }}
-                onKeyDownCapture={() => {
-                  explicitSelection.current = true;
+            ))}
+          </ComposerAttachments>
+          <textarea
+            id="mutable-job-input"
+            data-slot="composer-input"
+            class="aui-composer-input field-sizing-content max-h-48 min-h-11 w-full resize-none overflow-y-auto bg-transparent px-3 py-2 text-base leading-6 caret-primary outline-none placeholder:text-muted-foreground"
+            placeholder={i18n.t("aui.composerPlaceholder")}
+            aria-label={i18n.t("aui.composerLabel")}
+            rows={1}
+            value={input().text}
+            disabled={inputDisabled()}
+            onInput={(event) => {
+              setShortcutIndex(0);
+              changeText(event.currentTarget.value);
+            }}
+            onKeyDown={(event) => {
+              if (event.isComposing || !shortcuts().length) return;
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setShortcutDismissed(input().text);
+              } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                event.preventDefault();
+                const count = shortcuts().length;
+                setShortcutIndex(
+                  (index) => (index + (event.key === "ArrowDown" ? 1 : count - 1)) % count,
+                );
+              } else if (event.key === "Enter" && !event.shiftKey) {
+                const shortcut = shortcuts()[shortcutIndex()];
+                if (shortcut) {
+                  event.preventDefault();
+                  runShortcut(shortcut);
+                }
+              }
+            }}
+            onPaste={(event) => {
+              if (!canAttach()) return;
+              const images = Array.from(event.clipboardData?.files ?? []).filter((file) =>
+                IMAGE_TYPES.includes(file.type),
+              );
+              if (!images.length) return;
+              event.preventDefault();
+              selectImages(images);
+            }}
+          />
+          <input
+            ref={bindElementRef(inputRef)}
+            type="file"
+            accept={IMAGE_TYPES.join(",")}
+            multiple
+            hidden
+            onChange={(event) => {
+              selectImages(Array.from(event.target.files ?? []));
+              event.target.value = "";
+            }}
+          />
+          {pendingImages().some((item) => item.failed) && (
+            <div role="alert" class="text-xs text-destructive">
+              Image upload failed.{" "}
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                disabled={busy() || uploading() > 0}
+                onClick={() => {
+                  const retry = pendingImagesRef.current
+                    .filter((item) => item.failed)
+                    .map((item) => ({ ...item, failed: false }));
+                  setPending([
+                    ...pendingImagesRef.current.filter((item) => !item.failed),
+                    ...retry,
+                  ]);
+                  startUploads(retry);
                 }}
               >
-                <ModelSelector
-                  triggerRef={modelTriggerRef}
-                  sessionId={sessionId}
-                  selection={selection}
-                  onChange={(value) => {
-                    const projectChanged = value.project !== selection?.project;
-                    onSelectionChange(value);
-                    if (ready && explicitSelection.current) {
-                      explicitSelection.current = false;
-                      if (!projectChanged)
-                        change({ ...work.current.desired, configuration: config(value) });
-                    }
-                  }}
-                  onPreference={onPreference}
-                  onImageSupportChange={imageSupport}
-                  busy={busy || !ready || uncertain || conflict}
-                  statusText={
-                    conflict
-                      ? "Review the Job conflict before continuing."
-                      : uncertain
-                        ? "Waiting to reconcile submission."
-                        : busy
-                          ? "Saving Job…"
-                          : undefined
-                  }
-                  projectLocked={Boolean(conversation || confirmed || work.current.association)}
-                  lockedProject={
-                    confirmed
-                      ? confirmed.project
-                      : conversation
-                        ? project
-                        : work.current.association?.project
-                  }
-                />
-              </div>
-              <ComposerActions className="shrink-0">
-                {editingQueue ? (
-                  <Button type="submit" size="sm" disabled={sendDisabled}>
-                    Save queued Job
-                  </Button>
-                ) : (
-                  <ComposerSend
-                    type="submit"
-                    idle={sendDisabled}
-                    disabled={sendDisabled}
-                    aria-label={t("aui.sendMessage")}
-                    title={t("aui.sendMessage")}
-                  />
-                )}
-              </ComposerActions>
-            </ComposerToolbar>
-          </ComposerBar>
-          {commands.length > 0 && (
-            <ComposerTriggerPopover
-              char="/"
-              emptyItemsLabel={t("chat.composer.noCommands")}
-              {...slash}
-            />
+                Retry upload
+              </Button>
+            </div>
           )}
-        </ComposerPrimitive.Root>
-      </ComposerPrimitive.TriggerPopoverRoot>
-      <p role="status" className="text-xs text-muted-foreground">
-        {pendingImages.length ? "Images not yet saved" : status}
-        {confirmed ? ` · revision ${confirmed.revision}` : ""}
-        {uploading ? ` · uploading ${uploading}` : ""}
+          <ComposerToolbar class="gap-2">
+            <ComposerAttachButton
+              aria-label={i18n.t("chat.composer.attachImage")}
+              title={i18n.t("chat.composer.attachImage")}
+              class="shrink-0"
+              disabled={!canAttach()}
+              onClick={() => inputRef.current?.click()}
+            />
+            <div
+              class="min-w-0 flex-1"
+              onPointerDown={() => {
+                explicitSelection.current = true;
+              }}
+              onKeyDown={() => {
+                explicitSelection.current = true;
+              }}
+            >
+              <ModelSelector
+                triggerRef={modelTriggerRef}
+                sessionId={props.sessionId}
+                selection={props.selection}
+                onChange={(value) => {
+                  const projectChanged = value.project !== props.selection?.project;
+                  props.onSelectionChange(value);
+                  if (ready() && explicitSelection.current) {
+                    explicitSelection.current = false;
+                    if (!projectChanged)
+                      change({ ...work.current.desired, configuration: config(value) });
+                  }
+                }}
+                onPreference={props.onPreference}
+                onImageSupportChange={imageSupport}
+                busy={busy() || !ready() || uncertain() || conflict()}
+                statusText={
+                  conflict()
+                    ? "Review the Job conflict before continuing."
+                    : uncertain()
+                      ? "Waiting to reconcile submission."
+                      : busy()
+                        ? "Saving Job…"
+                        : undefined
+                }
+                projectLocked={Boolean(
+                  props.conversation || confirmed() || work.current.association,
+                )}
+                lockedProject={
+                  confirmed()
+                    ? confirmed()!.project
+                    : props.conversation
+                      ? props.project
+                      : work.current.association?.project
+                }
+              />
+            </div>
+            <ComposerActions class="shrink-0">
+              {editingQueue() ? (
+                <Button type="submit" size="sm" disabled={sendDisabled()}>
+                  Save queued Job
+                </Button>
+              ) : (
+                <ComposerSend
+                  type="submit"
+                  idle={sendDisabled()}
+                  disabled={sendDisabled()}
+                  aria-label={i18n.t("aui.sendMessage")}
+                  title={i18n.t("aui.sendMessage")}
+                />
+              )}
+            </ComposerActions>
+          </ComposerToolbar>
+        </ComposerBar>
+        <Show when={shortcuts().length}>
+          <div class="absolute inset-x-2 bottom-full z-20 mb-2 grid gap-1 rounded-lg border border-border bg-popover p-1 shadow-md">
+            <For each={shortcuts()} keyed={(shortcut) => shortcut.key}>
+              {(shortcut, index) => (
+                <button
+                  type="button"
+                  class={[
+                    "rounded px-3 py-2 text-left text-sm hover:bg-muted focus-visible:outline-2",
+                    index() === shortcutIndex() ? "bg-muted" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  onClick={() => runShortcut(shortcut())}
+                >
+                  /{shortcut().key} · {shortcut().label}
+                </button>
+              )}
+            </For>
+          </div>
+        </Show>
+      </form>
+
+      <p role="status" class="text-xs text-muted-foreground">
+        {pendingImages().length ? "Images not yet saved" : status()}
+        {confirmed() ? ` · revision ${confirmed()!.revision}` : ""}
+        {uploading() ? ` · uploading ${uploading()}` : ""}
       </p>
-      {uncertain && (
-        <div role="alert" className="text-xs text-destructive">
+      {uncertain() && (
+        <div role="alert" class="text-xs text-destructive">
           Submission outcome is uncertain.{" "}
           <Button
             type="button"
             size="xs"
             variant="ghost"
-            disabled={busy}
+            disabled={busy()}
             onClick={() => void reconcileSubmission()}
           >
             Reconcile submission
           </Button>
         </div>
       )}
-      {error && (
-        <div role="alert" className="text-xs text-destructive">
-          {error}{" "}
-          {!uncertain && (
+      {error() && (
+        <div role="alert" class="text-xs text-destructive">
+          {error()}{" "}
+          {!uncertain() && (
             <Button
               type="button"
               size="xs"
               variant="ghost"
-              disabled={busy || (conflict && uploading > 0)}
+              disabled={busy() || (conflict() && uploading() > 0)}
               onClick={() =>
-                !ready
+                !ready()
                   ? window.location.reload()
-                  : conflict
+                  : conflict()
                     ? void loadSaved()
                     : (void flush().catch(() => {}), void refreshQueue(), void refreshUnfinished())
               }
             >
-              {!ready ? "Reload" : conflict ? "Load saved version" : "Retry"}
+              {!ready() ? "Reload" : conflict() ? "Load saved version" : "Retry"}
             </Button>
           )}
         </div>

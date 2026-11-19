@@ -1,70 +1,66 @@
-"use client";
-
-import { useState } from "react";
+import { createMemo, createSignal } from "solid-js";
 import { Dialog, DialogContent, DialogDescription, DialogTitle } from "@/components/ui/dialog";
-import type { ApiClient } from "../runtime/api-client";
 import { useI18n } from "../i18n";
+import type { ApiClient } from "../runtime/api-client";
 import { JobTree } from "./job-tree";
 import { JobWatch } from "./job-watch";
 
-export function JobDetailsDialog({
-  client,
-  job,
-  onJob,
-  onOpenChat,
-}: {
+export function JobDetailsDialog(props: {
   client: ApiClient;
   job: string | null;
   onJob: (job: string | null) => void;
   onOpenChat: (job: string) => void;
 }) {
-  const { t } = useI18n();
-  const [treeSelection, setTreeSelection] = useState<{ job: string; root: string } | null>(null);
-  if (treeSelection !== null && treeSelection.job !== job) setTreeSelection(null);
-  const treeRoot = treeSelection?.job === job ? treeSelection.root : job;
+  const i18n = useI18n();
+  const [treeSelection, setTreeSelection] = createSignal<{ job: string; root: string } | null>(
+    null,
+  );
+  if (treeSelection() !== null && treeSelection()!.job !== props.job) setTreeSelection(null);
+  const treeRoot = createMemo(() =>
+    treeSelection()?.job === props.job ? treeSelection()!.root : props.job,
+  );
 
   return (
     <Dialog
-      open={job !== null}
+      open={props.job !== null}
       onOpenChange={(open) => {
-        if (!open) onJob(null);
+        if (!open) props.onJob(null);
       }}
     >
       <DialogContent
-        className="flex h-[calc(100dvh-2rem)] max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none"
+        class="flex h-[calc(100dvh-2rem)] max-h-[calc(100dvh-2rem)] w-[calc(100vw-2rem)] max-w-none flex-col gap-0 overflow-hidden p-0 sm:max-w-none"
         closeButtonClassName="top-2"
       >
-        <div className="border-b border-border px-6 py-4 pr-14">
-          <DialogTitle>{t("jobs.detailsTitle")}</DialogTitle>
-          <DialogDescription className="sr-only">{t("jobs.tree.description")}</DialogDescription>
+        <div class="border-b border-border px-6 py-4 pr-14">
+          <DialogTitle>{i18n.t("jobs.detailsTitle")}</DialogTitle>
+          <DialogDescription class="sr-only">{i18n.t("jobs.tree.description")}</DialogDescription>
         </div>
-        {job && treeRoot ? (
-          <div className="grid min-h-0 flex-1 grid-cols-1 overflow-auto lg:grid-cols-[minmax(18rem,0.8fr)_minmax(0,1.6fr)] lg:overflow-hidden">
-            <section className="min-w-0 border-b border-border lg:flex lg:min-h-0 lg:flex-col lg:border-r lg:border-b-0">
-              <h2 className="sticky top-0 z-10 flex min-h-16 shrink-0 items-center border-b border-border bg-popover px-5 py-3 font-heading text-lg lg:static">
-                {t("jobs.tree.title")}
+        {props.job && treeRoot() ? (
+          <div class="grid min-h-0 flex-1 grid-cols-1 overflow-auto lg:grid-cols-[minmax(18rem,0.8fr)_minmax(0,1.6fr)] lg:overflow-hidden">
+            <section class="min-w-0 border-b border-border lg:flex lg:min-h-0 lg:flex-col lg:border-r lg:border-b-0">
+              <h2 class="sticky top-0 z-10 flex min-h-16 shrink-0 items-center border-b border-border bg-popover px-5 py-3 font-heading text-lg lg:static">
+                {i18n.t("jobs.tree.title")}
               </h2>
-              <div className="ocg-subtle-scrollbar min-h-0 p-5 lg:flex-1 lg:overflow-auto">
-                <p className="mb-4 text-sm text-muted-foreground">{t("jobs.tree.description")}</p>
+              <div class="ocg-subtle-scrollbar min-h-0 p-5 lg:flex-1 lg:overflow-auto">
+                <p class="mb-4 text-sm text-muted-foreground">{i18n.t("jobs.tree.description")}</p>
                 <JobTree
-                  key={treeRoot}
-                  client={client}
-                  root={treeRoot}
-                  selected={job}
+                  client={props.client}
+                  root={treeRoot()!}
+                  selected={props.job}
                   onSelect={(next) => {
-                    if (next !== job) setTreeSelection({ job: next, root: treeRoot });
-                    onJob(next);
+                    if (next !== props.job) setTreeSelection({ job: next, root: treeRoot()! });
+                    props.onJob(next);
                   }}
                   onReroot={(next) => {
                     setTreeSelection(null);
-                    onJob(next);
+                    props.onJob(next);
                   }}
-                  onOpenChat={onOpenChat}
+                  onOpenChat={props.onOpenChat}
                 />
               </div>
             </section>
-            <div className="min-w-0 lg:min-h-0">
-              <JobWatch key={job} client={client} jobId={job} bare />
+            <div class="min-w-0 lg:min-h-0">
+              <JobWatch client={props.client} jobId={props.job} bare />
             </div>
           </div>
         ) : null}

@@ -1,19 +1,7 @@
-"use client";
-
-import * as React from "react";
+import { type JSX, Portal } from "@solidjs/web";
+import { createContext, createEffect, createSignal, onCleanup, Show, useContext } from "solid-js";
+import { handleEvent, splitProps, type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
-
-type DropdownMenuProps = {
-  children: React.ReactNode;
-  open?: boolean;
-  onOpenChange?: (open: boolean) => void;
-};
-
-type DropdownMenuContextValue = {
-  open: boolean;
-  setOpen: (open: boolean) => void;
-  triggerRef: React.RefObject<HTMLElement | null>;
-};
 
 export type MenuItemState = { index: number; disabled: boolean };
 
@@ -52,225 +40,198 @@ export function menuFocusTarget(
   return enabled[(position + step + enabled.length) % enabled.length];
 }
 
-const DropdownMenuContext = React.createContext<DropdownMenuContextValue | null>(null);
+type MenuState = {
+  open: () => boolean;
+  setOpen: (open: boolean) => void;
+  trigger: HTMLElement | undefined;
+};
+const MenuContext = createContext<MenuState>();
 
-function useDropdownMenu() {
-  const context = React.useContext(DropdownMenuContext);
-  if (!context) throw new Error("Dropdown components must be used within DropdownMenu");
-  return context;
-}
-
-export function DropdownMenu({ children, open: controlledOpen, onOpenChange }: DropdownMenuProps) {
-  const [internalOpen, setInternalOpen] = React.useState(false);
-  const triggerRef = React.useRef<HTMLElement | null>(null);
-  const isControlled = controlledOpen !== undefined;
-  const open = isControlled ? controlledOpen : internalOpen;
-
-  const setOpen = React.useCallback(
-    (value: boolean) => {
-      if (!isControlled) setInternalOpen(value);
-      onOpenChange?.(value);
+export function DropdownMenu(props: {
+  children: View;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+}) {
+  const [internal, setOpen] = createSignal(false);
+  const state: MenuState = {
+    open: () => props.open ?? internal(),
+    setOpen(value) {
+      if (props.open === undefined) setOpen(value);
+      props.onOpenChange?.(value);
     },
-    [isControlled, onOpenChange],
+    trigger: undefined,
+  };
+  return <MenuContext value={state}>{props.children}</MenuContext>;
+}
+
+export function DropdownMenuTrigger(props: { children?: View; asChild?: boolean; class?: string }) {
+  const state = useContext(MenuContext);
+  const element = props.asChild ? (
+    props.children
+  ) : (
+    <button type="button" class={props.class}>
+      {props.children}
+    </button>
   );
+  if (!state || !(element instanceof HTMLElement)) return element;
+  state.trigger = element;
+  element.setAttribute("aria-haspopup", "menu");
+  createEffect(state.open, (open) => element.setAttribute("aria-expanded", String(open)));
+  function toggle(event: Event) {
+    if (!event.defaultPrevented) state?.setOpen(!state.open());
+  }
+  function onKey(event: globalThis.KeyboardEvent) {
+    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      event.preventDefault();
+      state?.setOpen(true);
+    }
+  }
+  element.addEventListener("click", toggle);
+  element.addEventListener("keydown", onKey);
+  onCleanup(() => {
+    element.removeEventListener("click", toggle);
+    element.removeEventListener("keydown", onKey);
+  });
+  return element;
+}
 
-  const contextValue = React.useMemo(() => ({ open, setOpen, triggerRef }), [open, setOpen]);
+type MenuContentProps = JSX.IntrinsicElements["div"] & {
+  align?: "start" | "center" | "end";
+  side?: "top" | "bottom" | "left" | "right";
+  sideOffset?: number;
+  onCloseAutoFocus?: (event: Event) => void;
+};
 
+export function DropdownMenuContent(props: MenuContentProps) {
+  const state = useContext(MenuContext);
+  const [local, rest] = splitProps(props, [
+    "class",
+    "children",
+    "align",
+    "side",
+    "sideOffset",
+    "onCloseAutoFocus",
+  ]);
+  let content!: HTMLDivElement;
+  function focusItem(key: MenuNavigationKey) {
+    const items = menuFocusables(content);
+    const current = [...content.querySelectorAll('[role="menuitem"]')].indexOf(
+      document.activeElement!,
+    );
+    const next = menuFocusTarget(items, current, key);
+    if (next !== null) items[next]?.focus();
+  }
+  function close(restore: boolean) {
+    state?.setOpen(false);
+    if (!restore) return;
+    const event = new Event("closeautofocus", { cancelable: true });
+    local.onCloseAutoFocus?.(event);
+    if (!event.defaultPrevented) state?.trigger?.focus();
+  }
+  createEffect(
+    () => state?.open() ?? false,
+    (open) => {
+      if (!open) return;
+      const frame = requestAnimationFrame(() => {
+        const anchor = state?.trigger?.getBoundingClientRect();
+        if (!content || !anchor) return;
+        const bounds = content.getBoundingClientRect();
+        const gap = local.sideOffset ?? 6;
+        let left =
+          local.align === "end"
+            ? anchor.right - bounds.width
+            : local.align === "center"
+              ? anchor.left + (anchor.width - bounds.width) / 2
+              : anchor.left;
+        let top = local.side === "top" ? anchor.top - bounds.height - gap : anchor.bottom + gap;
+        if (local.side === "right") {
+          left = anchor.right + gap;
+          top = local.align === "end" ? anchor.bottom - bounds.height : anchor.top;
+        }
+        if (local.side === "left") {
+          left = anchor.left - bounds.width - gap;
+          top = anchor.top;
+        }
+        if (!local.side && top + bounds.height > window.innerHeight)
+          top = anchor.top - bounds.height - gap;
+        content.style.left = `${Math.max(4, Math.min(left, window.innerWidth - bounds.width - 4))}px`;
+        content.style.top = `${Math.max(4, Math.min(top, window.innerHeight - bounds.height - 4))}px`;
+        content.focus();
+        focusItem("Home");
+      });
+      const outside = (event: globalThis.PointerEvent) => {
+        const node = event.target;
+        if (node instanceof Node && !content?.contains(node) && !state?.trigger?.contains(node))
+          close(false);
+      };
+      document.addEventListener("pointerdown", outside, true);
+      return () => {
+        cancelAnimationFrame(frame);
+        document.removeEventListener("pointerdown", outside, true);
+      };
+    },
+  );
   return (
-    <DropdownMenuContext.Provider value={contextValue}>{children}</DropdownMenuContext.Provider>
+    <Show when={state?.open()}>
+      <Portal>
+        <div
+          {...rest}
+          ref={content}
+          tabindex={-1}
+          role="menu"
+          class={cn(
+            "fixed z-[60] min-w-36 rounded-xl border border-border bg-popover p-1.5 text-popover-foreground shadow-md outline-none",
+            local.class,
+          )}
+          onKeyDown={(event) => {
+            if (event.key === "Escape" || event.key === "Tab") {
+              if (event.key === "Escape") event.preventDefault();
+              close(event.key === "Escape");
+            } else if (
+              event.key === "ArrowDown" ||
+              event.key === "ArrowUp" ||
+              event.key === "Home" ||
+              event.key === "End"
+            ) {
+              event.preventDefault();
+              focusItem(event.key);
+            }
+          }}
+        >
+          {local.children}
+        </div>
+      </Portal>
+    </Show>
   );
 }
 
-type DropdownMenuTriggerProps = {
-  children: React.ReactNode;
-  asChild?: boolean;
-  className?: string;
-};
+export function DropdownMenuItem(
+  props: JSX.IntrinsicElements["button"] & { onSelect?: () => void; destructive?: boolean },
+) {
+  const state = useContext(MenuContext);
+  const [local, rest] = splitProps(props, ["class", "onClick", "onSelect", "destructive"]);
+  return (
+    <button
+      {...rest}
+      type="button"
+      role="menuitem"
+      tabindex={-1}
+      class={cn(
+        "flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left text-sm outline-none hover:bg-muted focus:bg-muted disabled:pointer-events-none disabled:opacity-50",
+        local.destructive && "text-destructive",
+        local.class,
+      )}
+      onClick={(event) => {
+        handleEvent(local.onClick, event);
+        if (event.defaultPrevented) return;
+        state?.setOpen(false);
+        state?.trigger?.focus();
+        local.onSelect?.();
+      }}
+    />
+  );
+}
 
-export const DropdownMenuTrigger = React.forwardRef<HTMLButtonElement, DropdownMenuTriggerProps>(
-  function DropdownMenuTrigger({ children, asChild, className }, ref) {
-    const { open, setOpen, triggerRef } = useDropdownMenu();
-    const localRef = React.useRef<HTMLButtonElement>(null);
-
-    React.useImperativeHandle(ref, () => localRef.current!);
-    React.useImperativeHandle(triggerRef, () => localRef.current as HTMLElement);
-
-    if (asChild && React.isValidElement(children)) {
-      const childProps = children.props as Record<string, unknown>;
-      const clonedProps: Record<string, unknown> = {
-        onClick: (e: React.MouseEvent) => {
-          setOpen(!open);
-          if (typeof childProps.onClick === "function") {
-            childProps.onClick(e);
-          }
-        },
-        "aria-expanded": open,
-        "aria-haspopup": "menu",
-        ref: localRef,
-      };
-      return React.cloneElement(children, clonedProps);
-    }
-
-    return (
-      <button
-        ref={localRef}
-        type="button"
-        onClick={() => setOpen(!open)}
-        aria-expanded={open}
-        aria-haspopup="menu"
-        className={className}
-      >
-        {children}
-      </button>
-    );
-  },
-);
-
-type DropdownMenuContentProps = {
-  children: React.ReactNode;
-  align?: "start" | "end";
-  className?: string;
-  onEscapeKeyDown?: (event: KeyboardEvent) => void;
-  onInteractOutside?: (event: Event) => void;
-};
-
-export const DropdownMenuContent = React.forwardRef<HTMLDivElement, DropdownMenuContentProps>(
-  function DropdownMenuContent(
-    { children, align = "end", className, onEscapeKeyDown, onInteractOutside },
-    ref,
-  ) {
-    const { open, setOpen, triggerRef } = useDropdownMenu();
-    const contentRef = React.useRef<HTMLDivElement>(null);
-    const focusedIndex = React.useRef(-1);
-
-    React.useImperativeHandle(ref, () => contentRef.current!);
-
-    const focusByKey = React.useCallback((key: MenuNavigationKey) => {
-      const items = menuFocusables(contentRef.current);
-      const target = menuFocusTarget(items, focusedIndex.current, key);
-      if (target === null) return false;
-      focusedIndex.current = target;
-      items[target]?.focus();
-      return true;
-    }, []);
-
-    const navigate = React.useRef(focusByKey);
-    React.useEffect(() => {
-      navigate.current = focusByKey;
-    }, [focusByKey]);
-
-    React.useEffect(() => {
-      if (!open) return;
-      focusedIndex.current = -1;
-      const timer = setTimeout(() => {
-        navigate.current("ArrowDown");
-      }, 0);
-      return () => clearTimeout(timer);
-    }, [open]);
-
-    React.useEffect(() => {
-      if (!open) return;
-
-      const handleKeyDown = (event: KeyboardEvent) => {
-        if (event.key === "Escape") {
-          onEscapeKeyDown?.(event);
-          if (!event.defaultPrevented) {
-            event.preventDefault();
-            setOpen(false);
-            triggerRef.current?.focus();
-          }
-        } else if (
-          event.key === "ArrowDown" ||
-          event.key === "ArrowUp" ||
-          event.key === "Home" ||
-          event.key === "End"
-        ) {
-          if (focusByKey(event.key)) event.preventDefault();
-        }
-      };
-
-      const handleClickOutside = (event: MouseEvent | TouchEvent) => {
-        if (contentRef.current && !contentRef.current.contains(event.target as Node)) {
-          const isClickOnTrigger = triggerRef.current?.contains(event.target as Node);
-
-          if (!isClickOnTrigger) {
-            onInteractOutside?.(event);
-            if (!event.defaultPrevented) {
-              setOpen(false);
-            }
-          }
-        }
-      };
-
-      document.addEventListener("keydown", handleKeyDown);
-      document.addEventListener("mousedown", handleClickOutside);
-      document.addEventListener("touchstart", handleClickOutside);
-
-      return () => {
-        document.removeEventListener("keydown", handleKeyDown);
-        document.removeEventListener("mousedown", handleClickOutside);
-        document.removeEventListener("touchstart", handleClickOutside);
-      };
-    }, [open, setOpen, triggerRef, focusByKey, onEscapeKeyDown, onInteractOutside]);
-
-    if (!open) return null;
-
-    return (
-      <div
-        ref={contentRef}
-        role="menu"
-        className={cn(
-          "absolute z-50 min-w-[8rem] rounded-md border border-border bg-popover p-1 text-popover-foreground shadow-md",
-          align === "end" ? "right-0" : "left-0",
-          "top-full mt-1",
-          className,
-        )}
-      >
-        {children}
-      </div>
-    );
-  },
-);
-
-type DropdownMenuItemProps = {
-  children: React.ReactNode;
-  onSelect?: () => void;
-  disabled?: boolean;
-  className?: string;
-};
-
-export const DropdownMenuItem = React.forwardRef<HTMLButtonElement, DropdownMenuItemProps>(
-  function DropdownMenuItem({ children, onSelect, disabled, className }, ref) {
-    const { setOpen, triggerRef } = useDropdownMenu();
-    const localRef = React.useRef<HTMLButtonElement>(null);
-
-    React.useImperativeHandle(ref, () => localRef.current!);
-
-    const handleSelect = () => {
-      if (disabled) return;
-      onSelect?.();
-      setOpen(false);
-      setTimeout(() => {
-        triggerRef.current?.focus();
-      }, 0);
-    };
-
-    return (
-      <button
-        ref={localRef}
-        type="button"
-        role="menuitem"
-        disabled={disabled}
-        onClick={handleSelect}
-        className={cn(
-          "flex w-full items-center rounded-sm px-2 py-1.5 text-sm outline-none transition-colors",
-          "hover:bg-muted focus-visible:bg-muted",
-          disabled && "pointer-events-none opacity-50",
-          className,
-        )}
-      >
-        {children}
-      </button>
-    );
-  },
-);
+export function DropdownMenuSeparator() {
+  return <hr class="my-1 border-border" />;
+}

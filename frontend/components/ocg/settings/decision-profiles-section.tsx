@@ -1,39 +1,32 @@
-"use client";
-
-import { useState, type FormEvent } from "react";
-import Link from "next/link";
-import type { ProfilesSnapshot } from "../contracts";
-import type { DecisionLimits as DecisionLimits } from "../contracts/api";
-import type { ApiClient, ProfileWriteRequest } from "../runtime/api-client";
-import { isProfileConflict } from "../runtime/api-client";
-import { useI18n } from "../i18n";
-import { ApiKeyInput, Section, describeError, selectableLlmProfiles } from "./settings-parts";
+import { createMemo, createSignal } from "solid-js";
+import { WorkspaceLink } from "@/components/ocg/layout/workspace-link";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
-import { Textarea } from "@/components/ui/textarea";
-import { DismissibleNotice } from "../primitives/dismissible-notice";
 import {
   Dialog,
   DialogContent,
-  DialogHeader,
-  DialogTitle,
   DialogDescription,
   DialogFooter,
+  DialogHeader,
+  DialogTitle,
 } from "@/components/ui/dialog";
-import { HeadersEditor } from "./headers-editor";
+import { Input } from "@/components/ui/input";
+import { Select, SelectItem } from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { type FormEvent } from "@/lib/ui-state";
+import type { ProfilesSnapshot } from "../contracts";
+import type { DecisionLimits as DecisionLimits } from "../contracts/api";
+import { useI18n } from "../i18n";
+import { DismissibleNotice } from "../primitives/dismissible-notice";
+import type { ApiClient, ProfileWriteRequest } from "../runtime/api-client";
+import { isProfileConflict } from "../runtime/api-client";
 import {
+  draftsToInputs,
   type HeaderDraft,
   type HeaderDraftError,
-  draftsToInputs,
   headersToDrafts,
 } from "./header-drafts";
+import { HeadersEditor } from "./headers-editor";
+import { ApiKeyInput, describeError, Section, selectableLlmProfiles } from "./settings-parts";
 
 const emptyLimits: DecisionLimits = {
   max_input_tokens_per_request: null,
@@ -52,31 +45,25 @@ export function DecisionProfilesSection(props: ProfileEditorProps) {
   return <ProfileEditor {...props} kind="decision_agent" />;
 }
 
-function ProfileEditor({
-  client,
-  profiles,
-  onSaved,
-  onManageModels,
-  kind,
-}: ProfileEditorProps & { kind: "decision_model" | "decision_agent" }) {
-  const { t } = useI18n();
-  const [editing, setEditing] = useState<string>();
-  const [editingSeq, setEditingSeq] = useState<number>();
-  const [name, setName] = useState("");
-  const [model, setModel] = useState("");
-  const [endpoint, setEndpoint] = useState("");
-  const [credential, setCredential] = useState("");
-  const [credentialRef, setCredentialRef] = useState<string | null>(null);
-  const [headers, setHeaders] = useState<HeaderDraft[]>([]);
-  const [headerError, setHeaderError] = useState<HeaderDraftError>();
-  const [capabilities, setCapabilities] = useState<string[]>(["choice"]);
-  const [limits, setLimits] = useState<DecisionLimits>(emptyLimits);
-  const [instructions, setInstructions] = useState("");
-  const [models, setModels] = useState<string[]>([]);
-  const [defaultModel, setDefaultModel] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string>();
-  const [deleting, setDeleting] = useState<{ id: string; name: string }>();
+function ProfileEditor(props: ProfileEditorProps & { kind: "decision_model" | "decision_agent" }) {
+  const i18n = useI18n();
+  const [editing, setEditing] = createSignal<string>();
+  const [editingSeq, setEditingSeq] = createSignal<number>();
+  const [name, setName] = createSignal("");
+  const [model, setModel] = createSignal("");
+  const [endpoint, setEndpoint] = createSignal("");
+  const [credential, setCredential] = createSignal("");
+  const [credentialRef, setCredentialRef] = createSignal<string | null>(null);
+  const [headers, setHeaders] = createSignal<HeaderDraft[]>([]);
+  const [headerError, setHeaderError] = createSignal<HeaderDraftError>();
+  const [capabilities, setCapabilities] = createSignal<string[]>(["choice"]);
+  const [limits, setLimits] = createSignal<DecisionLimits>(emptyLimits);
+  const [instructions, setInstructions] = createSignal("");
+  const [models, setModels] = createSignal<string[]>([]);
+  const [defaultModel, setDefaultModel] = createSignal<string | null>(null);
+  const [busy, setBusy] = createSignal(false);
+  const [error, setError] = createSignal<string>();
+  const [deleting, setDeleting] = createSignal<{ id: string; name: string }>();
   function reset() {
     setEditing(undefined);
     setEditingSeq(undefined);
@@ -96,7 +83,7 @@ function ProfileEditor({
   }
   async function save(event: FormEvent) {
     event.preventDefault();
-    const headerRequest = draftsToInputs(headers);
+    const headerRequest = draftsToInputs(headers());
     if ("error" in headerRequest) {
       setHeaderError(headerRequest.error);
       return;
@@ -105,176 +92,184 @@ function ProfileEditor({
     setBusy(true);
     setError(undefined);
     const payload: ProfileWriteRequest =
-      kind === "decision_model"
+      props.kind === "decision_model"
         ? {
-            kind,
-            name: name.trim(),
-            model: model.trim(),
-            endpoint: endpoint.trim(),
+            kind: props.kind,
+            name: name().trim(),
+            model: model().trim(),
+            endpoint: endpoint().trim(),
             protocol: "typesafe_systemone",
-            declared_capabilities: capabilities,
-            limits,
-            credential_ref: credentialRef,
+            declared_capabilities: capabilities(),
+            limits: limits(),
+            credential_ref: credentialRef(),
             headers: headerRequest.inputs,
-            ...(editingSeq === undefined ? {} : { expected_edit_seq: editingSeq }),
-            ...(credential ? { credential } : {}),
+            ...(editingSeq() === undefined ? {} : { expected_edit_seq: editingSeq() }),
+            ...(credential() ? { credential: credential() } : {}),
           }
         : {
-            kind,
-            name: name.trim(),
-            instructions: instructions.trim() || null,
-            models,
-            default_model: defaultModel,
-            ...(editingSeq === undefined ? {} : { expected_edit_seq: editingSeq }),
+            kind: props.kind,
+            name: name().trim(),
+            instructions: instructions().trim() || null,
+            models: models(),
+            default_model: defaultModel(),
+            ...(editingSeq() === undefined ? {} : { expected_edit_seq: editingSeq() }),
           };
     try {
-      const result = editing
-        ? await client.updateProfile(editing, payload)
-        : await client.createProfile(payload);
-      onSaved(result);
+      const result = editing()
+        ? await props.client.updateProfile(editing()!, payload)
+        : await props.client.createProfile(payload);
+      props.onSaved(result);
       reset();
     } catch (cause) {
-      if (isProfileConflict(cause) && editing) {
+      if (isProfileConflict(cause) && editing()) {
         setError(
-          t(kind === "decision_agent" ? "settings.agent.conflict" : "settings.llm.conflict"),
+          i18n.t(
+            props.kind === "decision_agent" ? "settings.agent.conflict" : "settings.llm.conflict",
+          ),
         );
         try {
-          const latest = await client.readProfiles();
-          onSaved(latest);
+          const latest = await props.client.readProfiles();
+          props.onSaved(latest);
           const current = [...latest.decision_profiles, ...latest.decision_agent_profiles].find(
-            (profile) => profile.id === editing,
+            (profile) => profile.id === editing(),
           );
           if (current) setEditingSeq(current.edit_seq);
         } catch {}
       } else {
-        setError(describeError(cause, t));
+        setError(describeError(cause, i18n.t));
       }
     } finally {
       setBusy(false);
       setCredential("");
     }
   }
-  const availableModels = [
-    ...selectableLlmProfiles(profiles.llm_profiles, ...models),
-    ...profiles.decision_profiles,
-  ];
-  const selectedModels = availableModels.filter((model) => models.includes(model.id));
+  const availableModels = createMemo(() => [
+    ...selectableLlmProfiles(props.profiles.llm_profiles, ...models()),
+    ...props.profiles.decision_profiles,
+  ]);
+  const selectedModels = createMemo(() =>
+    availableModels().filter((model) => models().includes(model.id)),
+  );
   return (
     <Section
-      id={kind === "decision_model" ? "settings-decision-models" : "settings-decision-profiles"}
-      title={t(kind === "decision_model" ? "decision.modelsTitle" : "decision.title")}
-      description={t(
-        kind === "decision_model" ? "decision.modelsDescription" : "decision.description",
+      id={
+        props.kind === "decision_model" ? "settings-decision-models" : "settings-decision-profiles"
+      }
+      title={i18n.t(props.kind === "decision_model" ? "decision.modelsTitle" : "decision.title")}
+      description={i18n.t(
+        props.kind === "decision_model" ? "decision.modelsDescription" : "decision.description",
       )}
     >
       <Dialog
-        open={!!deleting}
+        open={!!deleting()}
         onOpenChange={(open) => {
-          if (!busy && !open) setDeleting(undefined);
+          if (!busy() && !open) setDeleting(undefined);
         }}
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>{t("decision.deleteTitle", { name: deleting?.name ?? "" })}</DialogTitle>
-            <DialogDescription>{t("decision.deleteHint")}</DialogDescription>
+            <DialogTitle>
+              {i18n.t("decision.deleteTitle", { name: deleting()?.name ?? "" })}
+            </DialogTitle>
+            <DialogDescription>{i18n.t("decision.deleteHint")}</DialogDescription>
           </DialogHeader>
-          {error && <DismissibleNotice message={error} />}
+          {error() && <DismissibleNotice message={error()!} />}
           <DialogFooter>
-            <Button variant="outline" disabled={busy} onClick={() => setDeleting(undefined)}>
-              {t("common.cancel")}
+            <Button variant="outline" disabled={busy()} onClick={() => setDeleting(undefined)}>
+              {i18n.t("common.cancel")}
             </Button>
             <Button
               variant="destructive"
-              disabled={busy}
+              disabled={busy()}
               onClick={() => {
-                if (!deleting) return;
+                if (!deleting()) return;
                 setBusy(true);
                 setError(undefined);
-                void client
-                  .deleteLlmProfile(deleting.id)
+                void props.client
+                  .deleteLlmProfile(deleting()!.id)
                   .then(
                     (result) => {
-                      onSaved(result);
-                      if (editing === deleting.id) reset();
+                      props.onSaved(result);
+                      if (editing() === deleting()!.id) reset();
                       setDeleting(undefined);
                     },
-                    (cause) => setError(describeError(cause, t)),
+                    (cause) => setError(describeError(cause, i18n.t)),
                   )
                   .finally(() => setBusy(false));
               }}
             >
-              {t("common.remove")}
+              {i18n.t("common.remove")}
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
       <form
         onSubmit={(event) => void save(event)}
-        className="mb-2 space-y-3 border-b border-border pb-4"
+        class="mb-2 space-y-3 border-b border-border pb-4"
       >
-        <fieldset disabled={busy} className="space-y-3">
-          {editing && (
+        <fieldset disabled={busy()} class="space-y-3">
+          {editing() && (
             <Button type="button" variant="ghost" onClick={reset}>
-              {t("decision.new")}
+              {i18n.t("decision.new")}
             </Button>
           )}
-          <label className="grid gap-1 text-xs">
-            {t("decision.name")}
-            <Input required value={name} onChange={(event) => setName(event.target.value)} />
+          <label class="grid gap-1 text-xs">
+            {i18n.t("decision.name")}
+            <Input required value={name()} onInput={(event) => setName(event.target.value)} />
           </label>
-          {kind === "decision_model" ? (
+          {props.kind === "decision_model" ? (
             <>
-              <label className="grid gap-1 text-xs">
-                {t("decision.modelId")}
-                <Input required value={model} onChange={(event) => setModel(event.target.value)} />
+              <label class="grid gap-1 text-xs">
+                {i18n.t("decision.modelId")}
+                <Input required value={model()} onInput={(event) => setModel(event.target.value)} />
               </label>
-              <label className="grid gap-1 text-xs">
-                {t("decision.endpoint")}
+              <label class="grid gap-1 text-xs">
+                {i18n.t("decision.endpoint")}
                 <Input
                   required
                   type="url"
-                  value={endpoint}
-                  onChange={(event) => setEndpoint(event.target.value)}
+                  value={endpoint()}
+                  onInput={(event) => setEndpoint(event.target.value)}
                 />
               </label>
-              <label className="grid gap-1 text-xs">
-                {t("decision.credential")}
+              <label class="grid gap-1 text-xs">
+                {i18n.t("decision.credential")}
                 <ApiKeyInput
-                  value={credential}
+                  value={credential()}
                   onChange={(event) => setCredential(event.target.value)}
                 />
               </label>
               <HeadersEditor
-                legend={t("headers.title")}
-                hint={t("headers.connectionHint")}
-                value={headers}
+                legend={i18n.t("headers.title")}
+                hint={i18n.t("headers.connectionHint")}
+                value={headers()}
                 onChange={setHeaders}
-                disabled={busy}
+                disabled={busy()}
                 allowSecret
-                error={headerError}
+                error={headerError()}
               />
-              <fieldset className="space-y-2">
-                <legend className="text-xs">{t("decision.capabilities")}</legend>
+              <fieldset class="space-y-2">
+                <legend class="text-xs">{i18n.t("decision.capabilities")}</legend>
                 {(["choice", "binary_probability", "ordinal_score"] as const).map((capability) => (
-                  <label key={capability} className="mr-3 inline-flex items-center gap-1 text-xs">
+                  <label class="mr-3 inline-flex items-center gap-1 text-xs">
                     <input
                       type="checkbox"
-                      checked={capabilities.includes(capability)}
+                      checked={capabilities().includes(capability)}
                       onChange={(event) =>
                         setCapabilities(
                           event.target.checked
-                            ? [...capabilities, capability]
-                            : capabilities.filter((value) => value !== capability),
+                            ? [...capabilities(), capability]
+                            : capabilities().filter((value) => value !== capability),
                         )
                       }
                     />
-                    {t(`decision.${capability}`)}
+                    {i18n.t(`decision.${capability}`)}
                   </label>
                 ))}
               </fieldset>
               <details>
-                <summary className="cursor-pointer text-xs">{t("decision.limits")}</summary>
-                <div className="mt-2 grid grid-cols-2 gap-2">
+                <summary class="cursor-pointer text-xs">{i18n.t("decision.limits")}</summary>
+                <div class="mt-2 grid grid-cols-2 gap-2">
                   {(
                     [
                       "max_input_tokens_per_request",
@@ -283,17 +278,17 @@ function ProfileEditor({
                       "max_output_tokens_per_question",
                     ] as const
                   ).map((field) => (
-                    <label key={field} className="grid gap-1 text-xs">
-                      {t(`decision.${field}`)}
+                    <label class="grid gap-1 text-xs">
+                      {i18n.t(`decision.${field}`)}
                       <Input
                         type="number"
                         min={1}
                         max={1_000_000}
                         step={1}
-                        value={limits[field] ?? ""}
-                        onChange={(event) =>
+                        value={limits()[field] ?? ""}
+                        onInput={(event) =>
                           setLimits({
-                            ...limits,
+                            ...limits(),
                             [field]: event.target.value ? event.currentTarget.valueAsNumber : null,
                           })
                         }
@@ -305,24 +300,24 @@ function ProfileEditor({
             </>
           ) : (
             <>
-              <label className="grid gap-1 text-xs">
-                {t("decision.instructions")}
+              <label class="grid gap-1 text-xs">
+                {i18n.t("decision.instructions")}
                 <Textarea
-                  value={instructions}
-                  onChange={(event) => setInstructions(event.target.value)}
+                  value={instructions()}
+                  onInput={(event) => setInstructions(event.target.value)}
                 />
               </label>
-              <fieldset className="space-y-2">
-                <legend className="text-xs">{t("decision.availableModels")}</legend>
-                {availableModels.length === 0 ? (
-                  <div className="space-y-2 text-xs">
-                    <p className="text-muted-foreground">{t("decision.noModels")}</p>
-                    <Link
+              <fieldset class="space-y-2">
+                <legend class="text-xs">{i18n.t("decision.availableModels")}</legend>
+                {availableModels().length === 0 ? (
+                  <div class="space-y-2 text-xs">
+                    <p class="text-muted-foreground">{i18n.t("decision.noModels")}</p>
+                    <WorkspaceLink
                       href="/settings/models"
-                      className="inline-flex min-h-9 items-center rounded text-primary underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
+                      class="inline-flex min-h-9 items-center rounded text-primary underline underline-offset-4 focus-visible:outline-2 focus-visible:outline-ring"
                       onClick={(event) => {
                         if (
-                          !onManageModels ||
+                          !props.onManageModels ||
                           event.button !== 0 ||
                           event.metaKey ||
                           event.ctrlKey ||
@@ -331,102 +326,96 @@ function ProfileEditor({
                         )
                           return;
                         event.preventDefault();
-                        onManageModels();
+                        props.onManageModels();
                       }}
                     >
-                      {t("decision.addModels")}
-                    </Link>
+                      {i18n.t("decision.addModels")}
+                    </WorkspaceLink>
                   </div>
                 ) : (
-                  availableModels.map((model) => (
-                    <label key={model.id} className="flex items-center gap-2 text-xs">
+                  availableModels().map((model) => (
+                    <label class="flex items-center gap-2 text-xs">
                       <input
                         type="checkbox"
-                        checked={models.includes(model.id)}
+                        checked={models().includes(model.id)}
                         disabled={
-                          "enabled" in model && !model.enabled && !models.includes(model.id)
+                          "enabled" in model && !model.enabled && !models().includes(model.id)
                         }
                         onChange={(event) => {
                           setModels(
                             event.target.checked
-                              ? [...models, model.id]
-                              : models.filter((value) => value !== model.id),
+                              ? [...models(), model.id]
+                              : models().filter((value) => value !== model.id),
                           );
-                          if (defaultModel === model.id && !event.target.checked)
+                          if (defaultModel() === model.id && !event.target.checked)
                             setDefaultModel(null);
                         }}
                       />
                       {model.name}
-                      {"enabled" in model && !model.enabled && ` (${t("settings.llm.disabled")})`}
+                      {"enabled" in model &&
+                        !model.enabled &&
+                        ` (${i18n.t("settings.llm.disabled")})`}
                     </label>
                   ))
                 )}
               </fieldset>
-              {selectedModels.length > 0 && (
-                <label className="grid gap-1 text-xs">
-                  {t("profile.defaultModel")}
+              {selectedModels().length > 0 && (
+                <label class="grid gap-1 text-xs">
+                  {i18n.t("profile.defaultModel")}
                   <Select
-                    value={defaultModel ?? ""}
+                    value={defaultModel() ?? ""}
                     items={[
-                      { value: "", label: t("decision.firstModel") },
-                      ...selectedModels.map((model) => ({
+                      { value: "", label: i18n.t("decision.firstModel") },
+                      ...selectedModels().map((model) => ({
                         value: model.id,
                         label:
                           "enabled" in model && !model.enabled
-                            ? `${model.name} (${t("settings.llm.disabled")})`
+                            ? `${model.name} (${i18n.t("settings.llm.disabled")})`
                             : model.name,
                       })),
                     ]}
                     onValueChange={(next) => setDefaultModel(next || null)}
+                    class="min-h-10 w-full rounded-md bg-background px-2"
                   >
-                    <SelectTrigger className="min-h-10 w-full rounded-md bg-background px-2">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="">{t("decision.firstModel")}</SelectItem>
-                      {selectedModels.map((model) => (
-                        <SelectItem
-                          key={model.id}
-                          value={model.id}
-                          disabled={"enabled" in model && !model.enabled}
-                        >
-                          {model.name}
-                          {"enabled" in model &&
-                            !model.enabled &&
-                            ` (${t("settings.llm.disabled")})`}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
+                    <SelectItem value="">{i18n.t("decision.firstModel")}</SelectItem>
+                    {selectedModels().map((model) => (
+                      <SelectItem value={model.id} disabled={"enabled" in model && !model.enabled}>
+                        {model.name}
+                        {"enabled" in model &&
+                          !model.enabled &&
+                          ` (${i18n.t("settings.llm.disabled")})`}
+                      </SelectItem>
+                    ))}
                   </Select>
                 </label>
               )}
-              <p className="text-xs text-muted-foreground">{t("decision.inputOnly")}</p>
+              <p class="text-xs text-muted-foreground">{i18n.t("decision.inputOnly")}</p>
             </>
           )}
-          {error && <DismissibleNotice message={error} />}
+          {error() && <DismissibleNotice message={error()!} />}
           <Button
             type="submit"
             disabled={
-              !name.trim() ||
-              (kind === "decision_model" ? !capabilities.length : !selectedModels.length)
+              !name().trim() ||
+              (props.kind === "decision_model" ? !capabilities().length : !selectedModels().length)
             }
           >
-            {busy ? t("context.saving") : t("common.save")}
+            {busy() ? i18n.t("context.saving") : i18n.t("common.save")}
           </Button>
         </fieldset>
       </form>
-      <div className="divide-y divide-border py-2">
-        {kind === "decision_model" &&
-          profiles.decision_profiles.map((profile) => (
-            <div key={profile.id} className="flex items-center justify-between gap-2 py-2 text-sm">
+      <div class="divide-y divide-border py-2">
+        {props.kind === "decision_model" &&
+          props.profiles.decision_profiles.map((profile) => (
+            <div class="flex items-center justify-between gap-2 py-2 text-sm">
               <span>
                 {profile.name} · {profile.model}
               </span>
-              <div className="flex gap-1">
+              <div class="flex gap-1">
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={busy || !profile.editable}
+                  disabled={busy() || !profile.editable}
                   onClick={() => {
                     reset();
                     setEditing(profile.id);
@@ -440,33 +429,33 @@ function ProfileEditor({
                     setLimits(profile.limits);
                   }}
                 >
-                  {t("decision.edit")}
+                  {i18n.t("decision.edit")}
                 </Button>
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={busy || !profile.editable}
+                  disabled={busy() || !profile.editable}
                   onClick={() => {
                     setError(undefined);
                     setDeleting({ id: profile.id, name: profile.name });
                   }}
                 >
-                  {t("common.remove")}
+                  {i18n.t("common.remove")}
                 </Button>
               </div>
             </div>
           ))}
-        {kind === "decision_agent" &&
-          profiles.decision_agent_profiles.map((profile) => (
-            <div key={profile.id} className="flex items-center justify-between gap-2 py-2 text-sm">
+        {props.kind === "decision_agent" &&
+          props.profiles.decision_agent_profiles.map((profile) => (
+            <div class="flex items-center justify-between gap-2 py-2 text-sm">
               <span>
-                {profile.name} · {t("decision.agent")}
+                {profile.name} · {i18n.t("decision.agent")}
               </span>
-              <div className="flex gap-1">
+              <div class="flex gap-1">
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={busy || !profile.editable}
+                  disabled={busy() || !profile.editable}
                   onClick={() => {
                     reset();
                     setEditing(profile.id);
@@ -477,18 +466,18 @@ function ProfileEditor({
                     setDefaultModel(profile.default_model);
                   }}
                 >
-                  {t("decision.edit")}
+                  {i18n.t("decision.edit")}
                 </Button>
                 <Button
                   size="sm"
                   variant="ghost"
-                  disabled={busy || !profile.editable}
+                  disabled={busy() || !profile.editable}
                   onClick={() => {
                     setError(undefined);
                     setDeleting({ id: profile.id, name: profile.name });
                   }}
                 >
-                  {t("common.remove")}
+                  {i18n.t("common.remove")}
                 </Button>
               </div>
             </div>

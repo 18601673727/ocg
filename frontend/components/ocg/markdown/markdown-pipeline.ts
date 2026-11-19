@@ -1,10 +1,10 @@
+import hljs from "highlight.js/lib/common";
 import MarkdownIt, {
   type MarkdownIt as MarkdownItType,
   type StateBlock,
   type StateInline,
 } from "markdown-it";
 import taskLists from "markdown-it-task-lists";
-import hljs from "highlight.js/lib/common";
 
 const DOLLAR = "$";
 

@@ -1,20 +1,9 @@
-"use client";
-
-import {
-  createContext,
-  useCallback,
-  useContext,
-  useEffect,
-  useMemo,
-  useState,
-  type ReactNode,
-} from "react";
+import type { JSX } from "@solidjs/web";
+import { createContext, createSignal, useContext } from "solid-js";
+import { dictionaries, formatTemplate, type TranslateFn } from "./dictionaries";
 import { DEFAULT_LOCALE, detectLocale, isLocale, LOCALE_STORAGE_KEY, type Locale } from "./locale";
-import { dictionaries, formatTemplate, type I18nKey } from "./dictionaries";
 
-export type TranslateVars = Record<string, string | number>;
-
-export type TranslateFn = (key: I18nKey, vars?: TranslateVars) => string;
+export type { TranslateFn, TranslateVars } from "./dictionaries";
 
 type I18nContextValue = {
   locale: Locale;
@@ -23,59 +12,37 @@ type I18nContextValue = {
   hydrated: boolean;
 };
 
-const I18nContext = createContext<I18nContextValue | null>(null);
+const I18nContext = createContext<I18nContextValue>();
 
-function translate(locale: Locale, key: I18nKey, vars?: TranslateVars): string {
-  const table = dictionaries[locale] ?? dictionaries[DEFAULT_LOCALE];
-  const fallback = dictionaries[DEFAULT_LOCALE];
-  const template = table[key] ?? fallback[key] ?? key;
-  return formatTemplate(template, vars);
-}
-
-function applyDocumentLocale(locale: Locale) {
-  if (typeof document === "undefined") return;
-  document.documentElement.lang = locale;
-}
-
-export function I18nProvider({ children }: { children: ReactNode }) {
-  const [locale, setLocaleState] = useState<Locale>(() => DEFAULT_LOCALE);
-  const [hydrated, setHydrated] = useState(false);
-
-  useEffect(() => {
-    const loadTimer = window.setTimeout(() => {
-      const detected = detectLocale(window.localStorage, window.navigator.language);
-      setLocaleState(detected);
-      applyDocumentLocale(detected);
-      setHydrated(true);
-    }, 0);
-    return () => window.clearTimeout(loadTimer);
-  }, []);
-
-  const setLocale = useCallback((next: Locale) => {
-    if (!isLocale(next)) return;
-    setLocaleState(next);
-    applyDocumentLocale(next);
-    try {
-      window.localStorage.setItem(LOCALE_STORAGE_KEY, next);
-    } catch {}
-  }, []);
-
-  const t = useCallback<TranslateFn>((key, vars) => translate(locale, key, vars), [locale]);
-
-  const value = useMemo(
-    () => ({ locale, setLocale, t, hydrated }),
-    [locale, setLocale, t, hydrated],
+export function I18nProvider(props: { children: JSX.Element }) {
+  const [locale, setLocale] = createSignal(
+    detectLocale(window.localStorage, window.navigator.language),
   );
-
-  return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>;
+  const value: I18nContextValue = {
+    get locale() {
+      return locale();
+    },
+    hydrated: true,
+    t: (key, vars) =>
+      formatTemplate(dictionaries[locale()][key] ?? dictionaries[DEFAULT_LOCALE][key] ?? key, vars),
+    setLocale(next) {
+      if (!isLocale(next)) return;
+      setLocale(next);
+      document.documentElement.lang = next;
+      try {
+        window.localStorage.setItem(LOCALE_STORAGE_KEY, next);
+      } catch {}
+    },
+  };
+  return <I18nContext value={value}>{props.children}</I18nContext>;
 }
 
-export function useI18n(): I18nContextValue {
-  const value = useContext(I18nContext);
-  if (!value) throw new Error("useI18n must be used inside I18nProvider");
-  return value;
+export function useI18n() {
+  const context = useContext(I18nContext);
+  if (!context) throw new Error("useI18n must be used inside I18nProvider");
+  return context;
 }
 
-export function useT(): TranslateFn {
+export function useT() {
   return useI18n().t;
 }

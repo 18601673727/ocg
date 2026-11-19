@@ -66,7 +66,7 @@ fn file_under(root: &std::path::Path, relative: &str) -> Result<(PathBuf, bool),
             continue;
         };
         if metadata.is_file() && metadata.len() <= MAX_ASSET_BYTES {
-            return Ok((resolved, candidate.starts_with("_next/static/")));
+            return Ok((resolved, candidate.starts_with("_assets/")));
         }
     }
     Err(NOT_FOUND)

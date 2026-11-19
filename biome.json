@@ -1,0 +1,86 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.6.8/schema.json",
+  "files": {
+    "includes": [
+      "biome.json",
+      "benchmark/frontend/**",
+      "!!benchmark/frontend/node_modules",
+      "frontend/**",
+      "!!frontend/node_modules",
+      "!!frontend/out",
+      "!frontend/components/ocg/contracts/generated.ts"
+    ]
+  },
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "rules": {
+      "preset": "none",
+      "a11y": {
+        "noAriaUnsupportedElements": "warn",
+        "useAltText": "warn",
+        "useAriaPropsForRole": "warn",
+        "useAriaPropsSupportedByRole": "warn",
+        "useValidAriaProps": "warn",
+        "useValidAriaValues": "warn"
+      },
+      "complexity": {
+        "noArguments": "error",
+        "noBannedTypes": "error",
+        "noUselessThisAlias": "error",
+        "noUselessTypeConstraint": "error"
+      },
+      "correctness": {
+        "noUnusedImports": "warn",
+        "noUnusedVariables": "warn"
+      },
+      "performance": {
+        "noSyncScripts": "error",
+        "noUnwantedPolyfillio": "warn",
+        "useGoogleFontPreconnect": "warn"
+      },
+      "style": {
+        "noCommonJs": "error",
+        "noNamespace": "error",
+        "useArrayLiterals": "error",
+        "useAsConstAssertion": "error",
+        "useConst": "error",
+        "useSpreadOverApply": "error"
+      },
+      "suspicious": {
+        "noCommentText": "error",
+        "noDuplicateEnumValues": "error",
+        "noDuplicateJsxProps": "error",
+        "noExplicitAny": "error",
+        "noExtraNonNullAssertion": "error",
+        "noMisleadingInstantiator": "error",
+        "noNonNullAssertedOptionalChain": "error",
+        "noTsIgnore": "error",
+        "noUnsafeDeclarationMerging": "error",
+        "noVar": "error",
+        "useGoogleFontDisplay": "warn",
+        "useNamespaceKeyword": "error"
+      }
+    }
+  },
+  "css": {
+    "parser": {
+      "tailwindDirectives": true
+    }
+  },
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": "on"
+      }
+    }
+  }
+}
