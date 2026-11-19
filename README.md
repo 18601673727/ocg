@@ -26,7 +26,7 @@ OCG combines a Rust backend, a browser interface, and an embedded database. Conn
 
 | Component | Technology | Responsibility |
 | --- | --- | --- |
-| [Web interface](frontend/) | Next.js, React, TypeScript | Browser UI built as a static export and served by the backend. |
+| [Web interface](frontend/) | Solid 2, Rsbuild, TypeScript | Browser workspace for conversations, jobs, and settings. |
 | [Application API](src/api/v1/) | Rust, ntex | Authenticated application APIs, Job operations, and event streams. |
 | [Execution runtime](src/system/) | Rust, ntex | Scheduling, job lifecycle, agent orchestration, and tool execution. |
 | [AI services](src/service/ai/) | Rust provider adapters | Model requests, streaming responses, context preparation, compaction, and decisions. |
@@ -72,11 +72,12 @@ git clone https://github.com/18601673727/ocg.git
 cd ocg
 
 cargo build --locked --release --bin ocg
+cargo run --locked --bin ocg-rs-ts
 pnpm --dir frontend install --frozen-lockfile
 pnpm --dir frontend build
 ```
 
-The build produces the backend at `target/release/ocg` and exports the web interface to `frontend/out`.
+Cargo builds the backend at `target/release/ocg`. Rsbuild writes the static site to `frontend/out`.
 
 #### Run
 
@@ -97,7 +98,7 @@ The served web interface establishes its browser session automatically. The API 
 
 > **Access control:** Anyone who can reach the served UI can obtain full operator access without a sign-in code. Keep remote access behind an SSH tunnel or [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/access-controls/applications/http-apps/self-hosted-public-app/) (Zero Trust) with an enforced authentication policy.
 
-`OCG_DATA_DIR` is required. `OCG_API_PORT` and `OCG_API_TOKEN` enable the API together; the token must be a random value of 32–512 accepted characters. `OCG_UI_DIR` selects the exported frontend directory. See the [server configuration](src/api/v1/config.rs) for the exact rules.
+`OCG_DATA_DIR` is required. Set `OCG_API_PORT` and `OCG_API_TOKEN` together to enable the API. The token must be a random value of 32–512 accepted characters. When `OCG_UI_DIR` points to `frontend/out`, the Rust backend serves the static pages and the API from the same origin. [Server configuration](src/api/v1/config.rs)
 
 The HTTP listener binds to `127.0.0.1`. For a remote installation, forward the same port over SSH:
 
@@ -119,6 +120,23 @@ Keep the OCG data directory separate from project workspaces. The [data layout](
 > **Storage:** This implementation starts with **Format 1** and requires a new database. It has no historical migration or compatibility reader. `ocg verify <data-directory>` checks an existing database without modifying it; the installer runs this check before switching versions. Keep existing data separately rather than opening it as a new database.
 
 ## Performance
+
+### Long-conversation frontend benchmark
+
+The benchmark starts an isolated Rust backend and a local mock model provider, seeds 56 conversation turns, and opens the production frontend in headless Chrome. It measures initial JavaScript size, latency from provider updates to the browser DOM, and scroll frame intervals. [Benchmark source](benchmark/frontend/)
+
+Install Google Chrome in addition to the build requirements. Run these commands from the repository root.
+
+```sh
+cargo build --locked --bin ocg
+cargo run --locked --bin ocg-rs-ts
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend build
+pnpm --dir benchmark/frontend install --frozen-lockfile
+pnpm --dir benchmark/frontend bench
+```
+
+The default schedule runs once at 1× CPU and three times at 4×. To run only the throttled rounds, use `pnpm --dir benchmark/frontend bench 4,4,4`. The runner prints the path to `benchmark.json` in its temporary output directory. Set `OCG_BENCH_BROWSER` to use a custom Chrome or Chromium executable or `OCG_BENCH_BACKEND` to use a custom OCG binary.
 
 ### Backend comparison (2026-11-17)
 
