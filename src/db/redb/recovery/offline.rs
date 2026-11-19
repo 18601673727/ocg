@@ -8,6 +8,8 @@ use crate::db::redb::schema::{
     ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, CREDENTIAL_KEY_FILE_NAME, CREDENTIALS,
     MAX_OBSERVATION_SCAN, MESSAGES, META, POOL_ALLOCATIONS, POOLS, REQUEST_EVENTS,
 };
+#[cfg(unix)]
+use crate::db::redb::schema::{CONVERSATION_CONFIG_REFS, verify_compaction_rebuild_preservation};
 use crate::db::redb::schema::{DATABASE_FILE_NAME, FORMAT_VERSION};
 use crate::db::redb::{allocations, batch, indexes, reads, recovery, rows};
 use crate::host::identity::{current_boot_id, current_host_id};
@@ -16,6 +18,10 @@ use serde_json::Value as Json;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::path::Path;
+
+#[cfg(all(test, unix))]
+#[path = "offline_tests.rs"]
+mod tests;
 
 enum OfflineAccess<'a> {
     InPlace(&'a ::redb::ReadOnlyDatabase),
@@ -147,6 +153,145 @@ pub(super) fn with_verified_finalization_copy<T>(
             ));
         }
         body(database)
+    })
+}
+
+#[cfg(unix)]
+fn with_verified_rebuild_copy<T>(
+    file: std::fs::File,
+    body: impl FnOnce(&mut Database) -> Result<T, ReservedRefusal>,
+) -> Result<T, ReservedRefusal> {
+    let mut builder = Database::builder();
+    builder.set_repair_callback(|repair| repair.abort());
+    with_database_copy(file, &builder, |database| {
+        if !database.check_integrity().map_err(StorageError::from)? {
+            return Err(ReservedRefusal::new(
+                "page_integrity",
+                "the offline rebuild copy failed redb integrity verification",
+            ));
+        }
+        body(database)
+    })
+}
+
+#[cfg(unix)]
+pub(crate) struct CompactionRefRebuildPlan {
+    pub(crate) evidence: Json,
+    pub(crate) digest: String,
+    changes_required: bool,
+}
+
+#[cfg(unix)]
+fn compaction_ref_rebuild_plan(
+    database: &Database,
+    directory: &Path,
+    source_sha256: &str,
+) -> Result<CompactionRefRebuildPlan, ReservedRefusal> {
+    use ::redb::TableHandle;
+    use serde_json::json;
+
+    let tx = database.begin_read().map_err(StorageError::from)?;
+    recovery::startup_metadata(&tx)?;
+    recovery::check_records_after_compaction_refs(&tx)?;
+    recovery::residual_ownership_in(&tx)?;
+    verify_payloads(&tx, directory)?;
+    let counts = indexes::compaction_ref_rebuild_counts(&tx)?;
+    let changes_required = counts.missing != 0 || counts.extra != 0;
+    let evidence = json!({
+        "kind": "ocg-compaction-ref-rebuild-plan-v1",
+        "table": CONVERSATION_CONFIG_REFS.name(),
+        "database_format": FORMAT_VERSION,
+        "source_sha256": source_sha256,
+        "expected_refs": counts.expected,
+        "missing_refs": counts.missing,
+        "extra_refs": counts.extra,
+        "changes_required": changes_required,
+    });
+    let bytes = serde_json::to_vec(&evidence)
+        .map_err(|error| ReservedRefusal::new("invalid_plan", error.to_string()))?;
+    Ok(CompactionRefRebuildPlan {
+        evidence,
+        digest: ContentDigest::of(&bytes).to_string(),
+        changes_required,
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn plan_compaction_ref_rebuild(
+    file: std::fs::File,
+    directory: &Path,
+    source_sha256: &str,
+) -> Result<CompactionRefRebuildPlan, ReservedRefusal> {
+    with_verified_rebuild_copy(file, |database| {
+        compaction_ref_rebuild_plan(database, directory, source_sha256)
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn apply_compaction_ref_rebuild(
+    file: std::fs::File,
+    directory: &Path,
+    source_sha256: &str,
+    expected_digest: &str,
+) -> Result<Json, ReservedRefusal> {
+    with_verified_rebuild_copy(file, |database| {
+        let plan = compaction_ref_rebuild_plan(database, directory, source_sha256)?;
+        if plan.digest != expected_digest {
+            return Err(ReservedRefusal::new(
+                "plan_digest_mismatch",
+                "the source or rebuild plan changed; repeat the dry-run",
+            ));
+        }
+        if !plan.changes_required {
+            return Err(ReservedRefusal::new(
+                "index_already_current",
+                "the conversation configuration reference index already matches its source rows",
+            ));
+        }
+        let mut tx = database.begin_write().map_err(StorageError::from)?;
+        tx.set_durability(::redb::Durability::Immediate)
+            .map_err(StorageError::from)?;
+        indexes::rebuild_compaction_refs(&tx)?;
+        tx.commit().map_err(StorageError::from)?;
+        Ok(serde_json::json!({"plan": plan.evidence, "plan_digest": plan.digest}))
+    })
+}
+
+#[cfg(unix)]
+pub(crate) fn verify_compaction_ref_publication_delta(
+    directory: &Path,
+    source: &std::fs::File,
+    replacement: &std::fs::File,
+    source_sha256: &str,
+    expected_plan: &Json,
+    expected_digest: &str,
+) -> Result<Json, ReservedRefusal> {
+    let source = finalization_copy(source)?;
+    let replacement = finalization_copy(replacement)?;
+    with_verified_rebuild_copy(source, |source| {
+        let plan = compaction_ref_rebuild_plan(source, directory, source_sha256)?;
+        if plan.digest != expected_digest
+            || &plan.evidence != expected_plan
+            || !plan.changes_required
+        {
+            return Err(ReservedRefusal::new(
+                "plan_digest_mismatch",
+                "the prepared plan is not the exact rebuild plan authorized by its source",
+            ));
+        }
+        with_verified_rebuild_copy(replacement, |replacement| {
+            let residual = recovery::verify_reserved_residual(replacement)?;
+            let source_tx = source.begin_read().map_err(StorageError::from)?;
+            let replacement_tx = replacement.begin_read().map_err(StorageError::from)?;
+            verify_payloads(&replacement_tx, directory)?;
+            verify_compaction_rebuild_preservation(&source_tx, &replacement_tx)?;
+            Ok(serde_json::json!({
+                "plan": plan.evidence,
+                "plan_digest": plan.digest,
+                "other_tables_byte_identical": true,
+                "residual_ownership": residual.ownership.facts(),
+            }))
+        })
     })
 }
 

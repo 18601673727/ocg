@@ -108,7 +108,7 @@ pub(super) fn update_compaction_refs(
 
 fn visit_compaction_refs(
     tx: &impl TxRead,
-    mut visit: impl FnMut((u8, u128, u128)) -> Result<(), StorageError>,
+    mut visit: impl FnMut(CompactionReference, ConfigId, JobId) -> Result<(), StorageError>,
 ) -> Result<(u64, bool), StorageError> {
     let conversations = tx.table(CONVERSATIONS)?;
     let mut count = 0;
@@ -129,7 +129,7 @@ fn visit_compaction_refs(
         }
         for role in CompactionReference::ALL {
             if let Some(config) = role.config(policy) {
-                visit(role.key(config, job))?;
+                visit(role, config, job)?;
                 count += 1;
             }
         }
@@ -139,8 +139,8 @@ fn visit_compaction_refs(
 
 pub(super) fn verify_compaction_refs(tx: &ReadTransaction) -> Result<bool, StorageError> {
     let index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
-    let (expected, has_unknown) = visit_compaction_refs(tx, |key| {
-        if index.get(key)?.is_none() {
+    let (expected, has_unknown) = visit_compaction_refs(tx, |role, config, job| {
+        if index.get(role.key(config, job))?.is_none() {
             return Err(StorageError::corrupted(
                 "missing conversation configuration reference",
             ));
@@ -153,6 +153,62 @@ pub(super) fn verify_compaction_refs(tx: &ReadTransaction) -> Result<bool, Stora
         ));
     }
     Ok(has_unknown)
+}
+
+#[cfg(unix)]
+pub(super) struct CompactionRefCounts {
+    pub(super) expected: u64,
+    pub(super) missing: u64,
+    pub(super) extra: u64,
+}
+
+#[cfg(unix)]
+pub(super) fn compaction_ref_rebuild_counts(
+    tx: &ReadTransaction,
+) -> Result<CompactionRefCounts, StorageError> {
+    use crate::db::entities::ConfigKind;
+
+    let index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
+    let configs = tx.open_table(schema::CONFIGS)?;
+    let mut matched = 0;
+    let (expected, _) = visit_compaction_refs(tx, |role, config, job| {
+        let row = configs.get(config.get())?.ok_or_else(|| {
+            StorageError::corrupted(format!("{job} references missing config {config}"))
+        })?;
+        let row = rows::ConfigRow::decode_at(config.get(), row.value())?;
+        let kind_matches = match role {
+            CompactionReference::Summary => row.kind == ConfigKind::Model,
+            CompactionReference::Predictor => row.kind == ConfigKind::DecisionAgent,
+            CompactionReference::Acceptance => {
+                matches!(row.kind, ConfigKind::Model | ConfigKind::DecisionModel)
+            }
+        };
+        if !kind_matches || row.archived_at.is_some() {
+            return Err(StorageError::corrupted(format!(
+                "{job} has an invalid compaction reference to config {config}"
+            )));
+        }
+        matched += u64::from(index.get(role.key(config, job))?.is_some());
+        Ok(())
+    })?;
+    Ok(CompactionRefCounts {
+        expected,
+        missing: expected - matched,
+        extra: index.len()?.checked_sub(matched).ok_or_else(|| {
+            StorageError::corrupted("conversation configuration reference count is inconsistent")
+        })?,
+    })
+}
+
+#[cfg(unix)]
+pub(super) fn rebuild_compaction_refs(tx: &WriteTransaction) -> Result<(), StorageError> {
+    tx.delete_table(CONVERSATION_CONFIG_REFS)?;
+    let mut index = tx.open_table(CONVERSATION_CONFIG_REFS)?;
+    visit_compaction_refs(tx, |role, config, job| {
+        index.insert(role.key(config, job), ())?;
+        Ok(())
+    })?;
+    Ok(())
 }
 
 pub(super) fn search_gram(chars: &[char]) -> u64 {

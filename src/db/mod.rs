@@ -21,13 +21,16 @@ pub(crate) enum DevelopmentReservationError {
     Other(DatabaseError),
 }
 
-#[cfg(unix)]
-pub(crate) use redb::verify_publication;
 pub(crate) use redb::{
     DATABASE_FILE_NAME, ReservedRefusal, database_file, inspect_held_allocations_offline,
     reconcile_held_apply, reconcile_held_preflight, reconcile_reserved_apply,
     reconcile_reserved_preflight, storage_format_versions, verify_held_publication_delta,
     verify_offline, verify_reserved_publication_delta,
+};
+#[cfg(unix)]
+pub(crate) use redb::{
+    apply_compaction_ref_rebuild, plan_compaction_ref_rebuild,
+    verify_compaction_ref_publication_delta, verify_publication,
 };
 
 const GROUP_LIMIT: usize = 32;

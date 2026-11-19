@@ -6,6 +6,8 @@ mod llm_target;
 mod reconcile_reserved;
 #[cfg(unix)]
 pub(crate) use reconcile_reserved::check_offline_publication;
+#[cfg(all(test, unix))]
+pub(crate) use reconcile_reserved::run_compaction_ref_rebuild;
 mod scheduled_external_policy;
 pub mod typescript;
 #[cfg(unix)]
@@ -33,6 +35,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(unix)]
         if command == "reconcile-held" {
             return reconcile_reserved::run_held(arguments.collect());
+        }
+        #[cfg(unix)]
+        if command == "rebuild-compaction-refs" {
+            return reconcile_reserved::run_compaction_ref_rebuild(arguments.collect());
         }
         if command == "verify" {
             return verify(arguments.collect());
@@ -88,6 +94,7 @@ fn usage() -> &'static str {
        verify <data-directory> [--pages]\n\
        reconcile-reserved <data-directory> <job> --confirm-no-start | --finalize\n\
        reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
+       rebuild-compaction-refs <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
        scheduled-external-policy <create|list|show|update|enable|disable|revoke> ...\n\
        register-llm                            (OpenAI Chat Completions)\n\
        help, --help, -h\n\

@@ -53,6 +53,19 @@ macro_rules! tables {
             )?)*)*
             Ok(())
         }
+
+        #[cfg(unix)]
+        pub(super) fn verify_compaction_rebuild_preservation(
+            source: &ReadTransaction,
+            published: &ReadTransaction,
+        ) -> Result<(), recovery::reserved::ReservedRefusal> {
+            use ::redb::TableHandle;
+
+            $($(if $name.name() != CONVERSATION_CONFIG_REFS.name() {
+                recovery::audit::verify_identical_table(source, published, $name)?;
+            })*)*
+            Ok(())
+        }
     };
 }
 

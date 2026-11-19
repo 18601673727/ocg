@@ -15,6 +15,7 @@ use crate::host::data_directory::{DATABASE_LOCK_FILE, private_file};
 const USAGE: &str = "usage: ocg reconcile-reserved <data-directory> <job-id> --confirm-no-start | ocg reconcile-reserved <data-directory> --finalize";
 const HELD_USAGE: &str =
     "usage: ocg reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize";
+const REBUILD_USAGE: &str = "usage: ocg rebuild-compaction-refs <data-directory> --dry-run | --apply <plan-digest> | --finalize";
 const STALE_PREFIX: &str = ".ocg-reconcile-";
 const PREPARED_SCHEMA: &str = "ocg-publication-prepared-v1";
 const COMPLETION_SCHEMA: &str = "ocg-publication-finalized-v1";
@@ -30,6 +31,7 @@ type Failure = Box<dyn std::error::Error>;
 enum RecoveryKind {
     Reserved,
     Held,
+    CompactionRefs,
 }
 
 impl RecoveryKind {
@@ -37,6 +39,14 @@ impl RecoveryKind {
         match self {
             Self::Reserved => "reserved",
             Self::Held => "held",
+            Self::CompactionRefs => "rebuild-compaction-refs",
+        }
+    }
+
+    fn transaction_reexecuted_field(self) -> &'static str {
+        match self {
+            Self::Reserved | Self::Held => "allocation_transaction_reexecuted",
+            Self::CompactionRefs => "rebuild_transaction_reexecuted",
         }
     }
 }
@@ -44,6 +54,7 @@ impl RecoveryKind {
 enum Operation {
     Reserved(JobId),
     Held { expected_digest: Option<String> },
+    CompactionRefs { expected_digest: Option<String> },
 }
 
 impl Operation {
@@ -51,6 +62,7 @@ impl Operation {
         match self {
             Self::Reserved(_) => RecoveryKind::Reserved,
             Self::Held { .. } => RecoveryKind::Held,
+            Self::CompactionRefs { .. } => RecoveryKind::CompactionRefs,
         }
     }
 }
@@ -323,7 +335,7 @@ fn open_plain(path: &Path, write: bool) -> Result<(File, Identity), Refused> {
     options
         .read(true)
         .write(write)
-        .custom_flags(libc::O_NOFOLLOW);
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     let file = options
         .open(path)
         .map_err(|error| io("open a publication file", error))?;
@@ -658,6 +670,11 @@ fn validate_prepared(evidence: &PreparedEvidence, actual: &Identity) -> Result<(
             evidence.record_version != 0
                 && evidence.database_format == u64::from(evidence.record_version)
         }
+        "rebuild-compaction-refs" => {
+            evidence.plan_digest.is_some()
+                && evidence.record_version != 0
+                && evidence.database_format == u64::from(evidence.record_version)
+        }
         // A historical receipt stays in the chain after its converter is removed.
         "format-1-to-2" => versions == (2, 2),
         _ => false,
@@ -817,6 +834,29 @@ fn acquire_lock(directory: &Path) -> Result<File, Refused> {
     Ok(lock)
 }
 
+fn revalidate_publication_lock(directory: &Path, lock: &File) -> Result<(), Refused> {
+    let (named_lock, named) = open_plain(&directory.join(DATABASE_LOCK_FILE), false)?;
+    let held = identity(
+        &lock
+            .metadata()
+            .map_err(|error| io("stat the held lock", error))?,
+    );
+    if named != held || named.length != 0 {
+        return Err(refused(
+            "lock_changed",
+            "the held host lock could not be verified",
+        ));
+    }
+    match named_lock.try_lock() {
+        Err(std::fs::TryLockError::WouldBlock) => Ok(()),
+        Ok(()) => Err(refused(
+            "lock_changed",
+            "the host lock is no longer held exclusively",
+        )),
+        Err(std::fs::TryLockError::Error(error)) => Err(io("verify exclusive host lock", error)),
+    }
+}
+
 pub fn run(arguments: Vec<String>) -> Result<(), Failure> {
     if let [directory, flag] = arguments.as_slice()
         && flag == "--finalize"
@@ -836,10 +876,26 @@ pub fn run(arguments: Vec<String>) -> Result<(), Failure> {
 }
 
 pub fn run_held(arguments: Vec<String>) -> Result<(), Failure> {
+    run_planned(arguments, HELD_USAGE, |expected_digest| Operation::Held {
+        expected_digest,
+    })
+}
+
+pub fn run_compaction_ref_rebuild(arguments: Vec<String>) -> Result<(), Failure> {
+    run_planned(arguments, REBUILD_USAGE, |expected_digest| {
+        Operation::CompactionRefs { expected_digest }
+    })
+}
+
+fn run_planned(
+    arguments: Vec<String>,
+    usage: &str,
+    operation: impl FnOnce(Option<String>) -> Operation,
+) -> Result<(), Failure> {
     let (directory, expected_digest) = match arguments.as_slice() {
         [directory, flag] if flag == "--dry-run" => (directory, None),
         [directory, flag] if flag == "--finalize" => {
-            return finish(finalize(Path::new(directory), RecoveryKind::Held));
+            return finish(finalize(Path::new(directory), operation(None).kind()));
         }
         [directory, flag, digest] if flag == "--apply" => {
             if !valid_digest(digest) {
@@ -847,12 +903,9 @@ pub fn run_held(arguments: Vec<String>) -> Result<(), Failure> {
             }
             (directory, Some(digest.clone()))
         }
-        _ => return Err(HELD_USAGE.into()),
+        _ => return Err(usage.into()),
     };
-    finish(reconcile(
-        Path::new(directory),
-        Operation::Held { expected_digest },
-    ))
+    finish(reconcile(Path::new(directory), operation(expected_digest)))
 }
 
 fn finish(result: Result<Value, Refused>) -> Result<(), Failure> {
@@ -903,6 +956,10 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
         .map_err(|error| io("resolve the data directory", error))?;
     let database_path = directory.join(DATABASE_FILE_NAME);
     let lock = acquire_lock(&directory)?;
+    let rebuilding = operation.kind() == RecoveryKind::CompactionRefs;
+    if rebuilding {
+        revalidate_publication_lock(&directory, &lock)?;
+    }
 
     let mut original = open_original(&database_path)?;
     let before = identity(&original.metadata().map_err(|error| io("stat", error))?);
@@ -933,6 +990,13 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                         "the current database SHA-256 {source_sha256} equals neither prepared source {} nor replacement {}",
                         active.source.sha256, active.replacement.sha256
                     ),
+                ));
+            }
+            if rebuilding && !active.source.matches_identity(&before) {
+                return Err(refused_in_state(
+                    "source_changed",
+                    INCONSISTENT,
+                    "the prepared source digest matches but its file identity changed",
                 ));
             }
             chain.prepared[index].reference.clone().into()
@@ -970,6 +1034,26 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 }));
             }
         }
+        Operation::CompactionRefs {
+            expected_digest: None,
+        } => {
+            let private = private_copy(&mut original, &source_sha256)?;
+            let plan = crate::db::plan_compaction_ref_rebuild(private, &directory, &source_sha256)?;
+            confirm_source(&database_path, &before, &source_sha256)?;
+            revalidate_publication_lock(&directory, &lock)?;
+            return Ok(json!({
+                "outcome": "planned",
+                "state": supersedes.as_ref().map(|_| PREPARED_NOT_PUBLISHED),
+                "plan": plan.evidence,
+                "plan_digest": plan.digest,
+                "original": {"sha256": source_sha256, "bytes": source_length},
+                "source_unchanged": true,
+                "apply": "ocg rebuild-compaction-refs <data-directory> --apply <plan-digest>",
+            }));
+        }
+        Operation::CompactionRefs {
+            expected_digest: Some(_),
+        } => {}
     }
 
     let token = uuid::Uuid::now_v7();
@@ -1005,6 +1089,14 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 .as_deref()
                 .ok_or_else(|| refused("plan_required", "an apply digest is required"))?,
         )?,
+        Operation::CompactionRefs { expected_digest } => crate::db::apply_compaction_ref_rebuild(
+            work,
+            &directory,
+            &source_sha256,
+            expected_digest
+                .as_deref()
+                .ok_or_else(|| refused("plan_required", "an apply digest is required"))?,
+        )?,
     };
     crash_point("after-apply");
 
@@ -1019,6 +1111,19 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
     let result_identity = identity(&work.metadata().map_err(|error| io("stat", error))?);
     let replacement = FileFact::new(&result_identity, result_sha256);
     revalidate_named(&work_path, &result_identity)?;
+    if let Operation::CompactionRefs {
+        expected_digest: Some(expected_digest),
+    } = &operation
+    {
+        crate::db::verify_compaction_ref_publication_delta(
+            &directory,
+            &original,
+            &work,
+            &source_sha256,
+            &applied["plan"],
+            expected_digest,
+        )?;
+    }
 
     let artifact_path = directory.join(format!("{DATABASE_FILE_NAME}.pre-reconcile-{token}"));
     let mut artifact_guard = Scratch(Some(artifact_path.clone()));
@@ -1090,6 +1195,16 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 }),
             )
         }
+        Operation::CompactionRefs { expected_digest } => (
+            applied["plan"].clone(),
+            expected_digest.clone(),
+            vec![json!({"table": applied["plan"]["table"]})],
+            json!({
+                "missing_refs_to_insert": applied["plan"]["missing_refs"],
+                "extra_refs_to_remove": applied["plan"]["extra_refs"],
+                "other_tables": "byte-identical",
+            }),
+        ),
     };
     let prepared = PreparedEvidence {
         schema: PREPARED_SCHEMA.to_owned(),
@@ -1131,18 +1246,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
         false,
     )?;
 
-    let mut recheck = open_original(&database_path)?;
-    let named = identity(&recheck.metadata().map_err(|error| io("stat", error))?);
-    let (recheck_sha256, _) =
-        digest(&mut recheck).map_err(|error| io("reread the database", error))?;
-    if named != before || recheck_sha256 != source_sha256 {
-        return Err(refused_in_state(
-            "source_changed",
-            PREPARED_NOT_PUBLISHED,
-            "the database changed after it was checked; nothing was published",
-        ));
-    }
-    drop(recheck);
+    confirm_source(&database_path, &before, &source_sha256)?;
     revalidate_named(&work_path, &result_identity)?;
     revalidate_named(&artifact_path, &artifact_identity)?;
     let (manifest_check, manifest_reference, _) = read_record::<PreparedEvidence>(&manifest_path)?;
@@ -1151,6 +1255,9 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
             "audit_evidence",
             "prepared evidence changed before publication",
         ));
+    }
+    if rebuilding {
+        revalidate_publication_lock(&directory, &lock)?;
     }
 
     crash_point("before-rename");
@@ -1188,7 +1295,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
     drop(lock);
 
     let mut report = json!({
-        "outcome": "reconciled",
+        "outcome": if rebuilding { "rebuilt" } else { "reconciled" },
         "state": PUBLISHED_FINALIZED,
         "no_provider_contacted": true,
         "applied": applied,
@@ -1203,12 +1310,30 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
     });
     match operation {
         Operation::Reserved(job) => report["job"] = json!(job.to_string()),
-        Operation::Held { .. } => {
+        Operation::Held { .. } | Operation::CompactionRefs { .. } => {
             report["plan"] = report["applied"]["plan"].clone();
             report["plan_digest"] = report["applied"]["plan_digest"].clone();
         }
     }
     Ok(report)
+}
+
+fn confirm_source(
+    database_path: &Path,
+    before: &Identity,
+    source_sha256: &str,
+) -> Result<(), Refused> {
+    let (mut file, named) = open_plain(database_path, false)?;
+    let (actual_digest, _) = digest(&mut file).map_err(|error| io("reread the database", error))?;
+    if &named != before || actual_digest != source_sha256 {
+        return Err(refused_in_state(
+            "source_changed",
+            PREPARED_NOT_PUBLISHED,
+            "the database changed after it was checked; nothing was published",
+        ));
+    }
+    revalidate_named(database_path, before)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1311,6 +1436,20 @@ fn verify_publication(
             &prepared.recovery_plan,
             prepared.plan_digest.as_deref().unwrap_or_default(),
         ),
+        Operation::CompactionRefs { .. } => crate::db::verify_compaction_ref_publication_delta(
+            directory,
+            &artifact,
+            &published_file,
+            &prepared.source.sha256,
+            &prepared.recovery_plan,
+            prepared.plan_digest.as_deref().ok_or_else(|| {
+                refused_in_state(
+                    "audit_evidence",
+                    PUBLISHED_UNFINALIZED,
+                    "the rebuild plan digest is missing",
+                )
+            })?,
+        ),
     }
     .map_err(|error| Refused {
         state: Some(PUBLISHED_UNFINALIZED),
@@ -1410,6 +1549,9 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
         .map_err(|error| io("resolve the data directory", error))?;
     let database_path = directory.join(DATABASE_FILE_NAME);
     let lock = acquire_lock(&directory)?;
+    if kind == RecoveryKind::CompactionRefs {
+        revalidate_publication_lock(&directory, &lock)?;
+    }
     let chain = load_audit_chain(&directory)?;
     let Some(active_index) = chain.active else {
         let Some(latest) = chain.latest_finalized else {
@@ -1464,7 +1606,7 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
             "published_sha256": completion.evidence.published.sha256,
             "current_sha256": current_sha256,
             "current_matches_published": current_sha256 == completion.evidence.published.sha256,
-            "allocation_transaction_reexecuted": false,
+            kind.transaction_reexecuted_field(): false,
             "note": "a later current digest may represent ordinary writes or an operator restore; the finalized chain was not reset",
         }));
     };
@@ -1505,11 +1647,23 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
         RecoveryKind::Held => Operation::Held {
             expected_digest: prepared.plan_digest.clone(),
         },
+        RecoveryKind::CompactionRefs => Operation::CompactionRefs {
+            expected_digest: prepared.plan_digest.clone(),
+        },
     };
-    let mut current = open_original(&database_path)?;
+    let (mut current, current_identity) = open_plain(&database_path, false)?;
     let (current_sha256, _) =
         digest(&mut current).map_err(|error| io("read the current database", error))?;
     if current_sha256 == prepared.source.sha256 {
+        if kind == RecoveryKind::CompactionRefs
+            && !prepared.source.matches_identity(&current_identity)
+        {
+            return Err(refused_in_state(
+                "source_changed",
+                INCONSISTENT,
+                "the prepared source digest matches but its file identity changed",
+            ));
+        }
         return Err(refused_in_state(
             "not_published",
             PREPARED_NOT_PUBLISHED,
@@ -1563,7 +1717,7 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
         "outcome": "finalized",
         "state": PUBLISHED_FINALIZED,
         "reconstructed_after_crash": true,
-        "allocation_transaction_reexecuted": false,
+        kind.transaction_reexecuted_field(): false,
         "prepared_evidence": prepared_record.path.display().to_string(),
         "completion_evidence": completion_path.display().to_string(),
         "completion_evidence_sha256": completion_reference.sha256,
