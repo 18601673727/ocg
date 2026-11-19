@@ -7,7 +7,10 @@ import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 
 const [directory, backendPath, uiDirectory] = process.argv.slice(2);
-const turnCount = 56;
+const turnCount = Number(process.env.OCG_BENCH_TURNS ?? 56);
+if (!Number.isInteger(turnCount) || turnCount < 1 || turnCount > 100) {
+  throw new Error("OCG_BENCH_TURNS must be an integer from 1 to 100");
+}
 const updateCount = 72;
 const backendToken = randomBytes(32).toString("hex");
 function id() {
@@ -270,7 +273,7 @@ try {
     if (i % 10 === 0 || i === turnCount) console.log("Seeded turns:", i);
   }
   fixture = { root, config };
-  process.send({ origin, providerPort, root, turnCount, updateCount });
+  process.send({ origin, providerPort, root, turnCount, updateCount, backendToken });
 } catch (error) {
   console.error(error);
   process.exitCode = 1;

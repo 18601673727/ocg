@@ -3,7 +3,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "bench": "node browser.mjs"
+    "bench": "node browser.mjs",
+    "regression": "node regression.mjs"
   },
   "devDependencies": {
     "playwright-core": "1.65.1"

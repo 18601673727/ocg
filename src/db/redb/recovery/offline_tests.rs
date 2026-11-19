@@ -12,10 +12,11 @@ use crate::db::entities::{
     AllocationExecutor, AllocationPool, CompactionPolicy, ConfigBody, ConfigId, ConnectionConfig,
     DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionModelConfig, DecisionProtocol,
     ExecutionOperation, ExecutionPoolId, ExecutorId, GlobalCompactionSettings, JobEdit, JobId,
-    LlmTransport, ModelCapability, ModelConfig, PredictiveCompaction,
+    LlmTransport, ModelCapability, ModelConfig, PredictiveCompaction, Timestamp,
 };
 use crate::db::redb::batch::{Commit, run_batch_with};
 use crate::db::redb::recovery;
+use crate::db::redb::rows::ConfigRow;
 use crate::db::redb::schema::{
     self, CONFIGS, CONVERSATION_CONFIG_REFS, CONVERSATIONS, JOB_RUNTIME, META,
 };
@@ -308,6 +309,47 @@ fn rebuild_refuses_corrupt_source_rows_and_unrelated_damage() {
             .contains("missing config")
     );
     assert_eq!(fixture.bytes(), source);
+}
+
+#[test]
+fn rebuild_accepts_archived_configuration_references() {
+    let fixture = Fixture::new();
+    fixture.damage_index(true, false);
+    fixture.edit(|tx| {
+        let mut configs = tx.open_table(CONFIGS).unwrap();
+        let mut row = {
+            let bytes = configs.get(fixture.summary.get()).unwrap().unwrap();
+            ConfigRow::decode_at(fixture.summary.get(), bytes.value()).unwrap()
+        };
+        let now = Timestamp::now();
+        row.archived_at = Some(now);
+        row.updated_at = now;
+        row.edit_seq += 1;
+        configs
+            .insert(fixture.summary.get(), row.encode().as_slice())
+            .unwrap();
+    });
+    let source = fixture.bytes();
+    assert!(recovery::open(&fixture.dir).is_err());
+
+    let plan = fixture.report(&["--dry-run"], true);
+    assert_eq!(plan["plan"]["missing_refs"], 1);
+    assert_eq!(plan["plan"]["expected_refs"], 3);
+    let applied = fixture.report(&["--apply", plan["plan_digest"].as_str().unwrap()], true);
+    assert_eq!(applied["state"], "PUBLISHED_FINALIZED");
+    fixture.assert_rebuilt();
+
+    let before = ::redb::ReadOnlyDatabase::open(Path::new(
+        applied["rollback_artifact"]["path"].as_str().unwrap(),
+    ))
+    .unwrap();
+    let after = ::redb::ReadOnlyDatabase::open(fixture.path()).unwrap();
+    schema::verify_compaction_rebuild_preservation(
+        &before.begin_read().unwrap(),
+        &after.begin_read().unwrap(),
+    )
+    .unwrap();
+    assert_ne!(fixture.bytes(), source);
 }
 
 #[test]

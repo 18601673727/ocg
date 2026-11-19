@@ -277,7 +277,7 @@ function UserMessage() {
     <div
       data-slot="aui_user-message-root"
       data-role="user"
-      class="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 [contain-intrinsic-size:auto_80px] [content-visibility:auto] [&>*]:col-start-2"
+      class="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 [contain-intrinsic-size:auto_80px] [&>*]:col-start-2"
     >
       <ImageGallery images={message().images} compact />
       <div class="relative col-start-2 min-w-0 justify-self-end">

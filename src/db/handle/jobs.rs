@@ -485,6 +485,22 @@ impl DatabaseHandle {
     pub async fn hide_conversation(&self, root: JobId) -> Result<JobAction, DatabaseError> {
         self.write(4096, OperationKind::Close, root, |batch, root| {
             mutations::set_conversation(batch, root, JobEdit::Hide)?;
+            // A fully settled conversation is only hidden, not closed, so it
+            // stays reopenable after restore. Conversations with running or
+            // unsettled work are closed (which stops them).
+            if batch.unsettled_turns(root)?.is_empty()
+                && batch.live_children(root)?.is_empty()
+                && batch.unsettled_non_turn_jobs(root)?.is_empty()
+            {
+                return Ok(JobAction {
+                    conversation: root,
+                    record_seq: None,
+                    running: Vec::new(),
+                    ended: Vec::new(),
+                    already: false,
+                    settled: true,
+                });
+            }
             batch.close(root, Actor::User)
         })
         .await

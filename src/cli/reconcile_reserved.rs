@@ -1039,7 +1039,12 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
         } => {
             let private = private_copy(&mut original, &source_sha256)?;
             let plan = crate::db::plan_compaction_ref_rebuild(private, &directory, &source_sha256)?;
-            confirm_source(&database_path, &before, &source_sha256)?;
+            confirm_source(
+                &database_path,
+                &before,
+                &source_sha256,
+                supersedes.as_ref().map(|_| PREPARED_NOT_PUBLISHED),
+            )?;
             revalidate_publication_lock(&directory, &lock)?;
             return Ok(json!({
                 "outcome": "planned",
@@ -1246,7 +1251,12 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
         false,
     )?;
 
-    confirm_source(&database_path, &before, &source_sha256)?;
+    confirm_source(
+        &database_path,
+        &before,
+        &source_sha256,
+        Some(PREPARED_NOT_PUBLISHED),
+    )?;
     revalidate_named(&work_path, &result_identity)?;
     revalidate_named(&artifact_path, &artifact_identity)?;
     let (manifest_check, manifest_reference, _) = read_record::<PreparedEvidence>(&manifest_path)?;
@@ -1322,15 +1332,16 @@ fn confirm_source(
     database_path: &Path,
     before: &Identity,
     source_sha256: &str,
+    state: Option<&'static str>,
 ) -> Result<(), Refused> {
     let (mut file, named) = open_plain(database_path, false)?;
     let (actual_digest, _) = digest(&mut file).map_err(|error| io("reread the database", error))?;
     if &named != before || actual_digest != source_sha256 {
-        return Err(refused_in_state(
-            "source_changed",
-            PREPARED_NOT_PUBLISHED,
-            "the database changed after it was checked; nothing was published",
-        ));
+        return Err(Refused {
+            code: "source_changed".to_owned(),
+            detail: "the database changed after it was checked; nothing was published".to_owned(),
+            state,
+        });
     }
     revalidate_named(database_path, before)?;
     Ok(())
@@ -1725,4 +1736,32 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
         "verification": completion.verification,
         "exclusive_lock_released_after_final_confirmation": true,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_change_reports_prepared_state_only_when_evidence_exists() {
+        let path =
+            std::env::temp_dir().join(format!("ocg-source-identity-{}", uuid::Uuid::now_v7()));
+        std::fs::write(&path, b"original source").unwrap();
+        let mut file = File::open(&path).unwrap();
+        let before = identity(&file.metadata().unwrap());
+        let (original_digest, _) = digest(&mut file).unwrap();
+        drop(file);
+
+        assert!(confirm_source(&path, &before, &original_digest, None).is_ok());
+        std::fs::write(&path, b"modified source").unwrap();
+        for expected_state in [None, Some(PREPARED_NOT_PUBLISHED)] {
+            let refusal = match confirm_source(&path, &before, &original_digest, expected_state) {
+                Err(refusal) => refusal,
+                Ok(()) => panic!("a changed source was accepted"),
+            };
+            assert_eq!(refusal.code, "source_changed");
+            assert_eq!(refusal.state, expected_state);
+        }
+        std::fs::remove_file(&path).unwrap();
+    }
 }

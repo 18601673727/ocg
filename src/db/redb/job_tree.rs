@@ -627,7 +627,10 @@ impl Batch {
         })
     }
 
-    fn unsettled_non_turn_jobs(&mut self, conversation: JobId) -> Result<Vec<JobId>, BatchError> {
+    pub(crate) fn unsettled_non_turn_jobs(
+        &mut self,
+        conversation: JobId,
+    ) -> Result<Vec<JobId>, BatchError> {
         self.step(|tx| {
             let Some(counts) = state::pending(tx, conversation)? else {
                 return Ok(Vec::new());

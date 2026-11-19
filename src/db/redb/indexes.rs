@@ -183,7 +183,7 @@ pub(super) fn compaction_ref_rebuild_counts(
                 matches!(row.kind, ConfigKind::Model | ConfigKind::DecisionModel)
             }
         };
-        if !kind_matches || row.archived_at.is_some() {
+        if !kind_matches {
             return Err(StorageError::corrupted(format!(
                 "{job} has an invalid compaction reference to config {config}"
             )));
