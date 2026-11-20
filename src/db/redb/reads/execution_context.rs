@@ -579,51 +579,24 @@ impl From<::redb::TableError> for SummarySourceError {
     }
 }
 
-pub(super) fn verify_native_summary_in(
-    rx: &ReadTransaction,
+pub(crate) fn verify_native_summary_in(
+    tx: &impl crate::db::redb::TxRead,
     conversation: JobId,
     consumer: JobId,
     producer: JobId,
     source: ContentDigest,
 ) -> Result<Option<VerifiedNativeSummary>, SummarySourceError> {
-    verify_native_summary_tables(
-        &rx.open_table(JOBS)?,
-        &rx.open_table(JOB_RUNTIME)?,
-        &rx.open_table(JOB_OUTPUTS)?,
-        &rx.open_table(MESSAGES)?,
-        conversation,
-        consumer,
-        producer,
-        source,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn verify_native_summary_tables<J, S, O, M>(
-    jobs: &J,
-    states: &S,
-    outputs: &O,
-    messages: &M,
-    conversation: JobId,
-    consumer: JobId,
-    producer: JobId,
-    source: ContentDigest,
-) -> Result<Option<VerifiedNativeSummary>, SummarySourceError>
-where
-    J: ReadableTable<u128, &'static [u8]>,
-    S: ReadableTable<u128, &'static [u8]>,
-    O: ReadableTable<(u128, u32), &'static [u8]>,
-    M: ReadableTable<&'static [u8], &'static [u8]>,
-{
     if consumer == producer {
         return Ok(None);
     }
+    let jobs = tx.table(JOBS)?;
     let producer_bytes = jobs
         .get(producer.get())?
         .ok_or_else(|| StorageError::corrupted("summary producer missing"))?;
     let producer_job =
         crate::db::redb::jobs::decode_mutable_job(producer.get(), producer_bytes.value())
             .map_err(|error| SummarySourceError::payload(producer, error))?;
+    let states = tx.table(JOB_RUNTIME)?;
     let state_bytes = states
         .get(producer.get())?
         .ok_or_else(|| StorageError::corrupted("summary producer state missing"))?;
@@ -638,16 +611,19 @@ where
     {
         return Ok(None);
     }
-    let manifest_bytes = messages
-        .get(source.as_bytes().as_slice())?
-        .ok_or_else(|| StorageError::corrupted("summary manifest missing"))?;
-    let manifest: crate::db::entities::NativeSummaryManifest =
-        serde_json::from_slice(manifest_bytes.value())
-            .map_err(|_| StorageError::corrupted("malformed summary manifest"))?;
+    let manifest = {
+        let messages = tx.table(MESSAGES)?;
+        let manifest_bytes = messages
+            .get(source.as_bytes().as_slice())?
+            .ok_or_else(|| StorageError::corrupted("summary manifest missing"))?;
+        serde_json::from_slice::<crate::db::entities::NativeSummaryManifest>(manifest_bytes.value())
+            .map_err(|_| StorageError::corrupted("malformed summary manifest"))?
+    };
     manifest.validate().map_err(StorageError::corrupted)?;
     if manifest.conversation != conversation {
         return Err(StorageError::corrupted("summary manifest names another conversation").into());
     }
+    let outputs = tx.table(JOB_OUTPUTS)?;
     let output = outputs
         .range((producer.get(), 0)..=(producer.get(), u32::MAX))?
         .next_back()
@@ -666,18 +642,10 @@ where
         producer,
         detail: "malformed summary result link".to_owned(),
     })?;
-    if link.source != source {
+    if link.source() != source {
         return Err(StorageError::corrupted("summary result names another source").into());
     }
-    let payload = messages
-        .get(link.payload.as_bytes().as_slice())?
-        .ok_or_else(|| StorageError::corrupted("summary payload missing"))?;
-    let summary: crate::db::entities::SummarizationResult = serde_json::from_slice(payload.value())
-        .map_err(|_| StorageError::corrupted("malformed summary payload"))?;
-    summary.validate().map_err(StorageError::corrupted)?;
-    if summary.source != source {
-        return Err(StorageError::corrupted("summary payload names another source").into());
-    }
+    let summary = crate::db::redb::observations::linked_summary(tx, producer, link)?;
     Ok(Some(VerifiedNativeSummary { manifest, summary }))
 }
 
@@ -859,6 +827,7 @@ fn development_candidate_in(
                 .collect()
         });
     let mut covered_inputs = Vec::with_capacity(covered.len());
+    let is_merge = record.job.input.text().starts_with("Merge ");
     if let Some(source_digest) = record.job.summary_source {
         let messages = rx.open_table(MESSAGES)?;
         let manifest_bytes = messages
@@ -870,7 +839,6 @@ fn development_candidate_in(
         manifest.validate().map_err(StorageError::corrupted)?;
         let jobs_table = rx.open_table(JOBS)?;
         let outputs_table = rx.open_table(JOB_OUTPUTS)?;
-        let is_merge = record.job.input.text().starts_with("Merge ");
         if !is_merge {
             for boundary in &manifest.sources {
                 let job_bytes = jobs_table
@@ -1018,6 +986,7 @@ fn development_candidate_in(
             continue;
         }
         let mut prior_outputs = Vec::new();
+        let mut counted = BTreeSet::new();
         for (expected_sequence, entry) in
             (1u32..).zip(outputs.range((id.get(), 0)..=(id.get(), u32::MAX))?)
         {
@@ -1032,8 +1001,15 @@ fn development_candidate_in(
                     "predecessor output sequence has a gap",
                 ));
             }
-            output_bytes = output_bytes.saturating_add(value.value().len());
-            selected_bytes = selected_bytes.saturating_add(value.value().len());
+            let row = decode_output(key.value(), value.value())?;
+            let cost = super::super::observations::context_output_bytes(
+                rx,
+                &row,
+                value.value().len(),
+                &mut counted,
+            )?;
+            output_bytes = output_bytes.saturating_add(cost);
+            selected_bytes = selected_bytes.saturating_add(cost);
             if selected_bytes > 8 * 1024 * 1024 {
                 return Err(context_unavailable(
                     "selected execution context exceeds byte limit",
@@ -1044,7 +1020,7 @@ fn development_candidate_in(
                     "conversation output exceeds byte limit",
                 ));
             }
-            prior_outputs.push(decode_output(key.value(), value.value())?);
+            prior_outputs.push(row);
             output_count += 1;
         }
         if !ended_unstarted
@@ -1094,7 +1070,7 @@ fn development_candidate_in(
             response_replay,
         });
     }
-    if record.job.summary_source.is_none() || record.job.input.text().starts_with("Merge ") {
+    if record.job.summary_source.is_none() || is_merge {
         covered_inputs.reverse();
     }
     history.reverse();

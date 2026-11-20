@@ -10,9 +10,9 @@ use crate::db::redb::codec::{Dec, DecodeResult, Enc, TAG_JOB};
 use crate::db::redb::reservations::mutable_configuration_requirement;
 use crate::db::redb::rows::encode_submission;
 use crate::db::redb::schema::{
-    CHILD_GROUPS, CHILDREN, CONVERSATIONS, DRAFT_CONTEXTS, JOB_INPUTS, JOB_OUTPUTS, JOB_RUNTIME,
-    JOBS, LIVE_CHILDREN, MESSAGES, MUTABLE_READY, PENDING, RECURRENCE_DUE, RECURRENCES, RETRY_JOBS,
-    SUBMISSIONS, SUCCESSORS, TOOL_CALLS, TURNS,
+    CHILD_GROUPS, CHILDREN, CONVERSATIONS, DRAFT_CONTEXTS, JOB_INPUTS, JOBS, LIVE_CHILDREN,
+    MUTABLE_READY, PENDING, RECURRENCE_DUE, RECURRENCES, RETRY_JOBS, SUBMISSIONS, SUCCESSORS,
+    TOOL_CALLS, TURNS,
 };
 use crate::db::redb::state::JobRuntime;
 use crate::db::redb::{indexes, reads, state};
@@ -646,15 +646,13 @@ impl Batch {
         // so it must stay fail-closed. A candidate borrowed for a prospective
         // selection only has to be usable.
         let verified = self.verify_summary_source(|tx| {
-            let jobs = tx.open_table(JOBS)?;
-            if selection != job.context_selection && jobs.get(producer.get())?.is_none() {
+            if selection != job.context_selection
+                && tx.open_table(JOBS)?.get(producer.get())?.is_none()
+            {
                 return Ok(None);
             }
-            reads::execution_context::verify_native_summary_tables(
-                &jobs,
-                &tx.open_table(JOB_RUNTIME)?,
-                &tx.open_table(JOB_OUTPUTS)?,
-                &tx.open_table(MESSAGES)?,
+            reads::execution_context::verify_native_summary_in(
+                tx,
                 job.parent_id,
                 job.id,
                 producer,

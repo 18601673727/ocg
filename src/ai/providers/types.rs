@@ -17,6 +17,7 @@ pub trait ProviderOutputSink {
     fn append<'a>(
         &'a mut self,
         kind: IntermediateOutputKind,
+        part: (u32, u32),
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>>;
 

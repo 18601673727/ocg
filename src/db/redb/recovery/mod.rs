@@ -27,6 +27,8 @@ use std::path::{Path, PathBuf};
 
 pub(super) mod audit;
 pub(super) mod held;
+#[cfg(unix)]
+pub(super) mod migration;
 pub(super) mod offline;
 pub(super) mod reserved;
 mod settle;
@@ -152,6 +154,13 @@ pub(super) fn check_identity(
             .map(u64::from_le_bytes)
             .map_err(|_| unsupported_format("database format marker is malformed"))?,
     };
+    if found == 1 {
+        return Err(unsupported_format(if cfg!(unix) {
+            "database format 1 requires offline migration: run ocg migrate <data-directory> --dry-run"
+        } else {
+            "database format 1 requires ocg migrate, a Unix-only offline command"
+        }));
+    }
     if found != FORMAT_VERSION {
         return Err(unsupported_format(&format!(
             "database format {found} is not supported; this build opens only format {FORMAT_VERSION}"

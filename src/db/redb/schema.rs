@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const FORMAT_VERSION: u64 = 1; // Shared by database metadata and record headers.
+pub(super) const FORMAT_VERSION: u64 = 2; // Shared by database metadata and record headers.
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
-pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-format-1";
+pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-format-2";
 
 pub(super) const fn record_version_byte() -> u8 {
     const { assert!(FORMAT_VERSION <= u8::MAX as u64) };
@@ -51,6 +51,34 @@ macro_rules! tables {
                     recovery::check_preflight_header(entry?.1.value(), &[$($tag),+])?;
                 }
             )?)*)*
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        pub(super) fn rewrite_format1_records(source: &ReadTransaction, tx: &WriteTransaction) -> Result<(), StorageError> {
+            macro_rules! rewrite {
+                (JOB_OUTPUTS, $tags:expr) => {};
+                ($definition:ident, $tags:expr) => {
+                    recovery::migration::rewrite_tagged(source, tx, $definition, $tags)?
+                };
+            }
+            $($($(rewrite!($name, &[$($tag),+]);)?)*)*
+            Ok(())
+        }
+
+        #[cfg(unix)]
+        pub(super) fn verify_format1_records(source: &ReadTransaction, result: &ReadTransaction) -> Result<(), recovery::reserved::ReservedRefusal> {
+            macro_rules! verify {
+                (JOB_OUTPUTS, $tags:expr) => {};
+                (META) => { recovery::migration::verify_metadata(source, result)? };
+                ($definition:ident, $tags:expr) => {
+                    recovery::migration::verify_tagged(source, result, $definition, $tags)?
+                };
+                ($definition:ident) => {
+                    recovery::audit::verify_identical_table(source, result, $definition)?
+                };
+            }
+            $($(verify!($name $(, &[$($tag),+])?);)*)*
             Ok(())
         }
 

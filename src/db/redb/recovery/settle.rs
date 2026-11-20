@@ -173,7 +173,7 @@ pub(crate) fn confirmed_answer(
         }
     }
     let mut result = serde_json::Map::new();
-    result.insert("text".to_owned(), serde_json::Value::String(text.clone()));
+    result.insert("text".to_owned(), serde_json::Value::String(text));
     if let Some(reason) = raw_finish {
         result.insert(
             "finish_reason".to_owned(),
@@ -181,7 +181,7 @@ pub(crate) fn confirmed_answer(
         );
     }
     Ok(Some(crate::db::entities::FinalResult {
-        summary: Some(text),
+        summary: None,
         code: None,
         goal_reached: None,
         value: Some(serde_json::Value::Object(result)),

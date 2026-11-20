@@ -1,7 +1,6 @@
 use crate::db::entities::identity::{JobId, RequestEventId};
 use crate::db::entities::{
     AvailabilityStat, Measurements, RequestEligibility, RequestNumber, Timestamp, UsageFinality,
-    output_filter,
 };
 use serde_json::Value;
 use std::fmt;
@@ -14,17 +13,6 @@ pub struct MessageBody {
 }
 
 impl MessageBody {
-    pub fn new(value: &Value) -> Result<Self, serde_json::Error> {
-        let filtered = if value.get("role").and_then(Value::as_str) == Some("assistant")
-            || value.get("output").is_some()
-        {
-            output_filter::value(value)
-        } else {
-            std::borrow::Cow::Borrowed(value)
-        };
-        Self::new_exact(filtered.as_ref())
-    }
-
     pub(crate) fn new_exact(value: &Value) -> Result<Self, serde_json::Error> {
         let bytes = serde_json::to_vec(value)?;
         Ok(Self {

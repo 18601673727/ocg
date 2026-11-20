@@ -18,7 +18,7 @@ pub enum IntermediateOutputKind {
     Summarization,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputKind {
     Progress,
@@ -180,6 +180,7 @@ pub struct MutableJobRecord {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobOutput {
+    pub part: Option<(u32, u32, u32)>,
     pub kind: IntermediateOutputKind,
     pub summary: Option<String>,
     pub code: Option<String>,
@@ -630,6 +631,12 @@ pub struct OutcomeRecord {
 
 #[derive(Clone, Debug, PartialEq, Eq, ts_rs::TS)]
 pub struct JobOutputRecord {
+    #[ts(skip)]
+    pub part: Option<(u32, u32, u32)>,
+    #[ts(skip)]
+    pub span: Option<(u32, u32)>,
+    #[ts(skip)]
+    pub answer_request: Option<u32>,
     pub id: JobOutputId,
     pub job: JobId,
     pub seq: i64,

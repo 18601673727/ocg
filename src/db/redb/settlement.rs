@@ -315,6 +315,7 @@ impl Batch {
         let (seq, id) = self.write_output(
             token.job,
             OutputKind::Result,
+            None,
             result.summary,
             result.code,
             result.goal_reached,

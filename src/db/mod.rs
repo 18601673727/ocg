@@ -32,6 +32,8 @@ pub(crate) use redb::{
     apply_compaction_ref_rebuild, plan_compaction_ref_rebuild,
     verify_compaction_ref_publication_delta, verify_publication,
 };
+#[cfg(unix)]
+pub(crate) use redb::{migrate_answers, verify_answer_migration};
 
 const GROUP_LIMIT: usize = 32;
 const COMPACTION_MIN_FILE_BYTES: u64 = 64 * 1024 * 1024;

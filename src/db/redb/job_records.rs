@@ -316,12 +316,13 @@ impl Batch {
                 reason: "no eligible settled source",
             });
         };
-        let manifest_body = MessageBody::new(&serde_json::to_value(&manifest).map_err(|_| {
-            BatchError(Failure::Storage(StorageError::corrupted(
-                "summary manifest serialization failed",
-            )))
-        })?)
-        .map_err(|e| BatchError(Failure::Storage(StorageError::corrupted(e.to_string()))))?;
+        let manifest_body =
+            MessageBody::new_exact(&serde_json::to_value(&manifest).map_err(|_| {
+                BatchError(Failure::Storage(StorageError::corrupted(
+                    "summary manifest serialization failed",
+                )))
+            })?)
+            .map_err(|e| BatchError(Failure::Storage(StorageError::corrupted(e.to_string()))))?;
         let source_digest = manifest_body.digest();
         let existing = self.read_summary_source(|tx| {
             let children = tx.table(CHILDREN)?;
@@ -472,7 +473,7 @@ impl Batch {
                 for (idx, stage) in stages.iter().enumerate() {
                     if let SummarizationStage::Chunk { start, end, .. } = *stage {
                         let chunk_slice = &source_text[start as usize..end as usize];
-                        let chunk_msg = MessageBody::new(&serde_json::json!({
+                        let chunk_msg = MessageBody::new_exact(&serde_json::json!({
                             "source": source_digest,
                             "chunk_index": idx,
                             "text": chunk_slice,

@@ -690,12 +690,14 @@ fn outputs(
         Some(Ok(seq)) => seq + 1,
     };
     let mut records = Vec::new();
+    let mut pieces = observations::PieceReader::default();
     for entry in outputs
         .range((job.get(), start)..=(job.get(), u32::MAX))?
         .take(limit.min(MAX_PAGE))
     {
         let (key, bytes) = entry?;
         let mut output = decode_output(key.value(), bytes.value())?;
+        pieces.project(rx, &mut output)?;
         observations::project_answer(rx, job, &mut output)?;
         records.push(output);
     }
@@ -724,6 +726,7 @@ fn latest_output(
         .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
         .transpose()?;
     if let Some(output) = &mut output {
+        observations::PieceReader::default().project(rx, output)?;
         observations::project_answer(rx, job, output)?;
     }
     Ok(output)
@@ -760,6 +763,9 @@ fn conversation_result(
         value = output.value;
     }
     Ok(Some(JobOutputRecord {
+        part: None,
+        span: None,
+        answer_request: None,
         id: JobOutputId::new(1),
         job: row.id,
         seq: 1,

@@ -62,12 +62,8 @@ impl RequestRecorder {
                 replace_images(&mut value, attachments)?;
                 value
             };
-            let body = if responses {
-                MessageBody::new_exact(&value)
-            } else {
-                MessageBody::new(&value)
-            }
-            .map_err(|error| record_error(error.to_string()))?;
+            let body =
+                MessageBody::new_exact(&value).map_err(|error| record_error(error.to_string()))?;
             digests.push(body.digest());
             if !self.stored.contains(&body.digest()) && pending.insert(body.digest()) {
                 bodies.push(body);
@@ -131,7 +127,8 @@ impl RequestRecorder {
         bodies: &mut Vec<MessageBody>,
         pending: &mut BTreeSet<ContentDigest>,
     ) -> Result<ContentDigest, OutputSinkError> {
-        let body = MessageBody::new(value).map_err(|error| record_error(error.to_string()))?;
+        let body =
+            MessageBody::new_exact(value).map_err(|error| record_error(error.to_string()))?;
         let digest = body.digest();
         if !self.stored.contains(&digest) && pending.insert(digest) {
             bodies.push(body);

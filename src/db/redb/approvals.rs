@@ -34,7 +34,7 @@ pub(super) fn open_key(conversation: JobId, call: ToolCallRef) -> (u128, u128, u
 pub(super) fn command_assessment_identity(
     call: ToolCallRef,
 ) -> Result<MessageBody, serde_json::Error> {
-    MessageBody::new(&serde_json::json!({"command_assessment": {
+    MessageBody::new_exact(&serde_json::json!({"command_assessment": {
         "job": call.job.to_string(), "request": call.request.get(), "index": call.index
     }}))
 }

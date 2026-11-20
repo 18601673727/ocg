@@ -67,14 +67,15 @@ impl DevelopmentExecution {
                     let decision = self.handoff.generative_inputs().is_none();
                     let mut pending_state = None;
                     let mut sent = if decision {
-                        let body =
-                            entities::MessageBody::new(&serde_json::json!({"decision": body}))
-                                .map_err(|_| {
-                                    DatabaseError::Rejected(Violation::InvalidValue(
-                                        "request",
-                                        "prepared decision cannot be recorded",
-                                    ))
-                                })?;
+                        let body = entities::MessageBody::new_exact(
+                            &serde_json::json!({"decision": body}),
+                        )
+                        .map_err(|_| {
+                            DatabaseError::Rejected(Violation::InvalidValue(
+                                "request",
+                                "prepared decision cannot be recorded",
+                            ))
+                        })?;
                         let digest = body.digest();
                         entities::SentRequest {
                             job: self.handoff.job(),

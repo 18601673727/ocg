@@ -37,6 +37,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
             return reconcile_reserved::run_held(arguments.collect());
         }
         #[cfg(unix)]
+        if command == "migrate" {
+            return reconcile_reserved::run_migrate(arguments.collect());
+        }
+        #[cfg(unix)]
         if command == "rebuild-compaction-refs" {
             return reconcile_reserved::run_compaction_ref_rebuild(arguments.collect());
         }
@@ -94,6 +98,7 @@ fn usage() -> &'static str {
        verify <data-directory> [--pages]\n\
        reconcile-reserved <data-directory> <job> --confirm-no-start | --finalize\n\
        reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
+       migrate <data-directory> --dry-run | --apply <plan-digest> | --finalize (Unix only)\n\
        rebuild-compaction-refs <data-directory> --dry-run | --apply <plan-digest> | --finalize\n\
        scheduled-external-policy <create|list|show|update|enable|disable|revoke> ...\n\
        register-llm                            (OpenAI Chat Completions)\n\

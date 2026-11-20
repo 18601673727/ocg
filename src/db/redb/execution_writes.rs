@@ -13,7 +13,7 @@ use crate::db::redb::jobs::encode_mutable_job;
 use crate::db::redb::reads::execution_context::summary_child_job;
 use crate::db::redb::rows::encode_output;
 use crate::db::redb::schema::{
-    CHILDREN, CONVERSATIONS, JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MESSAGES, META,
+    CHILDREN, CONVERSATIONS, JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, META,
     REQUEST_EVENTS, REQUEST_TIMELINE, TOOL_CALLS, USAGE_TOTALS,
 };
 use crate::db::redb::{indexes, reads, rows, state};
@@ -25,6 +25,70 @@ struct PreparedUsage {
     observed_at: Timestamp,
     measurements: Measurements,
     token: TokenAnnotation,
+}
+
+fn hand_over_pieces(
+    tx: &::redb::WriteTransaction,
+    job: JobId,
+    request: RequestNumber,
+    body: &[u8],
+) -> Result<(), StorageError> {
+    let received = serde_json::from_slice(body)
+        .map_err(|e| StorageError::corrupted(format!("invalid recorded answer: {e}")))?;
+    let mut groups = std::collections::BTreeMap::new();
+    let mut outputs = tx.open_table(JOB_OUTPUTS)?;
+    for entry in outputs.range((job.get(), 0)..=(job.get(), u32::MAX))? {
+        let (key, bytes) = entry?;
+        let row = super::rows::decode_output(key.value(), bytes.value())?;
+        let Some((n, output, part)) = row.part else {
+            continue;
+        };
+        if n != request.get() {
+            continue;
+        }
+        let Some(text) = super::observations::received_part(&received, row.kind, output, part)
+        else {
+            continue;
+        };
+        let (expected, offset, matches, spans) = groups
+            .entry((row.kind, output, part))
+            .or_insert_with(|| (text, 0usize, true, Vec::new()));
+        let piece = row
+            .summary
+            .as_deref()
+            .ok_or_else(|| StorageError::corrupted("streaming piece has no text"))?;
+        let end = offset
+            .checked_add(piece.len())
+            .ok_or_else(|| StorageError::corrupted("streamed part exceeds limit"))?;
+        *matches &= expected.get(*offset..end) == Some(piece);
+        let span = u32::try_from(*offset)
+            .ok()
+            .zip(u32::try_from(piece.len()).ok())
+            .ok_or_else(|| StorageError::corrupted("streamed part exceeds limit"))?;
+        spans.push((key.value(), span));
+        *offset = end;
+    }
+    for ((kind, output, part), (text, end, matches, spans)) in groups {
+        if !matches || end != text.len() {
+            log::warn!(
+                "Job {job} request {} {kind:?} part ({output}, {part}) differs from the recorded answer",
+                request.get()
+            );
+            continue;
+        }
+        for (key, span) in spans {
+            let mut row = {
+                let bytes = outputs
+                    .get(key)?
+                    .ok_or_else(|| StorageError::corrupted("streaming piece missing"))?;
+                super::rows::decode_output(key, bytes.value())?
+            };
+            row.summary = None;
+            row.span = Some(span);
+            outputs.insert(key, encode_output(&row).as_slice())?;
+        }
+    }
+    Ok(())
 }
 
 impl Batch {
@@ -62,6 +126,7 @@ impl Batch {
         let (seq, id) = self.write_output(
             job,
             output.kind.into(),
+            output.part,
             output.summary,
             output.code,
             output.goal_reached,
@@ -255,6 +320,7 @@ impl Batch {
         self.step(|_| indexes::validate_native_sample(new.as_ref()))?;
         let identity = self.development_usage_identity(job)?;
         self.put_message(&answer.response)?;
+        self.step(|tx| hand_over_pieces(tx, job, stat.request, &answer.response.bytes))?;
         let observed_at = stat.observed_at;
         let payloads = [
             RequestPayload::Measurement {
@@ -719,21 +785,22 @@ impl Batch {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn write_output(
         &mut self,
         job: JobId,
         kind: OutputKind,
+        part: Option<(u32, u32, u32)>,
         summary: Option<String>,
         code: Option<String>,
         goal_reached: Option<bool>,
         value: Option<serde_json::Value>,
     ) -> Result<(u32, JobOutputId), BatchError> {
-        let summary = summary.map(
-            |text| match crate::db::entities::output_filter::text(&text) {
-                std::borrow::Cow::Borrowed(_) => text,
-                std::borrow::Cow::Owned(filtered) => filtered,
-            },
-        );
+        let summary = if part.is_some() {
+            summary
+        } else {
+            summary.map(|text| crate::db::entities::output_filter::text(&text).into_owned())
+        };
         let code = code.map(
             |text| match crate::db::entities::output_filter::text(&text) {
                 std::borrow::Cow::Borrowed(_) => text,
@@ -759,7 +826,10 @@ impl Batch {
             return self.reject(Violation::ValueOutOfRange("seq"));
         };
         let id = JobOutputId::new(self.next_id()?);
-        let record = JobOutputRecord {
+        let mut record = JobOutputRecord {
+            part,
+            span: None,
+            answer_request: None,
             id,
             job,
             seq: i64::from(seq),
@@ -771,6 +841,23 @@ impl Batch {
             created_at: self.now,
         };
         self.step(|tx| {
+            if kind == OutputKind::Result && record.model_text().is_some() && record.code.is_none()
+            {
+                record.answer_request =
+                    super::observations::latest_request(&tx.open_table(REQUEST_EVENTS)?, job)?;
+                if super::observations::answer_text(tx, job, &record)?.is_some() {
+                    if let Some(object) = record
+                        .value
+                        .as_mut()
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        object.remove("text");
+                    }
+                    record.summary = None;
+                } else {
+                    record.answer_request = None;
+                }
+            }
             tx.open_table(JOB_OUTPUTS)?
                 .insert((job.get(), seq), encode_output(&record).as_slice())?;
             if record.kind == OutputKind::Result {
@@ -806,63 +893,37 @@ impl Batch {
         output: &mut crate::db::entities::FinalResult,
     ) -> Result<(), BatchError> {
         let Some(source) = job.summary_source else {
-            if output.code.is_none()
-                && output.summary.is_some()
-                && output
-                    .value
-                    .as_ref()
-                    .and_then(|value| value.get("text"))
-                    .and_then(|text| text.as_str())
-                    == output.summary.as_deref()
-            {
-                output.summary = None;
-            }
             return Ok(());
         };
-        let raw = output
-            .summary
-            .as_deref()
-            .ok_or(BatchError(Failure::Rejected(Violation::InvalidValue(
-                "summary",
-                "summary result text is missing",
-            ))))?;
-        let summary: crate::db::entities::SummarizationResult =
-            serde_json::from_str(raw).map_err(|_| {
-                BatchError(Failure::Rejected(Violation::InvalidValue(
-                    "summary",
-                    "summary result must be valid JSON",
-                )))
-            })?;
-        if summary.validate().is_err() || summary.source != source {
+        let request = self.step(|tx| {
+            let Some(request) =
+                super::observations::latest_request(&tx.open_table(REQUEST_EVENTS)?, job.id)?
+                    .and_then(RequestNumber::new)
+            else {
+                return Ok(None);
+            };
+            Ok(
+                super::observations::received_summary(tx, job.id, request, source)?
+                    .map(|_| request),
+            )
+        })?;
+        let Some(answer_request) = request else {
             return self.reject(Violation::InvalidValue(
                 "summary",
-                "summary result failed schema or source validation",
+                "recorded summary answer is missing or invalid",
             ));
-        }
-        let summary_value = serde_json::to_value(&summary).map_err(|_| {
-            BatchError(Failure::Storage(StorageError::corrupted(
-                "summary serialization failed",
-            )))
-        })?;
-        let body = crate::db::entities::MessageBody::new(&summary_value).map_err(|_| {
-            BatchError(Failure::Rejected(Violation::InvalidValue(
-                "summary",
-                "summary payload exceeds maximum message size",
-            )))
-        })?;
-        self.put_message(&body)?;
-        let producer_job = ContentDigest::of(&encode_mutable_job(job));
-        let link = crate::db::entities::NativeSummaryResultLink {
+        };
+        let link = crate::db::entities::NativeSummaryResultLink::Received {
             source,
-            producer_job,
-            payload: body.digest(),
+            producer_job: ContentDigest::of(&encode_mutable_job(job)),
+            answer_request,
         };
         output.value = Some(serde_json::to_value(link).map_err(|_| {
             BatchError(Failure::Storage(StorageError::corrupted(
                 "summary link serialization failed",
             )))
         })?);
-        output.summary = Some(summary.summary);
+        output.summary = None;
         Ok(())
     }
 
@@ -1206,11 +1267,8 @@ impl Batch {
         })?;
         for (producer, source) in candidates {
             let verified = self.verify_summary_source(|tx| {
-                reads::execution_context::verify_native_summary_tables(
-                    &tx.open_table(JOBS)?,
-                    &tx.open_table(JOB_RUNTIME)?,
-                    &tx.open_table(JOB_OUTPUTS)?,
-                    &tx.open_table(MESSAGES)?,
+                reads::execution_context::verify_native_summary_in(
+                    tx,
                     conversation,
                     consumer,
                     producer,

@@ -183,7 +183,7 @@ pub(crate) async fn supervise_development_generative(
                 attach_file_snapshots(&mut value, workspace, &result.text).await;
             }
             let finalization = JobFinalization::Completed(FinalResult {
-                summary: Some(result.text.clone()),
+                summary: None,
                 code: None,
                 goal_reached: None,
                 value: Some(value),
@@ -524,7 +524,7 @@ async fn record_answered_request(
         MessageBody::new_exact(&serde_json::json!({"output": output.items}))
     } else {
         serde_json::to_value(assistant_message(result))
-            .and_then(|message| MessageBody::new(&message))
+            .and_then(|message| MessageBody::new_exact(&message))
     }
     .map_err(|_| {
         DatabaseError::Rejected(Violation::InvalidValue(
@@ -690,14 +690,7 @@ pub(crate) async fn supervise_development_decision(
             "Decision request evidence incomplete; ownership remains held",
         )));
     }
-    let response = if matches!(frozen,
-        crate::db::entities::FrozenDecisionConfig::Generative(generative, _)
-            if generative.llm.provider.transport == crate::db::entities::LlmTransport::OpenAiResponses)
-    {
-        MessageBody::new_exact(&result.raw)
-    } else {
-        MessageBody::new(&result.raw)
-    }.map_err(|_| {
+    let response = MessageBody::new_exact(&result.raw).map_err(|_| {
         DatabaseError::Rejected(Violation::InvalidValue(
             "response",
             "Decision response cannot be recorded",
@@ -1088,6 +1081,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
     fn append<'a>(
         &'a mut self,
         kind: IntermediateOutputKind,
+        part: (u32, u32),
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
         Box::pin(async move {
@@ -1101,6 +1095,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                     &self.execution.handoff,
                     self.output_seq,
                     JobOutput {
+                        part: Some((self.request.get(), part.0, part.1)),
                         kind,
                         summary: Some(text.to_owned()),
                         code: None,

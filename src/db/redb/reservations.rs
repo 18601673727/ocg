@@ -24,9 +24,9 @@ use crate::db::redb::reads::read;
 use crate::db::redb::rows::{decode_attachment, decode_output};
 use crate::db::redb::schema::{
     ACTIVE_ALLOCATIONS, ALLOCATION_REQUESTS, ATTACHMENTS, CREDENTIALS, DATABASE_FORMAT_KEY,
-    EXECUTORS, FORMAT_VERSION, JOB_EVENTS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MESSAGES, META,
-    MUTABLE_READY, PENDING, POOL_ALLOCATIONS, POOLS, RECURRENCE_DUE, REQUEST_EVENTS,
-    SCHEDULED_EXTERNAL_BINDING, TOOL_CALLS,
+    EXECUTORS, FORMAT_VERSION, JOB_EVENTS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, META, MUTABLE_READY,
+    PENDING, POOL_ALLOCATIONS, POOLS, RECURRENCE_DUE, REQUEST_EVENTS, SCHEDULED_EXTERNAL_BINDING,
+    TOOL_CALLS,
 };
 use crate::db::redb::{allocations, reads, state};
 use crate::host::identity::{current_boot_id, current_host_id};
@@ -647,11 +647,8 @@ impl Batch {
                     // can no longer be verified the preparation is unusable, and
                     // the damage must surface instead of being reported as staleness.
                     let current = self.step(|tx| {
-                        reads::execution_context::verify_native_summary_tables(
-                            &tx.open_table(JOBS)?,
-                            &tx.open_table(JOB_RUNTIME)?,
-                            &tx.open_table(JOB_OUTPUTS)?,
-                            &tx.open_table(MESSAGES)?,
+                        reads::execution_context::verify_native_summary_in(
+                            tx,
                             job.parent_id,
                             job.id,
                             producer,
@@ -695,6 +692,7 @@ impl Batch {
                     }
                     let outputs = self.step(|tx| {
                         let mut outputs = Vec::new();
+                        let mut counted = std::collections::BTreeSet::new();
                         let mut bytes = 0usize;
                         let table = tx.open_table(JOB_OUTPUTS)?;
                         for entry in table
@@ -705,11 +703,18 @@ impl Batch {
                             .take(turn.outputs.len().saturating_add(1))
                         {
                             let (key, value) = entry?;
-                            bytes = bytes.saturating_add(value.value().len());
+                            let row = decode_output(key.value(), value.value())?;
+                            bytes =
+                                bytes.saturating_add(super::observations::context_output_bytes(
+                                    tx,
+                                    &row,
+                                    value.value().len(),
+                                    &mut counted,
+                                )?);
                             if bytes > 8 * 1024 * 1024 {
                                 return Ok(None);
                             }
-                            outputs.push(decode_output(key.value(), value.value())?);
+                            outputs.push(row);
                         }
                         Ok(Some(outputs))
                     })?;

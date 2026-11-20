@@ -280,6 +280,16 @@ pub(super) fn encode_output(o: &JobOutputRecord) -> Vec<u8> {
     e.opt(o.goal_reached.as_ref(), |e, v| e.bool(*v));
     e.ojson(o.value.as_ref());
     e.ts(o.created_at);
+    e.opt(o.part.as_ref(), |e, &(request, output, part)| {
+        e.u32(request);
+        e.u32(output);
+        e.u32(part);
+    });
+    e.opt(o.span.as_ref(), |e, &(offset, len)| {
+        e.u32(offset);
+        e.u32(len);
+    });
+    e.opt(o.answer_request.as_ref(), |e, &n| e.u32(n));
     e.0
 }
 
@@ -301,8 +311,31 @@ pub(super) fn decode_output(
     let goal_reached = d.opt(Dec::bool)?;
     let value = d.ojson()?;
     let created_at = d.ts()?;
+    let part = d.opt(|d| Ok((d.u32()?, d.u32()?, d.u32()?)))?;
+    let span = d.opt(|d| Ok((d.u32()?, d.u32()?)))?;
+    let answer_request = d.opt(Dec::u32)?;
     d.end()?;
+    if part.is_some_and(|(request, _, _)| {
+        request == 0 || !matches!(kind, OutputKind::Progress | OutputKind::Reasoning)
+    }) || span.is_some()
+        && (part.is_none()
+            || summary.is_some()
+            || code.is_some()
+            || value.is_some()
+            || goal_reached.is_some())
+        || answer_request.is_some_and(|n| {
+            n == 0
+                || kind != OutputKind::Result
+                || summary.is_some()
+                || value.as_ref().is_some_and(|v| v.get("text").is_some())
+        })
+    {
+        return Err(StorageError::corrupted("invalid output text ownership"));
+    }
     Ok(JobOutputRecord {
+        part,
+        span,
+        answer_request,
         id,
         job: JobId::new(job_id),
         seq: seq as i64,

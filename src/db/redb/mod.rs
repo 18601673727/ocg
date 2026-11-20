@@ -59,6 +59,8 @@ pub(crate) use recovery::held::{
     reconcile_held_apply, reconcile_held_preflight, verify_held_publication_delta,
 };
 #[cfg(unix)]
+pub(crate) use recovery::migration::{migrate_answers, verify_answer_migration};
+#[cfg(unix)]
 pub(crate) use recovery::offline::{
     apply_compaction_ref_rebuild, plan_compaction_ref_rebuild,
     verify_compaction_ref_publication_delta,

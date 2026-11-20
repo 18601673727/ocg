@@ -89,6 +89,7 @@ pub(crate) fn read_mutable_conversation_turn_page(
         }
         let id = details.record.job.id;
         let mut outputs = Vec::new();
+        let mut pieces = super::super::observations::PieceReader::default();
         for entry in rx
             .open_table(JOB_OUTPUTS)?
             .range((id.get(), 0)..=(id.get(), u32::MAX))?
@@ -96,7 +97,16 @@ pub(crate) fn read_mutable_conversation_turn_page(
         {
             let (key, bytes) = entry?;
             let mut output = decode_output(key.value(), bytes.value())?;
-            super::super::observations::project_answer(&rx, id, &mut output)?;
+            if let Some(result) = details
+                .result
+                .as_ref()
+                .filter(|result| result.id == output.id)
+            {
+                output = result.clone();
+            } else {
+                pieces.project(&rx, &mut output)?;
+                super::super::observations::project_answer(&rx, id, &mut output)?;
+            }
             outputs.push(output);
         }
         let outputs_truncated = outputs.len() == TURN_PAGE_OUTPUTS

@@ -404,11 +404,26 @@ pub struct NativeSummaryManifest {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct NativeSummaryResultLink {
-    pub source: ContentDigest,
-    pub payload: ContentDigest,
-    pub producer_job: ContentDigest,
+#[serde(untagged, deny_unknown_fields)]
+pub enum NativeSummaryResultLink {
+    Received {
+        source: ContentDigest,
+        producer_job: ContentDigest,
+        answer_request: crate::db::entities::RequestNumber,
+    },
+    Payload {
+        source: ContentDigest,
+        producer_job: ContentDigest,
+        payload: ContentDigest,
+    },
+}
+
+impl NativeSummaryResultLink {
+    pub(crate) fn source(self) -> ContentDigest {
+        match self {
+            Self::Received { source, .. } | Self::Payload { source, .. } => source,
+        }
+    }
 }
 
 impl NativeSummaryManifest {

@@ -504,12 +504,18 @@ struct DecodedMessage {
     escaped_len: usize,
 }
 
+impl DecodedMessage {
+    fn answer(&self) -> Option<&str> {
+        (!self.requests_tools).then_some(self.text.as_ref())
+    }
+}
+
 pub(super) fn answer_text(
     tx: &impl TxRead,
     id: JobId,
     output: &crate::db::entities::JobOutputRecord,
 ) -> Result<Option<String>, StorageError> {
-    if output.kind != crate::db::entities::OutputKind::Result {
+    if output.answer_request.is_none() {
         return Ok(None);
     }
     let jobs = tx.table(JOBS)?;
@@ -539,6 +545,17 @@ pub(super) fn project_answer(
             .as_object_mut()
             .ok_or_else(|| StorageError::corrupted("answer Result value is not an object"))?;
         object.insert("text".to_owned(), serde_json::Value::String(text));
+    } else if output.kind == crate::db::entities::OutputKind::Result
+        && output.summary.is_none()
+        && let Some(value) = output
+            .value
+            .as_ref()
+            .filter(|v| v.get("producer_job").is_some())
+    {
+        let link = serde_json::from_value(value.clone())
+            .map_err(|_| StorageError::corrupted("invalid summary result link"))?;
+        let summary = linked_summary(tx, id, link)?.summary;
+        output.summary = Some(crate::db::entities::output_filter::text(&summary).into_owned());
     }
     Ok(())
 }
@@ -575,15 +592,13 @@ pub(super) fn answer_text_in(
         return Ok(None);
     }
     let Some(parent) = conversations.get(job.parent_id.get())? else {
-        return Err(StorageError::corrupted(
-            "answer parent conversation missing",
-        ));
+        return Ok(None);
     };
     if JobSpec::decode_at(job.parent_id.get(), parent.value())?.is_chunk_group() {
         return Ok(None);
     }
     let Some(runtime) = states.get(id.get())? else {
-        return Err(StorageError::corrupted("answer Job state missing"));
+        return Ok(None);
     };
     if !state::decode_state(id.get(), runtime.value())?
         .outcome
@@ -591,14 +606,38 @@ pub(super) fn answer_text_in(
     {
         return Ok(None);
     }
-    let Some((key, _)) = events
+    let Some(number) = output.answer_request else {
+        return Ok(None);
+    };
+    if latest_request(events, id)? != Some(number) {
+        return Ok(None);
+    }
+    let Some(digest) = received_digest(events, id, number)? else {
+        return Ok(None);
+    };
+    let body = messages
+        .get(digest.as_bytes().as_slice())?
+        .ok_or_else(|| StorageError::corrupted("response references a missing message"))?;
+    let decoded = decode_message(digest, body.value())?;
+    Ok(decoded.answer().map(str::to_owned))
+}
+
+pub(super) fn latest_request(
+    events: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
+    id: JobId,
+) -> Result<Option<u32>, StorageError> {
+    Ok(events
         .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
         .next_back()
         .transpose()?
-    else {
-        return Ok(None);
-    };
-    let number = key.value().1;
+        .map(|(key, _)| key.value().1))
+}
+
+fn received_digest(
+    events: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
+    id: JobId,
+    number: u32,
+) -> Result<Option<ContentDigest>, StorageError> {
     let request =
         RequestNumber::new(number).ok_or_else(|| StorageError::corrupted("zero request number"))?;
     for entry in events
@@ -609,14 +648,260 @@ pub(super) fn answer_text_in(
         if let RequestPayload::Received { digest } =
             decode_request_event(id, request, key.value().2, value.value())?.payload
         {
-            let body = messages
-                .get(digest.as_bytes().as_slice())?
-                .ok_or_else(|| StorageError::corrupted("response references a missing message"))?;
-            let decoded = decode_message(digest, body.value())?;
-            return Ok((!decoded.requests_tools).then(|| decoded.text.to_string()));
+            return Ok(Some(digest));
         }
     }
     Ok(None)
+}
+
+pub(super) fn received_body(
+    tx: &impl TxRead,
+    job: JobId,
+    number: u32,
+) -> Result<Option<Value>, StorageError> {
+    let Some(digest) = received_digest(&tx.table(REQUEST_EVENTS)?, job, number)? else {
+        return Ok(None);
+    };
+    let messages = tx.table(MESSAGES)?;
+    let body = messages
+        .get(digest.as_bytes().as_slice())?
+        .ok_or_else(|| StorageError::corrupted("response references a missing message"))?;
+    serde_json::from_slice(body.value())
+        .map(Some)
+        .map_err(|e| StorageError::corrupted(format!("invalid response JSON: {e}")))
+}
+
+fn raw_answer(body: &Value) -> Option<String> {
+    if let Some(items) = body["output"].as_array() {
+        let mut text = String::new();
+        for item in items
+            .iter()
+            .filter(|item| item["type"] == "message" && item["role"] == "assistant")
+        {
+            for part in item["content"].as_array()? {
+                text.push_str(
+                    part[if part["type"] == "refusal" {
+                        "refusal"
+                    } else {
+                        "text"
+                    }]
+                    .as_str()?,
+                );
+            }
+        }
+        Some(text)
+    } else if body["role"] == "assistant" {
+        body["content"].as_str().map(str::to_owned)
+    } else {
+        None
+    }
+}
+
+pub(super) fn received_part(
+    body: &Value,
+    kind: crate::db::entities::OutputKind,
+    output: u32,
+    part: u32,
+) -> Option<&str> {
+    use crate::db::entities::OutputKind;
+    if let Some(items) = body["output"].as_array() {
+        let item = items.get(output as usize)?;
+        match kind {
+            OutputKind::Progress if item["type"] == "message" && item["role"] == "assistant" => {
+                let part = &item["content"][part as usize];
+                match part["type"].as_str()? {
+                    "output_text" => part["text"].as_str(),
+                    "refusal" => part["refusal"].as_str(),
+                    _ => None,
+                }
+            }
+            OutputKind::Reasoning if item["type"] == "reasoning" => {
+                item["summary"][part as usize]["text"].as_str()
+            }
+            _ => None,
+        }
+    } else if kind == OutputKind::Progress
+        && (output, part) == (0, 0)
+        && body["role"] == "assistant"
+    {
+        body["content"].as_str()
+    } else {
+        None
+    }
+}
+
+pub(super) fn context_output_bytes(
+    tx: &impl TxRead,
+    row: &crate::db::entities::JobOutputRecord,
+    stored_len: usize,
+    counted: &mut std::collections::BTreeSet<u32>,
+) -> Result<usize, StorageError> {
+    let request = row
+        .answer_request
+        .or_else(|| row.span.and(row.part).map(|part| part.0));
+    let Some(n) = request.filter(|n| counted.insert(*n)) else {
+        return Ok(stored_len);
+    };
+    let digest = received_digest(&tx.table(REQUEST_EVENTS)?, row.job, n)?
+        .ok_or_else(|| StorageError::corrupted("answered request has no response"))?;
+    let messages = tx.table(MESSAGES)?;
+    let body = messages
+        .get(digest.as_bytes().as_slice())?
+        .ok_or_else(|| StorageError::corrupted("answered request has no message"))?;
+    let decoded = decode_message(digest, body.value())?;
+    Ok(stored_len.saturating_add(decoded.answer().map_or(0, str::len)))
+}
+
+pub(super) fn received_summary(
+    tx: &impl TxRead,
+    job: JobId,
+    request: RequestNumber,
+    source: ContentDigest,
+) -> Result<Option<crate::db::entities::SummarizationResult>, StorageError> {
+    let Some(body) = received_body(tx, job, request.get())? else {
+        return Ok(None);
+    };
+    if requests_tools(&body) {
+        return Ok(None);
+    }
+    let summary = raw_answer(&body)
+        .and_then(|text| {
+            serde_json::from_str::<crate::db::entities::SummarizationResult>(&text).ok()
+        })
+        .filter(|summary| summary.source == source && summary.validate().is_ok());
+    Ok(summary)
+}
+
+pub(super) fn linked_summary(
+    tx: &impl TxRead,
+    job: JobId,
+    link: crate::db::entities::NativeSummaryResultLink,
+) -> Result<crate::db::entities::SummarizationResult, StorageError> {
+    use crate::db::entities::NativeSummaryResultLink;
+    match link {
+        NativeSummaryResultLink::Received {
+            source,
+            answer_request,
+            ..
+        } => received_summary(tx, job, answer_request, source)?
+            .ok_or_else(|| StorageError::corrupted("invalid or missing recorded summary answer")),
+        NativeSummaryResultLink::Payload {
+            source, payload, ..
+        } => {
+            let messages = tx.table(MESSAGES)?;
+            let bytes = messages
+                .get(payload.as_bytes().as_slice())?
+                .ok_or_else(|| StorageError::corrupted("summary payload missing"))?;
+            let summary: crate::db::entities::SummarizationResult =
+                serde_json::from_slice(bytes.value())
+                    .map_err(|_| StorageError::corrupted("malformed summary payload"))?;
+            summary.validate().map_err(StorageError::corrupted)?;
+            if summary.source != source {
+                return Err(StorageError::corrupted(
+                    "summary payload names another source",
+                ));
+            }
+            Ok(summary)
+        }
+    }
+}
+
+#[derive(Default)]
+pub(super) struct PieceReader {
+    filters: std::collections::BTreeMap<
+        (crate::db::entities::OutputKind, (u32, u32, u32)),
+        crate::db::entities::output_filter::TextFilter,
+    >,
+    bodies: HashMap<u32, Value>,
+}
+
+impl PieceReader {
+    pub(super) fn project(
+        &mut self,
+        tx: &impl TxRead,
+        row: &mut crate::db::entities::JobOutputRecord,
+    ) -> Result<(), StorageError> {
+        use crate::db::redb::{rows::decode_output, schema::JOB_OUTPUTS};
+        let Some(part @ (number, output, index)) = row.part else {
+            return Ok(());
+        };
+        let job = row.job;
+        let key = (row.kind, part);
+        let seq = u32::try_from(row.seq)
+            .map_err(|_| StorageError::corrupted("invalid output sequence"))?;
+        let first = !self.filters.contains_key(&key);
+        let filter = self.filters.entry(key).or_default();
+        let text = if let Some((offset, len)) = row.span {
+            let body = match self.bodies.entry(number) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(received_body(tx, job, number)?.ok_or_else(|| {
+                        StorageError::corrupted("piece references missing response")
+                    })?)
+                }
+            };
+            let part_text = received_part(body, row.kind, output, index)
+                .ok_or_else(|| StorageError::corrupted("piece references missing response part"))?;
+            let end = offset
+                .checked_add(len)
+                .ok_or_else(|| StorageError::corrupted("piece offset overflow"))?
+                as usize;
+            let offset = offset as usize;
+            let piece = part_text
+                .get(offset..end)
+                .ok_or_else(|| StorageError::corrupted("piece outside response part"))?;
+            if first && offset > 0 {
+                filter.consume(&part_text[..offset], false);
+            }
+            filter.consume(piece, end == part_text.len())
+        } else {
+            let table = tx.table(JOB_OUTPUTS)?;
+            if first && seq > 1 {
+                for entry in table.range((job.get(), 0)..(job.get(), seq))? {
+                    let (k, v) = entry?;
+                    let prior = decode_output(k.value(), v.value())?;
+                    if (prior.kind, prior.part) == (row.kind, Some(part)) {
+                        filter.consume(
+                            prior
+                                .summary
+                                .as_deref()
+                                .ok_or_else(|| StorageError::corrupted("piece text missing"))?,
+                            false,
+                        );
+                    }
+                }
+            }
+            let raw = row
+                .summary
+                .as_deref()
+                .ok_or_else(|| StorageError::corrupted("piece text missing"))?;
+            let mut text = filter.consume(raw, false);
+            if filter.has_pending() {
+                let mut finished = received_digest(&tx.table(REQUEST_EVENTS)?, job, number)?
+                    .is_some()
+                    || state::read(tx, job)?.is_some_and(|state| state.state.outcome.is_some());
+                if finished {
+                    for entry in table.range((
+                        Bound::Excluded((job.get(), seq)),
+                        Bound::Included((job.get(), u32::MAX)),
+                    ))? {
+                        let (k, v) = entry?;
+                        let later = decode_output(k.value(), v.value())?;
+                        if (later.kind, later.part) == (row.kind, Some(part)) {
+                            finished = false;
+                            break;
+                        }
+                    }
+                    if finished {
+                        text.push_str(&filter.consume("", true));
+                    }
+                }
+            }
+            text
+        };
+        row.summary = Some(text);
+        Ok(())
+    }
 }
 
 const MESSAGE_CACHE_BYTES: usize = 8 * 1024 * 1024;
@@ -657,6 +942,20 @@ fn evict_least_recently_used(cache: &mut MessageCache) -> bool {
     }
 }
 
+fn requests_tools(message: &Value) -> bool {
+    message["output"].as_array().is_some_and(|items| {
+        items.iter().any(|item| {
+            item["type"] == "function_call"
+                || item["content"]
+                    .as_array()
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_use"))
+        })
+    }) || message
+        .get("tool_calls")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|calls| !calls.is_empty())
+}
+
 fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, StorageError> {
     {
         let mut cache = lock_message_cache();
@@ -680,6 +979,7 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
         let mut text = String::new();
         for item in output {
             if item["type"] == "message"
+                && item["role"] == "assistant"
                 && let Some(parts) = item["content"].as_array()
             {
                 for part in parts {
@@ -694,9 +994,13 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
                 }
             }
         }
-        crate::db::entities::output_filter::text(&text).into_owned()
+        text
     } else {
         text
+    };
+    let text = match crate::db::entities::output_filter::text(&text) {
+        std::borrow::Cow::Borrowed(_) => text,
+        std::borrow::Cow::Owned(filtered) => filtered,
     };
     let decoded = DecodedMessage {
         escaped_len: text
@@ -704,17 +1008,7 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
             .map(crate::db::entities::escaped_json_char_cost)
             .sum(),
         text: Arc::from(text),
-        requests_tools: output.is_some_and(|items| {
-            items.iter().any(|item| {
-                item["type"] == "function_call"
-                    || item["content"]
-                        .as_array()
-                        .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_use"))
-            })
-        }) || message
-            .get("tool_calls")
-            .and_then(serde_json::Value::as_array)
-            .is_some_and(|calls| !calls.is_empty()),
+        requests_tools: requests_tools(&message),
     };
 
     let mut cache = lock_message_cache();

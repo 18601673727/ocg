@@ -206,7 +206,7 @@ enum PartKind {
     Arguments,
 }
 
-type PartKey = (usize, PartKind, usize);
+type PartKey = (u32, PartKind, u32);
 
 #[derive(Default)]
 pub(crate) struct Stream {
@@ -215,13 +215,13 @@ pub(crate) struct Stream {
 }
 
 pub(crate) enum Event {
-    Delta(IntermediateOutputKind, String),
+    Delta(IntermediateOutputKind, (u32, u32), String),
     Progress,
     Terminal(Value),
     Ignore,
 }
 
-type Delta = (IntermediateOutputKind, String);
+type Delta = (IntermediateOutputKind, (u32, u32), String);
 
 pub(crate) struct Terminal {
     pub(crate) output: ResponseOutput,
@@ -278,7 +278,7 @@ impl Stream {
         let index = |key: &str| {
             event[key]
                 .as_u64()
-                .and_then(|index| usize::try_from(index).ok())
+                .and_then(|index| u32::try_from(index).ok())
                 .ok_or_else(|| incomplete(status_code, "Responses delta has no valid index"))
         };
         let output_index = index("output_index")?;
@@ -309,7 +309,7 @@ impl Stream {
         }
         buffered.push_str(delta);
         Ok(match output_kind(part) {
-            Some(kind) => Event::Delta(kind, delta.to_owned()),
+            Some(kind) => Event::Delta(kind, (output_index, part_index), delta.to_owned()),
             None => Event::Progress,
         })
     }
@@ -379,7 +379,7 @@ impl Stream {
         let mut calls = ToolCallAssembler::default();
         let mut text = String::new();
         let mut remaining = Vec::new();
-        for (index, item) in items.iter().enumerate() {
+        for (index, item) in (0u32..).zip(&items) {
             if failure.is_none() && !matches!(item["status"].as_str(), None | Some("completed")) {
                 return Err(incomplete(
                     status_code,
@@ -391,7 +391,7 @@ impl Stream {
                     let parts = item["content"].as_array().ok_or_else(|| {
                         incomplete(status_code, "Responses message has no content array")
                     })?;
-                    for (part_index, part) in parts.iter().enumerate() {
+                    for (part_index, part) in (0u32..).zip(parts) {
                         let (kind, field) = match part["type"].as_str() {
                             Some("output_text") => (PartKind::Text, "text"),
                             Some("refusal") => (PartKind::Refusal, "refusal"),
@@ -416,7 +416,7 @@ impl Stream {
                 }
                 Some("reasoning") => {
                     if let Some(parts) = item["summary"].as_array() {
-                        for (part_index, part) in parts.iter().enumerate() {
+                        for (part_index, part) in (0u32..).zip(parts) {
                             if let Some(value) = part["text"].as_str() {
                                 self.reconcile(
                                     (index, PartKind::Summary, part_index),
@@ -502,7 +502,7 @@ impl Stream {
         if !tail.is_empty()
             && let Some(kind) = output_kind(key.1)
         {
-            remaining.push((kind, tail.to_owned()));
+            remaining.push((kind, (key.0, key.2), tail.to_owned()));
         }
         Ok(())
     }

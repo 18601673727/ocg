@@ -157,7 +157,7 @@ pub(super) fn with_verified_finalization_copy<T>(
 }
 
 #[cfg(unix)]
-fn with_verified_rebuild_copy<T>(
+pub(super) fn with_verified_rebuild_copy<T>(
     file: std::fs::File,
     body: impl FnOnce(&mut Database) -> Result<T, ReservedRefusal>,
 ) -> Result<T, ReservedRefusal> {
@@ -394,7 +394,7 @@ fn residual_logical_report(directory: &Path, database: &impl ReadableDatabase) -
     }
 }
 
-fn verify_payloads(tx: &ReadTransaction, directory: &Path) -> Result<(), StorageError> {
+pub(super) fn verify_payloads(tx: &ReadTransaction, directory: &Path) -> Result<(), StorageError> {
     reads::catalog::global_outbound_headers(&tx.open_table(META)?)?;
     for entry in tx.open_table(MESSAGES)?.iter()? {
         let (key, bytes) = entry?;

@@ -436,6 +436,7 @@ struct StreamOutput<'a> {
     sink: Option<&'a mut dyn ProviderOutputSink>,
     text: String,
     kind: IntermediateOutputKind,
+    part: (u32, u32),
     started: Option<Instant>,
 }
 
@@ -445,6 +446,7 @@ impl<'a> StreamOutput<'a> {
             sink,
             text: String::with_capacity(STREAM_OUTPUT_BUFFER_BYTES),
             kind: IntermediateOutputKind::Progress,
+            part: (0, 0),
             started: None,
         }
     }
@@ -463,14 +465,16 @@ impl<'a> StreamOutput<'a> {
     async fn buffer(
         &mut self,
         kind: IntermediateOutputKind,
+        part: (u32, u32),
         mut delta: &str,
     ) -> Result<(), OutputSinkError> {
         if delta.is_empty() || self.sink.is_none() {
             return Ok(());
         }
-        if self.kind != kind {
+        if self.kind != kind || self.part != part {
             self.flush().await?;
             self.kind = kind;
+            self.part = part;
         }
         while !delta.is_empty() {
             if self.text.is_empty() {
@@ -504,7 +508,7 @@ impl<'a> StreamOutput<'a> {
         }
         let text = ClearOnDrop(&mut self.text);
         match self.sink.as_deref_mut() {
-            Some(sink) => sink.append(self.kind, text.0.as_str()).await,
+            Some(sink) => sink.append(self.kind, self.part, text.0.as_str()).await,
             None => Ok(()),
         }
     }
@@ -514,9 +518,10 @@ impl ProviderOutputSink for StreamOutput<'_> {
     fn append<'a>(
         &'a mut self,
         kind: IntermediateOutputKind,
+        part: (u32, u32),
         text: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), OutputSinkError>> + 'a>> {
-        Box::pin(async move { self.buffer(kind, text).await })
+        Box::pin(async move { self.buffer(kind, part, text).await })
     }
 
     fn observe<'a>(
@@ -727,9 +732,9 @@ async fn parse_stream_body(
                             break 'stream;
                         }
                         responses::Event::Progress => saw_delta = true,
-                        responses::Event::Delta(kind, delta) => {
+                        responses::Event::Delta(kind, part, delta) => {
                             saw_delta = true;
-                            output.buffer(kind, &delta).await.map_err(|error| {
+                            output.buffer(kind, part, &delta).await.map_err(|error| {
                                 local_stop(&error.message, status_code, None, None)
                             })?;
                         }
@@ -829,7 +834,7 @@ async fn parse_stream_body(
                 saw_delta = true;
             }
             for (kind, delta) in delta {
-                output.buffer(kind, &delta).await.map_err(|error| {
+                output.buffer(kind, (0, 0), &delta).await.map_err(|error| {
                     local_stop(
                         &error.message,
                         status_code,
@@ -866,8 +871,8 @@ async fn parse_stream_body(
         response.finish_reason = Some(terminal.finish);
         response.raw_finish_reason = Some(terminal.detail);
         response_output = Some(terminal.output);
-        for (kind, delta) in terminal.remaining {
-            output.buffer(kind, &delta).await.map_err(|error| {
+        for (kind, part, delta) in terminal.remaining {
+            output.buffer(kind, part, &delta).await.map_err(|error| {
                 local_stop(
                     &error.message,
                     status_code,

@@ -125,7 +125,11 @@ pub(crate) struct TextFilter {
 }
 
 impl TextFilter {
-    fn consume(&mut self, input: &str, finished: bool) -> String {
+    pub(crate) fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    pub(crate) fn consume(&mut self, input: &str, finished: bool) -> String {
         if self.pending.is_empty() && !input.contains('<') {
             return if self.block.is_none() {
                 input.to_owned()
