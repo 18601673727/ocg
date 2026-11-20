@@ -860,10 +860,6 @@ fn inspect_held_in(
         }
         _ => "an index table is missing".to_owned(),
     };
-    let features: Vec<_> = crate::host::execution_features::COMPILED_EXECUTION_FEATURES
-        .into_iter()
-        .map(|(name, compiled)| json!({"feature": name, "compiled": compiled}))
-        .collect();
     Ok(json!({
         "database": {
             "format": FORMAT_VERSION,
@@ -876,7 +872,6 @@ fn inspect_held_in(
         "held_reported": reports.len(),
         "held": reports,
         "allocation_indexes": allocation_indexes,
-        "execution_features": features,
         "note": "Read-only. Nothing was adopted, released, cancelled, retried or finalized.",
     }))
 }

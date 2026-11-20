@@ -207,10 +207,6 @@ where
         Ok(()) => {
             log::set_max_level(log_handle.active_config().level.filter());
             log::info!("OCG foundation initialized; storage is ready");
-            for (name, enabled) in crate::host::execution_features::COMPILED_EXECUTION_FEATURES {
-                let state = if enabled { "available" } else { "unavailable" };
-                log::info!("compiled execution capability {name}: {state}");
-            }
             let scheduler = if execution.scheduler_task_running() {
                 "active"
             } else {
