@@ -37,7 +37,23 @@ fn hand_over_pieces(
         .map_err(|e| StorageError::corrupted(format!("invalid recorded answer: {e}")))?;
     let mut groups = std::collections::BTreeMap::new();
     let mut outputs = tx.open_table(JOB_OUTPUTS)?;
-    for entry in outputs.range((job.get(), 0)..=(job.get(), u32::MAX))? {
+    let mut first = None;
+    for entry in outputs.range((job.get(), 0)..=(job.get(), u32::MAX))?.rev() {
+        let (key, bytes) = entry?;
+        let row = super::rows::decode_output(key.value(), bytes.value())?;
+        if let Some((number, _, _)) = row.part {
+            if number < request.get() {
+                break;
+            }
+            if number == request.get() {
+                first = Some(key.value().1);
+            }
+        }
+    }
+    let Some(first) = first else {
+        return Ok(());
+    };
+    for entry in outputs.range((job.get(), first)..=(job.get(), u32::MAX))? {
         let (key, bytes) = entry?;
         let row = super::rows::decode_output(key.value(), bytes.value())?;
         let Some((n, output, part)) = row.part else {
@@ -845,7 +861,10 @@ impl Batch {
             {
                 record.answer_request =
                     super::observations::latest_request(&tx.open_table(REQUEST_EVENTS)?, job)?;
-                if super::observations::answer_text(tx, job, &record)?.is_some() {
+                let answer = super::observations::answer_text(tx, job, &record)?;
+                if answer.as_deref() == record.model_text()
+                    && record.summary.as_deref().is_none_or(|summary| Some(summary) == record.model_text())
+                {
                     if let Some(object) = record
                         .value
                         .as_mut()
@@ -856,6 +875,7 @@ impl Batch {
                     record.summary = None;
                 } else {
                     record.answer_request = None;
+                    log::warn!("Job {job} recorded answer or summary does not match Result text; retaining Result text");
                 }
             }
             tx.open_table(JOB_OUTPUTS)?

@@ -109,6 +109,19 @@ impl DatabaseHandle {
             .await
     }
 
+    pub(crate) async fn job_outputs_with_pieces(
+        &self,
+        job: JobId,
+        after_seq: Option<i64>,
+        limit: usize,
+        pieces: redb::PieceReader,
+    ) -> Result<(Vec<JobOutputRecord>, redb::PieceReader), DatabaseError> {
+        self.read(move |database| {
+            redb::read_outputs_with_pieces(database, job, after_seq, limit, pieces)
+        })
+        .await
+    }
+
     pub async fn latest_output(
         &self,
         job: JobId,

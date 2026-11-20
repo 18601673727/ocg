@@ -665,7 +665,24 @@ pub(crate) fn read_outputs(
     after_seq: Option<i64>,
     limit: usize,
 ) -> Result<Vec<JobOutputRecord>, StorageError> {
-    outputs(&read(database)?, job, after_seq, limit)
+    outputs(
+        &read(database)?,
+        job,
+        after_seq,
+        limit,
+        &mut observations::PieceReader::default(),
+    )
+}
+
+pub(crate) fn read_outputs_with_pieces(
+    database: &Database,
+    job: JobId,
+    after_seq: Option<i64>,
+    limit: usize,
+    mut pieces: observations::PieceReader,
+) -> Result<(Vec<JobOutputRecord>, observations::PieceReader), StorageError> {
+    let page = outputs(&read(database)?, job, after_seq, limit, &mut pieces)?;
+    Ok((page, pieces))
 }
 
 fn outputs(
@@ -673,6 +690,7 @@ fn outputs(
     job: JobId,
     after_seq: Option<i64>,
     limit: usize,
+    pieces: &mut observations::PieceReader,
 ) -> Result<Vec<JobOutputRecord>, StorageError> {
     if let Some(conversation) = read_conversation_row(rx, job)? {
         if after_seq.is_some_and(|seq| seq >= 1) || limit == 0 {
@@ -690,7 +708,6 @@ fn outputs(
         Some(Ok(seq)) => seq + 1,
     };
     let mut records = Vec::new();
-    let mut pieces = observations::PieceReader::default();
     for entry in outputs
         .range((job.get(), start)..=(job.get(), u32::MAX))?
         .take(limit.min(MAX_PAGE))

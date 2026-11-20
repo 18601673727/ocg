@@ -50,7 +50,7 @@ pub(crate) use reads::conversations::{
 pub(crate) use reads::execution_context::{read_development_execution_context, read_trial_job};
 pub(crate) use reads::jobs::{
     read_job_search, read_job_tree, read_latest_output, read_mutable_job_details, read_native_job,
-    read_output_job_is_decision, read_outputs, read_tool_evidence,
+    read_output_job_is_decision, read_outputs, read_outputs_with_pieces, read_tool_evidence,
 };
 pub(crate) use reads::usage::{
     read_tool_stats, read_usage_buckets, read_usage_retries, read_usage_summary,
@@ -84,7 +84,7 @@ pub(crate) use scheduled_external::{
 };
 
 pub(crate) use observations::{
-    read_availability_stats, read_job_availability, read_job_metrics, read_metrics,
+    PieceReader, read_availability_stats, read_job_availability, read_job_metrics, read_metrics,
     read_provider_request, read_provider_responses,
 };
 

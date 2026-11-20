@@ -127,7 +127,9 @@ pub(super) async fn open(
     let changes = database.subscribe_catalog();
     let outputs = database.subscribe_outputs(job);
     let record = database.native_job(job).await?.ok_or(JOB_NOT_FOUND)?;
-    let page = database.job_outputs(job, after_seq, PAGE).await?;
+    let (page, pieces) = database
+        .job_outputs_with_pieces(job, after_seq, PAGE, Default::default())
+        .await?;
 
     if let Some(first) = page.first() {
         output_event(shared, job, first)?;
@@ -141,6 +143,7 @@ pub(super) async fn open(
         cursor: after_seq,
         drained: page.len() < PAGE,
         pending: page.into(),
+        pieces,
         record,
         announced: None,
         ended: false,
@@ -279,6 +282,7 @@ struct Feed {
     cursor: Option<i64>,
     record: NativeJobItem,
     pending: VecDeque<JobOutputRecord>,
+    pieces: crate::db::PieceReader,
     drained: bool,
     announced: Option<Lifecycle>,
     ended: bool,
@@ -313,8 +317,13 @@ impl Feed {
                 };
             }
             if !self.drained {
-                match database.job_outputs(self.job, self.cursor, PAGE).await {
-                    Ok(page) => {
+                let pieces = std::mem::take(&mut self.pieces);
+                match database
+                    .job_outputs_with_pieces(self.job, self.cursor, PAGE, pieces)
+                    .await
+                {
+                    Ok((page, pieces)) => {
+                        self.pieces = pieces;
                         self.drained = page.len() < PAGE;
                         self.pending = page.into();
                         continue;

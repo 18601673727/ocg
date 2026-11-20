@@ -191,8 +191,39 @@ fn old_output(key: (u128, u32), bytes: &[u8]) -> Result<JobOutputRecord, Storage
 #[derive(Default)]
 struct ConversionCounts {
     kept_text_jobs: Vec<JobId>,
+    kept_text_details: Vec<String>,
     converted_summary_links: usize,
     retained_summary_links: usize,
+}
+
+fn record_kept_text(
+    tx: &impl TxRead,
+    output: &JobOutputRecord,
+    counts: &mut ConversionCounts,
+) -> Result<(), StorageError> {
+    let mut probe = output.clone();
+    probe.answer_request = observations::latest_request(&tx.table(REQUEST_EVENTS)?, output.job)?;
+    let answer = observations::answer_text(tx, output.job, &probe)?;
+    let stored = output.model_text().or(output.summary.as_deref());
+    let comparison = match (stored, answer.as_deref()) {
+        (Some(text), Some(answer)) if text == answer => "matches recorded answer",
+        (Some(_), Some(_)) => "differs from recorded answer",
+        (None, _) | (_, None) => "recorded answer unavailable",
+    };
+    counts.kept_text_jobs.push(output.job);
+    let summary = if output
+        .summary
+        .as_deref()
+        .is_some_and(|text| Some(text) != output.model_text())
+    {
+        "; distinct summary retained"
+    } else {
+        ""
+    };
+    counts
+        .kept_text_details
+        .push(format!("{}: {comparison}{summary}", output.job));
+    Ok(())
 }
 
 fn convert_summary_link(
@@ -297,6 +328,14 @@ fn convert_output(
     {
         return Ok(());
     }
+    if output
+        .summary
+        .as_deref()
+        .is_some_and(|summary| Some(summary) != output.model_text())
+    {
+        record_kept_text(tx, output, counts)?;
+        return Ok(());
+    }
     let Some(visible) = output
         .model_text()
         .or(output.summary.as_deref())
@@ -320,7 +359,7 @@ fn convert_output(
         .ok_or_else(|| StorageError::corrupted("answer Result value is not an object"))?;
     object.insert("text".to_owned(), Json::String(visible));
     output.summary = None;
-    counts.kept_text_jobs.push(output.job);
+    record_kept_text(tx, output, counts)?;
     Ok(())
 }
 
@@ -349,6 +388,14 @@ fn verify_outputs(
             return Err(StorageError::corrupted("migration changed output facts"));
         }
         observations::project_answer(result, prior.job, &mut actual)?;
+        if let Some(summary) = prior.summary.as_deref()
+            && actual.summary.as_deref() != Some(summary)
+            && prior.model_text() != Some(summary)
+        {
+            return Err(StorageError::corrupted(
+                "migration lost distinct output summary",
+            ));
+        }
         if prior.model_text().or(prior.summary.as_deref())
             != actual.model_text().or(actual.summary.as_deref())
         {
@@ -374,7 +421,8 @@ fn verify_delta(
     let counts = verify_outputs(source, &result)?;
     let plan = json!({"kind": "migrate-answers-f2", "source_sha256": sha, "source_format": SOURCE_FORMAT,
         "target_format": FORMAT_VERSION, "converted_summary_links": counts.converted_summary_links, "retained_summary_links": counts.retained_summary_links,
-        "kept_text_job_count": counts.kept_text_jobs.len(), "kept_text_jobs": counts.kept_text_jobs.iter().map(ToString::to_string).collect::<Vec<_>>()});
+        "kept_text_job_count": counts.kept_text_jobs.len(), "kept_text_jobs": counts.kept_text_jobs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "kept_text_details": counts.kept_text_details});
     let encoded = serde_json::to_vec(&plan)
         .map_err(|e| ReservedRefusal::new("invalid_plan", e.to_string()))?;
     Ok(json!({"plan": plan, "plan_digest": ContentDigest::of(&encoded).to_string()}))
@@ -459,8 +507,16 @@ pub(crate) fn verify_answer_migration(
         let tx = source.begin_read().map_err(StorageError::from)?;
         with_verified_rebuild_copy(finalization_copy(published)?, |published| {
             let evidence = verify_delta(&tx, published, directory, sha)?;
-            if evidence["plan"] != *expected_plan
-                || evidence["plan_digest"].as_str() != Some(expected_digest)
+            let mut verified_plan = evidence["plan"].clone();
+            if expected_plan.get("kept_text_details").is_none()
+                && let Some(plan) = verified_plan.as_object_mut()
+            {
+                plan.remove("kept_text_details");
+            }
+            let encoded = serde_json::to_vec(&verified_plan)
+                .map_err(|error| ReservedRefusal::new("invalid_plan", error.to_string()))?;
+            if verified_plan != *expected_plan
+                || ContentDigest::of(&encoded).to_string() != expected_digest
             {
                 return Err(ReservedRefusal::new(
                     "plan_digest_mismatch",

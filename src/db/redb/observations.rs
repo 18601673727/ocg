@@ -807,7 +807,8 @@ pub(super) fn linked_summary(
 }
 
 #[derive(Default)]
-pub(super) struct PieceReader {
+pub(crate) struct PieceReader {
+    latest_request: Option<u32>,
     filters: std::collections::BTreeMap<
         (crate::db::entities::OutputKind, (u32, u32, u32)),
         crate::db::entities::output_filter::TextFilter,
@@ -825,6 +826,11 @@ impl PieceReader {
         let Some(part @ (number, output, index)) = row.part else {
             return Ok(());
         };
+        if self.latest_request.is_none_or(|latest| number > latest) {
+            self.filters.retain(|(_, part), _| part.0 >= number);
+            self.bodies.retain(|request, _| *request >= number);
+            self.latest_request = Some(number);
+        }
         let job = row.job;
         let key = (row.kind, part);
         let seq = u32::try_from(row.seq)
@@ -857,18 +863,30 @@ impl PieceReader {
         } else {
             let table = tx.table(JOB_OUTPUTS)?;
             if first && seq > 1 {
-                for entry in table.range((job.get(), 0)..(job.get(), seq))? {
+                let mut pieces = Vec::new();
+                let mut expected = seq;
+                for entry in table.range((job.get(), 0)..(job.get(), seq))?.rev() {
                     let (k, v) = entry?;
+                    if k.value().1.checked_add(1) != Some(expected) {
+                        break;
+                    }
+                    expected = k.value().1;
                     let prior = decode_output(k.value(), v.value())?;
+                    match prior.part {
+                        Some((request, _, _)) if request < number => break,
+                        None => break,
+                        Some(_) => {}
+                    }
                     if (prior.kind, prior.part) == (row.kind, Some(part)) {
-                        filter.consume(
+                        pieces.push(
                             prior
                                 .summary
-                                .as_deref()
                                 .ok_or_else(|| StorageError::corrupted("piece text missing"))?,
-                            false,
                         );
                     }
+                }
+                for piece in pieces.into_iter().rev() {
+                    filter.consume(&piece, false);
                 }
             }
             let raw = row
