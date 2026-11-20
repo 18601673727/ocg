@@ -507,12 +507,7 @@ pub(crate) fn verify_answer_migration(
         let tx = source.begin_read().map_err(StorageError::from)?;
         with_verified_rebuild_copy(finalization_copy(published)?, |published| {
             let evidence = verify_delta(&tx, published, directory, sha)?;
-            let mut verified_plan = evidence["plan"].clone();
-            if expected_plan.get("kept_text_details").is_none()
-                && let Some(plan) = verified_plan.as_object_mut()
-            {
-                plan.remove("kept_text_details");
-            }
+            let verified_plan = evidence["plan"].clone();
             let encoded = serde_json::to_vec(&verified_plan)
                 .map_err(|error| ReservedRefusal::new("invalid_plan", error.to_string()))?;
             if verified_plan != *expected_plan
