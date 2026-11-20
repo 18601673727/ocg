@@ -697,6 +697,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     for (const turn of conversation.turns)
       if (
         (turn.native_decision ||
+          turn.job.id === job ||
           this.turns.get(turn.job.id)?.details?.mutable_phase !== "queued") &&
         (turn.job.settlement.state === "unsettled" ||
           (turn.native_decision && turn.job.settlement.state === "unknown") ||

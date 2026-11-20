@@ -1,4 +1,5 @@
 import { Check, Copy, Maximize2, Minus, Plus } from "@lucide/solid";
+import { Dynamic } from "@solidjs/web";
 import { createEffect, createMemo, createSignal } from "solid-js";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { bindElementRef, elementRef, Group, type View } from "@/lib/ui-state";
@@ -385,8 +386,8 @@ function inline(parent: WalkContext, tokens: Token[], from = 0, to = tokens.leng
       case "s_open": {
         const tag = token.type === "strong_open" ? "strong" : token.type === "em_open" ? "em" : "s";
         const close = findClose(tokens, i, to, `${tag}_close`);
-        const Tag = tag;
-        out.push(<Tag>{inline(ctx, tokens, i + 1, close)}</Tag>);
+        const body = inline(ctx, tokens, i + 1, close);
+        out.push(<Dynamic component={tag}>{body}</Dynamic>);
         i = close;
         break;
       }
