@@ -1,6 +1,9 @@
 allowBuilds:
   esbuild: true
   fsevents: true
+overrides:
+  "solid-loader>@babel/core": "-"
+  "solid-loader>@solidjs/babel-plugin": "-"
 minimumReleaseAgeExclude:
   - "@rsbuild/plugin-solid@2.1.0"
   - "@solidjs/signals@2.0.2"
