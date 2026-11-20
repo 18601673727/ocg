@@ -806,6 +806,17 @@ impl Batch {
         output: &mut crate::db::entities::FinalResult,
     ) -> Result<(), BatchError> {
         let Some(source) = job.summary_source else {
+            if output.code.is_none()
+                && output.summary.is_some()
+                && output
+                    .value
+                    .as_ref()
+                    .and_then(|value| value.get("text"))
+                    .and_then(|text| text.as_str())
+                    == output.summary.as_deref()
+            {
+                output.summary = None;
+            }
             return Ok(());
         };
         let raw = output
