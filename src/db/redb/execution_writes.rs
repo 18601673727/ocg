@@ -325,8 +325,8 @@ impl Batch {
         let timeline = indexes::request_timeline_key(Some(identity), &event);
         let model = indexes::usage_model_key(Some(identity), &event);
         self.step(|tx| {
-            if tx
-                .open_table(REQUEST_EVENTS)?
+            let mut events = tx.open_table(REQUEST_EVENTS)?;
+            if events
                 .insert(
                     (job.get(), request.get(), seq),
                     encode_request_event(&event).as_slice(),
@@ -337,9 +337,7 @@ impl Batch {
                     "request evidence would overwrite history",
                 ));
             }
-            if let Some(kind) =
-                observations::observation_kind(&tx.open_table(REQUEST_EVENTS)?, &event)?
-            {
+            if let Some(kind) = observations::observation_kind(&events, &event)? {
                 tx.open_table(JOB_OBSERVATIONS)?
                     .insert((job.get(), kind, id), (request.get(), seq))?;
             }

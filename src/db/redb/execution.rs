@@ -725,7 +725,8 @@ impl Batch {
         let now = self.now;
         let transaction = self.execution_transaction;
         let (seq, first) = self.step(|tx| {
-            let previous_seq = latest_event_seq(&tx.open_table(JOB_EVENTS)?, job)?;
+            let mut events = tx.open_table(JOB_EVENTS)?;
+            let previous_seq = latest_event_seq(&events, job)?;
             if (previous_seq == 0) != matches!(kind, ExecutionEventKind::Created { .. }) {
                 return Err(StorageError::corrupted(
                     "execution creation event ordering is invalid",
@@ -749,7 +750,6 @@ impl Batch {
                 at: now,
                 kind,
             };
-            let mut events = tx.open_table(JOB_EVENTS)?;
             if events
                 .insert((job.get(), seq), encode_event(&event)?.as_slice())?
                 .is_some()

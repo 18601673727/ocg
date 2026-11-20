@@ -254,17 +254,24 @@ impl BenchmarkClient {
         )
         .await?;
         let executor = uuid::Uuid::now_v7().to_string();
-        self.post_json(
-            "/api/v1/executors",
-            &json!({
-                "id": executor,
-                "pool": pool,
-                "name": "benchmark-executor",
-                "enabled": true,
-                "capabilities": [{"operation": "llm_request", "protocol": "openai_chat_completions"}],
-            }),
-        )
-        .await?;
+        for index in 0..concurrency {
+            let id = if index == 0 {
+                executor.clone()
+            } else {
+                uuid::Uuid::now_v7().to_string()
+            };
+            self.post_json(
+                "/api/v1/executors",
+                &json!({
+                    "id": id,
+                    "pool": pool,
+                    "name": format!("benchmark-executor-{index}"),
+                    "enabled": true,
+                    "capabilities": [{"operation": "llm_request", "protocol": "openai_chat_completions"}],
+                }),
+            )
+            .await?;
+        }
         let endpoint = if provider_endpoint.ends_with("/chat/completions") {
             provider_endpoint.to_owned()
         } else {

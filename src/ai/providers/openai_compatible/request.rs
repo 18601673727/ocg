@@ -2,6 +2,7 @@ use jsonschema::Validator;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use super::admission;
 use super::error::TransportError;
@@ -97,7 +98,7 @@ impl ChatConversation {
             .into_iter()
             .filter_map(|refusal| refusal.index.map(|index| (index, refusal)))
             .collect();
-        let mut validators: Vec<Option<Validator>> = self.tools.iter().map(|_| None).collect();
+        let mut validators: Vec<Option<Arc<Validator>>> = self.tools.iter().map(|_| None).collect();
         let mut refused = Vec::new();
         for call in calls {
             let index = call.index;

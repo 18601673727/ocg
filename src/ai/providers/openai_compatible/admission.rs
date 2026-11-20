@@ -1,4 +1,6 @@
+use std::collections::VecDeque;
 use std::fmt;
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use jsonschema::Validator;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
@@ -10,12 +12,17 @@ use crate::db::entities::ToolCallRefusal;
 const DRAFT_2020_12: &str = "https://json-schema.org/draft/2020-12/schema";
 const MAX_SCHEMA_DEPTH: usize = 32;
 const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+const MAX_CACHED_SCHEMAS: usize = 128;
+const MAX_CACHED_SCHEMA_BYTES: usize = 16 * 1024;
+
+#[derive(Default)]
+struct ValidatorCache(VecDeque<(String, Arc<Validator>)>);
 
 pub(crate) fn parameter_validator(
     index: u32,
     name: &str,
     parameters: Option<&Value>,
-) -> Result<Validator, InvalidToolCall> {
+) -> Result<Arc<Validator>, InvalidToolCall> {
     let Some(schema) = parameters else {
         return Err(InvalidToolCall::at(
             ToolCallRefusal::MissingSchema,
@@ -32,14 +39,39 @@ pub(crate) fn parameter_validator(
     })
 }
 
-pub(crate) fn compile_parameters(schema: &Value) -> Result<Validator, String> {
+pub(crate) fn compile_parameters(schema: &Value) -> Result<Arc<Validator>, String> {
+    static CACHE: OnceLock<Mutex<ValidatorCache>> = OnceLock::new();
+
+    let key = schema.to_string();
+    let cache = CACHE.get_or_init(|| Mutex::new(ValidatorCache::default()));
+    if key.len() <= MAX_CACHED_SCHEMA_BYTES {
+        let entries = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, validator)) = entries.0.iter().find(|(cached, _)| *cached == key) {
+            return Ok(Arc::clone(validator));
+        }
+    }
+
     require_supported(schema, "", 0)?;
-    jsonschema::draft202012::options()
-        .should_validate_formats(true)
-        .should_ignore_unknown_formats(false)
-        .with_pattern_options(jsonschema::PatternOptions::regex())
-        .build(schema)
-        .map_err(|error| format!("cannot be enforced: {error}"))
+    let validator = Arc::new(
+        jsonschema::draft202012::options()
+            .should_validate_formats(true)
+            .should_ignore_unknown_formats(false)
+            .with_pattern_options(jsonschema::PatternOptions::regex())
+            .build(schema)
+            .map_err(|error| format!("cannot be enforced: {error}"))?,
+    );
+
+    if key.len() <= MAX_CACHED_SCHEMA_BYTES {
+        let mut entries = cache.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some((_, existing)) = entries.0.iter().find(|(cached, _)| *cached == key) {
+            return Ok(Arc::clone(existing));
+        }
+        if entries.0.len() == MAX_CACHED_SCHEMAS {
+            entries.0.pop_front();
+        }
+        entries.0.push_back((key, Arc::clone(&validator)));
+    }
+    Ok(validator)
 }
 
 fn require_supported(schema: &Value, at: &str, depth: usize) -> Result<(), String> {

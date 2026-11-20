@@ -123,26 +123,28 @@ Keep the OCG data directory separate from project workspaces. The [data layout](
 
 ### Backend reference (2026-11-20)
 
-Measured commit [`d421854`](https://github.com/18601673727/ocg/commit/d421854c230da8a4af0b5947170ddf35071e5be4) on `chuncheon` using the optimized Cargo benchmark profile and Rust 1.99.1. The host ran Debian Linux 6.12.113 on ARM64 with 2 vCPUs and 11.66 GiB RAM. Benchmark data used a separate directory on ext4 (`/dev/sda2`). The existing OCG service remained running.
+Measured [`1c20348`](https://github.com/18601673727/ocg/commit/1c20348b660027990d7be59ab2aa1e1e80721023) with the benchmark executor fix in this working tree on `chuncheon`, using the optimized Cargo benchmark profile and Rust 1.99.1. The host ran Debian Linux 6.12.113 on ARM64 with 2 vCPUs and 11.66 GiB RAM. Benchmark data used a separate ext4 directory on `/dev/sda2`. The existing OCG service remained running.
 
-The reference workload used concurrency 8, 1,000 jobs, 1,000 workspace files, three trials and 32 warm-up jobs. Startup used ten measured launches and two warm-up launches. History used 625 page pairs per reader and search used 200 iterations per reader. Each reference job made three mock model requests and two real workspace tool calls. Except for startup, values are medians of the three corresponding trial statistics.
+The reference workload used eight clients, a benchmark Pool with capacity eight and eight compatible Executors, 1,000 jobs, 1,000 workspace files, three trials and 32 warm-up jobs. An independent preflight observed eight running allocations simultaneously. Startup used ten measured launches and two warm-up launches. History used 625 page pairs per reader and search used 200 iterations per reader. Each reference job made three mock model requests and two real workspace tool calls. Except for startup, values are medians of the three corresponding trial statistics.
 
 | Metric | Result |
 | --- | --- |
-| Startup readiness | 35.68 ms median, 35.36–36.49 ms range |
-| Memory | 17.37 MiB idle, 113.61 MiB sampled loaded peak |
-| Job admission | 20.80 ms p50, 25.41 ms p95 |
-| Job throughput | 11.67 jobs/s, 685.15 ms completion p50, 714.79 ms p95 |
-| Streaming delivery | 14.35 ms p50, 21.54 ms p95 |
-| History read | 3.91 ms p50, 7.75 ms p95 |
-| Workspace search | 0.036 ms p50, 0.606 ms p95 |
-| Database footprint | 48.19 MiB, 48.32 KiB apparent growth per completed job |
+| Startup readiness | 35.93 ms median, 35.54–36.15 ms range |
+| Memory | 17.60 MiB idle, 118.33 MiB sampled loaded peak |
+| Job admission | 25.34 ms p50, 31.88 ms p95 |
+| Job throughput | 31.17 jobs/s, 257.42 ms completion p50, 294.02 ms p95 |
+| Streaming delivery | 16.62 ms p50, 27.31 ms p95 |
+| History read | 4.28 ms p50, 10.48 ms p95 |
+| Workspace search | 0.036 ms p50, 0.590 ms p95 |
+| Database footprint | 45.57 MiB, 46.57 KiB apparent growth per completed job |
 
-All eight sections completed successfully, with 73 successful measurements and no failed, rejected, timed-out or unfinished operations. The memory peak is sampled. Database growth uses a 1,056,768-byte empty baseline and apparent file lengths, which can differ from allocated disk space.
+All eight sections completed successfully, with 73 successful measurements and no failed, rejected, timed-out or unfinished operations. The memory peak is sampled. Database growth uses an equivalent empty baseline and apparent file lengths, which can differ from allocated disk space.
 
-The earlier ext4 reference below reported 38.10 jobs/s and 236.15 ms completion p95. That run used an earlier source snapshot, so this comparison describes the observed difference and does not isolate its cause.
+The previous `d421854` run reported 11.67 jobs/s and 714.79 ms completion p95. It used eight clients but created only one benchmark Executor. Together with the one default Executor, that limited execution to two simultaneous allocations. Its results are preserved at `/srv/ocg-backend-bench-d421854/`.
 
-The source snapshot, build log, per-section JSONL and stderr, combined results and generated summary are preserved on the host at `/srv/ocg-backend-bench-d421854/`. All 381 tracked source files were checked against the local snapshot. The combined JSONL SHA-256 is `0f230ea93407332dabe4e43b02da273b92ada9e8b42e6247b1dacbedc19c9ee0`. The extracted source has no Git metadata, so the benchmark's reported clean-tree status does not independently identify the commit. Use the eight-section commands in the earlier ext4 reference to reproduce this run.
+The earlier ext4 reference below reported 38.10 jobs/s and 236.15 ms completion p95 with eight execution slots. The current reference offers 22 tools per model request, including 12 Job-management tools, while the earlier workload offered 10. In a separate three-trial experiment on the current snapshot, an agent with coding capability only retained the two file reads and increased throughput to 32.60 jobs/s median. A separate experimental cache for compiled parameter validators retained all offered tools and raised throughput to 32.10 jobs/s median while reducing backend CPU time from 27 to 24 seconds per 1,000 jobs. Combining the coding-only agent with the cache yielded 33.09 jobs/s median and 19 seconds of backend CPU time. These experiments change different aspects of the workload or implementation and do not fully explain the remaining difference. CPU sampling also identified schema compilation and redb activity; traced write-call counts increased in the newer version. The precise contribution of the remaining changes is unquantified.
+
+The measured source snapshot, build log, preflight, per-section JSONL and stderr, combined results and summary are preserved at `/srv/ocg-backend-bench-1c20348/`. All 382 tracked source files were checked against the measured snapshot, including the uncommitted benchmark patch. The combined JSONL SHA-256 is `23e1d33ed526af3f26ad52e22f19b56de92db99faee37386ca949456b0d9da26`. The extracted source has no Git metadata, so the benchmark's reported clean-tree status does not independently identify the commit. The diagnostic cache is isolated at `/srv/ocg-bench-schema-cache-probe/`. Use the eight-section commands in the earlier ext4 reference to reproduce this run.
 
 ### Long-conversation frontend benchmark
 

@@ -178,7 +178,7 @@ impl ToolRegistry {
                 schema,
                 version,
                 effect,
-                validator: Arc::new(validator),
+                validator,
                 handler,
                 authorized: false,
             },
