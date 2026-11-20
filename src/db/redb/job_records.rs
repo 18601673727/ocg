@@ -33,6 +33,12 @@ impl Batch {
         model: ConfigId,
         submission: Submission,
     ) -> Result<crate::db::entities::CompactionRequest, BatchError> {
+        if self.job_lifecycle(conversation)?.hidden_at.is_some() {
+            return self.reject(Violation::InvalidValue(
+                "compaction_unavailable",
+                "conversation cannot admit a compaction child now",
+            ));
+        }
         self.request_compaction_for(conversation, model, submission, None)
     }
     pub(super) fn request_compaction_for(

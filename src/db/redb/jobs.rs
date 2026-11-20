@@ -1026,10 +1026,12 @@ impl Batch {
                         ));
                     }
                 }
+                let lifecycle = self.job_lifecycle(parent)?;
                 if row.is_chunk_group()
                     || row.is_standalone_decision_group()
                     || self.require_job_state(parent)?.outcome.is_some()
-                    || self.job_lifecycle(parent)?.closing.is_some()
+                    || lifecycle.closing.is_some()
+                    || lifecycle.hidden_at.is_some()
                 {
                     return self.reject(Violation::InvalidValue(
                         "conversation",
@@ -1490,9 +1492,11 @@ impl Batch {
             ));
         }
         let mut parent = self.require_mutable_conversation(job.parent_id)?;
+        let lifecycle = self.job_lifecycle(job.parent_id)?;
         if parent.is_chunk_group()
             || self.require_job_state(job.parent_id)?.outcome.is_some()
-            || self.job_lifecycle(job.parent_id)?.closing.is_some()
+            || lifecycle.closing.is_some()
+            || lifecycle.hidden_at.is_some()
         {
             return self.reject(Violation::InvalidValue(
                 "conversation",

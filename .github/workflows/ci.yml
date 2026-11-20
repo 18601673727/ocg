@@ -51,7 +51,7 @@ jobs:
         working-directory: benchmark/frontend
         run: |
           pnpm install --frozen-lockfile
-          pnpm exec playwright install --with-deps chromium
+          pnpm exec playwright-core install --with-deps chromium
       - name: Stage release-style UI layout
         run: |
           mkdir -p "$RUNNER_TEMP/ocg-staged"

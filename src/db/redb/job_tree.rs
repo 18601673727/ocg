@@ -224,10 +224,12 @@ impl Batch {
 
     fn require_room_for_child(&mut self, parent: JobId) -> Result<(), BatchError> {
         let row = self.require_mutable_conversation(parent)?;
+        let lifecycle = self.job_lifecycle(parent)?;
         if row.is_chunk_group()
             || row.is_standalone_decision_group()
             || self.require_job_state(parent)?.outcome.is_some()
-            || self.job_lifecycle(parent)?.closing.is_some()
+            || lifecycle.closing.is_some()
+            || lifecycle.hidden_at.is_some()
         {
             return self.reject(Violation::ParentClosed(parent));
         }
@@ -1188,6 +1190,7 @@ impl Batch {
         let mut lifecycle = self.job_lifecycle(parent)?;
         let parent_state = self.require_job_state(parent)?;
         if lifecycle.closing.is_some()
+            || lifecycle.hidden_at.is_some()
             || parent_state.outcome.is_some()
             || lifecycle.loop_count >= self.group_limits(parent)?.0.max_auto_turns
         {
