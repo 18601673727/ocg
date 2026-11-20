@@ -77,11 +77,10 @@ function nativeDecision(value: unknown): NativeDecisionTurn | undefined {
   return value as NativeDecisionTurn;
 }
 
-export type ProjectedEntry = {
+type ProjectedEntry = {
   seq: number;
   at_us: number;
   kind: Api.TurnEntry["kind"];
-  message: number | null;
   text: string | null;
   attachments: string[];
 };
@@ -116,32 +115,6 @@ export type Children = Omit<Api.Children, "children"> & {
 export type ConversationCard = Api.Card;
 export type JobTree = Omit<Api.Tree, "root"> & { root: TreeNode };
 
-export function materializeUserEntries(entries: readonly ProjectedEntry[]) {
-  const visible = new Map<
-    number,
-    ProjectedEntry & { withdrawn: boolean; history: { content: string; at: string }[] }
-  >();
-  for (const entry of entries) {
-    if (entry.kind === "user_message" || entry.kind === "agent_message") {
-      visible.set(entry.seq, { ...entry, withdrawn: false, history: [] });
-    } else if (entry.kind === "user_message_edit" || entry.kind === "user_message_withdraw") {
-      const original = entry.message === null ? undefined : visible.get(entry.message);
-      if (!original) continue;
-      if (entry.kind === "user_message_edit") {
-        original.history.push({
-          content: original.text ?? "",
-          at: new Date(entry.at_us / 1000).toISOString(),
-        });
-        original.text = entry.text;
-        original.attachments = entry.attachments;
-      } else {
-        original.withdrawn = true;
-      }
-    }
-  }
-  return [...visible.values()];
-}
-
 export function projectConversation(page: Api.Turns): Conversation {
   return {
     ...page,
@@ -158,11 +131,9 @@ export function projectConversation(page: Api.Turns): Conversation {
         seq: entry.seq,
         kind: entry.kind,
         at_us: entry.at_us,
-        message: "message" in entry ? entry.message : null,
-        text: "text" in entry ? entry.text : null,
-        attachments: "attachments" in entry ? entry.attachments : [],
+        text: entry.text,
+        attachments: entry.attachments,
       }));
-      const messages = materializeUserEntries(entries).filter((entry) => !entry.withdrawn);
       return {
         job: turn.job,
         native_decision: decision,
@@ -173,9 +144,9 @@ export function projectConversation(page: Api.Turns): Conversation {
         input: {
           job: turn.job.id,
           id: turn.job.input,
-          objective: messages.length ? messages.map((entry) => entry.text ?? "").join("\n") : null,
+          objective: entries.length ? entries.map((entry) => entry.text ?? "").join("\n") : null,
           submitted_at_us: turn.submitted_at_us ?? turn.job.created_at_us,
-          attachments: messages.flatMap((entry) => entry.attachments),
+          attachments: entries.flatMap((entry) => entry.attachments),
           configuration: turn.configuration,
         },
         outputs: turn.outputs,

@@ -5,7 +5,6 @@ import { Collapsible, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { type ElementProps, splitProps, type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
 
-export const ANIMATION_DURATION = 180;
 export const estimateReasoningTokens = (text: string) =>
   Math.ceil(new TextEncoder().encode(text).length / 3);
 export type ReasoningRootProps = ElementProps<typeof Collapsible> & { streaming?: boolean };
@@ -130,7 +129,3 @@ export function ReasoningContent(viewProps: ElementProps<"div"> & { streaming?: 
 export function ReasoningText(props: { children: View }) {
   return <div>{props.children}</div>;
 }
-export function ReasoningFade(props: { children: View }) {
-  return <div>{props.children}</div>;
-}
-export const reasoningVariants = {};

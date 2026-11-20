@@ -13,10 +13,6 @@ pub(crate) enum JobActivityPhase {
     RunningTools,
     WaitingForUser,
     RateLimited,
-    #[allow(dead_code)]
-    RunningTasks,
-    #[allow(dead_code)]
-    Synthesizing,
     Completed,
     Failed,
     Cancelled,

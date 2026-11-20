@@ -70,8 +70,6 @@ const SettingsSurface = lazy(() =>
   import("../settings/settings-surface").then((module) => ({ default: module.SettingsSurface })),
 );
 
-export type { WorkspaceView } from "./view-domain";
-
 type Health = Api.Health;
 function currentLocation() {
   const url = new URL(window.location.href);

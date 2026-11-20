@@ -72,7 +72,7 @@ export function formatToolJson(text: string): string {
 const categories = ["read", "search", "code", "edit", "command", "agent", "other"] as const;
 type Category = (typeof categories)[number];
 
-export function toolCategory(name: string): Category {
+function toolCategory(name: string): Category {
   switch (name) {
     case "workspace_read_file":
     case "workspace_list_directory":
@@ -95,7 +95,7 @@ export function toolCategory(name: string): Category {
   }
 }
 
-export function toolActivitySummary(tools: readonly ToolActivity[]) {
+function toolActivitySummary(tools: readonly ToolActivity[]) {
   const counts = new Map<Category, number>();
   let bytes = 0;
   let durationMs = 0;

@@ -1,4 +1,4 @@
-export type WorkType = "research" | "coding" | "design" | "devops";
+type WorkType = "research" | "coding" | "design" | "devops";
 
 export type ChatSession = {
   id: string;
@@ -18,24 +18,15 @@ export type ChatSession = {
   closed?: boolean;
 };
 
-export type MessageRole = "user" | "assistant" | "call" | "tool";
+type MessageRole = "user" | "assistant" | "call" | "tool";
 
-export type MessageStatus =
-  | "pending"
-  | "streaming"
-  | "completed"
-  | "cancelled"
-  | "unknown"
-  | "failed";
+type MessageStatus = "pending" | "streaming" | "completed" | "cancelled" | "unknown" | "failed";
 
 export type ChatMessage = {
   decision?: import("./contracts/conversations").NativeDecisionTurn;
   planningTarget?: string;
-  agentInstruction?: boolean;
   compaction?: import("./contracts").ConversationTurn["compaction"];
-  withdrawn?: boolean;
   queued?: boolean;
-  queueHistory?: { content: string; at: string }[];
   execution?: import("./runtime/job-status").NativeExecutionStatus;
   activity?: import("./contracts").JobActivity;
   taskPlan?: import("./contracts").TaskPlan | null;
@@ -58,7 +49,7 @@ export type ChatMessage = {
   status: MessageStatus;
 };
 
-export type RuntimeConnectionState = "connected" | "connecting" | "disconnected" | "failed";
+type RuntimeConnectionState = "connected" | "connecting" | "disconnected" | "failed";
 
 export type RuntimeStatus = {
   state: RuntimeConnectionState;

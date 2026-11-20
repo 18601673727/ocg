@@ -13,7 +13,7 @@ import { clamp } from "./range";
 import { useReceiptFocus } from "./receipt-focus";
 import { inkButton, mono, paper } from "./surfaces";
 
-export interface OptionListOption {
+interface OptionListOption {
   id: string;
   label: string;
   description?: View;

@@ -30,10 +30,7 @@ import {
 
 const ANIMATION_DURATION = 200;
 
-export type ToolFallbackRootProps = Omit<
-  ElementProps<typeof Collapsible>,
-  "open" | "onOpenChange"
-> & {
+type ToolFallbackRootProps = Omit<ElementProps<typeof Collapsible>, "open" | "onOpenChange"> & {
   open?: boolean;
   onOpenChange?: (open: boolean) => void;
   defaultOpen?: boolean;
@@ -430,13 +427,4 @@ const ToolFallback = Object.assign(ToolFallbackImpl, {
   Error: ToolFallbackError,
 });
 
-export {
-  formatUnknownValue,
-  ToolFallback,
-  ToolFallbackArgs,
-  ToolFallbackContent,
-  ToolFallbackError,
-  ToolFallbackResult,
-  ToolFallbackRoot,
-  ToolFallbackTrigger,
-};
+export { ToolFallback };

@@ -4,7 +4,6 @@ import { ContractError } from "./decode";
 export type Job = Api.Job;
 export type ExecutionPhase = Api.ExecutionPhase;
 export type ExecutionHistory = Api.ExecutionHistory;
-export type ExecutionHistoryEvent = Api.ExecutionHistoryEvent;
 export type ExecutionState = Api.ExecutionState;
 export type Output = Api.Output;
 export type JobDetails = Api.Job &
@@ -75,7 +74,7 @@ export function projectJobDetails(input: Api.JobDetails): JobDetails {
   };
 }
 
-export type NativeStopRequest = "ended_before_start" | "requested" | "already_requested";
+type NativeStopRequest = "ended_before_start" | "requested" | "already_requested";
 
 export type NativeStop = {
   job: string;

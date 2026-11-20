@@ -13,17 +13,17 @@ export const DEFAULT_APPEARANCE: AppearancePreferences = {
   accent: "teal",
 };
 
-export function resolveThemePreference(value: unknown): ThemePreference {
+function resolveThemePreference(value: unknown): ThemePreference {
   return value === "light" || value === "dark" ? value : DEFAULT_APPEARANCE.theme;
 }
 
-export function resolveAccentPreference(value: unknown): AccentPreference {
+function resolveAccentPreference(value: unknown): AccentPreference {
   return value === "ochre" || value === "slate" || value === "teal"
     ? value
     : DEFAULT_APPEARANCE.accent;
 }
 
-export function parseAppearancePreferences(raw: string | null | undefined): AppearancePreferences {
+function parseAppearancePreferences(raw: string | null | undefined): AppearancePreferences {
   if (!raw) return { ...DEFAULT_APPEARANCE };
   try {
     const value: unknown = JSON.parse(raw);

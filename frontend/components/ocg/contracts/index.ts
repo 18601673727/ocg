@@ -16,7 +16,6 @@ export { TREE_MAX_DEPTH } from "./shared";
 export type {
   ChatImage,
   ChatImageUploadRequest,
-  JsonValue,
 } from "./view-models";
 
 export type ChatModelSelection = import("./view-models").ChatModelSelection & {

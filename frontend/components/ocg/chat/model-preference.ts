@@ -12,7 +12,7 @@ function storage(): Storage | null {
   }
 }
 
-export function modelPreferenceKey(projectId: string | undefined, sessionId: string): string {
+function modelPreferenceKey(projectId: string | undefined, sessionId: string): string {
   return `${PREFIX}:${JSON.stringify([projectId ?? null, sessionId])}`;
 }
 

@@ -1,6 +1,6 @@
 import { createSubscription } from "@/lib/ui-state";
 
-export function isLoopbackApiUrl(raw: string): boolean {
+function isLoopbackApiUrl(raw: string): boolean {
   try {
     const url = new URL(raw);
     return (
@@ -17,7 +17,7 @@ export function isLoopbackApiUrl(raw: string): boolean {
   }
 }
 
-export function isTrustedApiUrl(raw: string): boolean {
+function isTrustedApiUrl(raw: string): boolean {
   if (isLoopbackApiUrl(raw)) return true;
   if (typeof window === "undefined") return false;
   try {

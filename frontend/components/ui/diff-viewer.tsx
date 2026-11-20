@@ -564,7 +564,7 @@ function DiffViewerFileContent(props: DiffViewerFileContentProps) {
   );
 }
 
-export type DiffViewerProps = VariantProps<typeof diffViewerVariants> & {
+type DiffViewerProps = VariantProps<typeof diffViewerVariants> & {
   code?: string | undefined;
   patch?: string | undefined;
   oldFile?: { content: string; name?: string | undefined } | undefined;
@@ -657,20 +657,4 @@ function DiffViewer(props: DiffViewerProps) {
   );
 }
 
-export type { ParsedFile, ParsedLine, SplitLinePair };
-
-export {
-  computeDiff,
-  DiffViewer,
-  DiffViewerContent,
-  DiffViewerFile,
-  DiffViewerFileBadge,
-  DiffViewerHeader,
-  DiffViewerLine,
-  DiffViewerSplitLine,
-  DiffViewerStats,
-  diffLineTextVariants,
-  diffLineVariants,
-  diffViewerVariants,
-  parsePatch,
-};
+export { DiffViewer };

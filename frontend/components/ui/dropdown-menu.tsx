@@ -3,13 +3,13 @@ import { createContext, createEffect, createSignal, onCleanup, Show, useContext 
 import { handleEvent, splitProps, type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
 
-export type MenuItemState = { index: number; disabled: boolean };
+type MenuItemState = { index: number; disabled: boolean };
 
 export type MenuNavigationKey = "ArrowUp" | "ArrowDown" | "Home" | "End";
 
 export type MenuFocusable = { index: number; disabled: boolean; focus: () => void };
 
-export function menuFocusables(root: HTMLElement | null): MenuFocusable[] {
+function menuFocusables(root: HTMLElement | null): MenuFocusable[] {
   const items = root?.querySelectorAll<HTMLButtonElement>('[role="menuitem"]') ?? [];
   return [...items].map((element, index) => ({
     index,
@@ -18,14 +18,14 @@ export function menuFocusables(root: HTMLElement | null): MenuFocusable[] {
   }));
 }
 
-export function enabledMenuIndexes(items: readonly MenuItemState[]): number[] {
+function enabledMenuIndexes(items: readonly MenuItemState[]): number[] {
   return items
     .filter((item) => !item.disabled)
     .map((item) => item.index)
     .sort((first, second) => first - second);
 }
 
-export function menuFocusTarget(
+function menuFocusTarget(
   items: readonly MenuItemState[],
   current: number,
   key: MenuNavigationKey,
@@ -230,8 +230,4 @@ export function DropdownMenuItem(
       }}
     />
   );
-}
-
-export function DropdownMenuSeparator() {
-  return <hr class="my-1 border-border" />;
 }

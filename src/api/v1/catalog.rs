@@ -260,56 +260,13 @@ pub(super) fn actor_view(actor: &crate::db::entities::Actor) -> ActorView {
     }
 }
 
-#[allow(dead_code)]
-#[derive(serde::Serialize, ts_rs::TS)]
-#[serde(tag = "type", rename_all = "snake_case")]
-#[ts(rename = "ResponseFormat")]
-pub(crate) enum ResponseFormatView {
-    JsonObject,
-    JsonSchema { name: String },
-}
-
-#[allow(dead_code)]
 #[derive(serde::Serialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(rename = "TurnEntryKind")]
 pub(crate) enum TurnEntryKindView {
-    ContextPreparation {
-        job: String,
-        policy_revision: String,
-    },
-    ContextUse {
-        artifact: Option<String>,
-    },
     UserMessage {
         text: String,
         attachments: Vec<String>,
-    },
-    UserMessageEdit {
-        message: u32,
-        text: String,
-        attachments: Vec<String>,
-    },
-    UserMessageWithdraw {
-        message: u32,
-    },
-    AgentMessage {
-        text: String,
-        call: String,
-    },
-    Decision {
-        approval: (String, u32, u32),
-    },
-    RetryOf {
-        turn: String,
-        by: ActorView,
-    },
-    Iteration {
-        n: u64,
-    },
-    ResponseFormat {
-        #[serde(flatten)]
-        format: ResponseFormatView,
     },
 }
 
@@ -1000,20 +957,6 @@ pub(crate) enum ContextWorkView {
         reserved_tokens: u32,
         reserved_requests: u32,
         source: ContextSourceView,
-    },
-    #[allow(dead_code)]
-    Prediction {
-        job: String,
-        conversation: String,
-        state: String,
-        predictor: String,
-        model: String,
-        activity_turn: String,
-        policy_revision: u64,
-        policy: CompactionPolicyInput,
-        max_tokens: u32,
-        forecast_tokens: Option<u64>,
-        result: Option<Value>,
     },
 }
 

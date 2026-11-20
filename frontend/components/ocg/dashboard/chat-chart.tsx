@@ -2,7 +2,7 @@ import { createMemo } from "solid-js";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useI18n } from "../i18n";
 
-export type ChartType = "line" | "bar" | "pie" | "combo";
+type ChartType = "line" | "bar" | "pie" | "combo";
 export type ChatChartSeries = {
   label: string;
   data: readonly number[];

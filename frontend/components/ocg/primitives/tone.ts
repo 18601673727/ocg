@@ -1,6 +1,6 @@
 export type Tone = "emerald" | "sky" | "amber" | "red" | "violet" | "slate";
 
-export const BORDER_TONE: Record<Tone, string> = {
+const BORDER_TONE: Record<Tone, string> = {
   emerald: "border-emerald-500/30",
   sky: "border-sky-500/30",
   amber: "border-amber-500/30",
@@ -9,7 +9,7 @@ export const BORDER_TONE: Record<Tone, string> = {
   slate: "border-border",
 };
 
-export const FILL_TONE: Record<Tone, string> = {
+const FILL_TONE: Record<Tone, string> = {
   emerald: "bg-emerald-500/10",
   sky: "bg-sky-500/10",
   amber: "bg-amber-500/10",
@@ -18,7 +18,7 @@ export const FILL_TONE: Record<Tone, string> = {
   slate: "bg-muted/50",
 };
 
-export const SURFACE_TONE: Record<Tone, string> = Object.fromEntries(
+const SURFACE_TONE: Record<Tone, string> = Object.fromEntries(
   (Object.keys(BORDER_TONE) as Tone[]).map((tone) => [
     tone,
     `${BORDER_TONE[tone]} ${FILL_TONE[tone]}`,

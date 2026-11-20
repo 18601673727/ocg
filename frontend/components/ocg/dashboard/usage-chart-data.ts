@@ -2,7 +2,7 @@ import type * as Api from "@/components/ocg/contracts/api";
 
 type UsageRow = Api.Envelope<Api.UsageBuckets>["rows"][number];
 export type ModelKey = string | null;
-export type UsageBar = { bucketUs: number; total: number; totals: Map<ModelKey, number> };
+type UsageBar = { bucketUs: number; total: number; totals: Map<ModelKey, number> };
 export type RankedUsage = {
   model: ModelKey;
   unknown: boolean;

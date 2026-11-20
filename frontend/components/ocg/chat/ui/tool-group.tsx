@@ -24,7 +24,7 @@ const toolGroupVariants = cva("aui-tool-group-root group/tool-group w-full", {
   defaultVariants: { variant: "outline" },
 });
 
-export type ToolGroupRootProps = Omit<ElementProps<typeof Collapsible>, "open" | "onOpenChange"> &
+type ToolGroupRootProps = Omit<ElementProps<typeof Collapsible>, "open" | "onOpenChange"> &
   VariantProps<typeof toolGroupVariants> & {
     open?: boolean;
     onOpenChange?: (open: boolean) => void;
@@ -169,4 +169,4 @@ function ToolGroupContent(
   );
 }
 
-export { ToolGroupContent, ToolGroupRoot, ToolGroupTrigger, toolGroupVariants };
+export { ToolGroupContent, ToolGroupRoot, ToolGroupTrigger };

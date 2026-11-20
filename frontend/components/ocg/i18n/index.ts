@@ -1,26 +1,6 @@
-export { I18nProvider, type TranslateFn, useI18n, useT } from "./context";
-export {
-  type Dictionary,
-  dictionaries,
-  en,
-  formatTemplate,
-  type I18nKey,
-  zh,
-} from "./dictionaries";
+export { I18nProvider, type TranslateFn, useI18n } from "./context";
+export type { I18nKey } from "./dictionaries";
 export { LanguageSwitcher } from "./language-switcher";
-export {
-  DEFAULT_LOCALE,
-  detectLocale,
-  isLocale,
-  LOCALE_LABEL,
-  LOCALE_SHORT_LABEL,
-  LOCALE_STORAGE_KEY,
-  LOCALES,
-  type Locale,
-  readStoredLocale,
-  resolveLocale,
-} from "./locale";
-export { LOCALE_BOOTSTRAP_SCRIPT } from "./locale-bootstrap";
 
 import type { TranslateFn } from "./context";
 import type { I18nKey } from "./dictionaries";
@@ -62,13 +42,4 @@ const STATE_KEYS: Record<string, I18nKey> = {
 export function runtimeStateLabel(t: TranslateFn, state: string): string {
   const key = STATE_KEYS[state];
   return key ? t(key) : state;
-}
-
-export function runtimeStatusDetail(
-  t: TranslateFn,
-  status: import("../types").RuntimeStatus,
-): string | undefined {
-  if (status.detailCode === "provider-ready") return t("chat.runtimeConnected");
-  if (status.detailCode === "configuration-required") return t("chat.runtimeUnconfigured");
-  return status.detail;
 }

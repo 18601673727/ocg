@@ -11,16 +11,11 @@ export const LOCALE_LABEL: Record<Locale, string> = {
   "zh-CN": "简体中文",
 };
 
-export const LOCALE_SHORT_LABEL: Record<Locale, string> = {
-  "en-US": "EN",
-  "zh-CN": "中文",
-};
-
 export function isLocale(value: unknown): value is Locale {
   return value === "en-US" || value === "zh-CN";
 }
 
-export function resolveLocale(value: unknown): Locale {
+function resolveLocale(value: unknown): Locale {
   if (typeof value !== "string") return DEFAULT_LOCALE;
   const normalized = value.replace("_", "-").toLowerCase();
   if (
@@ -35,9 +30,7 @@ export function resolveLocale(value: unknown): Locale {
   return DEFAULT_LOCALE;
 }
 
-export function readStoredLocale(
-  storage: Pick<Storage, "getItem"> | null | undefined,
-): Locale | null {
+function readStoredLocale(storage: Pick<Storage, "getItem"> | null | undefined): Locale | null {
   try {
     const raw = storage?.getItem(LOCALE_STORAGE_KEY);
     if (!raw) return null;

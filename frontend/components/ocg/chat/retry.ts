@@ -26,9 +26,7 @@ export function retryInput(
     .reverse()
     .find(
       (message) =>
-        message.role === "user" &&
-        !message.withdrawn &&
-        (!failed.commandId || message.commandId === failed.commandId),
+        message.role === "user" && (!failed.commandId || message.commandId === failed.commandId),
     );
   return user && (user.content.trim() || user.images?.length)
     ? { content: user.content.trim(), images: user.images }

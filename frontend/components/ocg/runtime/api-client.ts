@@ -131,7 +131,7 @@ export type NativeAllocation = {
   started_at_unix_micros: number | null;
 };
 
-export type NativePoolOccupancy =
+type NativePoolOccupancy =
   | {
       available: true;
       held: number;
@@ -240,7 +240,7 @@ export type MutableJob = {
   input: MutableJobInput;
 };
 
-export type AutonomousLoopbackEligibility = {
+type AutonomousLoopbackEligibility = {
   eligible: boolean;
   code: string;
   detail: string;

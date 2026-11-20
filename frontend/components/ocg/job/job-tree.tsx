@@ -35,7 +35,7 @@ function stateLabel(t: TranslateFn, state: TreeState): string {
   return runtimeStateLabel(t, state);
 }
 
-export function mergeChildren(existing: TreeNode[], incoming: TreeNode[]): TreeNode[] {
+function mergeChildren(existing: TreeNode[], incoming: TreeNode[]): TreeNode[] {
   const merged = new Map(existing.map((child) => [child.id, child]));
   for (const child of incoming) {
     const previous = merged.get(child.id);

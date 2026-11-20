@@ -31,8 +31,6 @@ function StepIcon(props: { state: StepState }) {
     case "running_tools":
     case "waiting_for_user":
     case "rate_limited":
-    case "running_tasks":
-    case "synthesizing":
       return (
         <LoaderCircle
           aria-hidden="true"

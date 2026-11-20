@@ -11,7 +11,7 @@ import {
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectItem } from "@/components/ui/select";
 import { elementRef } from "@/lib/ui-state";
-import type { ContextStatus, DecisionAnswer, ProfilesSnapshot } from "../contracts";
+import type { ContextStatus, ProfilesSnapshot } from "../contracts";
 import { useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
 import { useOcgRuntime } from "../runtime/runtime-context";
@@ -19,64 +19,12 @@ import { describeError, selectableLlmProfiles } from "../settings/settings-parts
 
 type Status = ContextStatus;
 
-function formatShare(value: number): string {
-  return Number.isInteger(value)
-    ? String(value)
-    : value.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
-}
-
 function formatTokens(value: number): string {
   if (value < 1000) return String(value);
   if (value < 1_000_000) return `${(value / 1000).toFixed(1)}K`;
   return `${(value / 1_000_000).toFixed(1)}M`;
 }
 
-function describeDecisionAnswer(
-  answer: DecisionAnswer,
-  t: ReturnType<typeof useI18n>["t"],
-): string {
-  if (answer.kind === "choice") {
-    const parts = [t("context.predictionChoice", { selected: answer.selected })];
-    if (answer.distribution) {
-      parts.push(
-        t("context.predictionDistribution", {
-          values: Object.entries(answer.distribution)
-            .map(([key, value]) => `${key}: ${formatShare(value)}`)
-            .join(", "),
-        }),
-      );
-    }
-    if (answer.confidence) {
-      parts.push(
-        t("context.providerConfidence", {
-          value: formatShare(answer.confidence.value),
-          semantics: answer.confidence.semantics,
-        }),
-      );
-    }
-    return parts.join(" · ");
-  }
-  if (answer.kind === "binary_probability") {
-    return t("context.predictionBinary", { value: formatShare(answer.true_probability) });
-  }
-  const parts = [t("context.predictionExpectation", { value: formatShare(answer.expectation) })];
-  if (answer.distribution) {
-    parts.push(
-      t("context.predictionDistribution", {
-        values: answer.distribution.map(formatShare).join(", "),
-      }),
-    );
-  }
-  if (answer.confidence) {
-    parts.push(
-      t("context.providerConfidence", {
-        value: formatShare(answer.confidence.value),
-        semantics: answer.confidence.semantics,
-      }),
-    );
-  }
-  return parts.join(" · ");
-}
 export function ConversationContext(props: {
   conversation: string;
   agentProfile?: string;
@@ -352,33 +300,6 @@ export function ConversationContext(props: {
                             })}
                           </p>
                         )}
-                      </>
-                    )}
-                    {work.kind === "prediction" && work.result && (
-                      <>
-                        {work.result.outcome.kind === "answer" ? (
-                          <p>
-                            {i18n.t("context.predictionAnswer")} ·{" "}
-                            {describeDecisionAnswer(work.result.outcome.answer, i18n.t)}
-                          </p>
-                        ) : (
-                          <p class="text-muted-foreground">
-                            {i18n.t(
-                              work.result.outcome.kind === "uncertain"
-                                ? "context.predictionUncertain"
-                                : "context.predictionUnusable",
-                            )}{" "}
-                            · {work.result.outcome.reason}
-                          </p>
-                        )}
-                        {work.result.reported_model &&
-                          work.result.reported_model !== work.result.requested_model && (
-                            <p class="text-muted-foreground">
-                              {i18n.t("context.predictionReportedModel", {
-                                model: work.result.reported_model,
-                              })}
-                            </p>
-                          )}
                       </>
                     )}
                     {work.kind === "summarization" &&

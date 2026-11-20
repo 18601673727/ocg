@@ -15,7 +15,7 @@ import type {
   ProviderResponse,
   ToolCall,
 } from "../contracts";
-import { ContractError, materializeUserEntries } from "../contracts";
+import { ContractError } from "../contracts";
 import type * as Api from "../contracts/api";
 import { fileSnapshots } from "../markdown/file-snapshot";
 import type { ChatMessage, ChatSession, OcgRuntimeEvent } from "../types";
@@ -1039,21 +1039,17 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         },
       ];
     }
-    const entries = materializeUserEntries(turn.entries ?? []);
+    const entries = turn.entries ?? [];
     const queued =
       turn.job.previous !== null &&
       turn.job.started_at_us === null &&
       turn.job.settlement.state === "unsettled";
     const inputs: ChatMessage[] = entries.map((entry) => ({
-      agentInstruction: entry.kind === "agent_message",
-      intermediate: entry.kind === "agent_message",
-      queued: entry.kind === "user_message" && queued,
-      withdrawn: entry.withdrawn,
-      queueHistory: entry.history,
+      queued,
       id: `${turn.job.id}:entry:${entry.seq}`,
       jobId: turn.job.id,
       commandId: turn.job.id,
-      role: entry.kind === "agent_message" ? "assistant" : "user",
+      role: "user",
       content: entry.text ?? "",
       status: "completed",
       createdAt: new Date(entry.at_us / 1000).toISOString(),
@@ -1074,16 +1070,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           },
         ]
       : [];
-    const withdrawnBeforeStart =
-      turn.job.started_at_us === null &&
-      turn.job.settlement.state === "cancelled" &&
-      entries.length > 0 &&
-      entries.every((entry) => entry.withdrawn) &&
-      !turn.outputs.length &&
-      !turn.tools.length &&
-      !turn.responses.length;
     const projected = this.projectTurn(turn);
-    const transcript = withdrawnBeforeStart ? [] : projected.transcript;
+    const transcript = projected.transcript;
     return [
       ...boundary,
       ...inputs,
@@ -1191,16 +1179,14 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         (turn) => turn.job.started_at_us === null && turn.job.settlement.state === "unsettled",
       )
       .flatMap((turn) =>
-        materializeUserEntries(turn.entries ?? [])
-          .filter((entry) => entry.kind === "user_message" && !entry.withdrawn)
-          .map((entry) => ({
-            id: `${turn.job.id}:entry:${entry.seq}`,
-            input: {
-              content: entry.text ?? "",
-              images: entry.attachments.flatMap((id) => this.images.get(id) ?? []),
-              mode: "queue" as const,
-            },
-          })),
+        (turn.entries ?? []).map((entry) => ({
+          id: `${turn.job.id}:entry:${entry.seq}`,
+          input: {
+            content: entry.text ?? "",
+            images: entry.attachments.flatMap((id) => this.images.get(id) ?? []),
+            mode: "queue" as const,
+          },
+        })),
       );
     this.emit({ type: "conversation.queue-updated", sessionId, queue, paused: false });
   }

@@ -3,7 +3,7 @@ import { createContext, createSignal, useContext } from "solid-js";
 import { dictionaries, formatTemplate, type TranslateFn } from "./dictionaries";
 import { DEFAULT_LOCALE, detectLocale, isLocale, LOCALE_STORAGE_KEY, type Locale } from "./locale";
 
-export type { TranslateFn, TranslateVars } from "./dictionaries";
+export type { TranslateFn } from "./dictionaries";
 
 type I18nContextValue = {
   locale: Locale;
@@ -41,8 +41,4 @@ export function useI18n() {
   const context = useContext(I18nContext);
   if (!context) throw new Error("useI18n must be used inside I18nProvider");
   return context;
-}
-
-export function useT() {
-  return useI18n().t;
 }

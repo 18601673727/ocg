@@ -4,7 +4,7 @@ type BucketRow = Api.Envelope<Api.UsageBuckets>["rows"][number];
 type RetryRow = Api.UsageRetries["retry_rows"][number];
 type UsageObservation = Api.Usage["observations"][number];
 
-export type ReliabilityBucket = {
+type ReliabilityBucket = {
   bucketUs: number;
   requests: number;
   errors: number;

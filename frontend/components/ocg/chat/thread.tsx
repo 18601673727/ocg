@@ -288,24 +288,14 @@ function UserMessage() {
           <MessageActions />
         </div>
       </div>
-      <Show when={message().withdrawn || message().queued}>
+      <Show when={message().queued}>
         <p
           role="status"
           data-slot="queued-message-status"
           class="text-right text-xs text-muted-foreground"
         >
-          {t(message().withdrawn ? "chat.queueWithdrawn" : "chat.queuedMessage")}
+          {t("chat.queuedMessage")}
         </p>
-      </Show>
-      <Show when={message().queueHistory?.length}>
-        <details class="max-w-prose text-xs text-muted-foreground">
-          <summary class="cursor-pointer text-right">{t("chat.queueEdited")}</summary>
-          <For each={message().queueHistory}>
-            {(revision) => (
-              <p class="mt-2 whitespace-pre-wrap rounded border p-2">{revision.content}</p>
-            )}
-          </For>
-        </details>
       </Show>
     </div>
   );
@@ -334,21 +324,11 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
           when={!message().intermediate || visible() || message().failureReason || props.footer}
         >
           <div
-            data-slot={
-              message().agentInstruction ? "agent-instruction" : "aui_assistant-message-root"
-            }
+            data-slot="aui_assistant-message-root"
             data-role="assistant"
             data-intermediate={message().intermediate || undefined}
-            class={cn(
-              "relative -mb-7.5 pb-7.5",
-              message().agentInstruction && "rounded-xl border border-border bg-muted/30 px-4 py-3",
-            )}
+            class="relative -mb-7.5 pb-7.5"
           >
-            <Show when={message().agentInstruction}>
-              <header class="mb-2 text-xs font-medium text-muted-foreground">
-                {t("chat.agentInstruction")}
-              </header>
-            </Show>
             <div
               data-slot="aui_assistant-message-content"
               class={cn(

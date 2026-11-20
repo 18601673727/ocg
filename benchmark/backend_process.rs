@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -338,12 +338,4 @@ fn listening_address(line: &str) -> Option<String> {
     let (_, rest) = line.split_once("listening on ")?;
     let address = rest.trim();
     address.starts_with("http").then(|| address.to_owned())
-}
-
-#[allow(dead_code)]
-fn drain_until_exit(mut child: Child) {
-    let mut stdin = child.stdin.take();
-    if let Some(stdin) = stdin.as_mut() {
-        let _ = stdin.write_all(b"\n");
-    }
 }

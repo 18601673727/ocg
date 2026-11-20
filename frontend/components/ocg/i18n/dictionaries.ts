@@ -1,6 +1,6 @@
 import type { Locale } from "./locale";
 
-export const en = {
+const en = {
   "job.activity.queued": "Queued",
   "job.activity.unsubmitted": "Draft, not submitted",
   "job.activity.starting": "Starting",
@@ -8,8 +8,6 @@ export const en = {
   "job.activity.running_tools": "Executing tools",
   "job.activity.waiting_for_user": "Waiting for your response",
   "job.activity.rate_limited": "Provider rate limit; waiting to retry",
-  "job.activity.running_tasks": "Executing task phases",
-  "job.activity.synthesizing": "Synthesizing phase results",
   "job.activity.completed": "Completed",
   "job.activity.failed": "Failed",
   "job.activity.cancelled": "Cancelled",
@@ -144,15 +142,6 @@ export const en = {
   "context.queued": "Preparation queued; original history retained.",
   "context.retry": "Retry the same request",
   "context.preparedMode": "Prediction mode: {mode}",
-  "context.predictionAnswer": "Prediction result",
-  "context.predictionChoice": "Selected {selected}",
-  "context.predictionDistribution": "Distribution {values}",
-  "context.predictionBinary": "Probability {value}",
-  "context.predictionExpectation": "Expected score {value}",
-  "context.providerConfidence": "Provider confidence {value} ({semantics})",
-  "context.predictionUncertain": "Prediction uncertain",
-  "context.predictionUnusable": "Prediction unusable",
-  "context.predictionReportedModel": "Provider reported model {model}",
   "decision.modelsTitle": "Decision models",
   "decision.modelsDescription":
     "Configure native decision models here alongside generative models.",
@@ -560,7 +549,6 @@ export const en = {
   "chat.modelsLoading": "Loading models…",
   "chat.settingsNextTurn": "Applied to the next message.",
   "chat.steerStatusPending": "Checking whether steer is available. Messages can still be queued.",
-  "chat.agentInstruction": "Agent instruction",
   "chat.compacted": "Summary adopted for this turn",
   "chat.compactionPredictive": "Predictive",
   "chat.compactionRule": "Rule-based",
@@ -585,8 +573,6 @@ export const en = {
   "chat.contextOmissions": "Reported omissions",
   "chat.compactionQueueOnly":
     "Steer is unavailable during rule-based or manual compaction. Queue a message to continue.",
-  "chat.queueEdited": "Edited · previous versions",
-  "chat.queueWithdrawn": "Withdrawn from queue · retained in history",
   "chat.editQueued": "Edit queued message",
   "chat.queueEditUnavailable": "This runtime cannot change queued messages.",
   "chat.queue": "Queue",
@@ -1360,7 +1346,7 @@ export type TranslateFn = (key: I18nKey, vars?: TranslateVars) => string;
 
 export type Dictionary = Record<I18nKey, string>;
 
-export const zh: Dictionary = {
+const zh: Dictionary = {
   "job.activity.queued": "排队中",
   "job.activity.unsubmitted": "草稿，尚未提交",
   "job.activity.starting": "启动中",
@@ -1368,8 +1354,6 @@ export const zh: Dictionary = {
   "job.activity.running_tools": "执行工具中",
   "job.activity.waiting_for_user": "等待用户处理",
   "job.activity.rate_limited": "供应商限流，等待重试",
-  "job.activity.running_tasks": "执行任务阶段",
-  "job.activity.synthesizing": "汇总阶段结果",
   "job.activity.completed": "已完成",
   "job.activity.failed": "失败",
   "job.activity.cancelled": "已取消",
@@ -1487,15 +1471,6 @@ export const zh: Dictionary = {
   "context.queued": "准备任务已排队；原始历史记录已保留。",
   "context.retry": "重试同一请求",
   "context.preparedMode": "预测模式：{mode}",
-  "context.predictionAnswer": "预测结果",
-  "context.predictionChoice": "已选 {selected}",
-  "context.predictionDistribution": "分布 {values}",
-  "context.predictionBinary": "概率 {value}",
-  "context.predictionExpectation": "期望分值 {value}",
-  "context.providerConfidence": "提供方置信度 {value}（{semantics}）",
-  "context.predictionUncertain": "预测不确定",
-  "context.predictionUnusable": "预测不可用",
-  "context.predictionReportedModel": "提供方报告的模型 {model}",
   "decision.modelsTitle": "决策模型",
   "decision.modelsDescription": "在模型页面统一管理专用决策模型与生成式模型。",
   "decision.title": "决策配置",
@@ -1880,7 +1855,6 @@ export const zh: Dictionary = {
   "chat.modelsLoading": "正在加载模型…",
   "chat.settingsNextTurn": "所选配置将用于下一条消息。",
   "chat.steerStatusPending": "暂无法确认 steer 状态，可以继续排队发送消息。",
-  "chat.agentInstruction": "Agent 指令",
   "chat.compacted": "本轮已采用压缩摘要",
   "chat.compactionPredictive": "预测式",
   "chat.compactionRule": "规则式",
@@ -1904,8 +1878,6 @@ export const zh: Dictionary = {
   "chat.contextSummaryUnavailable": "该任务的最新输出中没有可用摘要。",
   "chat.contextOmissions": "报告的遗漏内容",
   "chat.compactionQueueOnly": "规则式或手动压缩期间暂不可 steer，可以继续排队发送消息。",
-  "chat.queueEdited": "已编辑 · 查看旧版本",
-  "chat.queueWithdrawn": "已从队列撤销 · 原文保留在历史中",
   "chat.editQueued": "编辑排队消息",
   "chat.queueEditUnavailable": "当前运行时无法修改排队消息。",
   "chat.queue": "排队",
