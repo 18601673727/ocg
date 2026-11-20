@@ -131,6 +131,10 @@ impl Batch {
             };
             let jobs = tx.table(JOBS)?;
             let outputs = tx.table(JOB_OUTPUTS)?;
+            let states = tx.table(JOB_RUNTIME)?;
+            let conversations = tx.table(CONVERSATIONS)?;
+            let events = tx.table(super::schema::REQUEST_EVENTS)?;
+            let messages = tx.table(super::schema::MESSAGES)?;
             let mut cursor = Some(tip);
             let mut total_tokens = 0usize;
             let mut steps = 0usize;
@@ -150,8 +154,21 @@ impl Batch {
                         decode_output(key.value(), value.value()),
                     )?;
                     if out.kind == OutputKind::Result {
-                        bytes = bytes
-                            .saturating_add(out.display_text().as_ref().map_or(0, String::len));
+                        let answer = super::observations::answer_text_in(
+                            &jobs,
+                            &states,
+                            &conversations,
+                            &events,
+                            &messages,
+                            turn_id,
+                            &out,
+                        )?;
+                        bytes = bytes.saturating_add(
+                            answer
+                                .or_else(|| out.display_text())
+                                .as_ref()
+                                .map_or(0, String::len),
+                        );
                     }
                 }
                 total_tokens = total_tokens.saturating_add(bytes.div_ceil(3));

@@ -1121,10 +1121,14 @@ impl Batch {
                     result = Some(rows::decode_output(key.value(), value.value())?);
                 }
             }
-            Ok(result)
+            match result {
+                Some(record) => Ok(super::observations::answer_text(tx, turn, &record)?
+                    .or_else(|| record.display_text())),
+                None => Ok(None),
+            }
         })?;
         Ok(answer
-            .and_then(|record| record.display_text())
+            .filter(|text| !text.is_empty())
             .map(|text| text.chars().take(RETURNED_RESULT_CHARS).collect()))
     }
 

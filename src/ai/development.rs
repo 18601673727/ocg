@@ -360,9 +360,14 @@ pub(crate) fn prepare_development_handoff(
                 {
                     None
                 } else {
-                    turn.outputs
-                        .last()
-                        .and_then(entities::JobOutputRecord::display_text)
+                    turn.answer_text
+                        .clone()
+                        .or_else(|| {
+                            turn.outputs
+                                .last()
+                                .and_then(entities::JobOutputRecord::display_text)
+                        })
+                        .filter(|text| !text.is_empty())
                 };
                 if !turn.awaiting_batch.is_empty() {
                     let context = paused_tool_context(&turn.awaiting_batch);

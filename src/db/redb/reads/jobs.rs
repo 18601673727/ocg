@@ -695,7 +695,9 @@ fn outputs(
         .take(limit.min(MAX_PAGE))
     {
         let (key, bytes) = entry?;
-        records.push(decode_output(key.value(), bytes.value())?);
+        let mut output = decode_output(key.value(), bytes.value())?;
+        observations::project_answer(rx, job, &mut output)?;
+        records.push(output);
     }
     Ok(records)
 }
@@ -715,12 +717,16 @@ fn latest_output(
         return conversation_result(rx, &conversation);
     }
     let outputs = rx.open_table(JOB_OUTPUTS)?;
-    outputs
+    let mut output = outputs
         .range((job.get(), 0)..=(job.get(), u32::MAX))?
         .next_back()
         .transpose()?
         .map(|(key, bytes)| decode_output(key.value(), bytes.value()))
-        .transpose()
+        .transpose()?;
+    if let Some(output) = &mut output {
+        observations::project_answer(rx, job, output)?;
+    }
+    Ok(output)
 }
 
 fn conversation_result(
@@ -748,7 +754,8 @@ fn conversation_result(
             .next_back()
             .transpose()?
     {
-        let output = decode_output(key.value(), bytes.value())?;
+        let mut output = decode_output(key.value(), bytes.value())?;
+        observations::project_answer(rx, JobId::new(turn), &mut output)?;
         summary = output.summary.unwrap_or_default();
         value = output.value;
     }
@@ -991,7 +998,10 @@ pub(crate) fn mutable_job_details_in(
         .transpose()?;
     let mut activity =
         ActivityProjection::new_mutable(&record, allocation.as_ref(), latest_output.as_ref());
-    let result = latest_output.filter(|output| output.kind == OutputKind::Result);
+    let mut result = latest_output.filter(|output| output.kind == OutputKind::Result);
+    if let Some(output) = &mut result {
+        observations::project_answer(rx, id, output)?;
+    }
     let mut usage = JobUsage::default();
     let mut events = Vec::new();
     let mut scanned = 0;

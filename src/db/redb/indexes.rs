@@ -302,7 +302,11 @@ pub(super) fn append_output_search_index(
     if output.kind != OutputKind::Result || !searchable_turn_context(tx, conversation, turn)? {
         return Ok(());
     }
-    if let Some(text) = search_output_text(output, completed) {
+    let answer = super::observations::answer_text(tx, turn, output)?;
+    if let Some(text) = answer
+        .as_deref()
+        .or_else(|| search_output_text(output, completed))
+    {
         insert_turn_search_grams(tx, conversation, turn, &search_grams(text))?;
     }
     Ok(())

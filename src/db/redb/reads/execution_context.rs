@@ -335,7 +335,10 @@ fn native_summary_owner(
     Ok(())
 }
 
-pub(crate) struct NativeSummaryTables<J, S, A, O, AT, T, P, E> {
+pub(crate) struct NativeSummaryTables<J, S, A, O, AT, T, P, E, C, R, M> {
+    pub conversations: C,
+    pub request_events: R,
+    pub messages: M,
     pub jobs: J,
     pub states: S,
     pub allocations: A,
@@ -346,8 +349,8 @@ pub(crate) struct NativeSummaryTables<J, S, A, O, AT, T, P, E> {
     pub executors: E,
 }
 
-pub(crate) fn native_source_boundary<J, S, A, O, AT, T, P, E>(
-    tables: &NativeSummaryTables<J, S, A, O, AT, T, P, E>,
+pub(crate) fn native_source_boundary<J, S, A, O, AT, T, P, E, C, R, M>(
+    tables: &NativeSummaryTables<J, S, A, O, AT, T, P, E, C, R, M>,
     id: JobId,
     conversation: JobId,
     budget: &mut SummaryBudget,
@@ -883,7 +886,14 @@ fn development_candidate_in(
                 {
                     let (key, val) = entry?;
                     let out = decode_output(key.value(), val.value())?;
-                    if let Some(t) = out.display_text() {
+                    if out.kind != OutputKind::Result {
+                        continue;
+                    }
+                    let answer = super::super::observations::answer_text(rx, boundary.job, &out)?;
+                    if let Some(t) = answer
+                        .or_else(|| out.display_text())
+                        .filter(|text| !text.is_empty())
+                    {
                         turn_text.push_str("Assistant: ");
                         turn_text.push_str(&t);
                         turn_text.push('\n');
@@ -1070,16 +1080,23 @@ fn development_candidate_in(
         } else {
             Vec::new()
         };
+        let answer_text = match prior_outputs.last() {
+            Some(output) => super::super::observations::answer_text(rx, id, output)?,
+            None => None,
+        };
         previous = prior.job.previous;
         history.push(DevelopmentContextTurn {
             record: prior,
             attachments: prior_attachments,
             outputs: prior_outputs,
+            answer_text,
             awaiting_batch,
             response_replay,
         });
     }
-    covered_inputs.reverse();
+    if record.job.summary_source.is_none() || record.job.input.text().starts_with("Merge ") {
+        covered_inputs.reverse();
+    }
     history.reverse();
     if record.job.summary_source.is_none() && covered_inputs.len() != covered.len() {
         return Err(StorageError::corrupted(

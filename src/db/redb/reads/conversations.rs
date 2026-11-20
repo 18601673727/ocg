@@ -95,7 +95,9 @@ pub(crate) fn read_mutable_conversation_turn_page(
             .take(TURN_PAGE_OUTPUTS)
         {
             let (key, bytes) = entry?;
-            outputs.push(decode_output(key.value(), bytes.value())?);
+            let mut output = decode_output(key.value(), bytes.value())?;
+            super::super::observations::project_answer(&rx, id, &mut output)?;
+            outputs.push(output);
         }
         let outputs_truncated = outputs.len() == TURN_PAGE_OUTPUTS
             && outputs
@@ -433,7 +435,10 @@ fn conversation_matches(
                 for output in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
                     let (key, bytes) = output?;
                     let output = rows::decode_output(key.value(), bytes.value())?;
-                    if indexes::search_output_text(&output, completed)
+                    let answer = super::super::observations::answer_text(rx, turn, &output)?;
+                    if answer
+                        .as_deref()
+                        .or_else(|| indexes::search_output_text(&output, completed))
                         .is_some_and(|text| text.to_lowercase().contains(term))
                     {
                         matched = true;
@@ -525,7 +530,13 @@ fn mutable_context_usage(
             let (key, value) = entry?;
             let output = decode_output(key.value(), value.value())?;
             if output.kind == OutputKind::Result {
-                bytes = bytes.saturating_add(output.display_text().as_ref().map_or(0, String::len));
+                let answer = super::super::observations::answer_text(rx, turn, &output)?;
+                bytes = bytes.saturating_add(
+                    answer
+                        .or_else(|| output.display_text())
+                        .as_ref()
+                        .map_or(0, String::len),
+                );
             }
         }
         let tokens = bytes.div_ceil(3);

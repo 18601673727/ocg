@@ -199,6 +199,7 @@ pub(crate) struct DevelopmentContextTurn {
     pub record: MutableJobRecord,
     pub attachments: Vec<AttachmentRecord>,
     pub outputs: Vec<JobOutputRecord>,
+    pub answer_text: Option<String>,
     pub awaiting_batch: Vec<crate::db::entities::ToolEvidenceRecord>,
     pub response_replay: Vec<serde_json::Value>,
 }

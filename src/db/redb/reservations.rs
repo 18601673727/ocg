@@ -713,7 +713,13 @@ impl Batch {
                         }
                         Ok(Some(outputs))
                     })?;
-                    if outputs.as_ref() != Some(&turn.outputs) {
+                    let answer = self.step(|tx| match turn.outputs.last() {
+                        Some(output) => {
+                            super::observations::answer_text(tx, turn.record.job.id, output)
+                        }
+                        None => Ok(None),
+                    })?;
+                    if answer != turn.answer_text || outputs.as_ref() != Some(&turn.outputs) {
                         return Err(stale());
                     }
                     previous = turn.record.job.previous;

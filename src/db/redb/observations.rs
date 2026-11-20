@@ -3,7 +3,7 @@ use std::ops::Bound;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use super::rows::decode_request_event;
-use super::{StorageError, jobs};
+use super::{StorageError, TxRead, jobs, state};
 use crate::db::entities::{
     AvailabilityObservation, AvailabilityStatRecord, DecisionTarget, MetricsRecord,
     ObservationCursor, ObservationFilter, ObservationPage, RequestEventRecord, RequestPayload,
@@ -16,8 +16,8 @@ use crate::db::entities::{
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::ConfigRow;
 use crate::db::redb::schema::{
-    CONFIGS, JOB_OBSERVATIONS, JOBS, MAX_PAGE, MESSAGES, REQUEST_EVENTS, REQUEST_TIMELINE,
-    RequestTimelineKey,
+    CONFIGS, CONVERSATIONS, JOB_OBSERVATIONS, JOB_RUNTIME, JOBS, MAX_PAGE, MESSAGES,
+    REQUEST_EVENTS, REQUEST_TIMELINE, RequestTimelineKey,
 };
 use ::redb::{Database, ReadTransaction, ReadableTable};
 use serde_json::Value;
@@ -502,6 +502,121 @@ struct DecodedMessage {
     text: Arc<str>,
     requests_tools: bool,
     escaped_len: usize,
+}
+
+pub(super) fn answer_text(
+    tx: &impl TxRead,
+    id: JobId,
+    output: &crate::db::entities::JobOutputRecord,
+) -> Result<Option<String>, StorageError> {
+    if output.kind != crate::db::entities::OutputKind::Result {
+        return Ok(None);
+    }
+    let jobs = tx.table(JOBS)?;
+    let states = tx.table(JOB_RUNTIME)?;
+    let conversations = tx.table(CONVERSATIONS)?;
+    let events = tx.table(REQUEST_EVENTS)?;
+    let messages = tx.table(MESSAGES)?;
+    answer_text_in(
+        &jobs,
+        &states,
+        &conversations,
+        &events,
+        &messages,
+        id,
+        output,
+    )
+}
+
+pub(super) fn project_answer(
+    tx: &impl TxRead,
+    id: JobId,
+    output: &mut crate::db::entities::JobOutputRecord,
+) -> Result<(), StorageError> {
+    if let Some(text) = answer_text(tx, id, output)? {
+        let value = output.value.get_or_insert_with(|| serde_json::json!({}));
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| StorageError::corrupted("answer Result value is not an object"))?;
+        object.insert("text".to_owned(), serde_json::Value::String(text));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn answer_text_in(
+    jobs: &impl ReadableTable<u128, &'static [u8]>,
+    states: &impl ReadableTable<u128, &'static [u8]>,
+    conversations: &impl ReadableTable<u128, &'static [u8]>,
+    events: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
+    messages: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    id: JobId,
+    output: &crate::db::entities::JobOutputRecord,
+) -> Result<Option<String>, StorageError> {
+    use crate::db::entities::{JobSpec, MutableJobContent, OutcomeKind, OutputKind};
+    if output.kind != OutputKind::Result
+        || output.code.is_some()
+        || output
+            .value
+            .as_ref()
+            .and_then(|value| value.get("finish_reason"))
+            .and_then(|value| value.as_str())
+            == Some("tool_calls")
+    {
+        return Ok(None);
+    }
+    let Some(row) = jobs.get(id.get())? else {
+        return Ok(None);
+    };
+    let job = jobs::decode_mutable_job(id.get(), row.value())?;
+    if job.summary_source.is_some()
+        || !matches!(job.input.content, MutableJobContent::Generative { .. })
+    {
+        return Ok(None);
+    }
+    let Some(parent) = conversations.get(job.parent_id.get())? else {
+        return Err(StorageError::corrupted(
+            "answer parent conversation missing",
+        ));
+    };
+    if JobSpec::decode_at(job.parent_id.get(), parent.value())?.is_chunk_group() {
+        return Ok(None);
+    }
+    let Some(runtime) = states.get(id.get())? else {
+        return Err(StorageError::corrupted("answer Job state missing"));
+    };
+    if !state::decode_state(id.get(), runtime.value())?
+        .outcome
+        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
+    {
+        return Ok(None);
+    }
+    let Some((key, _)) = events
+        .range((id.get(), 0, 0)..=(id.get(), u32::MAX, u32::MAX))?
+        .next_back()
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let number = key.value().1;
+    let request =
+        RequestNumber::new(number).ok_or_else(|| StorageError::corrupted("zero request number"))?;
+    for entry in events
+        .range((id.get(), number, 0)..=(id.get(), number, u32::MAX))?
+        .rev()
+    {
+        let (key, value) = entry?;
+        if let RequestPayload::Received { digest } =
+            decode_request_event(id, request, key.value().2, value.value())?.payload
+        {
+            let body = messages
+                .get(digest.as_bytes().as_slice())?
+                .ok_or_else(|| StorageError::corrupted("response references a missing message"))?;
+            let decoded = decode_message(digest, body.value())?;
+            return Ok((!decoded.requests_tools).then(|| decoded.text.to_string()));
+        }
+    }
+    Ok(None)
 }
 
 const MESSAGE_CACHE_BYTES: usize = 8 * 1024 * 1024;

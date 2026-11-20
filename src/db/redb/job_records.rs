@@ -217,6 +217,9 @@ impl Batch {
         let sealed = self.read_summary_source(|tx| {
             let tables = reads::execution_context::NativeSummaryTables {
                 jobs: tx.table(JOBS)?,
+                conversations: tx.table(CONVERSATIONS)?,
+                request_events: tx.table(REQUEST_EVENTS)?,
+                messages: tx.table(MESSAGES)?,
                 states: tx.table(JOB_RUNTIME)?,
                 allocations: tx.table(POOL_ALLOCATIONS)?,
                 outputs: tx.table(JOB_OUTPUTS)?,
@@ -270,7 +273,22 @@ impl Batch {
                         boundary.job,
                         crate::db::redb::rows::decode_output(key.value(), val.value()),
                     )?;
-                    if let Some(t) = out.display_text() {
+                    if out.kind != crate::db::entities::OutputKind::Result {
+                        continue;
+                    }
+                    let answer = super::observations::answer_text_in(
+                        &tables.jobs,
+                        &tables.states,
+                        &tables.conversations,
+                        &tables.request_events,
+                        &tables.messages,
+                        boundary.job,
+                        &out,
+                    )?;
+                    if let Some(t) = answer
+                        .or_else(|| out.display_text())
+                        .filter(|text| !text.is_empty())
+                    {
                         turn_text.push_str("Assistant: ");
                         turn_text.push_str(&t);
                         turn_text.push('\n');
