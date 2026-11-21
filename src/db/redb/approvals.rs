@@ -200,8 +200,7 @@ impl Batch {
         text: String,
     ) -> Result<Appended, BatchError> {
         use crate::db::entities::{
-            ComposerContextId, MutableJobContent, MutableJobInput, RequestFingerprint, Submission,
-            SubmissionKey,
+            MutableJobContent, MutableJobInput, RequestFingerprint, Submission, SubmissionKey,
         };
         let Some(asked) = self.mutable_job(approval.job)? else {
             return self.reject(Violation::InvalidValue(
@@ -235,17 +234,16 @@ impl Batch {
                 fingerprint: RequestFingerprint::from_digest(digest),
             }
         };
-        let context = ComposerContextId::new(self.next_id()?);
-        let id = self.create_unsubmitted_job(
-            context,
+        // Answering a card continues the tool call. Only a message typed into the child
+        // should keep that conversation open after the continuation finishes.
+        let turn = self.host_turn(
+            asked.parent_id,
             input,
             submission(b"create"),
-            Some(asked.parent_id),
-            None,
+            submission(b"submit"),
         )?;
-        let created = self.submit_mutable_job(id, 1, submission(b"submit"))?;
         Ok(Appended {
-            turn: created.id,
+            turn,
             seq: 1,
             joined: false,
         })
@@ -713,6 +711,10 @@ pub(crate) fn read_cards(
         let (origin, project) = (row.origin, row.project);
         let parent = row.parent_id.map(|id| id.to_string());
         if origin != Origin::System {
+            let waiting = super::job_tree::waiting_child_reports(&rx, conversation)?;
+            if !waiting.is_empty() {
+                cards.push(json!({"kind": "paused", "conversation": conversation.to_string(), "parent": parent, "waiting": waiting}));
+            }
             for entry in rx.open_table(OPEN_APPROVALS)?.range(
                 (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
             )? {

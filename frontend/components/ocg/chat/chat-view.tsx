@@ -355,6 +355,69 @@ function ConversationQuestion(props: {
   );
 }
 
+function PausedReportCard(props: {
+  card: Extract<ConversationCard, { kind: "paused" }>;
+  onOpen: (conversation: string) => void;
+}) {
+  const { api } = useOcgRuntime();
+  const i18n = useI18n();
+  const [limit, setLimit] = createSignal<number>();
+  const [error, setError] = createSignal<string | null>(null);
+  const [titles, setTitles] = createSignal(new Map<string, string>());
+  const [pages, setPages] = createSignal(1);
+  const parent = createMemo(() => props.card.conversation);
+  const oldest = createMemo(() =>
+    props.card.waiting.reduce<string | undefined>(
+      (first, id) => (first === undefined || id < first ? id : first),
+      undefined,
+    ),
+  );
+  useConversationError(error);
+  createEffect(parent, (id) => {
+    if (!api) return;
+    const controller = new AbortController();
+    void api.readConversationLimits(id, controller.signal).then(
+      (limits) => {
+        if (!controller.signal.aborted) setLimit(limits.max_auto_turns);
+      },
+      (cause) => {
+        if (!controller.signal.aborted) setError(String(cause));
+      },
+    );
+    return () => controller.abort();
+  });
+  createEffect(
+    () => [parent(), oldest(), pages()] as const,
+    ([id, first, count]) =>
+      api?.subscribeChildren(
+        id,
+        count,
+        (page) => {
+          setTitles(new Map(page.children.map((child) => [child.id, child.title])));
+          if (first && page.next_before && first < page.next_before) setPages(count + 1);
+        },
+        (cause) => setError(cause instanceof Error ? cause.message : String(cause)),
+      ),
+  );
+  return (
+    <div class="rounded-xl border border-border bg-card p-4 text-sm">
+      <p class="font-medium">
+        {limit() === undefined
+          ? i18n.t("chat.card.paused")
+          : i18n.t("chat.card.pausedAfter", { count: limit()! })}
+      </p>
+      <p>{i18n.t("chat.card.resumeReports")}</p>
+      <For each={props.card.waiting} keyed>
+        {(id) => (
+          <Button size="xs" variant="outline" onClick={() => props.onOpen(id)}>
+            {titles().get(id) || id}
+          </Button>
+        )}
+      </For>
+    </div>
+  );
+}
+
 export function ConversationCardStrip(props: {
   turn?: string;
   conversationId?: string;
@@ -515,7 +578,12 @@ export function ConversationCardStrip(props: {
             </Button>
           </div>
         )}
-        <For each={groupedCards().get(id)?.cards} keyed={(card) => card.approval.join(":")}>
+        <For
+          each={groupedCards().get(id)?.cards}
+          keyed={(card) =>
+            card.kind === "paused" ? "paused:" + card.conversation : card.approval.join(":")
+          }
+        >
           {(card) => {
             function ofKind<K extends ConversationCard["kind"]>(kind: K) {
               const current = card();
@@ -526,6 +594,9 @@ export function ConversationCardStrip(props: {
             const reject = () => void act(card(), { decision: "reject" });
             return (
               <Switch>
+                <Match when={ofKind("paused")}>
+                  {(paused) => <PausedReportCard card={paused()} onOpen={props.onOpen} />}
+                </Match>
                 <Match when={ofKind("approval")}>
                   {(approval) => (
                     <ApprovalRequest

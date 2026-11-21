@@ -11,8 +11,8 @@ use crate::db::entities::{
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::schema::{
-    CHILD_GROUPS, CHILDREN, CONVERSATIONS, JOB_OUTPUTS, JOBS, LIVE_CHILDREN, RECURRENCES,
-    RETRY_JOBS, TOOL_CALLS, TURNS,
+    CHILD_GROUPS, CHILDREN, CONVERSATIONS, DRAFT_CONTEXTS, JOB_OUTPUTS, JOBS, LIVE_CHILDREN,
+    OPEN_APPROVALS, RECURRENCES, RETRY_JOBS, TOOL_CALLS, TURNS,
 };
 use crate::db::redb::{rows, state};
 use ::redb::ReadableTable;
@@ -51,6 +51,7 @@ struct ChildResult {
 
 enum ReportTurn {
     Skip,
+    AtLimit,
     Permanent(Violation),
     WaitForConfiguration,
     InvalidInput(Violation),
@@ -162,7 +163,12 @@ impl Batch {
         }
         let mut lifecycle = self.job_lifecycle(conversation)?;
         lifecycle.limits = Some(limits);
-        self.put_job_lifecycle(conversation, &lifecycle)
+        self.put_job_lifecycle(conversation, &lifecycle)?;
+        // Descendants inherit tighter limits from their ancestors.
+        for parent in self.live_subtree(conversation)? {
+            self.flush_child_reports(parent)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn unsettled_turns(
@@ -503,7 +509,14 @@ impl Batch {
             running.extend(tokens);
         }
         for current in subtree.into_iter().rev() {
+            let was_open = self.require_job_state(current)?.outcome.is_none();
             self.settle_closing(current)?;
+            if was_open
+                && self.require_job_state(current)?.outcome.is_some()
+                && let Some(parent) = self.require_mutable_conversation(current)?.parent_id
+            {
+                self.report_settled_child(parent, current)?;
+            }
         }
         Ok(JobAction {
             conversation,
@@ -798,6 +811,7 @@ impl Batch {
         });
         lifecycle.loop_count = 0;
         self.put_job_lifecycle(conversation, &lifecycle)?;
+        self.flush_child_reports(conversation)?;
         if unhold
             && matches!(by, Actor::User)
             && let Some(rec) = self.get(RECURRENCES, conversation.get(), Recurrence::decode)?
@@ -1058,7 +1072,7 @@ impl Batch {
             .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
             || !self.live_children(conversation)?.is_empty()
             || !self.unsettled_non_turn_jobs(conversation)?.is_empty()
-            || self.has_open_job_approvals(conversation)?
+            || self.step(|tx| has_open_approvals(tx, conversation))?
         {
             return Ok(());
         }
@@ -1131,19 +1145,14 @@ impl Batch {
             results,
             turn,
         } = report;
-        if matches!(
-            turn,
-            ReportTurn::WaitForConfiguration | ReportTurn::InvalidInput(_)
-        ) {
-            return Ok(0);
-        }
-        for result in &results {
-            let mut lifecycle = self.job_lifecycle(result.child)?;
-            lifecycle.reported = Some(result.head);
-            self.put_job_lifecycle(result.child, &lifecycle)?;
-        }
         match turn {
+            ReportTurn::AtLimit
+            | ReportTurn::WaitForConfiguration
+            | ReportTurn::InvalidInput(_) => return Ok(0),
             ReportTurn::Post(input) => {
+                if self.step(|tx| has_current_draft(tx, parent))? {
+                    return Ok(0);
+                }
                 let marker = results
                     .iter()
                     .fold(0u32, |marker, r| marker ^ r.head.get() as u32);
@@ -1160,7 +1169,12 @@ impl Batch {
             ReportTurn::Permanent(reason) => {
                 log::warn!("child results for parent {parent} remain on the child cards: {reason}")
             }
-            ReportTurn::Skip | ReportTurn::WaitForConfiguration | ReportTurn::InvalidInput(_) => {}
+            ReportTurn::Skip => {}
+        }
+        for result in &results {
+            let mut lifecycle = self.job_lifecycle(result.child)?;
+            lifecycle.reported = Some(result.head);
+            self.put_job_lifecycle(result.child, &lifecycle)?;
         }
         Ok(results.len())
     }
@@ -1190,6 +1204,18 @@ impl Batch {
         }
     }
 
+    pub(crate) fn flush_child_reports(&mut self, parent: JobId) -> Result<(), BatchError> {
+        let mut before = None;
+        loop {
+            let (children, next) = self.step(|tx| unreported_calls(tx, parent, before))?;
+            for child in children {
+                self.retry_child_report(parent, child)?;
+            }
+            let Some(cursor) = next else { return Ok(()) };
+            before = Some(cursor);
+        }
+    }
+
     pub(crate) fn settle_child_turns(&mut self, turns: &[JobId]) -> Result<usize, BatchError> {
         let mut settled = 0;
         for turn in turns {
@@ -1202,25 +1228,7 @@ impl Batch {
 
     pub(crate) fn idle_worker(&mut self, caller: JobId, worker: JobId) -> Result<bool, BatchError> {
         let row = self.require_mutable_conversation(worker)?;
-        if row.parent_id != Some(caller)
-            || !matches!(row.origin, Origin::Agent { .. })
-            || !row.keep_open
-        {
-            return Ok(false);
-        }
-        let lifecycle = self.job_lifecycle(worker)?;
-        if lifecycle.closing.is_some()
-            || lifecycle.on_hold.is_some()
-            || lifecycle.user_input
-            || self.require_job_state(worker)?.outcome.is_some()
-            || !self.unsettled_turns(worker)?.is_empty()
-        {
-            return Ok(false);
-        }
-        match self.group_head(worker)? {
-            Some(head) => Ok(self.require_job_state(head)?.outcome.is_some()),
-            None => Ok(false),
-        }
+        self.step(|tx| idle_worker(tx, caller, &row))
     }
 
     pub(crate) fn frozen_agent_manages_jobs(
@@ -1343,6 +1351,132 @@ fn call_siblings(
     Ok(siblings)
 }
 
+fn has_open_approvals(tx: &impl TxRead, conversation: JobId) -> Result<bool, StorageError> {
+    Ok(tx
+        .table(OPEN_APPROVALS)?
+        .range((conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX))?
+        .next()
+        .transpose()?
+        .is_some())
+}
+
+fn idle_worker(tx: &impl TxRead, caller: JobId, row: &JobSpec) -> Result<bool, StorageError> {
+    if row.parent_id != Some(caller)
+        || !matches!(row.origin, Origin::Agent { .. })
+        || !row.keep_open
+    {
+        return Ok(false);
+    }
+    let runtime = state::require(tx, row.id)?;
+    if runtime.lifecycle.closing.is_some()
+        || runtime.lifecycle.on_hold.is_some()
+        || runtime.lifecycle.user_input
+        || runtime.state.outcome.is_some()
+        || has_open_approvals(tx, row.id)?
+    {
+        return Ok(false);
+    }
+    // unsettled_turns is the suffix ending at the head. A settled head has no such suffix.
+    match turn_head(tx, row.id)? {
+        Some(head) => Ok(state::require(tx, head)?.state.outcome.is_some()),
+        None => Ok(false),
+    }
+}
+
+fn waiting_on_child(tx: &impl TxRead, conversation: JobId) -> Result<bool, StorageError> {
+    for entry in tx
+        .table(LIVE_CHILDREN)?
+        .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
+    {
+        let child = conversation_row(tx, JobId::new(entry?.0.value().1))?;
+        if !idle_worker(tx, conversation, &child)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// A report must not move the head on which an unsubmitted user message is based.
+fn has_current_draft(tx: &impl TxRead, parent: JobId) -> Result<bool, StorageError> {
+    let head = turn_head(tx, parent)?;
+    for entry in tx.table(DRAFT_CONTEXTS)?.iter()? {
+        let draft = jobs::mutable_job_in(tx, JobId::new(entry?.1.value()))?
+            .ok_or_else(|| StorageError::corrupted("draft context references a missing Job"))?;
+        if draft.parent_id == parent && draft.previous == head {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// Return one unreported representative per call, newest first. Siblings from one call are contiguous.
+fn unreported_calls(
+    tx: &impl TxRead,
+    parent: JobId,
+    before: Option<u128>,
+) -> Result<(Vec<JobId>, Option<u128>), StorageError> {
+    use std::ops::Bound::{Excluded, Included};
+    let end = before.map_or(Included((parent.get(), u128::MAX)), |id| {
+        Excluded((parent.get(), id))
+    });
+    let mut children = Vec::new();
+    let mut last_call = None;
+    let mut count = 0;
+    let mut last = None;
+    for entry in tx
+        .table(CHILD_GROUPS)?
+        .range((Included((parent.get(), 0)), end))?
+        .rev()
+        .take(MAX_CHILD_SCAN)
+    {
+        let child = JobId::new(entry?.0.value().1);
+        count += 1;
+        last = Some(child.get());
+        let Origin::Agent { call } = conversation_row(tx, child)?.origin else {
+            continue;
+        };
+        if last_call != Some(call)
+            && let Some(head) = turn_head(tx, child)?
+            && state::require(tx, child)?.lifecycle.reported != Some(head)
+        {
+            last_call = Some(call);
+            children.push(child);
+        }
+    }
+    Ok((children, last.filter(|_| count == MAX_CHILD_SCAN)))
+}
+
+pub(super) fn waiting_child_reports(
+    tx: &impl TxRead,
+    parent: JobId,
+) -> Result<Vec<JobId>, StorageError> {
+    let mut waiting = Vec::new();
+    let mut has_draft = None;
+    for child in unreported_calls(tx, parent, None)?.0 {
+        let Some(report) = collect_child_report(tx, parent, child)? else {
+            continue;
+        };
+        match report.turn {
+            ReportTurn::AtLimit => {}
+            ReportTurn::Post(_) => {
+                let blocked = match has_draft {
+                    Some(blocked) => blocked,
+                    None => *has_draft.insert(has_current_draft(tx, parent)?),
+                };
+                if blocked {
+                    continue;
+                }
+            }
+            ReportTurn::Skip
+            | ReportTurn::Permanent(_)
+            | ReportTurn::WaitForConfiguration
+            | ReportTurn::InvalidInput(_) => continue,
+        }
+        waiting.extend(report.results.into_iter().map(|result| result.child));
+    }
+    Ok(waiting)
+}
+
 fn collect_child_report(
     tx: &impl TxRead,
     parent: JobId,
@@ -1359,7 +1493,10 @@ fn collect_child_report(
         let Some(outcome) = state::require(tx, head)?.state.outcome else {
             return Ok(None);
         };
-        if outcome.kind == OutcomeKind::Unknown {
+        if outcome.kind == OutcomeKind::Unknown
+            || has_open_approvals(tx, child)?
+            || waiting_on_child(tx, child)?
+        {
             return Ok(None);
         }
         let lifecycle = state::require(tx, child)?.lifecycle;
@@ -1454,7 +1591,7 @@ fn child_report_turn(
     let (limits, _) = reads::conversations::conversation_limits(tx, parent)?
         .ok_or_else(|| StorageError::corrupted("child report ancestor is missing"))?;
     if runtime.lifecycle.loop_count >= limits.max_auto_turns {
-        return Ok(ReportTurn::Skip);
+        return Ok(ReportTurn::AtLimit);
     }
     let previous = turn_head(tx, parent)?;
     let head = previous
@@ -1521,8 +1658,12 @@ pub(crate) fn read_child_report_page(
         }
         if let Some(report) = collect_child_report(&tx, parent, child)? {
             match report.turn {
-                // All calls on this parent would use the same unavailable configuration.
-                ReportTurn::WaitForConfiguration => next = Some((parent.get(), u128::MAX)),
+                ReportTurn::Post(_) if has_current_draft(&tx, parent)? => {
+                    next = Some((parent.get(), u128::MAX))
+                }
+                ReportTurn::AtLimit | ReportTurn::WaitForConfiguration => {
+                    next = Some((parent.get(), u128::MAX))
+                }
                 ReportTurn::InvalidInput(_) => {}
                 ReportTurn::Skip | ReportTurn::Permanent(_) | ReportTurn::Post(_) => {
                     // Re-read the parent head and loop count after each settlement.

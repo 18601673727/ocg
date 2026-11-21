@@ -268,12 +268,13 @@ impl DatabaseHandle {
             OperationKind::Open,
             |batch, (context, id, revision, input, submission)| {
                 batch.require_mutable_job_context(context, id)?;
-                match input {
+                let job = match input {
                     Some(input) => {
                         batch.submit_mutable_job_with_input(id, revision, input, submission)
                     }
                     None => batch.submit_mutable_job(id, revision, submission),
                 }?;
+                batch.flush_child_reports(job.parent_id)?;
                 batch.read_mutable_job(id)?.ok_or_else(|| {
                     redb::BatchError(redb::Failure::Storage(redb::StorageError::corrupted(
                         "submitted mutable Job is missing",

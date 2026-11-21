@@ -181,6 +181,10 @@ const en = {
   "chat.card.commandCapacity":
     "The Project command list is full. Remove an active command in Settings → Projects and save, then retry; or reject this request.",
   "chat.card.cards": "Needs your attention",
+  "chat.card.paused": "Automatic replies paused",
+  "chat.card.pausedAfter": "The agent paused after {count} automatic turns.",
+  "chat.card.resumeReports":
+    "Send your next message to continue with the results from these children.",
   "chat.card.approve": "Approve",
   "chat.card.reject": "Reject",
   "chat.card.answer": "Send answer",
@@ -1512,6 +1516,9 @@ const zh: Dictionary = {
   "chat.card.commandCapacity":
     "项目命令列表已满。请到设置 → 项目中移除一个活动命令并保存后重试，或拒绝此请求。",
   "chat.card.cards": "需要您处理",
+  "chat.card.paused": "已暂停自动回复",
+  "chat.card.pausedAfter": "智能体在 {count} 轮自动回复后暂停。",
+  "chat.card.resumeReports": "发送下一条消息，即可继续处理以下子对话的结果。",
   "chat.card.approve": "批准",
   "chat.card.reject": "拒绝",
   "chat.card.answer": "发送回答",

@@ -421,6 +421,11 @@ pub(crate) struct ApprovalAssessmentView {
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(rename = "Card")]
 pub(crate) enum CardView {
+    Paused {
+        conversation: String,
+        parent: Option<String>,
+        waiting: Vec<String>,
+    },
     Dispatch {
         conversation: String,
         parent: Option<String>,

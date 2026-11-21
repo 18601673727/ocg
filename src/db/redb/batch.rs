@@ -5,7 +5,7 @@ use crate::db::redb::reads::read;
 use crate::db::redb::recovery::allocate;
 use crate::db::redb::rows::{decode_tool_evidence, tool_call_key};
 use crate::db::redb::schema::{
-    JOB_EVENTS, JOB_RUNTIME, JOBS, OPEN_APPROVALS, POOL_ALLOCATIONS, SUBMISSIONS, TOOL_CALLS,
+    JOB_EVENTS, JOB_RUNTIME, JOBS, POOL_ALLOCATIONS, SUBMISSIONS, TOOL_CALLS,
 };
 use crate::db::redb::{allocations, state};
 use ::redb::{
@@ -412,16 +412,6 @@ impl Batch {
 impl Batch {
     pub(crate) fn wake_scheduler(&mut self) {
         self.touched_ready_or_delayed = true;
-    }
-    pub(crate) fn has_open_job_approvals(&mut self, group: JobId) -> Result<bool, BatchError> {
-        self.step(|tx| {
-            Ok(tx
-                .open_table(OPEN_APPROVALS)?
-                .range((group.get(), 0, 0, 0)..=(group.get(), u128::MAX, u32::MAX, u32::MAX))?
-                .next()
-                .transpose()?
-                .is_some())
-        })
     }
 }
 
