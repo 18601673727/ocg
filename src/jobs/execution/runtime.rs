@@ -570,7 +570,7 @@ async fn settle_tool_stop(
             .await?;
         return Err(DatabaseError::Rejected(Violation::InvalidValue(
             "execution",
-            "the tool loop stopped with a call's effect unknown; ownership remains held as Uncertain",
+            "the tool loop stopped with a call's effect unknown; the outcome is unknown",
         )));
     }
     let result = FinalResult {
@@ -884,10 +884,10 @@ async fn settle_development_error(
                 "execution",
                 match cancellation {
                     Some(CancellationReason::HostShutdown) => {
-                        "host shut down after the request may have been sent; ownership remains held as Uncertain"
+                        "host shut down after the request may have been sent; the outcome is unknown"
                     }
                     Some(CancellationReason::Deadline) => {
-                        "dispatch deadline expired after the request may have been sent; ownership remains held as Uncertain"
+                        "dispatch deadline expired after the request may have been sent; the outcome is unknown"
                     }
                     Some(
                         CancellationReason::UserStop
@@ -895,7 +895,7 @@ async fn settle_development_error(
                         | CancellationReason::EvidenceUnavailable,
                     )
                     | None => {
-                        "provider exchange did not return a supported result; ownership remains held as Uncertain"
+                        "provider exchange did not return a supported result; the outcome is unknown"
                     }
                 },
             )))
@@ -922,7 +922,7 @@ async fn settle_development_unsent(
             .await?;
         return Err(DatabaseError::Rejected(Violation::InvalidValue(
             "execution",
-            "the tool loop was interrupted after a request; ownership remains held as Uncertain",
+            "the tool loop was interrupted after a request; the outcome is unknown",
         )));
     }
     let (code, message) = match cancellation {

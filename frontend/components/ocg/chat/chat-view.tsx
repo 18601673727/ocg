@@ -46,64 +46,63 @@ function ChildConversationCard(props: {
   onAct: (child: ChildConversation, action: "stop" | "close" | "hold" | "unhold") => Promise<void>;
 }) {
   const i18n = useI18n();
-  const [detail, setDetail] = createSignal<Awaited<ReturnType<ApiClient["readJobDetails"]>> | null>(
-    null,
-  );
-  const [model, setModel] = createSignal<string | null>(null);
+  const [preview, setPreview] = createSignal<{ model?: string; text: string }>();
   const [error, setError] = createSignal<string | null>(null);
-  const [modelError, setModelError] = createSignal<string | null>(null);
   useConversationError(error, () => props.child.id);
-  useConversationError(modelError, () => props.child.id);
-  const phase = createMemo(() => props.child.recurrence?.phase);
-  const due = createMemo(() => props.child.recurrence?.due_us);
   createEffect(
-    () => [props.api, props.child.id, props.child.state, phase(), due()],
+    () => [
+      props.api,
+      props.child.id,
+      props.child.state,
+      props.child.job_state,
+      props.child.recurrence?.phase,
+      props.child.recurrence?.due_us,
+    ],
     () => {
       const controller = new AbortController();
-      void props.api
-        .readJobDetails(props.child.id, controller.signal)
-        .then((result) => {
-          if (!controller.signal.aborted) {
-            setDetail(result);
-            setError(null);
+      const { signal } = controller;
+      const load = async () => {
+        let before: string | undefined;
+        let model: string | undefined;
+        do {
+          const page = await props.api.readConversationTurns(
+            props.child.id,
+            before,
+            before ? 10 : 1,
+            signal,
+          );
+          for (const turn of page.turns) {
+            if (turn.planning_target) continue;
+            model ??= turn.input.configuration?.model;
+            const result = turn.outputs.find((output) => output.kind === "result");
+            let text = outputDisplayText(result);
+            if (!result && (turn.outputs_truncated || turn.job.settlement.state === "unknown")) {
+              const detail = await props.api.readJobDetails(turn.job.id, signal);
+              text = outputDisplayText(detail.result) || detail.unknown_reason || "";
+            }
+            if (text || props.child.state !== "settled") return { model, text };
           }
-        })
-        .catch((cause) => {
-          if (!controller.signal.aborted)
-            setError(cause instanceof Error ? cause.message : String(cause));
-        });
+          before = page.next_before ?? undefined;
+        } while (before);
+        return { model, text: "" };
+      };
+      setPreview(undefined);
+      setError(null);
+      void load().then(
+        (result) => {
+          if (!signal.aborted) setPreview(result);
+        },
+        (cause) => {
+          if (!signal.aborted) setError(cause instanceof Error ? cause.message : String(cause));
+        },
+      );
       return () => controller.abort();
     },
   );
-  createEffect(
-    () => [props.api, props.child.id, props.child.state, props.child.job_state, phase(), due()],
-    () => {
-      const controller = new AbortController();
-      void props.api
-        .readConversationTurns(props.child.id, undefined, 1, controller.signal)
-        .then((result) => {
-          if (!controller.signal.aborted) {
-            setModel(result.turns[0]?.input.configuration?.model ?? null);
-            setModelError(null);
-          }
-        })
-        .catch((cause) => {
-          if (!controller.signal.aborted)
-            setModelError(cause instanceof Error ? cause.message : String(cause));
-        });
-      return () => controller.abort();
-    },
-  );
-  const state = createMemo(() => detail()?.settlement.state);
-  const status = createMemo(() => {
-    const current = state();
-    return current && current !== "unsettled"
-      ? i18n.t(`state.${current}`)
-      : i18n.t(`chat.child.${props.child.state}`);
-  });
+  const status = createMemo(() => i18n.t(`chat.child.${props.child.state}`));
   const title = createMemo(() => props.child.title || i18n.t("chat.child.untitled"));
   const summary = createMemo(() =>
-    outputDisplayText(detail()?.result)
+    (preview()?.text ?? "")
       .trim()
       .split(/\n+/)[0]
       ?.replace(/^#{1,6}\s*/, "")
@@ -128,16 +127,20 @@ function ChildConversationCard(props: {
         </span>
         <span class="block text-muted-foreground">
           {props.agentName || i18n.t("chat.agent")}
-          {model() ? ` · ${model()}` : ""} · {status()}
+          {preview()?.model ? ` · ${preview()!.model}` : ""} · {status()}
           {props.child.on_hold
             ? ` · ${i18n.t(`chat.child.hold.${props.child.on_hold.by.kind}`)}`
             : ""}
         </span>
         <span class="line-clamp-3 text-muted-foreground">
           {summary() ||
-            detail()?.unknown_reason ||
+            error() ||
             i18n.t(
-              props.child.state === "settled" ? "chat.child.noResult" : "chat.child.pendingResult",
+              !preview()
+                ? "common.loading"
+                : props.child.state === "settled"
+                  ? "chat.child.noResult"
+                  : "chat.child.pendingResult",
             )}
         </span>
       </div>

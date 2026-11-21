@@ -544,6 +544,7 @@ impl Batch {
             || !self.unsettled_turns(conversation)?.is_empty()
             || !self.live_children(conversation)?.is_empty()
             || !self.unsettled_non_turn_jobs(conversation)?.is_empty()
+            || self.step(|tx| super::recovery::group_holds_capacity(tx, conversation))?
         {
             return Ok(());
         }
@@ -552,12 +553,6 @@ impl Batch {
             Some(head) => self.require_job_state(head.id)?.outcome,
             None => None,
         };
-        if answered
-            .as_ref()
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
-        {
-            return Ok(());
-        }
         let kept = answered.filter(|outcome| {
             !closing.running
                 && outcome.kind == OutcomeKind::Completed
@@ -570,7 +565,11 @@ impl Batch {
                 at: self.now,
                 cause: Some(OutcomeCause::Closed),
             }),
-        )
+        )?;
+        if let Some(parent) = spec.parent_id {
+            self.settle_closing(parent)?;
+        }
+        Ok(())
     }
 
     fn record_conversation_outcome(
@@ -1031,10 +1030,11 @@ impl Batch {
         if spec.is_chunk_group() || turn.summary_source.is_some() {
             return Ok(false);
         }
-        let Some(parent) = spec.parent_id else {
+        let Some(outcome) = self.require_job_state(job)?.outcome else {
             return Ok(false);
         };
-        let Some(outcome) = self.require_job_state(job)?.outcome else {
+        self.settle_closing(conversation)?;
+        let Some(parent) = spec.parent_id else {
             return Ok(false);
         };
         if outcome.kind == OutcomeKind::Unknown {
@@ -1044,9 +1044,7 @@ impl Batch {
         let is_head = self.group_head(conversation)? == Some(job);
         if is_head {
             let lifecycle = self.job_lifecycle(conversation)?;
-            if lifecycle.closing.is_some() {
-                self.settle_closing(conversation)?;
-            } else {
+            if lifecycle.closing.is_none() {
                 self.auto_close_if_done(conversation)?;
             }
             self.end_impossible_dependents(parent, conversation)?;

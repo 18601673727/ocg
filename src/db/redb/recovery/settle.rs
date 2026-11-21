@@ -391,7 +391,10 @@ fn finish_closing_groups(
 }
 
 /// Whether any member of `group` still owns capacity in this transaction.
-fn group_holds_capacity(tx: &::redb::WriteTransaction, group: JobId) -> Result<bool, StorageError> {
+pub(crate) fn group_holds_capacity(
+    tx: &::redb::WriteTransaction,
+    group: JobId,
+) -> Result<bool, StorageError> {
     let children = tx.open_table(CHILDREN)?;
     let allocations = tx.open_table(POOL_ALLOCATIONS)?;
     for entry in children.range((group.get(), 0)..=(group.get(), u128::MAX))? {

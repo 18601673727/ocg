@@ -1060,10 +1060,10 @@ impl Batch {
             return Ok(false);
         }
         let allocation = self.allocation_for_token(token)?;
-        if allocation.job_revision != revision || token.epoch >= self.epoch {
+        if allocation.job_revision != revision {
             return self.reject(Violation::InvalidValue(
                 "allocation",
-                "the allocation revision or epoch does not match an interrupted job",
+                "the allocation revision does not match the interrupted job",
             ));
         }
         if allocation.phase == AllocationPhase::Released {
@@ -1076,6 +1076,7 @@ impl Batch {
             ));
         }
         self.release_with_proof(allocation, proof)?;
+        self.child_turn_settled(token.job)?;
         Ok(true)
     }
 

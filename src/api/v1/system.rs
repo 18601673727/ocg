@@ -123,7 +123,7 @@ pub(super) async fn health(
                             epoch: allocation.allocation.token.epoch,
                             generation: allocation.allocation.token.generation.get(),
                             job_revision: allocation.allocation.job_revision,
-                            releasable: allocation.allocation.token.epoch < database.open_epoch(),
+                            releasable: allocation.allocation.stop_proof.is_none(),
                             evidence: allocation.evidence,
                             since: allocation.since.as_unix_micros(),
                         })

@@ -219,7 +219,7 @@ function ImportContent(props: {
     }
   }
   return (
-    <div class="flex h-[70dvh] min-h-[32rem] flex-col gap-6">
+    <div class="flex min-w-0 flex-col gap-6 md:h-[70dvh] md:min-h-[32rem]">
       <Dialog
         open={removing() !== null}
         onOpenChange={(open) => {
@@ -267,11 +267,11 @@ function ImportContent(props: {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-      <div class="grid min-h-0 flex-1 grid-cols-[14rem_minmax(0,1fr)] gap-5 overflow-hidden">
+      <div class="grid min-h-0 flex-1 grid-cols-1 gap-5 md:grid-cols-[14rem_minmax(0,1fr)] md:overflow-hidden">
         <div
           role="group"
           aria-label={i18n.t("settings.llm.provider")}
-          class="ocg-subtle-scrollbar flex min-h-0 min-w-0 flex-col gap-2 overflow-y-auto overscroll-contain border-r border-border pr-4"
+          class="ocg-subtle-scrollbar flex min-h-0 min-w-0 flex-col gap-2 overflow-y-auto overscroll-contain border-b border-border pb-4 md:border-r md:border-b-0 md:pr-4 md:pb-0"
         >
           {providers().map((entry) => {
             const id = entry.id;
@@ -327,7 +327,7 @@ function ImportContent(props: {
             {i18n.t("settings.llm.newProvider")}
           </Button>
         </div>
-        <div class="flex min-h-0 min-w-0 flex-col gap-3 overflow-hidden">
+        <div class="flex min-h-0 min-w-0 flex-col gap-3 md:overflow-hidden">
           {sourceId() === "new" && (
             <div class="grid shrink-0 grid-cols-1 gap-3 sm:grid-cols-2">
               <ProtocolSelect
@@ -413,7 +413,7 @@ function ImportContent(props: {
           </div>
           <div
             aria-busy={ariaState(loading())}
-            class="ocg-subtle-scrollbar min-h-24 min-w-0 flex-1 overflow-y-auto overscroll-contain rounded-md border border-border"
+            class="ocg-subtle-scrollbar max-h-80 min-h-24 min-w-0 flex-1 overflow-y-auto md:max-h-none overscroll-contain rounded-md border border-border"
           >
             {loading() ? (
               <p role="status" class="p-3 text-muted-foreground">
@@ -437,7 +437,7 @@ function ImportContent(props: {
                       })
                     }
                   />
-                  <span class="min-w-0 flex-1 break-all">
+                  <span class="min-w-0 flex-1 break-words">
                     {model.id}
                     <span class="mt-1 block text-xs text-muted-foreground">
                       {i18n.t("chat.effort")}:{" "}

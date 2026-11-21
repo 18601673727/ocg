@@ -1139,7 +1139,7 @@ export function createApiClient(options: ApiClientOptions) {
           signal.throwIfAborted();
           const previouslyUnavailable = locksUnavailable;
           const locks = browserLocks();
-          if (!previouslyUnavailable && locksUnavailable) restartSidebar();
+          if (!previouslyUnavailable && locksUnavailable) restartSidebar(true);
           if (locks) {
             let entered = false;
             try {
@@ -1150,7 +1150,7 @@ export function createApiClient(options: ApiClientOptions) {
             } catch (error) {
               if (signal.aborted || entered) throw error;
               locksUnavailable = true;
-              restartSidebar();
+              restartSidebar(true);
               outcome = await runAttempt();
             }
           } else outcome = await runAttempt();
@@ -1180,7 +1180,9 @@ export function createApiClient(options: ApiClientOptions) {
   const sidebarObservers = new Set<Observer<Conversations>>();
   const projectObservers = new Set<Observer<Projects>>();
   const childObservers = new Map<string, Map<Observer<Children>, number>>();
+  const latestChildren = new Map<string, Children>();
   let stopSidebar: (() => void) | undefined;
+  let sidebarQuery: string | undefined;
   let restartPending = false;
   let latestProjects: Projects | undefined;
   let latestConversations: Conversations | undefined;
@@ -1296,7 +1298,7 @@ export function createApiClient(options: ApiClientOptions) {
             if (page.children.some((child) => child.origin !== "system")) visiblePages++;
             if (!page.has_more || visiblePages >= maxPages) {
               if (signal.aborted) return;
-              observers.forEach((_, observer) => observer.receive({ ...page, children }));
+              publishChildren(id, { ...page, children });
               break;
             }
             childBefore = advance(childBefore, page.next_before);
@@ -1327,15 +1329,35 @@ export function createApiClient(options: ApiClientOptions) {
     };
   }
 
-  function restartSidebar() {
+  function publishChildren(id: string, page: Children) {
+    const observers = childObservers.get(id);
+    if (!observers) return;
+    latestChildren.set(id, page);
+    observers.forEach((_, observer) => observer.receive(page));
+  }
+
+  function restartSidebar(force = false) {
+    if (force) sidebarQuery = undefined;
     if (restartPending) return;
     restartPending = true;
     queueMicrotask(() => {
       restartPending = false;
+      const watching =
+        !closed && (sidebarObservers.size || projectObservers.size || childObservers.size);
+      const query = watching
+        ? [...childObservers]
+            .map(([id, observers]) => `child=${jobIdentity(id)}:${Math.max(...observers.values())}`)
+            .sort()
+            .join("&")
+        : undefined;
+      if (query !== undefined && query === sidebarQuery) return;
+      sidebarQuery = query;
       stopSidebar?.();
       stopSidebar = undefined;
-      if (closed || !(sidebarObservers.size || projectObservers.size || childObservers.size))
-        return;
+      for (const id of latestChildren.keys()) {
+        if (!childObservers.has(id)) latestChildren.delete(id);
+      }
+      if (query === undefined) return;
       if (!programmatic && !browserLocks()) {
         stopSidebar = finiteSidebar();
         return;
@@ -1343,9 +1365,6 @@ export function createApiClient(options: ApiClientOptions) {
       let conversations: Conversations["conversations"] = [];
       let projects: Projects["projects"] = [];
       const children = new Map<string, Children["children"]>();
-      const query = [...childObservers]
-        .map(([id, observers]) => `child=${jobIdentity(id)}:${Math.max(...observers.values())}`)
-        .join("&");
       stopSidebar = subscribeSnapshots(
         `/api/v1/sidebar/events${query ? `?${query}` : ""}`,
         (snapshot) => {
@@ -1371,13 +1390,13 @@ export function createApiClient(options: ApiClientOptions) {
               ? page.children
               : [...(children.get(snapshot.key) ?? []), ...page.children];
             children.set(snapshot.key, items);
-            if (snapshot.last)
-              childObservers
-                .get(snapshot.key)
-                ?.forEach((_, observer) => observer.receive({ ...page, children: items }));
+            if (snapshot.last) publishChildren(snapshot.key, { ...page, children: items });
           } else throw new ContractError("snapshot.topic", "a sidebar topic");
         },
         (error) => {
+          if (error instanceof ContractError || (error instanceof ApiError && !error.retryable)) {
+            sidebarQuery = undefined;
+          }
           sidebarObservers.forEach((observer) => observer.error(error));
           projectObservers.forEach((observer) => observer.error(error));
           childObservers.forEach((observers) =>
@@ -1728,6 +1747,8 @@ export function createApiClient(options: ApiClientOptions) {
       const observers = childObservers.get(conversation) ?? new Map<Observer<Children>, number>();
       observers.set(observer, Math.min(Math.max(pages, 1), 100));
       childObservers.set(conversation, observers);
+      const cached = latestChildren.get(conversation);
+      if (cached) receive(cached);
       restartSidebar();
       return () => {
         observers.delete(observer);

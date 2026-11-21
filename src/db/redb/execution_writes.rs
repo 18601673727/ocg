@@ -953,12 +953,23 @@ impl Batch {
         cause: crate::db::entities::UncertaintyReason,
     ) -> Result<(), BatchError> {
         self.require_development_write_for(proof, None)?;
+        let token = proof.token();
         self.transition_pool_allocation(
-            proof.token(),
+            token,
             crate::db::entities::AllocationPhase::Uncertain,
             Some(cause),
         )?;
-        self.probe = Some(Probe::Outcome(proof.token().job));
+        if self
+            .step(|tx| Ok(super::recovery::held::unfinished_commands(tx, token.job)?.is_empty()))?
+        {
+            self.release_uncertain(
+                token,
+                proof.revision(),
+                crate::db::entities::StopProof::Proof,
+                None,
+            )?;
+        }
+        self.probe = Some(Probe::Outcome(token.job));
         Ok(())
     }
 

@@ -197,7 +197,8 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
     if !api {
         return Ok(Destination::Asset);
     }
-    let caller = if session_route
+    let caller = if shared.assets.is_some()
+        && session_route
         && *method == Method::GET
         && headers.get_all(header::AUTHORIZATION).count() == 0
     {
