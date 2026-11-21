@@ -150,7 +150,6 @@ pub enum MutableFrozenConfiguration {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobRetry {
     pub original: JobId,
-    pub by: Actor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -159,6 +158,7 @@ pub struct MutableJob {
     pub parent_id: JobId,
     pub previous: Option<JobId>,
     pub retry: Option<JobRetry>,
+    pub submitted_by: Actor,
     pub composer_context: ComposerContextId,
     pub created_at: Timestamp,
     pub submitted_at: Option<Timestamp>,
@@ -864,7 +864,6 @@ pub(crate) struct JobLifecycle {
     pub(crate) compaction_policy: Option<CompactionPolicy>,
     pub(crate) compaction_revision: u64,
     pub(crate) after: Vec<(JobId, DependencyCondition)>,
-    pub(crate) user_input: bool,
     pub(crate) reported: Option<JobId>,
 }
 

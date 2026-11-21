@@ -315,7 +315,14 @@ pub(super) async fn respond(
                 .transpose()?;
             let submission = submission(request, &body, b"mutable-create-v1", context, None)?;
             let record = database
-                .create_mutable_job(context, convert(input)?, submission, conversation, project)
+                .create_unsubmitted_job(
+                    context,
+                    convert(input)?,
+                    submission,
+                    conversation,
+                    project,
+                    crate::db::entities::Actor::User,
+                )
                 .await
                 .map_err(refusal)?;
             Ok(Reply::new(StatusCode::OK, view(record)))

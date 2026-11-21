@@ -22,6 +22,22 @@ use crate::db::redb::schema::{
 use crate::db::redb::{reads, state};
 use ::redb::ReadableTable;
 
+pub(super) fn recurrence_submission(
+    conv_u128: u128,
+    next_n: u64,
+    label: &[u8],
+) -> crate::db::entities::Submission {
+    let mut ctx = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
+    ctx.update(label);
+    ctx.update(&conv_u128.to_le_bytes());
+    ctx.update(&next_n.to_le_bytes());
+    let digest: [u8; 32] = ctx.finish().as_ref().try_into().unwrap_or([0; 32]);
+    crate::db::entities::Submission {
+        key: crate::db::entities::SubmissionKey::from_digest(digest),
+        fingerprint: crate::db::entities::RequestFingerprint::from_digest(digest),
+    }
+}
+
 impl Batch {
     pub(super) fn read_summary_source<T>(
         &mut self,
@@ -280,6 +296,7 @@ impl Batch {
                     id: pred_id,
                     parent_id: conversation,
                     previous: None,
+                    submitted_by: crate::db::entities::Actor::Auto,
                     retry: None,
                     composer_context: crate::db::entities::ComposerContextId::new(batch.next_id()?),
                     created_at: batch.now,
@@ -576,6 +593,7 @@ impl Batch {
             id: dec_id,
             parent_id: job.parent_id,
             previous: None,
+            submitted_by: crate::db::entities::Actor::Auto,
             retry: None,
             composer_context: ComposerContextId::new(self.next_id()?),
             created_at: self.now,
@@ -846,22 +864,12 @@ impl Batch {
                 }
             };
             let next_n = rec.n.saturating_add(1);
-            let sub = |label: &[u8]| {
-                let mut ctx = aws_lc_rs::digest::Context::new(&aws_lc_rs::digest::SHA256);
-                ctx.update(label);
-                ctx.update(&conv_u128.to_le_bytes());
-                ctx.update(&next_n.to_le_bytes());
-                let digest: [u8; 32] = ctx.finish().as_ref().try_into().unwrap_or([0; 32]);
-                crate::db::entities::Submission {
-                    key: crate::db::entities::SubmissionKey::from_digest(digest),
-                    fingerprint: crate::db::entities::RequestFingerprint::from_digest(digest),
-                }
-            };
             match self.host_turn(
                 conv,
                 super::job_tree::host_input(objective, cfg, priority),
-                sub(b"recurrence-turn-create"),
-                sub(b"recurrence-turn-submit"),
+                recurrence_submission(conv_u128, next_n, b"recurrence-turn-create"),
+                recurrence_submission(conv_u128, next_n, b"recurrence-turn-submit"),
+                crate::db::entities::Actor::Auto,
             ) {
                 Ok(next_turn) => {
                     rec.phase = RecurrencePhase::Active;

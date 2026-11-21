@@ -187,26 +187,22 @@ impl DatabaseHandle {
             .await
     }
 
-    pub(crate) async fn create_mutable_job(
+    pub(crate) async fn create_unsubmitted_job(
         &self,
         context: entities::ComposerContextId,
         input: entities::MutableJobInput,
         creation: Submission,
         conversation: Option<JobId>,
         project: Option<entities::ProjectId>,
+        by: entities::Actor,
     ) -> Result<entities::MutableJobRecord, DatabaseError> {
         self.write_sized(
-            (context, input, creation, conversation, project),
-            |(_, input, _, _, _)| byte_count(input.size_hint()).saturating_add(8192),
+            (context, input, creation, conversation, project, by),
+            |(_, input, _, _, _, _)| byte_count(input.size_hint()).saturating_add(8192),
             OperationKind::CreateJobWithInput,
-            |batch, (context, input, creation, conversation, project)| {
-                let id = batch.create_unsubmitted_job(
-                    context,
-                    input,
-                    creation,
-                    conversation,
-                    project,
-                )?;
+            |batch, (context, input, creation, conversation, project, by)| {
+                let id =
+                    batch.create_job_as(context, input, creation, conversation, project, by)?;
                 match batch.read_mutable_job(id)? {
                     Some(job) => Ok(job),
                     None => batch.corrupted("created mutable Job is missing".to_owned()),

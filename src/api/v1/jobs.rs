@@ -46,6 +46,13 @@ pub(crate) enum ExecutionPhaseView {
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "JobRetry")]
+struct JobRetryView {
+    original: String,
+    by: super::catalog::ActorView,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Job")]
 pub(crate) struct JobView {
     id: String,
@@ -59,6 +66,9 @@ pub(crate) struct JobView {
     execution_mode: String,
     input: String,
     previous: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    retry: Option<JobRetryView>,
     kind: JobKindView,
     conversation: Option<String>,
     assigned_executor: Option<String>,
@@ -264,6 +274,10 @@ pub(super) fn mutable_job_view(
         execution_mode: "once".to_owned(),
         input: job.id.to_string(),
         previous: job.previous.map(|id| id.to_string()),
+        retry: job.retry.as_ref().map(|retry| JobRetryView {
+            original: retry.original.to_string(),
+            by: super::catalog::actor_view(&job.submitted_by),
+        }),
         kind: JobKindView::Turn,
         conversation: Some(job.parent_id.to_string()),
         assigned_executor: allocation

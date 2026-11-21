@@ -82,7 +82,6 @@ impl JobRuntime {
                 DependencyCondition::Settled => 2,
             });
         }
-        e.bool(row.user_input);
         e.ou128(row.reported.map(JobId::get));
         e.opt(self.pending.as_ref(), |e, (dependencies, children)| {
             e.u32(*dependencies);
@@ -94,6 +93,22 @@ impl JobRuntime {
 
     pub(super) fn decode_at(key: u128, bytes: &[u8]) -> DecodeResult<Self> {
         let mut d = Dec::new(bytes, TAG_JOB_RUNTIME)?;
+        let (state, mut lifecycle) = Self::decode_state_and_lifecycle(key, &mut d)?;
+        lifecycle.reported = d.ou128()?.map(JobId::new);
+        let row = Self {
+            state,
+            lifecycle,
+            pending: d.opt(|d| Ok((d.u32()?, d.u32()?)))?,
+            last_result: d.ou128()?.map(JobId::new),
+        };
+        d.end()?;
+        Ok(row)
+    }
+
+    pub(super) fn decode_state_and_lifecycle(
+        key: u128,
+        d: &mut Dec<'_>,
+    ) -> DecodeResult<(JobState, JobLifecycle)> {
         let outcome = d.opt(|d| {
             let kind = d.code_with(OutcomeKind::from_code, |_| {
                 StorageError::corrupted("invalid outcome")
@@ -153,17 +168,9 @@ impl JobRuntime {
                 }
                 items
             },
-            user_input: d.bool()?,
-            reported: d.ou128()?.map(JobId::new),
+            reported: None,
         };
-        let row = Self {
-            state,
-            lifecycle,
-            pending: d.opt(|d| Ok((d.u32()?, d.u32()?)))?,
-            last_result: d.ou128()?.map(JobId::new),
-        };
-        d.end()?;
-        Ok(row)
+        Ok((state, lifecycle))
     }
 }
 

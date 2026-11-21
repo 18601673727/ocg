@@ -283,6 +283,16 @@ impl<'a> Dec<'a> {
             ))),
         }
     }
+    #[cfg(unix)]
+    pub(super) fn payload(bytes: &'a [u8]) -> Self {
+        Self { bytes, at: 0 }
+    }
+
+    #[cfg(unix)]
+    pub(super) fn position(&self) -> usize {
+        self.at
+    }
+
     pub(super) fn take(&mut self, n: usize) -> DecodeResult<&'a [u8]> {
         let slice = self
             .bytes

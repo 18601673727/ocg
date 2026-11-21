@@ -1,76 +1,103 @@
 use super::offline::{finalization_copy, verify_payloads, with_verified_rebuild_copy};
 use super::reserved::ReservedRefusal;
 use crate::db::entities::{
-    ContentDigest, JobId, JobOutputId, JobOutputRecord, MutableJobContent, NativeSummaryResultLink,
-    OutcomeKind, OutputKind, RequestNumber,
+    Actor, ContentDigest, JobId, JobOutputId, JobOutputRecord, MutableJob, MutableJobContent,
+    NativeSummaryResultLink, Origin, OutcomeKind, OutputKind, Recurrence, RequestNumber,
+    SubmissionKey, SubmissionRecord, ToolCallRef,
 };
-use crate::db::redb::codec::{Code, Dec, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_OUTPUT};
+use crate::db::redb::codec::{
+    Code, Dec, Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME, TAG_OUTPUT,
+};
 use crate::db::redb::execution::TAG_EXECUTION_EVENT;
 use crate::db::redb::schema::{
-    DATABASE_FORMAT_KEY, FORMAT_VERSION, JOB_OUTPUTS, JOBS, MESSAGES, META, REQUEST_EVENTS,
-    SCHEMA_FINGERPRINT, SCHEMA_FINGERPRINT_KEY, check_required_tables, record_version_byte,
-    rewrite_format1_records, verify_format1_records,
+    APPROVALS, DATABASE_FORMAT_KEY, FORMAT_VERSION, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MESSAGES, META,
+    RECURRENCES, REQUEST_EVENTS, SCHEMA_FINGERPRINT, SCHEMA_FINGERPRINT_KEY, SUBMISSIONS,
+    TOOL_CALLS, TURNS, check_required_tables, record_version_byte, rewrite_record_headers,
+    verify_identical_database, verify_record_headers,
 };
-use crate::db::redb::{StorageError, TxRead, indexes, jobs, observations, rows, state};
+use crate::db::redb::{
+    StorageError, TxRead, approvals, job_tree, jobs, observations, reads, rows, settlement, state,
+};
 use ::redb::{
     Database, Durability, Key, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
     TableHandle, WriteTransaction,
 };
 use serde_json::{Value as Json, json};
-use std::{fs::File, path::Path};
-const SOURCE_FORMAT: u64 = 1;
+use std::{collections::BTreeMap, fs::File, path::Path};
 
-fn source_layout(source: &ReadTransaction) -> Result<(), ReservedRefusal> {
+#[derive(Clone, Copy)]
+pub(in crate::db::redb) struct Versions {
+    from: u8,
+    to: u8,
+}
+
+impl Versions {
+    fn crosses(self, version: u8) -> bool {
+        self.from < version && version <= self.to
+    }
+
+    // A step that owns a body conversion also promotes and verifies its header.
+    fn changes_body(self, tags: &[u8]) -> bool {
+        match tags {
+            [TAG_OUTPUT] => self.crosses(2),
+            [TAG_JOB] | [TAG_JOB_RUNTIME] => self.crosses(3),
+            _ => false,
+        }
+    }
+}
+
+fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> {
     let meta = source.open_table(META).map_err(StorageError::from)?;
     let format = meta.get(DATABASE_FORMAT_KEY).map_err(StorageError::from)?;
     let fingerprint = meta
         .get(SCHEMA_FINGERPRINT_KEY)
         .map_err(StorageError::from)?;
     let fingerprint = fingerprint.as_ref().map(|marker| marker.value());
-    match format.as_ref().map(|marker| marker.value()) {
-        Some(bytes) if bytes == SOURCE_FORMAT.to_le_bytes() => {}
-        Some(bytes)
-            if bytes == FORMAT_VERSION.to_le_bytes() && fingerprint == Some(SCHEMA_FINGERPRINT) =>
-        {
+    let source_format = format
+        .as_ref()
+        .and_then(|v| v.value().try_into().ok())
+        .map(u64::from_le_bytes);
+    let from = match (source_format, fingerprint) {
+        (Some(1), Some(b"ocg-native-format-1")) => 1,
+        (Some(2), Some(b"ocg-native-format-2")) => 2,
+        (Some(FORMAT_VERSION), Some(SCHEMA_FINGERPRINT)) => {
             return Err(ReservedRefusal::new(
                 "already_migrated",
-                "the database is already in Format 2",
+                format!("the database is already in Format {FORMAT_VERSION}"),
             ));
         }
         _ => {
             return Err(ReservedRefusal::new(
                 "unsupported_source",
-                "migration requires Format 1",
+                "migration requires Format 1 or 2 with its matching schema fingerprint",
             ));
         }
-    }
-    if fingerprint != Some(b"ocg-native-format-1".as_slice()) {
-        return Err(ReservedRefusal::new(
-            "unsupported_source",
-            "migration requires the ocg-native-format-1 fingerprint",
-        ));
-    }
+    };
     check_required_tables(source)?;
-    Ok(())
+    Ok(Versions {
+        from,
+        to: record_version_byte(),
+    })
 }
 
-fn promote_header(bytes: &mut [u8], tags: &[u8]) -> Result<(), StorageError> {
+fn promote_header(versions: Versions, bytes: &mut [u8], tags: &[u8]) -> Result<(), StorageError> {
     match bytes {
-        [tag, version, ..] if tags.contains(tag) && u64::from(*version) == SOURCE_FORMAT => {
-            *version = record_version_byte();
+        [tag, version, ..] if tags.contains(tag) && *version == versions.from => {
+            *version = versions.to;
             Ok(())
         }
         _ => Err(StorageError::corrupted(format!(
-            "invalid Format 1 record header for {tags:?}"
+            "invalid Format {} record header for {tags:?}",
+            versions.from
         ))),
     }
 }
 
-fn promote_record(bytes: &[u8], tags: &[u8]) -> Result<Vec<u8>, StorageError> {
+fn promote_record(versions: Versions, bytes: &[u8], tags: &[u8]) -> Result<Vec<u8>, StorageError> {
     let mut row = bytes.to_vec();
-    promote_header(&mut row, tags)?;
+    promote_header(versions, &mut row, tags)?;
     if row[0] == TAG_EXECUTION_EVENT {
-        let mut d = Dec::new(&row, TAG_EXECUTION_EVENT)?;
+        let mut d = Dec::payload(&row[2..]);
         d.u128()?;
         d.u64()?;
         d.u64()?;
@@ -81,35 +108,42 @@ fn promote_record(bytes: &[u8], tags: &[u8]) -> Result<Vec<u8>, StorageError> {
             d.take(len)?;
             d.end()?;
             let start = row.len() - len;
-            promote_header(&mut row[start..], &[42])?;
+            promote_header(versions, &mut row[start..], &[42])?;
         }
     }
     Ok(row)
 }
 
 pub(in crate::db::redb) fn rewrite_tagged<K: Key + 'static>(
+    versions: Versions,
     source: &ReadTransaction,
     tx: &WriteTransaction,
     definition: TableDefinition<'_, K, &'static [u8]>,
     tags: &[u8],
 ) -> Result<(), StorageError> {
+    if versions.changes_body(tags) {
+        return Ok(());
+    }
     let mut result = tx.open_table(definition)?;
     for entry in source.open_table(definition)?.iter()? {
         let (key, bytes) = entry?;
-        result.insert(key.value(), promote_record(bytes.value(), tags)?.as_slice())?;
+        result.insert(
+            key.value(),
+            promote_record(versions, bytes.value(), tags)?.as_slice(),
+        )?;
     }
     Ok(())
 }
 
-fn promote_metadata(key: &str, value: &[u8]) -> Result<Vec<u8>, StorageError> {
+fn promote_metadata(versions: Versions, key: &str, value: &[u8]) -> Result<Vec<u8>, StorageError> {
     match key {
         SCHEMA_FINGERPRINT_KEY => Ok(SCHEMA_FINGERPRINT.to_vec()),
         DATABASE_FORMAT_KEY => Ok(FORMAT_VERSION.to_le_bytes().to_vec()),
-        "compaction_settings" => promote_record(value, &[TAG_GLOBAL_COMPACTION]),
-        "outbound_headers" => promote_record(value, &[TAG_GLOBAL_HEADERS]),
+        "compaction_settings" => promote_record(versions, value, &[TAG_GLOBAL_COMPACTION]),
+        "outbound_headers" => promote_record(versions, value, &[TAG_GLOBAL_HEADERS]),
         "open_epoch" | "clean_shutdown" => Ok(value.to_vec()),
         _ => Err(StorageError::corrupted(format!(
-            "unrecognized Format 1 metadata row {key:?}"
+            "unrecognized source metadata row {key:?}"
         ))),
     }
 }
@@ -150,25 +184,36 @@ fn verify_transformed<K: Key + 'static>(
 }
 
 pub(in crate::db::redb) fn verify_tagged<K: Key + 'static>(
+    versions: Versions,
     source: &ReadTransaction,
     result: &ReadTransaction,
     definition: TableDefinition<'_, K, &'static [u8]>,
     tags: &[u8],
 ) -> Result<(), StorageError> {
+    if versions.changes_body(tags) {
+        return Ok(());
+    }
     verify_transformed(source, result, definition, |_, bytes| {
-        promote_record(bytes, tags)
+        promote_record(versions, bytes, tags)
     })
 }
 
 pub(in crate::db::redb) fn verify_metadata(
+    versions: Versions,
     source: &ReadTransaction,
     result: &ReadTransaction,
 ) -> Result<(), StorageError> {
-    verify_transformed(source, result, META, promote_metadata)
+    verify_transformed(source, result, META, |k, v| {
+        promote_metadata(versions, k, v)
+    })
 }
 
-fn old_output(key: (u128, u32), bytes: &[u8]) -> Result<JobOutputRecord, StorageError> {
-    let row = promote_record(bytes, &[TAG_OUTPUT])?;
+fn old_output(
+    versions: Versions,
+    key: (u128, u32),
+    bytes: &[u8],
+) -> Result<JobOutputRecord, StorageError> {
+    let row = promote_record(versions, bytes, &[TAG_OUTPUT])?;
     let mut d = Dec::new(&row, TAG_OUTPUT)?;
     let output = JobOutputRecord {
         job: JobId::new(key.0),
@@ -364,6 +409,7 @@ fn convert_output(
 }
 
 fn verify_outputs(
+    versions: Versions,
     source: &ReadTransaction,
     result: &ReadTransaction,
 ) -> Result<ConversionCounts, StorageError> {
@@ -377,7 +423,7 @@ fn verify_outputs(
     for entry in old.iter()? {
         let (k, v) = entry?;
         let key = k.value();
-        let prior = old_output(key, v.value())?;
+        let prior = old_output(versions, key, v.value())?;
         let mut expected = prior.clone();
         convert_output(result, &mut expected, &mut counts)?;
         let row = updated
@@ -407,20 +453,316 @@ fn verify_outputs(
     Ok(counts)
 }
 
-fn verify_delta(
+// TOOL_CALLS and APPROVALS are indexed by call, while a creation receipt names
+// only its digest. Invert the host's key formulas once for the whole store.
+enum HostCreation {
+    Tool(ToolCallRef, &'static str),
+    Approval,
+    Recurrence(JobId),
+}
+
+struct AuthorEvidence {
+    submissions: BTreeMap<JobId, SubmissionRecord>,
+    host: BTreeMap<SubmissionKey, HostCreation>,
+}
+
+impl AuthorEvidence {
+    fn read(tx: &impl TxRead) -> Result<Self, StorageError> {
+        let mut submissions = BTreeMap::new();
+        for entry in tx.table(SUBMISSIONS)?.iter()? {
+            let (key, value) = entry?;
+            let record = rows::decode_submission(key.value(), value.value())?;
+            if record.seq == 0 && submissions.insert(record.job, record).is_some() {
+                return Err(StorageError::corrupted(format!(
+                    "multiple creation submissions for {}",
+                    record.job
+                )));
+            }
+        }
+        let mut host = BTreeMap::new();
+        for entry in tx.table(TOOL_CALLS)?.iter()? {
+            let call = rows::tool_call_ref(entry?.0.value())?;
+            for purpose in ["assign", "message"] {
+                let key = job_tree::tool_submission(call, purpose.as_bytes(), 0).key;
+                host.insert(key, HostCreation::Tool(call, purpose));
+            }
+        }
+        for entry in tx.table(APPROVALS)?.iter()? {
+            let call = rows::tool_call_ref(entry?.0.value())?;
+            host.insert(
+                approvals::continuation_submission(call, b"create").key,
+                HostCreation::Approval,
+            );
+        }
+        for entry in tx.table(RECURRENCES)?.iter()? {
+            let (conv, row) = entry?;
+            let recurrence = Recurrence::decode(row.value())?;
+            if recurrence.n > u64::from(crate::db::entities::JobLimits::CEILING.max_iterations) {
+                return Err(StorageError::corrupted("invalid recurrence count"));
+            }
+            for n in 2..=recurrence.n {
+                let key =
+                    settlement::recurrence_submission(conv.value(), n, b"recurrence-turn-create")
+                        .key;
+                host.insert(key, HostCreation::Recurrence(JobId::new(conv.value())));
+            }
+        }
+        Ok(Self { submissions, host })
+    }
+
+    fn classify(
+        &self,
+        tx: &impl TxRead,
+        job: &MutableJob,
+        caller: impl Fn(ToolCallRef) -> Result<Actor, StorageError>,
+    ) -> Result<(Actor, &'static str), StorageError> {
+        if job.retry.is_some() {
+            return Ok((job.submitted_by.clone(), "retry"));
+        }
+        let parent = reads::jobs::read_conversation_row(tx, job.parent_id)?
+            .ok_or_else(|| StorageError::corrupted(format!("missing parent of Job {}", job.id)))?;
+        let record = self.submissions.get(&job.id);
+        match record {
+            None => {
+                if jobs::is_predictive_helper(tx, job)? {
+                    return Ok((Actor::Auto, "predictive"));
+                }
+                if reads::jobs::project_planning_target(tx, job)?.is_some() {
+                    return Ok((Actor::Auto, "planning_decision"));
+                }
+                if job.summary_source.is_some() {
+                    return Ok((Actor::Auto, "summary"));
+                }
+                if parent.is_chunk_group() {
+                    return Ok((Actor::Auto, "chunk"));
+                }
+                if parent.is_standalone_decision_group() {
+                    return Ok((Actor::User, "decision"));
+                }
+            }
+            Some(r) if r.key.as_bytes() != r.fingerprint.as_bytes() => {
+                return Ok((Actor::User, "composer"));
+            }
+            Some(r) => {
+                if let Origin::Agent { call } = parent.origin
+                    && job.previous.is_none()
+                    && reads::jobs::turn_first(&tx.table(TURNS)?, parent.id)? == Some(job.id)
+                {
+                    for (purpose, class) in [
+                        (b"plan create".as_slice(), "plan"),
+                        (b"dispatch create".as_slice(), "dispatch"),
+                    ] {
+                        if (0..job_tree::MAX_LIVE_CHILDREN as u32)
+                            .any(|n| job_tree::tool_submission(call, purpose, n).key == r.key)
+                        {
+                            return Ok((caller(call)?, class));
+                        }
+                    }
+                }
+                match self.host.get(&r.key) {
+                    Some(HostCreation::Tool(call, purpose)) => {
+                        return Ok((caller(*call)?, purpose));
+                    }
+                    Some(HostCreation::Approval) => return Ok((Actor::Auto, "approval")),
+                    Some(HostCreation::Recurrence(id)) if *id == parent.id => {
+                        return Ok((Actor::Auto, "recurrence"));
+                    }
+                    _ => {}
+                }
+                if job.input.text().starts_with(job_tree::REPORT_HEADER) {
+                    return Ok((Actor::Auto, "results"));
+                }
+            }
+        }
+        let key = record.map_or_else(|| "no seq-0 submission".to_owned(), |r| r.key.to_string());
+        Err(StorageError::corrupted(format!(
+            "cannot classify Job {} in {} ({key})",
+            job.id, parent.id
+        )))
+    }
+}
+
+fn source_caller(
     source: &ReadTransaction,
+    versions: Versions,
+    call: ToolCallRef,
+) -> Result<Actor, StorageError> {
+    let jobs = source.open_table(JOBS)?;
+    let row = jobs
+        .get(call.job.get())?
+        .ok_or_else(|| StorageError::corrupted(format!("tool caller {} missing", call.job)))?;
+    let row = promote_record(versions, row.value(), &[TAG_JOB])?;
+    let mut d = Dec::new(&row, TAG_JOB)?;
+    if d.u128()? != call.job.get() {
+        return Err(StorageError::corrupted("invalid tool caller identity"));
+    }
+    Ok(Actor::Agent {
+        conversation: JobId::new(d.u128()?),
+    })
+}
+
+fn migrate_job(
+    versions: Versions,
+    key: u128,
+    bytes: &[u8],
+    tx: &impl TxRead,
+    evidence: &AuthorEvidence,
+    source: &ReadTransaction,
+) -> Result<(Vec<u8>, Actor, &'static str), StorageError> {
+    let mut row = promote_record(versions, bytes, &[TAG_JOB])?;
+    let mut d = Dec::new(&row, TAG_JOB)?;
+    d.u128()?;
+    d.u128()?;
+    d.ou128()?;
+    let retry = d.ou128()?;
+    let offset = d.position();
+    // A retry already has its actor at this offset. Supply a temporary slot
+    // for ordinary Jobs so the current decoder can read the input and links.
+    if retry.is_none() {
+        row.insert(offset, 0);
+    }
+    let job = jobs::decode_mutable_job(key, &row)?;
+    let (author, class) =
+        evidence.classify(tx, &job, |call| source_caller(source, versions, call))?;
+    if retry.is_none() {
+        let mut encoded = Enc(Vec::new());
+        encoded.actor(&author);
+        row.splice(offset..=offset, encoded.0);
+    }
+    Ok((row, author, class))
+}
+
+fn migrate_runtime(versions: Versions, key: u128, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
+    let mut row = promote_record(versions, bytes, &[TAG_JOB_RUNTIME])?;
+    let mut d = Dec::new(&row, TAG_JOB_RUNTIME)?;
+    state::JobRuntime::decode_state_and_lifecycle(key, &mut d)?;
+    let offset = d.position();
+    d.bool()?;
+    row.remove(offset);
+    Ok(row)
+}
+
+fn migrate_turn_authors(
+    versions: Versions,
+    source: &ReadTransaction,
+    tx: &WriteTransaction,
+    evidence: &AuthorEvidence,
+) -> Result<(), StorageError> {
+    let mut jobs = tx.open_table(JOBS)?;
+    for entry in source.open_table(JOBS)?.iter()? {
+        let (k, v) = entry?;
+        let (row, _, _) = migrate_job(versions, k.value(), v.value(), tx, evidence, source)?;
+        jobs.insert(k.value(), row.as_slice())?;
+    }
+    let mut runtime = tx.open_table(JOB_RUNTIME)?;
+    for entry in source.open_table(JOB_RUNTIME)?.iter()? {
+        let (k, v) = entry?;
+        runtime.insert(
+            k.value(),
+            migrate_runtime(versions, k.value(), v.value())?.as_slice(),
+        )?;
+    }
+    Ok(())
+}
+
+fn migrate_outputs(
+    versions: Versions,
+    source: &ReadTransaction,
+    tx: &WriteTransaction,
+) -> Result<(), StorageError> {
+    let mut outputs = tx.open_table(JOB_OUTPUTS)?;
+    for entry in source.open_table(JOB_OUTPUTS)?.iter()? {
+        let (k, v) = entry?;
+        let mut row = old_output(versions, k.value(), v.value())?;
+        convert_output(tx, &mut row, &mut ConversionCounts::default())?;
+        outputs.insert(k.value(), rows::encode_output(&row).as_slice())?;
+    }
+    Ok(())
+}
+
+fn migrate_chain(
     database: &Database,
     directory: &Path,
     sha: &str,
 ) -> Result<Json, ReservedRefusal> {
-    source_layout(source)?;
+    let source = database.begin_read().map_err(StorageError::from)?;
+    let versions = source_layout(&source)?;
+    let mut tx = database.begin_write().map_err(StorageError::from)?;
+    tx.set_durability(Durability::Immediate)
+        .map_err(StorageError::from)?;
+    if tx
+        .list_persistent_savepoints()
+        .map_err(StorageError::from)?
+        .next()
+        .is_some()
+    {
+        return Err(ReservedRefusal::new(
+            "unsupported_source",
+            "the source contains persistent redb savepoints",
+        ));
+    }
+    rewrite_record_headers(versions, &source, &tx)?;
+    {
+        let mut meta = tx.open_table(META).map_err(StorageError::from)?;
+        for entry in source
+            .open_table(META)
+            .map_err(StorageError::from)?
+            .iter()
+            .map_err(StorageError::from)?
+        {
+            let (k, v) = entry.map_err(StorageError::from)?;
+            meta.insert(
+                k.value(),
+                promote_metadata(versions, k.value(), v.value())?.as_slice(),
+            )
+            .map_err(StorageError::from)?;
+        }
+    }
+    let evidence = if versions.crosses(3) {
+        let evidence = AuthorEvidence::read(&tx)?;
+        migrate_turn_authors(versions, &source, &tx, &evidence)?;
+        Some(evidence)
+    } else {
+        None
+    };
+    // Format 1 output conversion reads the final Job and runtime layouts.
+    if versions.crosses(2) {
+        migrate_outputs(versions, &source, &tx)?;
+    }
+    tx.commit().map_err(StorageError::from)?;
+
     super::verify_reserved_residual(database)?;
     let result = database.begin_read().map_err(StorageError::from)?;
-    verify_format1_records(source, &result)?;
+    verify_record_headers(versions, &source, &result)?;
     verify_payloads(&result, directory)?;
-    let counts = verify_outputs(source, &result)?;
-    let plan = json!({"kind": "migrate-answers-f2", "source_sha256": sha, "source_format": SOURCE_FORMAT,
-        "target_format": FORMAT_VERSION, "converted_summary_links": counts.converted_summary_links, "retained_summary_links": counts.retained_summary_links,
+    let mut authors = BTreeMap::from([("user", 0u64), ("auto", 0), ("agent", 0)]);
+    let mut classes = BTreeMap::new();
+    if let Some(evidence) = evidence {
+        verify_transformed(&source, &result, JOBS, |key, bytes| {
+            let (row, author, class) =
+                migrate_job(versions, key, bytes, &result, &evidence, &source)?;
+            let name = match author {
+                Actor::User => "user",
+                Actor::Agent { .. } => "agent",
+                Actor::Auto => "auto",
+                Actor::Loop => return Err(StorageError::corrupted("invalid Job author")),
+            };
+            *authors.entry(name).or_default() += 1;
+            *classes.entry(class).or_insert(0u64) += 1;
+            Ok(row)
+        })?;
+        verify_transformed(&source, &result, JOB_RUNTIME, |key, bytes| {
+            migrate_runtime(versions, key, bytes)
+        })?;
+    }
+    let counts = if versions.crosses(2) {
+        verify_outputs(versions, &source, &result)?
+    } else {
+        ConversionCounts::default()
+    };
+    let plan = json!({"kind": "storage-migration", "source_sha256": sha, "source_format": versions.from,
+        "target_format": versions.to, "submitted_by": authors, "creation_classes": classes,
+        "converted_summary_links": counts.converted_summary_links, "retained_summary_links": counts.retained_summary_links,
         "kept_text_job_count": counts.kept_text_jobs.len(), "kept_text_jobs": counts.kept_text_jobs.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "kept_text_details": counts.kept_text_details});
     let encoded = serde_json::to_vec(&plan)
@@ -428,63 +770,14 @@ fn verify_delta(
     Ok(json!({"plan": plan, "plan_digest": ContentDigest::of(&encoded).to_string()}))
 }
 
-pub(crate) fn migrate_answers(
+pub(crate) fn migrate_storage(
     file: File,
     directory: &Path,
     sha: &str,
     expected: Option<&str>,
 ) -> Result<Json, ReservedRefusal> {
     with_verified_rebuild_copy(file, |database| {
-        let source = database.begin_read().map_err(StorageError::from)?;
-        source_layout(&source)?;
-        let mut tx = database.begin_write().map_err(StorageError::from)?;
-        tx.set_durability(Durability::Immediate)
-            .map_err(StorageError::from)?;
-        if tx
-            .list_persistent_savepoints()
-            .map_err(StorageError::from)?
-            .next()
-            .is_some()
-        {
-            return Err(ReservedRefusal::new(
-                "unsupported_source",
-                "the source contains persistent redb savepoints",
-            ));
-        }
-        rewrite_format1_records(&source, &tx)?;
-        {
-            let mut meta = tx.open_table(META).map_err(StorageError::from)?;
-            for entry in source
-                .open_table(META)
-                .map_err(StorageError::from)?
-                .iter()
-                .map_err(StorageError::from)?
-            {
-                let (k, v) = entry.map_err(StorageError::from)?;
-                meta.insert(
-                    k.value(),
-                    promote_metadata(k.value(), v.value())?.as_slice(),
-                )
-                .map_err(StorageError::from)?;
-            }
-            let mut outputs = tx.open_table(JOB_OUTPUTS).map_err(StorageError::from)?;
-            for entry in source
-                .open_table(JOB_OUTPUTS)
-                .map_err(StorageError::from)?
-                .iter()
-                .map_err(StorageError::from)?
-            {
-                let (k, v) = entry.map_err(StorageError::from)?;
-                let mut row = old_output(k.value(), v.value())?;
-                convert_output(&tx, &mut row, &mut ConversionCounts::default())?;
-                outputs
-                    .insert(k.value(), rows::encode_output(&row).as_slice())
-                    .map_err(StorageError::from)?;
-            }
-        }
-        indexes::rebuild_compaction_refs(&tx)?;
-        tx.commit().map_err(StorageError::from)?;
-        let evidence = verify_delta(&source, database, directory, sha)?;
+        let evidence = migrate_chain(database, directory, sha)?;
         if expected.is_some_and(|expected| evidence["plan_digest"].as_str() != Some(expected)) {
             return Err(ReservedRefusal::new(
                 "plan_digest_mismatch",
@@ -495,7 +788,7 @@ pub(crate) fn migrate_answers(
     })
 }
 
-pub(crate) fn verify_answer_migration(
+pub(crate) fn verify_storage_migration(
     directory: &Path,
     source: &File,
     published: &File,
@@ -504,20 +797,20 @@ pub(crate) fn verify_answer_migration(
     expected_digest: &str,
 ) -> Result<Json, ReservedRefusal> {
     with_verified_rebuild_copy(finalization_copy(source)?, |source| {
-        let tx = source.begin_read().map_err(StorageError::from)?;
+        let evidence = migrate_chain(source, directory, sha)?;
+        if evidence["plan"] != *expected_plan
+            || evidence["plan_digest"].as_str() != Some(expected_digest)
+        {
+            return Err(ReservedRefusal::new(
+                "plan_digest_mismatch",
+                "the migration differs from the authorized plan",
+            ));
+        }
         with_verified_rebuild_copy(finalization_copy(published)?, |published| {
-            let evidence = verify_delta(&tx, published, directory, sha)?;
-            let verified_plan = evidence["plan"].clone();
-            let encoded = serde_json::to_vec(&verified_plan)
-                .map_err(|error| ReservedRefusal::new("invalid_plan", error.to_string()))?;
-            if verified_plan != *expected_plan
-                || ContentDigest::of(&encoded).to_string() != expected_digest
-            {
-                return Err(ReservedRefusal::new(
-                    "plan_digest_mismatch",
-                    "the migration differs from the authorized plan",
-                ));
-            }
+            let expected = source.begin_read().map_err(StorageError::from)?;
+            let actual = published.begin_read().map_err(StorageError::from)?;
+            check_required_tables(&actual)?;
+            verify_identical_database(&expected, &actual)?;
             Ok(evidence)
         })
     })

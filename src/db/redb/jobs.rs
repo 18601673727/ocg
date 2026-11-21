@@ -1,6 +1,6 @@
 use super::{StorageError, TxRead, execution};
 use crate::db::entities::{
-    Appended, AttachmentId, ConfigId, ExecutionConfiguration, ExecutionEventKind,
+    Actor, Appended, AttachmentId, ConfigId, ExecutionConfiguration, ExecutionEventKind,
     ExecutionOperation, FrozenConfiguration, FrozenDecisionConfig, JobId, JobLifecycle, JobSpec,
     JobState, LlmTransport, Origin, OutcomeCause, OutcomeKind, OutcomeRecord, ProfileId, ProjectId,
     RecordRef, Recurrence, RecurrenceHalt, RecurrencePhase, SubmissionRecord, Violation,
@@ -42,8 +42,8 @@ pub(super) fn encode_mutable_job(job: &crate::db::entities::MutableJob) -> Vec<u
     e.ou128(job.previous.map(JobId::get));
     e.opt(job.retry.as_ref(), |e, retry| {
         e.u128(retry.original.get());
-        e.actor(&retry.by);
     });
+    e.actor(&job.submitted_by);
     e.u128(job.composer_context.get());
     e.ts(job.created_at);
     e.ots(job.submitted_at);
@@ -289,9 +289,12 @@ pub(super) fn decode_mutable_job(
     let retry = d.opt(|d| {
         Ok(crate::db::entities::JobRetry {
             original: JobId::new(d.u128()?),
-            by: d.actor()?,
         })
     })?;
+    let submitted_by = d.actor()?;
+    if submitted_by == Actor::Loop {
+        return Err(StorageError::corrupted("invalid Job author"));
+    }
     let composer_context = crate::db::entities::ComposerContextId::new(d.u128()?);
     let created_at = d.ts()?;
     let submitted_at = d.ots()?;
@@ -430,6 +433,7 @@ pub(super) fn decode_mutable_job(
         parent_id,
         previous,
         retry,
+        submitted_by,
         composer_context,
         created_at,
         submitted_at,
@@ -652,6 +656,13 @@ impl Batch {
         job: &crate::db::entities::MutableJob,
     ) -> Result<(), BatchError> {
         let previous = self.mutable_job(job.id)?;
+        if job.submitted_by == Actor::Loop
+            || previous
+                .as_ref()
+                .is_some_and(|old| old.submitted_by != job.submitted_by)
+        {
+            return self.corrupted("invalid change of Job author".into());
+        }
         self.record_job_phase(job.id, previous.as_ref().map(|row| row.phase), job.phase)?;
         self.record_mutable_input_revision(
             job.id,
@@ -876,6 +887,7 @@ impl Batch {
         self.reject(Violation::NotFound(RecordRef::Job(job)))
     }
 
+    #[cfg(test)]
     pub(crate) fn create_unsubmitted_job(
         &mut self,
         context: crate::db::entities::ComposerContextId,
@@ -884,7 +896,14 @@ impl Batch {
         conversation: Option<JobId>,
         project: Option<ProjectId>,
     ) -> Result<JobId, BatchError> {
-        self.create_job_as(context, input, submission, conversation, project, true)
+        self.create_job_as(
+            context,
+            input,
+            submission,
+            conversation,
+            project,
+            Actor::User,
+        )
     }
 
     pub(crate) fn create_job_as(
@@ -894,7 +913,7 @@ impl Batch {
         submission: crate::db::entities::Submission,
         conversation: Option<JobId>,
         project: Option<ProjectId>,
-        by_user: bool,
+        by: Actor,
     ) -> Result<JobId, BatchError> {
         use crate::db::entities::{MutableJob, MutableJobPhase};
         self.require_allocation_durability()?;
@@ -960,6 +979,7 @@ impl Batch {
             id,
             parent_id,
             previous,
+            submitted_by: by,
             retry: None,
             composer_context: context,
             created_at: self.now,
@@ -973,10 +993,9 @@ impl Batch {
         };
         self.store_mutable_job(&job)?;
         self.put_job_state(id, &JobState::new(id))?;
-        if by_user {
+        if job.submitted_by == Actor::User {
             let mut lifecycle = self.job_lifecycle(parent_id)?;
-            if !lifecycle.user_input || lifecycle.loop_count != 0 {
-                lifecycle.user_input = true;
+            if lifecycle.loop_count != 0 {
                 lifecycle.loop_count = 0;
                 self.put_job_lifecycle(parent_id, &lifecycle)?;
             }
@@ -1587,6 +1606,7 @@ impl Batch {
         let job = MutableJob {
             id: job_id,
             parent_id: conversation_id,
+            submitted_by: Actor::User,
             previous: None,
             retry: None,
             composer_context: ComposerContextId::new(self.next_id()?),

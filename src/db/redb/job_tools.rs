@@ -111,7 +111,7 @@ impl Batch {
                     return self.reject(Violation::InvalidValue("text", "must not be empty"));
                 }
                 self.require_open_conversation(target)?;
-                let turn = self.agent_turn(target, text, call, b"message")?;
+                let turn = self.agent_turn(target, text, call, b"message", caller)?;
                 JobToolApplied::of(
                     json!({"conversation": target.to_string(), "turn": turn.to_string()}),
                 )
@@ -366,6 +366,7 @@ impl Batch {
                 job_tree::host_input(step.objective, configuration, priority),
                 job_tree::tool_submission(call, b"plan create", n),
                 job_tree::tool_submission(call, b"plan submit", n),
+                Actor::Agent { conversation },
             )?;
             opened.push(child);
             receipts.push(json!({"conversation": child.to_string(), "turn": turn.to_string()}));
@@ -451,7 +452,7 @@ impl Batch {
                 if objective.trim().is_empty() {
                     return self.reject(Violation::InvalidValue("objective", "must not be empty"));
                 }
-                let turn = self.agent_turn(worker, objective, approval, b"assign")?;
+                let turn = self.agent_turn(worker, objective, approval, b"assign", conversation)?;
                 Ok(Some(format!(
                     "I approve the assignment. The worker conversation {worker} was given the task as turn {turn}. Its result returns here when it settles. Please continue."
                 )))
@@ -505,7 +506,7 @@ impl Batch {
             if row.keep_open
                 || row.is_chunk_group()
                 || row.parent_id != Some(conversation)
-                || self.job_lifecycle(id)?.user_input
+                || self.step(|tx| job_tree::has_user_turn(tx, id, false))?
             {
                 return self.reject(Violation::InvalidValue(
                     "depends_on",
@@ -555,6 +556,9 @@ impl Batch {
                 job_tree::host_input(objective.clone(), configuration, asked.input.priority),
                 job_tree::tool_submission(approval, b"dispatch create", n),
                 job_tree::tool_submission(approval, b"dispatch submit", n),
+                Actor::Agent {
+                    conversation: asked.parent_id,
+                },
             )?;
             if let Some(interval_s) = every_seconds {
                 let rec = crate::db::entities::Recurrence {

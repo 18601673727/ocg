@@ -7,6 +7,7 @@ use crate::db::entities::{
 use crate::db::entities::{
     ExecutionEventKind, MessageBody, Recorded, ToolCallRef, ToolDecision, ToolOutcome, Violation,
 };
+use crate::db::entities::{RequestFingerprint, Submission, SubmissionKey};
 use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
 use crate::db::redb::codec::{Dec, DecodeResult, Enc};
 use crate::db::redb::reads::jobs::{read_conversation_row, read_state};
@@ -21,6 +22,19 @@ use crate::db::redb::schema::{
 };
 use ::redb::{Database, ReadTransaction, ReadableTable};
 use std::collections::BTreeSet;
+
+pub(super) fn continuation_submission(approval: ToolCallRef, step: &[u8]) -> Submission {
+    let mut identity = b"ocg approval continuation ".to_vec();
+    identity.extend_from_slice(step);
+    identity.extend_from_slice(&approval.job.get().to_le_bytes());
+    identity.extend_from_slice(&approval.request.get().to_le_bytes());
+    identity.extend_from_slice(&approval.index.to_le_bytes());
+    let digest = *crate::db::entities::ContentDigest::of(&identity).as_bytes();
+    Submission {
+        key: SubmissionKey::from_digest(digest),
+        fingerprint: RequestFingerprint::from_digest(digest),
+    }
+}
 
 pub(super) fn open_key(conversation: JobId, call: ToolCallRef) -> (u128, u128, u32, u32) {
     (
@@ -199,9 +213,7 @@ impl Batch {
         approval: ToolCallRef,
         text: String,
     ) -> Result<Appended, BatchError> {
-        use crate::db::entities::{
-            MutableJobContent, MutableJobInput, RequestFingerprint, Submission, SubmissionKey,
-        };
+        use crate::db::entities::{MutableJobContent, MutableJobInput};
         let Some(asked) = self.mutable_job(approval.job)? else {
             return self.reject(Violation::InvalidValue(
                 "approval_not_found",
@@ -222,25 +234,14 @@ impl Batch {
                 configuration: *configuration,
             },
         };
-        let submission = |step: &[u8]| {
-            let mut identity = b"ocg approval continuation ".to_vec();
-            identity.extend_from_slice(step);
-            identity.extend_from_slice(&approval.job.get().to_le_bytes());
-            identity.extend_from_slice(&approval.request.get().to_le_bytes());
-            identity.extend_from_slice(&approval.index.to_le_bytes());
-            let digest = *crate::db::entities::ContentDigest::of(&identity).as_bytes();
-            Submission {
-                key: SubmissionKey::from_digest(digest),
-                fingerprint: RequestFingerprint::from_digest(digest),
-            }
-        };
         // Answering a card continues the tool call. Only a message typed into the child
         // should keep that conversation open after the continuation finishes.
         let turn = self.host_turn(
             asked.parent_id,
             input,
-            submission(b"create"),
-            submission(b"submit"),
+            continuation_submission(approval, b"create"),
+            continuation_submission(approval, b"submit"),
+            Actor::Auto,
         )?;
         Ok(Appended {
             turn,

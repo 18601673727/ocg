@@ -87,7 +87,7 @@ where
     Ok(None)
 }
 
-pub(super) fn project_planning_target(
+pub(in crate::db::redb) fn project_planning_target(
     tx: &impl TxRead,
     job: &MutableJob,
 ) -> Result<Option<JobId>, StorageError> {

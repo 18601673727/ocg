@@ -12,6 +12,9 @@ use crate::db::entities::{ContentDigest, JobId};
 use crate::db::{DATABASE_FILE_NAME, storage_format_versions};
 use crate::host::data_directory::{DATABASE_LOCK_FILE, private_file};
 
+const FINALIZE_FORMAT_2: &str =
+    "finalize the pending migrate-answers-f2 publication with the Format 2 build first";
+
 const USAGE: &str = "usage: ocg reconcile-reserved <data-directory> <job-id> --confirm-no-start | ocg reconcile-reserved <data-directory> --finalize";
 const HELD_USAGE: &str =
     "usage: ocg reconcile-held <data-directory> --dry-run | --apply <plan-digest> | --finalize";
@@ -34,7 +37,7 @@ enum RecoveryKind {
     Reserved,
     Held,
     CompactionRefs,
-    MigrateAnswers,
+    MigrateStorage,
 }
 
 impl RecoveryKind {
@@ -43,7 +46,7 @@ impl RecoveryKind {
             Self::Reserved => "reserved",
             Self::Held => "held",
             Self::CompactionRefs => "rebuild-compaction-refs",
-            Self::MigrateAnswers => "migrate-answers-f2",
+            Self::MigrateStorage => "storage-migration",
         }
     }
 
@@ -51,7 +54,7 @@ impl RecoveryKind {
         match self {
             Self::Reserved | Self::Held => "allocation_transaction_reexecuted",
             Self::CompactionRefs => "rebuild_transaction_reexecuted",
-            Self::MigrateAnswers => "migration_transaction_reexecuted",
+            Self::MigrateStorage => "migration_transaction_reexecuted",
         }
     }
 }
@@ -60,7 +63,7 @@ enum Operation {
     Reserved(JobId),
     Held { expected_digest: Option<String> },
     CompactionRefs { expected_digest: Option<String> },
-    MigrateAnswers { expected_digest: Option<String> },
+    MigrateStorage { expected_digest: Option<String> },
 }
 
 impl Operation {
@@ -69,7 +72,7 @@ impl Operation {
             Self::Reserved(_) => RecoveryKind::Reserved,
             Self::Held { .. } => RecoveryKind::Held,
             Self::CompactionRefs { .. } => RecoveryKind::CompactionRefs,
-            Self::MigrateAnswers { .. } => RecoveryKind::MigrateAnswers,
+            Self::MigrateStorage { .. } => RecoveryKind::MigrateStorage,
         }
     }
 }
@@ -663,6 +666,9 @@ pub(crate) fn check_offline_publication(directory: &Path) -> std::io::Result<()>
     })?;
     if let Some(active) = chain.active {
         let operation = &chain.prepared[active].evidence.operation;
+        if operation == "migrate-answers-f2" {
+            return Err(std::io::Error::other(FINALIZE_FORMAT_2));
+        }
         return Err(std::io::Error::other(format!(
             "offline publication is pending ({operation}); finalize it with the original offline command, or retry the operation if the original database is still in place"
         )));
@@ -891,7 +897,7 @@ pub fn run_held(arguments: Vec<String>) -> Result<(), Failure> {
 
 pub fn run_migrate(arguments: Vec<String>) -> Result<(), Failure> {
     run_planned(arguments, MIGRATE_USAGE, |expected_digest| {
-        Operation::MigrateAnswers { expected_digest }
+        Operation::MigrateStorage { expected_digest }
     })
 }
 
@@ -972,7 +978,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
     let lock = acquire_lock(&directory)?;
     let check_lock = matches!(
         operation.kind(),
-        RecoveryKind::CompactionRefs | RecoveryKind::MigrateAnswers
+        RecoveryKind::CompactionRefs | RecoveryKind::MigrateStorage
     );
     if check_lock {
         revalidate_publication_lock(&directory, &lock)?;
@@ -992,6 +998,17 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
     let supersedes = match chain.active {
         Some(index) => {
             let active = &chain.prepared[index].evidence;
+            if active.operation == "migrate-answers-f2" {
+                return Err(refused_in_state(
+                    "offline_format_mismatch",
+                    if active.replacement.sha256 == source_sha256 {
+                        PUBLISHED_UNFINALIZED
+                    } else {
+                        PREPARED_NOT_PUBLISHED
+                    },
+                    FINALIZE_FORMAT_2,
+                ));
+            }
             if active.replacement.sha256 == source_sha256 {
                 return Err(refused_in_state(
                     "finalization_required",
@@ -1051,11 +1068,11 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 }));
             }
         }
-        Operation::MigrateAnswers {
+        Operation::MigrateStorage {
             expected_digest: None,
         } => {
             let private = private_copy(&mut original, &source_sha256)?;
-            let plan = crate::db::migrate_answers(private, &directory, &source_sha256, None)?;
+            let plan = crate::db::migrate_storage(private, &directory, &source_sha256, None)?;
             confirm_source(
                 &database_path,
                 &before,
@@ -1069,7 +1086,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 "apply": "ocg migrate <data-directory> --apply <plan-digest>"}),
             );
         }
-        Operation::MigrateAnswers {
+        Operation::MigrateStorage {
             expected_digest: Some(_),
         } => {}
         Operation::CompactionRefs {
@@ -1132,7 +1149,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 .as_deref()
                 .ok_or_else(|| refused("plan_required", "an apply digest is required"))?,
         )?,
-        Operation::MigrateAnswers { expected_digest } => crate::db::migrate_answers(
+        Operation::MigrateStorage { expected_digest } => crate::db::migrate_storage(
             work,
             &directory,
             &source_sha256,
@@ -1174,11 +1191,11 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
         )?;
     }
 
-    if let Operation::MigrateAnswers {
+    if let Operation::MigrateStorage {
         expected_digest: Some(expected),
     } = &operation
     {
-        crate::db::verify_answer_migration(
+        crate::db::verify_storage_migration(
             &directory,
             &original,
             &work,
@@ -1257,7 +1274,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 }),
             )
         }
-        Operation::MigrateAnswers { expected_digest } => (
+        Operation::MigrateStorage { expected_digest } => (
             applied["plan"].clone(),
             expected_digest.clone(),
             vec![json!({"database_format": 2})],
@@ -1368,7 +1385,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
     drop(lock);
 
     let mut report = json!({
-        "outcome": match operation.kind() { RecoveryKind::MigrateAnswers => "migrated", RecoveryKind::CompactionRefs => "rebuilt", RecoveryKind::Reserved | RecoveryKind::Held => "reconciled" },
+        "outcome": match operation.kind() { RecoveryKind::MigrateStorage => "migrated", RecoveryKind::CompactionRefs => "rebuilt", RecoveryKind::Reserved | RecoveryKind::Held => "reconciled" },
         "state": PUBLISHED_FINALIZED,
         "no_provider_contacted": true,
         "applied": applied,
@@ -1385,7 +1402,7 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
         Operation::Reserved(job) => report["job"] = json!(job.to_string()),
         Operation::Held { .. }
         | Operation::CompactionRefs { .. }
-        | Operation::MigrateAnswers { .. } => {
+        | Operation::MigrateStorage { .. } => {
             report["plan"] = report["applied"]["plan"].clone();
             report["plan_digest"] = report["applied"]["plan_digest"].clone();
         }
@@ -1512,7 +1529,7 @@ fn verify_publication(
             &prepared.recovery_plan,
             prepared.plan_digest.as_deref().unwrap_or_default(),
         ),
-        Operation::MigrateAnswers { .. } => crate::db::verify_answer_migration(
+        Operation::MigrateStorage { .. } => crate::db::verify_storage_migration(
             directory,
             &artifact,
             &published_file,
@@ -1638,7 +1655,7 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
     let lock = acquire_lock(&directory)?;
     if matches!(
         kind,
-        RecoveryKind::CompactionRefs | RecoveryKind::MigrateAnswers
+        RecoveryKind::CompactionRefs | RecoveryKind::MigrateStorage
     ) {
         revalidate_publication_lock(&directory, &lock)?;
     }
@@ -1702,6 +1719,13 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
     };
     let prepared_record = &chain.prepared[active_index];
     let prepared = &prepared_record.evidence;
+    if prepared.operation == "migrate-answers-f2" {
+        return Err(refused_in_state(
+            "offline_format_mismatch",
+            PUBLISHED_UNFINALIZED,
+            FINALIZE_FORMAT_2,
+        ));
+    }
     if prepared.operation != kind.as_str() {
         return Err(refused_in_state(
             "operation_mismatch",
@@ -1737,7 +1761,7 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
         RecoveryKind::Held => Operation::Held {
             expected_digest: prepared.plan_digest.clone(),
         },
-        RecoveryKind::MigrateAnswers => Operation::MigrateAnswers {
+        RecoveryKind::MigrateStorage => Operation::MigrateStorage {
             expected_digest: prepared.plan_digest.clone(),
         },
         RecoveryKind::CompactionRefs => Operation::CompactionRefs {
@@ -1750,7 +1774,7 @@ fn finalize(directory: &Path, kind: RecoveryKind) -> Result<Value, Refused> {
     if current_sha256 == prepared.source.sha256 {
         if matches!(
             kind,
-            RecoveryKind::CompactionRefs | RecoveryKind::MigrateAnswers
+            RecoveryKind::CompactionRefs | RecoveryKind::MigrateStorage
         ) && !prepared.source.matches_identity(&current_identity)
         {
             return Err(refused_in_state(

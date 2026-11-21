@@ -154,12 +154,15 @@ pub(super) fn check_identity(
             .map(u64::from_le_bytes)
             .map_err(|_| unsupported_format("database format marker is malformed"))?,
     };
-    if found == 1 {
-        return Err(unsupported_format(if cfg!(unix) {
-            "database format 1 requires offline migration: run ocg migrate <data-directory> --dry-run"
+    if matches!(found, 1 | 2) {
+        let action = if cfg!(unix) {
+            "run ocg migrate <data-directory> --dry-run"
         } else {
-            "database format 1 requires ocg migrate, a Unix-only offline command"
-        }));
+            "use the Unix-only ocg migrate command"
+        };
+        return Err(unsupported_format(&format!(
+            "database format {found} requires offline migration: {action}"
+        )));
     }
     if found != FORMAT_VERSION {
         return Err(unsupported_format(&format!(
@@ -520,6 +523,13 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
     for entry in jobs.iter()? {
         let (key, value) = entry?;
         let job = jobs::decode_mutable_job(key.value(), value.value())?;
+        if let crate::db::entities::Actor::Agent { conversation } = job.submitted_by {
+            require_job_exists(
+                &conversations,
+                conversation.get(),
+                "submitting Agent conversation",
+            )?;
+        }
         if let Some(retry) = &job.retry {
             let original = jobs
                 .get(retry.original.get())?
@@ -557,8 +567,7 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
                     "retry predecessor is not a settled retry source",
                 ));
             }
-            if let crate::db::entities::Actor::Agent { conversation } = retry.by {
-                require_job_exists(&conversations, conversation.get(), "retry actor")?;
+            if matches!(job.submitted_by, crate::db::entities::Actor::Agent { .. }) {
                 let count = agent_retries.entry(retry.original).or_default();
                 *count += 1;
                 if *count > job_tree::MAX_AGENT_RETRIES {
