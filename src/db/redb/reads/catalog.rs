@@ -17,7 +17,7 @@ use crate::db::redb::schema::MAX_PAGE;
 use crate::db::redb::schema::{
     ATTACHMENTS, CONFIGS, CREDENTIALS, EXECUTORS, META, POOLS, PROJECTS, SUBMISSIONS,
 };
-use ::redb::{Database, ReadTransaction, ReadableTable};
+use ::redb::{Database, ReadableTable};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) fn read_submission(
@@ -35,8 +35,14 @@ pub(crate) fn read_attachment(
     database: &Database,
     id: AttachmentId,
 ) -> Result<Option<AttachmentRecord>, StorageError> {
-    let rx = read(database)?;
-    rx.open_table(ATTACHMENTS)?
+    attachment(&read(database)?, id)
+}
+
+pub(in crate::db::redb) fn attachment(
+    tx: &impl TxRead,
+    id: AttachmentId,
+) -> Result<Option<AttachmentRecord>, StorageError> {
+    tx.table(ATTACHMENTS)?
         .get(id.get())?
         .map(|bytes| decode_attachment(id.get(), bytes.value()))
         .transpose()
@@ -91,11 +97,8 @@ pub(crate) fn read_config(
     config(&read(database)?, id)
 }
 
-pub(crate) fn config(
-    rx: &ReadTransaction,
-    id: ConfigId,
-) -> Result<Option<ConfigRecord>, StorageError> {
-    rx.open_table(CONFIGS)?
+pub(crate) fn config(rx: &impl TxRead, id: ConfigId) -> Result<Option<ConfigRecord>, StorageError> {
+    rx.table(CONFIGS)?
         .get(id.get())?
         .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
         .transpose()

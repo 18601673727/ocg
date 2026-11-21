@@ -147,14 +147,14 @@ pub(crate) async fn run(
         return;
     }
     log::info!("native scheduler running with configured Provider endpoints");
-    let catalog = database.subscribe_catalog();
+    let configs = database.subscribe_generative_configs();
     if let Err(error) = database.settle_unreported_children().await {
         log::warn!("native scheduler: unreported child conversations were not settled ({error})");
     }
     let scheduler = Allocator::new(database.clone(), shutdown.clone(), stops, workspace_tools);
     let wake = Scheduler::new(&database, wake, shutdown);
     let reports = async {
-        while catalog.changed().await.is_ok() {
+        while configs.changed().await.is_ok() {
             if let Err(error) = database.settle_unreported_children().await {
                 log::warn!("native scheduler: could not return pending child results ({error})");
             }

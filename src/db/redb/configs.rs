@@ -6,13 +6,13 @@ use crate::db::entities::{
     NativeDecisionConfig, ProjectDecisionConfig, ProviderSnapshot, RecordRef, Violation, merge,
     valid_credential_ref,
 };
-use crate::db::redb::StorageError;
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::codec::{Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS};
 use crate::db::redb::indexes::CompactionReference;
 use crate::db::redb::reads::catalog::live_credential_refs;
 use crate::db::redb::rows::{ConfigRow, decode_project};
 use crate::db::redb::schema::{CONFIGS, CONVERSATION_CONFIG_REFS, CREDENTIALS, META, PROJECTS};
+use crate::db::redb::{StorageError, TxRead};
 use crate::db::redb::{reads, state};
 use ::redb::ReadableTable;
 use std::collections::{BTreeMap, BTreeSet};
@@ -122,14 +122,6 @@ impl Batch {
                 .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()))
                 .transpose()
         })
-    }
-
-    pub(crate) fn config_record(
-        &mut self,
-        id: ConfigId,
-    ) -> Result<Option<crate::db::entities::ConfigRecord>, BatchError> {
-        self.config(id)
-            .map(|row| row.map(reads::catalog::config_record))
     }
 
     pub(crate) fn require_config(&mut self, id: ConfigId) -> Result<ConfigRow, BatchError> {
@@ -621,6 +613,10 @@ impl Batch {
 
     fn put_config(&mut self, row: &ConfigRow) -> Result<(), BatchError> {
         self.catalog_changed = true;
+        self.generative_config_changed |= match row.kind {
+            ConfigKind::Connection | ConfigKind::Model | ConfigKind::Agent => true,
+            ConfigKind::DecisionModel | ConfigKind::DecisionAgent => false,
+        };
         self.insert(CONFIGS, row.id.get(), row.encode().as_slice())
     }
 
@@ -1228,25 +1224,19 @@ impl Batch {
     }
 }
 
-pub(super) struct ConfigurationResolver<F> {
-    read: F,
+pub(super) struct ConfigurationResolver<'a, Tx> {
+    tx: &'a Tx,
     global_headers: GlobalHeaders,
 }
 
-impl<F> ConfigurationResolver<F>
-where
-    F: FnMut(ConfigId) -> Result<Option<ConfigRecord>, BatchError>,
-{
-    pub(super) fn new(read: F) -> Self {
-        Self {
-            read,
-            global_headers: GlobalHeaders::default(),
-        }
+impl<'a, Tx: TxRead> ConfigurationResolver<'a, Tx> {
+    pub(super) fn new(tx: &'a Tx, global_headers: GlobalHeaders) -> Self {
+        Self { tx, global_headers }
     }
 
-    fn with_global_headers(mut self, global_headers: GlobalHeaders) -> Self {
-        self.global_headers = global_headers;
-        self
+    fn for_execution(tx: &'a Tx) -> Result<Self, StorageError> {
+        let headers = reads::catalog::global_outbound_headers(&tx.table(META)?)?;
+        Ok(Self::new(tx, headers))
     }
 
     fn frozen_headers(&self, connection: &ConnectionConfig) -> FrozenHeaders {
@@ -1257,7 +1247,7 @@ where
     }
 
     fn require_config(&mut self, id: ConfigId) -> Result<ConfigRecord, BatchError> {
-        (self.read)(id)?.ok_or_else(|| {
+        reads::catalog::config(self.tx, id)?.ok_or_else(|| {
             BatchError(Failure::Rejected(Violation::NotFound(RecordRef::Profile(
                 id.into(),
             ))))
@@ -1607,7 +1597,7 @@ where
             if !models.contains(&id) {
                 continue;
             }
-            let Some(row) = (self.read)(id)? else {
+            let Some(row) = reads::catalog::config(self.tx, id)? else {
                 continue;
             };
             if row.archived_at.is_some()
@@ -1669,32 +1659,38 @@ impl Batch {
         &mut self,
         configuration: ExecutionConfiguration,
     ) -> Result<FrozenConfiguration, BatchError> {
-        if configuration.agent_profile.is_none() {
-            return self.reject(Violation::InvalidValue(
-                "agent_profile_required",
-                "name an Agent that lists this Model",
-            ));
-        }
-        self.freeze_system_configuration(configuration)
+        self.inspect(|tx| freeze_configuration(tx, configuration))
     }
 
     pub(crate) fn freeze_system_configuration(
         &mut self,
         configuration: ExecutionConfiguration,
     ) -> Result<FrozenConfiguration, BatchError> {
-        let global = self.global_headers()?;
-        ConfigurationResolver::new(|id| self.config_record(id))
-            .with_global_headers(global)
-            .freeze_configuration(configuration)
+        self.inspect(|tx| {
+            ConfigurationResolver::for_execution(tx)?.freeze_configuration(configuration)
+        })
     }
 
     pub(crate) fn freeze_decision_profile(
         &mut self,
         profile: ConfigId,
     ) -> Result<FrozenDecisionConfig, BatchError> {
-        let global = self.global_headers()?;
-        ConfigurationResolver::new(|id| self.config_record(id))
-            .with_global_headers(global)
-            .freeze_decision_profile(profile)
+        self.inspect(|tx| {
+            ConfigurationResolver::for_execution(tx)?.freeze_decision_profile(profile)
+        })
     }
+}
+
+pub(super) fn freeze_configuration(
+    tx: &impl TxRead,
+    configuration: ExecutionConfiguration,
+) -> Result<FrozenConfiguration, BatchError> {
+    if configuration.agent_profile.is_none() {
+        return Err(Violation::InvalidValue(
+            "agent_profile_required",
+            "name an Agent that lists this Model",
+        )
+        .into());
+    }
+    ConfigurationResolver::for_execution(tx)?.freeze_configuration(configuration)
 }

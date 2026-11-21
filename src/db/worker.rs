@@ -51,6 +51,7 @@ pub(super) struct Executed {
     durable_commit_us: Option<u64>,
     scheduling_dirty: bool,
     catalog_changed: bool,
+    generative_config_changed: bool,
     pub(super) output_changed: Option<JobId>,
     pub(super) observations: Vec<ObservationChange>,
     pub(super) committed: bool,
@@ -116,6 +117,7 @@ pub(super) fn settle<T: Send + 'static>(
         durable_commit_us: outcome.durable_commit_us,
         scheduling_dirty,
         catalog_changed,
+        generative_config_changed: committed && outcome.generative_config_changed,
         output_changed,
         observations: Vec::new(),
         committed,
@@ -252,6 +254,7 @@ impl DatabaseWorker {
                 let shared = Arc::new(Shared {
                     data_directory: data_directory.clone(),
                     catalog_changes: Default::default(),
+                    generative_config_changes: Default::default(),
                     observation_changes: Default::default(),
                     output_changes: Default::default(),
                     scheduler_wake,
@@ -706,6 +709,12 @@ impl WriteWorker {
             self.shared.catalog_changes.publish();
         }
         if lock.is_none() && lost.is_none() {
+            if executed
+                .iter()
+                .any(|(ran, _)| ran.generative_config_changed)
+            {
+                self.shared.generative_config_changes.publish();
+            }
             for (ran, _) in &executed {
                 if ran.committed {
                     for observation in &ran.observations {

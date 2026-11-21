@@ -1,6 +1,6 @@
 use std::ops::Bound;
 
-use super::catalog::{config_record, effective_context_policy, global_compaction_settings};
+use super::catalog::{effective_context_policy, global_compaction_settings};
 use super::jobs::tool_evidence;
 use crate::db::entities::JobId;
 use crate::db::entities::{
@@ -8,9 +8,7 @@ use crate::db::entities::{
     ConversationEntry, ConversationsPage, JobLifecycle, JobLimits, JobSpec,
     MutableConversationPage, MutableConversationTurn, Origin, OutputKind, Recurrence,
 };
-use crate::db::entities::{
-    ConfigId, ConfigRecord, ExecutionOperation, MutableJobPhase, OutcomeKind,
-};
+use crate::db::entities::{ConfigId, ExecutionOperation, MutableJobPhase, OutcomeKind};
 use crate::db::redb::allocations::pools_offering_capability;
 use crate::db::redb::batch::{BatchError, Failure};
 use crate::db::redb::configs::ConfigurationResolver;
@@ -21,11 +19,11 @@ use crate::db::redb::reads::jobs::{
     turn_head, unstarted_settlement_in,
 };
 use crate::db::redb::reads::read;
-use crate::db::redb::rows::{ConfigRow, decode_output, decode_project};
+use crate::db::redb::rows::{decode_output, decode_project};
 use crate::db::redb::schema::MAX_PAGE;
 use crate::db::redb::schema::{
-    ATTACHMENTS, CHILD_GROUPS, CHILDREN, CONFIGS, CONVERSATION_SEARCH, CONVERSATIONS, JOB_OUTPUTS,
-    JOBS, MESSAGES, META, OPEN_APPROVALS, POOL_ALLOCATIONS, PROJECTS, RECURRENCES, TURNS,
+    ATTACHMENTS, CHILD_GROUPS, CHILDREN, CONVERSATION_SEARCH, CONVERSATIONS, JOB_OUTPUTS, JOBS,
+    MESSAGES, META, OPEN_APPROVALS, POOL_ALLOCATIONS, PROJECTS, RECURRENCES, TURNS,
 };
 use crate::db::redb::{StorageError, TxRead};
 use crate::db::redb::{allocations, indexes, rows, state};
@@ -473,14 +471,20 @@ pub(crate) fn read_conversation_limits(
     database: &Database,
     conversation: JobId,
 ) -> Result<Option<(JobLimits, u8)>, StorageError> {
-    let rx = read(database)?;
+    conversation_limits(&read(database)?, conversation)
+}
+
+pub(in crate::db::redb) fn conversation_limits(
+    tx: &impl TxRead,
+    conversation: JobId,
+) -> Result<Option<(JobLimits, u8)>, StorageError> {
     let mut current = conversation;
     let mut limits = JobLimits::CEILING;
     for depth in 0..=crate::db::entities::MAX_JOB_DEPTH {
-        let Some(row) = read_conversation_row(&rx, current)? else {
+        let Some(row) = read_conversation_row(tx, current)? else {
             return Ok(None);
         };
-        let own = read_job_lifecycle(&rx, current)?.limits;
+        let own = state::require(tx, current)?.lifecycle.limits;
         if let Some(own) = own {
             limits = limits.intersect(own);
         }
@@ -629,10 +633,8 @@ pub(crate) fn read_context_state(
     } else if !decision.enabled {
         Some("prediction is disabled by the project decision configuration".to_owned())
     } else if let Some(active) = &active {
-        let resolved = ConfigurationResolver::new(|id| {
-            read_config_record(&rx, id).map_err(|error| BatchError(Failure::Storage(error)))
-        })
-        .project_decision(&decision, active);
+        let resolved =
+            ConfigurationResolver::new(&rx, Default::default()).project_decision(&decision, active);
         match resolved {
             Ok(Some(frozen)) => {
                 predictor = Some(frozen.profile_ref().id);
@@ -777,16 +779,6 @@ pub(crate) fn read_context_state(
         work,
         next_before: None,
     }))
-}
-
-fn read_config_record(
-    rx: &ReadTransaction,
-    id: ConfigId,
-) -> Result<Option<ConfigRecord>, StorageError> {
-    rx.open_table(CONFIGS)?
-        .get(id.get())?
-        .map(|bytes| ConfigRow::decode_at(id.get(), bytes.value()).map(config_record))
-        .transpose()
 }
 
 pub(super) fn decision_executor_available(

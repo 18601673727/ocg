@@ -21,10 +21,10 @@ use ::redb::{Database, ReadTransaction, ReadableTable};
 use std::collections::BTreeMap;
 
 pub(crate) fn read_conversation_row(
-    rx: &ReadTransaction,
+    rx: &impl TxRead,
     id: JobId,
 ) -> Result<Option<JobSpec>, StorageError> {
-    rx.open_table(CONVERSATIONS)?
+    rx.table(CONVERSATIONS)?
         .get(id.get())?
         .map(|bytes| JobSpec::decode_at(id.get(), bytes.value()))
         .transpose()

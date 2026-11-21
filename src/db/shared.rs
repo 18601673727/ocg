@@ -66,6 +66,7 @@ pub(super) fn admitted(admission: &Admission) -> Result<(), DatabaseError> {
 pub(super) struct Shared {
     pub(super) data_directory: DataDirectory,
     pub(super) output_changes: crate::support::notification::KeyedNotifications<u128>,
+    pub(super) generative_config_changes: crate::support::notification::Notifications,
     pub(super) catalog_changes: crate::support::notification::Notifications,
     pub(super) observation_changes: crate::support::notification::Journal<ObservationChange>,
     pub(super) scheduler_wake: SchedulerWake,

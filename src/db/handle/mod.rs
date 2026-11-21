@@ -86,6 +86,12 @@ impl DatabaseHandle {
             .take()
     }
 
+    pub(crate) fn subscribe_generative_configs(
+        &self,
+    ) -> crate::support::notification::Subscription {
+        self.shared.generative_config_changes.subscribe()
+    }
+
     pub(crate) fn subscribe_catalog(&self) -> crate::support::notification::Subscription {
         self.shared.catalog_changes.subscribe()
     }

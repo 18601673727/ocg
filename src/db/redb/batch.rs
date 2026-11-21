@@ -18,6 +18,18 @@ use std::time::Instant;
 #[derive(Clone, Debug)]
 pub(crate) struct BatchError(pub(crate) Failure);
 
+impl From<StorageError> for BatchError {
+    fn from(error: StorageError) -> Self {
+        Self(Failure::Storage(error))
+    }
+}
+
+impl From<Violation> for BatchError {
+    fn from(reason: Violation) -> Self {
+        Self(Failure::Rejected(reason))
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Failure {
     Rejected(Violation),
@@ -56,6 +68,7 @@ pub(crate) struct BatchOutcome<T> {
     pub(crate) scheduling_wake: bool,
     pub(crate) capacity_freed: bool,
     pub(crate) catalog_changed: bool,
+    pub(crate) generative_config_changed: bool,
     pub(crate) probe: Option<Probe>,
     pub(crate) resource_deltas: Vec<NativeResourceDelta>,
 }
@@ -74,6 +87,7 @@ impl<T> BatchOutcome<T> {
             scheduling_wake: false,
             capacity_freed: false,
             catalog_changed: false,
+            generative_config_changed: false,
             probe: None,
             resource_deltas: Vec::new(),
         }
@@ -89,6 +103,7 @@ pub(crate) struct Batch {
     pub(super) freed_capacity: bool,
     pub(super) changed_pool: bool,
     pub(super) catalog_changed: bool,
+    pub(super) generative_config_changed: bool,
     pub(super) probe: Option<Probe>,
     pub(super) resource_deltas: Vec<NativeResourceDelta>,
     pub(super) execution_transaction: Option<u64>,
@@ -162,6 +177,7 @@ pub(crate) fn run_batch_declinable<T>(
                     scheduling_wake: false,
                     capacity_freed: false,
                     catalog_changed: false,
+                    generative_config_changed: false,
                     probe: None,
                     resource_deltas: Vec::new(),
                 },
@@ -188,6 +204,7 @@ fn commit_batch<T>(batch: Batch, value: T, commit: Commit) -> BatchOutcome<T> {
             scheduling_wake: batch.touched_ready_or_delayed || batch.changed_pool,
             capacity_freed: batch.freed_capacity,
             catalog_changed: batch.catalog_changed,
+            generative_config_changed: batch.generative_config_changed,
             probe: batch.probe,
             resource_deltas: batch.resource_deltas,
         },
@@ -266,6 +283,7 @@ impl Batch {
             freed_capacity: false,
             changed_pool: false,
             catalog_changed: false,
+            generative_config_changed: false,
             probe: None,
             resource_deltas: Vec::new(),
             execution_transaction: None,
@@ -322,9 +340,16 @@ impl Batch {
         &mut self,
         f: impl FnOnce(&WriteTransaction) -> Result<T, StorageError>,
     ) -> Result<T, BatchError> {
+        self.inspect(|tx| Ok(f(tx)?))
+    }
+
+    pub(super) fn inspect<T>(
+        &mut self,
+        f: impl FnOnce(&WriteTransaction) -> Result<T, BatchError>,
+    ) -> Result<T, BatchError> {
         self.check_failure()?;
-        let result = f(&self.tx).map_err(|error| BatchError(Failure::Storage(error)));
-        if let Err(BatchError(failure)) = &result {
+        let result = f(&self.tx);
+        if let Err(BatchError(failure @ Failure::Storage(_))) = &result {
             self.remember_failure(failure);
         }
         result

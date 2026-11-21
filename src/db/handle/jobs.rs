@@ -430,23 +430,57 @@ impl DatabaseHandle {
     }
 
     pub(crate) async fn settle_unreported_children(&self) -> Result<usize, DatabaseError> {
+        log::debug!("starting pending child report sweep");
         let mut cursor = None;
         let mut reported = 0;
         loop {
-            let (next, count) = self
-                .write(
-                    64 * 1024,
-                    OperationKind::SettleChildTurns,
-                    cursor,
-                    |batch, after| batch.settle_unreported_children(after),
-                )
+            let page = self
+                .read(move |db| redb::read_child_report_page(db, cursor))
                 .await?;
-            reported += count;
-            cursor = next;
+            if let Some((parent, child)) = page.candidate {
+                reported += self.retry_child_report(parent, child).await?;
+            }
+            cursor = page.next;
             if cursor.is_none() {
                 return Ok(reported);
             }
         }
+    }
+
+    async fn retry_child_report(
+        &self,
+        parent: JobId,
+        child: JobId,
+    ) -> Result<usize, DatabaseError> {
+        use crate::db::commands::Command;
+        use std::ops::ControlFlow::{Break, Continue};
+        self.submit(|reply| {
+            Command::custom(
+                (parent, child),
+                reply,
+                |_| 64 * 1024,
+                |(parent, child), reply, database, operation, commit| {
+                    let (outcome, declined) =
+                        redb::run_batch_declinable(database, operation.epoch, commit, |batch| {
+                            let marked = batch.retry_child_report(parent, child)?;
+                            Ok(if marked == 0 {
+                                Break(0)
+                            } else {
+                                Continue(marked)
+                            })
+                        });
+                    crate::db::worker::settle(
+                        operation,
+                        commit,
+                        OperationKind::SettleChildTurns,
+                        reply,
+                        outcome,
+                        declined,
+                    )
+                },
+            )
+        })
+        .await
     }
 
     pub async fn hold(&self, conversation: JobId, by: Actor) -> Result<JobAction, DatabaseError> {

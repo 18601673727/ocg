@@ -16,6 +16,7 @@ mod batch;
 mod configs;
 mod execution_writes;
 mod job_tree;
+pub(crate) use job_tree::read_child_report_page;
 mod jobs;
 mod observations;
 pub(crate) mod reads;

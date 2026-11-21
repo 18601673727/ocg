@@ -1,4 +1,4 @@
-use super::{StorageError, execution};
+use super::{StorageError, TxRead, execution};
 use crate::db::entities::{
     Appended, AttachmentId, ConfigId, ExecutionConfiguration, ExecutionEventKind,
     ExecutionOperation, FrozenConfiguration, FrozenDecisionConfig, JobId, JobLifecycle, JobSpec,
@@ -554,38 +554,7 @@ impl Batch {
         &mut self,
         job: &crate::db::entities::MutableJob,
     ) -> Result<(), BatchError> {
-        self.require_generative_history(job.parent_id, job.previous, Some(job.id))
-    }
-
-    pub(super) fn require_generative_history(
-        &mut self,
-        parent: JobId,
-        previous: Option<JobId>,
-        current: Option<JobId>,
-    ) -> Result<(), BatchError> {
-        if self.has_decision_predecessors(parent, previous, current)? {
-            return self.reject(Violation::InvalidValue(
-                "execution_context",
-                "Generative Jobs cannot follow Decision history",
-            ));
-        }
-        Ok(())
-    }
-
-    fn has_decision_predecessors(
-        &mut self,
-        parent: JobId,
-        previous: Option<JobId>,
-        current: Option<JobId>,
-    ) -> Result<bool, BatchError> {
-        let result = self
-            .step(|tx| decision_predecessors(&tx.open_table(JOBS)?, parent, previous, current))?;
-        result.map_err(|reason| {
-            BatchError(Failure::Rejected(Violation::InvalidValue(
-                "execution_context",
-                reason,
-            )))
-        })
+        self.inspect(|tx| require_generative_history(tx, job.parent_id, job.previous, Some(job.id)))
     }
 
     pub(crate) fn unsupported_start_context(
@@ -736,43 +705,6 @@ impl Batch {
         Ok(())
     }
 
-    pub(super) fn validate_mutable_input(
-        &mut self,
-        input: &crate::db::entities::MutableJobInput,
-    ) -> Result<(), BatchError> {
-        if let crate::db::entities::MutableJobContent::Decision { request, .. } = &input.content {
-            use crate::db::entities::DecisionCapability;
-            let capabilities = BTreeSet::from([
-                DecisionCapability::Choice,
-                DecisionCapability::BinaryProbability,
-                DecisionCapability::OrdinalScore,
-            ]);
-            if let Err(reason) = request.validate(&capabilities) {
-                return self.reject(Violation::InvalidValue("decision", reason));
-            }
-            return Ok(());
-        }
-        if input.text().len() > MAX_INPUT_BYTES
-            || input.text().chars().any(invalid_input_character)
-            || input.attachments().len() > 8
-        {
-            return self.reject(Violation::InvalidValue("input", "invalid Job input"));
-        }
-        let mut seen = BTreeSet::new();
-        for attachment in input.attachments() {
-            if !seen.insert(*attachment) {
-                return self.reject(Violation::InvalidValue(
-                    "attachments",
-                    "duplicate attachment",
-                ));
-            }
-            if !self.require_attachment(*attachment)?.is_available() {
-                return self.reject(Violation::AttachmentCleanedUp(*attachment));
-            }
-        }
-        Ok(())
-    }
-
     pub(super) fn frozen_configuration(
         &mut self,
         job: &crate::db::entities::MutableJob,
@@ -858,27 +790,8 @@ impl Batch {
             }
             return Ok(FrozenConfiguration::Decision(frozen));
         }
-        if input.text().trim().is_empty() && input.attachments().is_empty() {
-            return self.reject(Violation::InvalidValue("input", "Job input is empty"));
-        }
-        let Some(configuration) = input.configuration() else {
-            return self.reject(Violation::InvalidValue(
-                "configuration",
-                "Job configuration is required",
-            ));
-        };
-        match self.freeze_configuration(configuration)? {
-            FrozenConfiguration::Generative(frozen) => {
-                if let Some(reason) = frozen.native_execution_refusal() {
-                    return self.reject(Violation::InvalidValue("configuration", reason));
-                }
-                Ok(FrozenConfiguration::Generative(frozen))
-            }
-            FrozenConfiguration::Decision(_) => self.reject(Violation::InvalidValue(
-                "configuration",
-                "typed decision work is not supported here",
-            )),
-        }
+        self.inspect(|tx| generative_execution(tx, input))
+            .map(FrozenConfiguration::Generative)
     }
 
     fn bind_mutable_decision_input(
@@ -904,9 +817,7 @@ impl Batch {
         &mut self,
         job: JobId,
     ) -> Result<Option<crate::db::entities::MutableJob>, BatchError> {
-        self.get(JOBS, job.get(), |bytes| {
-            decode_mutable_job(job.get(), bytes)
-        })
+        self.step(|tx| mutable_job_in(tx, job))
     }
 
     pub(crate) fn read_mutable_job(
@@ -976,36 +887,6 @@ impl Batch {
         self.create_job_as(context, input, submission, conversation, project, true)
     }
 
-    pub(super) fn require_conversation_agent(
-        &mut self,
-        parent: &JobSpec,
-        selected: Option<ConfigId>,
-    ) -> Result<(), BatchError> {
-        if parent.agent != selected {
-            return self.reject(Violation::InvalidValue(
-                "conversation",
-                "Agent differs from the conversation",
-            ));
-        }
-        Ok(())
-    }
-
-    pub(super) fn require_open_turn_parent(&mut self, row: &JobSpec) -> Result<(), BatchError> {
-        let lifecycle = self.job_lifecycle(row.id)?;
-        if row.is_chunk_group()
-            || row.is_standalone_decision_group()
-            || self.require_job_state(row.id)?.outcome.is_some()
-            || lifecycle.closing.is_some()
-            || lifecycle.hidden_at.is_some()
-        {
-            return self.reject(Violation::InvalidValue(
-                "conversation",
-                "conversation is not open",
-            ));
-        }
-        Ok(())
-    }
-
     pub(crate) fn create_job_as(
         &mut self,
         context: crate::db::entities::ComposerContextId,
@@ -1054,7 +935,7 @@ impl Batch {
             ));
         }
         self.bind_mutable_decision_input(&mut input)?;
-        self.validate_mutable_input(&input)?;
+        self.inspect(|tx| validate_mutable_input(tx, &input))?;
         let parent_id = match conversation {
             Some(parent) => {
                 let row = self.require_mutable_conversation(parent)?;
@@ -1067,7 +948,8 @@ impl Batch {
                         ));
                     }
                 }
-                self.require_open_turn_parent(&row)?;
+                let runtime = self.step(|tx| state::require(tx, row.id))?;
+                require_open_turn_parent(&row, &runtime)?;
                 parent
             }
             None => self.create_mutable_conversation(project)?,
@@ -1156,7 +1038,7 @@ impl Batch {
                 "a retry must remain a Generative Job",
             ));
         }
-        self.validate_mutable_input(&input)?;
+        self.inspect(|tx| validate_mutable_input(tx, &input))?;
         let next_context = context_selection.unwrap_or(job.context_selection);
         if !self.mutable_context_valid(&job, next_context)? {
             return self.reject(Violation::InvalidValue(
@@ -1360,7 +1242,9 @@ impl Batch {
                 "Job cannot be cancelled by this operation",
             ));
         }
-        if !self.has_decision_predecessors(job.parent_id, job.previous, Some(job.id))? {
+        if !self.inspect(|tx| {
+            has_decision_predecessors(tx, job.parent_id, job.previous, Some(job.id))
+        })? {
             return self.reject(Violation::InvalidValue(
                 "job",
                 "Job does not have unsupported Decision history",
@@ -1539,7 +1423,7 @@ impl Batch {
                 "conversation has changed since Job creation",
             ));
         }
-        self.validate_mutable_input(&job.input)?;
+        self.inspect(|tx| validate_mutable_input(tx, &job.input))?;
         if matches!(
             &job.input.content,
             crate::db::entities::MutableJobContent::Generative { .. }
@@ -1555,12 +1439,12 @@ impl Batch {
                     parent.agent = selected;
                     self.insert(CONVERSATIONS, parent.id.get(), parent.encode().as_slice())?;
                 } else {
-                    self.require_conversation_agent(&parent, selected)?;
+                    require_conversation_agent(&parent, selected)?;
                 }
             }
             FrozenConfiguration::Decision(frozen) => {
                 if parent.agent.is_some() {
-                    self.require_conversation_agent(
+                    require_conversation_agent(
                         &parent,
                         frozen.agent_ref().map(|reference| reference.id),
                     )?;
@@ -1961,11 +1845,10 @@ pub(super) fn decision_predecessors(
 ) -> Result<Result<bool, &'static str>, StorageError> {
     use crate::db::entities::MutableJobContent;
 
-    // Reserve a slot for a proposed report turn before it has an allocated id.
-    let limit = 4096 - usize::from(current.is_none());
+    const MAX_PREDECESSORS: usize = 4096;
     let mut seen = BTreeSet::new();
     while let Some(id) = previous {
-        if seen.len() == limit {
+        if seen.len() == MAX_PREDECESSORS {
             return Ok(Err(
                 "conversation history exceeds the supported admission limit",
             ));
@@ -1986,4 +1869,135 @@ pub(super) fn decision_predecessors(
         previous = prior.previous;
     }
     Ok(Ok(false))
+}
+
+pub(super) fn validate_mutable_input(
+    tx: &impl TxRead,
+    input: &crate::db::entities::MutableJobInput,
+) -> Result<(), BatchError> {
+    if let crate::db::entities::MutableJobContent::Decision { request, .. } = &input.content {
+        use crate::db::entities::DecisionCapability;
+        let capabilities = BTreeSet::from([
+            DecisionCapability::Choice,
+            DecisionCapability::BinaryProbability,
+            DecisionCapability::OrdinalScore,
+        ]);
+        if let Err(reason) = request.validate(&capabilities) {
+            return Err(Violation::InvalidValue("decision", reason).into());
+        }
+        return Ok(());
+    }
+    if input.text().len() > MAX_INPUT_BYTES
+        || input.text().chars().any(invalid_input_character)
+        || input.attachments().len() > 8
+    {
+        return Err(Violation::InvalidValue("input", "invalid Job input").into());
+    }
+    let mut seen = BTreeSet::new();
+    for attachment in input.attachments() {
+        if !seen.insert(*attachment) {
+            return Err(Violation::InvalidValue("attachments", "duplicate attachment").into());
+        }
+        let record = reads::catalog::attachment(tx, *attachment)?
+            .ok_or(Violation::NotFound(RecordRef::Attachment(*attachment)))?;
+        if !record.is_available() {
+            return Err(Violation::AttachmentCleanedUp(*attachment).into());
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn generative_execution(
+    tx: &impl TxRead,
+    input: &crate::db::entities::MutableJobInput,
+) -> Result<crate::db::entities::FrozenExecutionConfig, BatchError> {
+    if input.text().trim().is_empty() && input.attachments().is_empty() {
+        return Err(Violation::InvalidValue("input", "Job input is empty").into());
+    }
+    let Some(configuration) = input.configuration() else {
+        return Err(
+            Violation::InvalidValue("configuration", "Job configuration is required").into(),
+        );
+    };
+    match super::configs::freeze_configuration(tx, configuration)? {
+        FrozenConfiguration::Generative(frozen) => {
+            if let Some(reason) = frozen.native_execution_refusal() {
+                return Err(Violation::InvalidValue("configuration", reason).into());
+            }
+            Ok(frozen)
+        }
+        FrozenConfiguration::Decision(_) => Err(Violation::InvalidValue(
+            "configuration",
+            "typed decision work is not supported here",
+        )
+        .into()),
+    }
+}
+
+pub(super) fn require_conversation_agent(
+    parent: &JobSpec,
+    selected: Option<ConfigId>,
+) -> Result<(), Violation> {
+    if parent.agent != selected {
+        return Err(Violation::InvalidValue(
+            "conversation",
+            "Agent differs from the conversation",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn require_open_turn_parent(
+    row: &JobSpec,
+    runtime: &JobRuntime,
+) -> Result<(), Violation> {
+    if row.is_chunk_group()
+        || row.is_standalone_decision_group()
+        || runtime.state.outcome.is_some()
+        || runtime.lifecycle.closing.is_some()
+        || runtime.lifecycle.hidden_at.is_some()
+    {
+        return Err(Violation::InvalidValue(
+            "conversation",
+            "conversation is not open",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn require_generative_history(
+    tx: &impl TxRead,
+    parent: JobId,
+    previous: Option<JobId>,
+    current: Option<JobId>,
+) -> Result<(), BatchError> {
+    if has_decision_predecessors(tx, parent, previous, current)? {
+        return Err(Violation::InvalidValue(
+            "execution_context",
+            "Generative Jobs cannot follow Decision history",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+fn has_decision_predecessors(
+    tx: &impl TxRead,
+    parent: JobId,
+    previous: Option<JobId>,
+    current: Option<JobId>,
+) -> Result<bool, BatchError> {
+    let jobs = tx.table(JOBS).map_err(StorageError::from)?;
+    decision_predecessors(&jobs, parent, previous, current)?
+        .map_err(|reason| Violation::InvalidValue("execution_context", reason).into())
+}
+
+pub(super) fn mutable_job_in(
+    tx: &impl TxRead,
+    id: JobId,
+) -> Result<Option<crate::db::entities::MutableJob>, StorageError> {
+    tx.table(JOBS)?
+        .get(id.get())?
+        .map(|row| decode_mutable_job(id.get(), row.value()))
+        .transpose()
 }

@@ -1,4 +1,4 @@
-use super::{StorageError, jobs};
+use super::{StorageError, TxRead, jobs, reads};
 use crate::db::entities::{
     Actor, Appended, ConfigId, ContentDigest, DependencyCondition, JobId, JobLimits, JobSpec,
     JobState, Origin, OutcomeKind, OutputKind, ProjectId, Recurrence, SubmissionKey,
@@ -16,6 +16,7 @@ use crate::db::redb::schema::{
 };
 use crate::db::redb::{rows, state};
 use ::redb::ReadableTable;
+use reads::jobs::{read_conversation_row, turn_head};
 
 const MAX_LIVE_CHILDREN: usize = 16;
 const MAX_LIVE_SUBTREE: usize = 64;
@@ -51,7 +52,8 @@ struct ChildResult {
 enum ReportTurn {
     Skip,
     Permanent(Violation),
-    Wait,
+    WaitForConfiguration,
+    InvalidInput(Violation),
     Post(MutableJobInput),
 }
 
@@ -62,9 +64,9 @@ struct ChildReport {
     turn: ReportTurn,
 }
 
-struct ChildReportPage {
-    next: Option<(u128, u128)>,
-    report: Option<ChildReport>,
+pub(crate) struct ChildReportPage {
+    pub(crate) next: Option<(u128, u128)>,
+    pub(crate) candidate: Option<(JobId, JobId)>,
 }
 
 pub(super) fn host_input(
@@ -200,26 +202,7 @@ impl Batch {
         &mut self,
         conversation: JobId,
     ) -> Result<(ExecutionConfiguration, JobQueuePriority), BatchError> {
-        let Some(head) = self.head_turn(conversation)? else {
-            return self.reject(Violation::InvalidValue(
-                "conversation",
-                "the conversation has no turn to take its configuration from",
-            ));
-        };
-        match head.input.content {
-            MutableJobContent::Generative {
-                configuration: Some(configuration),
-                ..
-            } => Ok((configuration, head.input.priority)),
-            MutableJobContent::Generative {
-                configuration: None,
-                ..
-            }
-            | MutableJobContent::Decision { .. } => self.reject(Violation::InvalidValue(
-                "conversation",
-                "the conversation has no Agent configuration",
-            )),
-        }
+        Ok(head_configuration(self.head_turn(conversation)?)?)
     }
 
     pub(super) fn host_turn(
@@ -1141,206 +1124,6 @@ impl Batch {
         Ok(())
     }
 
-    fn returned_answer(&mut self, turn: JobId) -> Result<Option<String>, BatchError> {
-        self.step(|tx| {
-            let outputs = tx.open_table(JOB_OUTPUTS)?;
-            let mut result = None;
-            for entry in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
-                let (key, value) = entry?;
-                if rows::output_kind(value.value())? == OutputKind::Result {
-                    result = Some(rows::decode_output(key.value(), value.value())?);
-                }
-            }
-            match result {
-                Some(record) => Ok(super::observations::answer_text(tx, turn, &record)?
-                    .or_else(|| record.display_text())),
-                None => Ok(None),
-            }
-        })
-    }
-
-    // Children from one call are allocated together in a single write. Their
-    // keys are contiguous within their parent, even after the children close.
-    fn call_siblings(
-        &mut self,
-        parent: JobId,
-        child: JobId,
-        call: ToolCallRef,
-    ) -> Result<Vec<JobId>, BatchError> {
-        self.step(|tx| {
-            let groups = tx.open_table(CHILD_GROUPS)?;
-            let conversations = tx.open_table(CONVERSATIONS)?;
-            let key = (parent.get(), child.get());
-            let mut siblings = Vec::new();
-            let mut collect = |id: u128| -> Result<bool, StorageError> {
-                let row = conversations
-                    .get(id)?
-                    .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
-                if JobSpec::decode_at(id, row.value())?.origin != (Origin::Agent { call }) {
-                    return Ok(false);
-                }
-                if siblings.len() == MAX_LIVE_CHILDREN {
-                    return Err(StorageError::corrupted("too many children from one call"));
-                }
-                siblings.push(JobId::new(id));
-                Ok(true)
-            };
-            for entry in groups.range((parent.get(), 0)..key)?.rev() {
-                if !collect(entry?.0.value().1)? {
-                    break;
-                }
-            }
-            for entry in groups.range(key..=(parent.get(), u128::MAX))? {
-                if !collect(entry?.0.value().1)? {
-                    break;
-                }
-            }
-            siblings.sort_unstable();
-            Ok(siblings)
-        })
-    }
-
-    fn collect_child_report(
-        &mut self,
-        parent: JobId,
-        child: JobId,
-    ) -> Result<Option<ChildReport>, BatchError> {
-        let Origin::Agent { call } = self.require_mutable_conversation(child)?.origin else {
-            return Ok(None);
-        };
-        let mut results = Vec::new();
-        for child in self.call_siblings(parent, child, call)? {
-            let Some(head) = self.group_head(child)? else {
-                return Ok(None);
-            };
-            let Some(outcome) = self.require_job_state(head)?.outcome else {
-                return Ok(None);
-            };
-            if outcome.kind == OutcomeKind::Unknown {
-                return Ok(None);
-            }
-            let lifecycle = self.job_lifecycle(child)?;
-            if lifecycle.reported != Some(head) {
-                results.push(ChildResult {
-                    child,
-                    head,
-                    outcome: outcome.kind,
-                    title: lifecycle.title.unwrap_or_else(|| child.to_string()),
-                });
-            }
-        }
-        if results.is_empty() {
-            return Ok(None);
-        }
-        let turn = self.child_report_turn(parent, &results)?;
-        Ok(Some(ChildReport {
-            parent,
-            call,
-            results,
-            turn,
-        }))
-    }
-
-    fn child_report_text(&mut self, results: &[ChildResult]) -> Result<String, BatchError> {
-        let mut text = String::from(REPORT_HEADER);
-        let mut available = jobs::MAX_INPUT_BYTES - text.len();
-        let mut sections = Vec::new();
-        for result in results {
-            let child = result.child;
-            let title = &result.title[..result.title.floor_char_boundary(REPORT_TITLE_BYTES)];
-            let title = title.replace(jobs::invalid_input_character, " ");
-            let status = match result.outcome {
-                OutcomeKind::Completed => "completed",
-                OutcomeKind::Failed => "failed",
-                OutcomeKind::Cancelled => "cancelled",
-                OutcomeKind::Unknown => "unknown",
-            };
-            let header = format!("\n\n[{title}] conversation {child}: {status}\n");
-            let pointer = format!("\nFull answer in child conversation {child}.");
-            let answer: String = self
-                .returned_answer(result.head)?
-                .unwrap_or_default()
-                .chars()
-                .take(jobs::MAX_INPUT_BYTES + 1)
-                .map(|c| {
-                    if jobs::invalid_input_character(c) {
-                        ' '
-                    } else {
-                        c
-                    }
-                })
-                .collect();
-            // At most MAX_LIVE_CHILDREN were opened by the call. Reserve every
-            // header plus enough for either the full answer or its pointer.
-            available -= header.len() + pointer.len().min(answer.len());
-            sections.push((header, answer, pointer));
-        }
-        for (header, answer, pointer) in sections {
-            text.push_str(&header);
-            available += pointer.len().min(answer.len());
-            if answer.len() <= available {
-                text.push_str(&answer);
-                available -= answer.len();
-            } else {
-                let end = answer.floor_char_boundary(available - pointer.len());
-                text.push_str(&answer[..end]);
-                text.push_str(&pointer);
-                available -= end + pointer.len();
-            }
-        }
-        Ok(text)
-    }
-
-    fn child_report_turn(
-        &mut self,
-        parent: JobId,
-        results: &[ChildResult],
-    ) -> Result<ReportTurn, BatchError> {
-        let lifecycle = self.job_lifecycle(parent)?;
-        if lifecycle.closing.is_some()
-            || lifecycle.hidden_at.is_some()
-            || self.require_job_state(parent)?.outcome.is_some()
-            || lifecycle.loop_count >= self.group_limits(parent)?.0.max_auto_turns
-        {
-            return Ok(ReportTurn::Skip);
-        }
-        let (configuration, priority) = match self.conversation_configuration(parent) {
-            Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::Permanent(reason)),
-            other => other?,
-        };
-        let input = host_input(self.child_report_text(results)?, configuration, priority);
-        let spec = self.require_mutable_conversation(parent)?;
-        match self.require_open_turn_parent(&spec) {
-            Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::Permanent(reason)),
-            other => other?,
-        }
-        let previous = self.group_head(parent)?;
-        match self.require_generative_history(parent, previous, None) {
-            Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::Permanent(reason)),
-            other => other?,
-        }
-        match self.validate_mutable_input(&input) {
-            Err(BatchError(Failure::Rejected(reason))) => {
-                log::warn!("invalid child report input for parent {parent}: {reason}");
-                return Ok(ReportTurn::Wait);
-            }
-            other => other?,
-        }
-        let frozen = match self.mutable_execution(&input) {
-            Err(BatchError(Failure::Rejected(_))) => return Ok(ReportTurn::Wait),
-            other => other?,
-        };
-        let agent = match frozen {
-            crate::db::entities::FrozenConfiguration::Generative(frozen) => frozen.agent_ref,
-            crate::db::entities::FrozenConfiguration::Decision(frozen) => frozen.agent_ref(),
-        };
-        match self.require_conversation_agent(&spec, agent.map(|reference| reference.id)) {
-            Ok(()) => Ok(ReportTurn::Post(input)),
-            Err(BatchError(Failure::Rejected(reason))) => Ok(ReportTurn::Permanent(reason)),
-            Err(error) => Err(error),
-        }
-    }
-
     fn return_child_results(&mut self, report: ChildReport) -> Result<usize, BatchError> {
         let ChildReport {
             parent,
@@ -1348,7 +1131,10 @@ impl Batch {
             results,
             turn,
         } = report;
-        if matches!(turn, ReportTurn::Wait) {
+        if matches!(
+            turn,
+            ReportTurn::WaitForConfiguration | ReportTurn::InvalidInput(_)
+        ) {
             return Ok(0);
         }
         for result in &results {
@@ -1374,7 +1160,7 @@ impl Batch {
             ReportTurn::Permanent(reason) => {
                 log::warn!("child results for parent {parent} remain on the child cards: {reason}")
             }
-            ReportTurn::Skip | ReportTurn::Wait => {}
+            ReportTurn::Skip | ReportTurn::WaitForConfiguration | ReportTurn::InvalidInput(_) => {}
         }
         Ok(results.len())
     }
@@ -1384,67 +1170,24 @@ impl Batch {
         parent: JobId,
         child: JobId,
     ) -> Result<usize, BatchError> {
-        match self.collect_child_report(parent, child)? {
+        let Some(report) = self.step(|tx| collect_child_report(tx, parent, child))? else {
+            return Ok(0);
+        };
+        if let ReportTurn::InvalidInput(reason) = &report.turn {
+            log::warn!("invalid child report input for child {child} of parent {parent}: {reason}");
+        }
+        self.return_child_results(report)
+    }
+
+    pub(crate) fn retry_child_report(
+        &mut self,
+        parent: JobId,
+        child: JobId,
+    ) -> Result<usize, BatchError> {
+        match self.step(|tx| collect_child_report(tx, parent, child))? {
             Some(report) => self.return_child_results(report),
             None => Ok(0),
         }
-    }
-
-    fn unreported_child_turns(
-        &mut self,
-        after: Option<(u128, u128)>,
-    ) -> Result<ChildReportPage, BatchError> {
-        use std::ops::Bound::{Excluded, Unbounded};
-        let keys = self.step(|tx| {
-            tx.open_table(CHILD_GROUPS)?
-                .range((after.map_or(Unbounded, Excluded), Unbounded))?
-                .take(MAX_CHILD_SCAN)
-                .map(|entry| Ok(entry?.0.value()))
-                .collect::<Result<Vec<_>, StorageError>>()
-        })?;
-        let mut next = after;
-        for &key in &keys {
-            if next.is_some_and(|cursor| key <= cursor) {
-                continue;
-            }
-            next = Some(key);
-            let (parent, child) = (JobId::new(key.0), JobId::new(key.1));
-            let Some(head) = self.group_head(child)? else {
-                continue;
-            };
-            if self.job_lifecycle(child)?.reported == Some(head) {
-                continue;
-            }
-            if let Some(report) = self.collect_child_report(parent, child)? {
-                if matches!(report.turn, ReportTurn::Post(_)) {
-                    // Posting changes the head and loop count. Resume with those
-                    // committed values before considering another call.
-                    return Ok(ChildReportPage {
-                        next,
-                        report: Some(report),
-                    });
-                }
-                // The parent cannot accept a report in this snapshot. Skip it
-                // across page boundaries as well as within the current page.
-                next = Some((parent.get(), u128::MAX));
-            }
-        }
-        Ok(ChildReportPage {
-            next: next.filter(|_| keys.len() == MAX_CHILD_SCAN),
-            report: None,
-        })
-    }
-
-    pub(crate) fn settle_unreported_children(
-        &mut self,
-        after: Option<(u128, u128)>,
-    ) -> Result<(Option<(u128, u128)>, usize), BatchError> {
-        let page = self.unreported_child_turns(after)?;
-        let marked = match page.report {
-            Some(report) => self.return_child_results(report)?,
-            None => 0,
-        };
-        Ok((page.next, marked))
     }
 
     pub(crate) fn settle_child_turns(&mut self, turns: &[JobId]) -> Result<usize, BatchError> {
@@ -1516,4 +1259,283 @@ fn actor_name(actor: &Actor) -> &'static str {
         Actor::Auto => "the host",
         Actor::Loop => "the loop limit",
     }
+}
+
+fn head_configuration(
+    head: Option<MutableJob>,
+) -> Result<(ExecutionConfiguration, JobQueuePriority), Violation> {
+    let Some(head) = head else {
+        return Err(Violation::InvalidValue(
+            "conversation",
+            "the conversation has no turn to take its configuration from",
+        ));
+    };
+    match head.input.content {
+        MutableJobContent::Generative {
+            configuration: Some(configuration),
+            ..
+        } => Ok((configuration, head.input.priority)),
+        MutableJobContent::Generative {
+            configuration: None,
+            ..
+        }
+        | MutableJobContent::Decision { .. } => Err(Violation::InvalidValue(
+            "conversation",
+            "the conversation has no Agent configuration",
+        )),
+    }
+}
+
+fn returned_answer(tx: &impl TxRead, turn: JobId) -> Result<Option<String>, StorageError> {
+    let outputs = tx.table(JOB_OUTPUTS)?;
+    let mut result = None;
+    for entry in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
+        let (key, value) = entry?;
+        if rows::output_kind(value.value())? == OutputKind::Result {
+            result = Some(rows::decode_output(key.value(), value.value())?);
+        }
+    }
+    match result {
+        Some(record) => {
+            Ok(super::observations::answer_text(tx, turn, &record)?
+                .or_else(|| record.display_text()))
+        }
+        None => Ok(None),
+    }
+}
+
+// Children from one call are allocated together in a single write. Their
+// keys are contiguous within their parent, even after the children close.
+fn call_siblings(
+    tx: &impl TxRead,
+    parent: JobId,
+    child: JobId,
+    call: ToolCallRef,
+) -> Result<Vec<JobId>, StorageError> {
+    let groups = tx.table(CHILD_GROUPS)?;
+    let conversations = tx.table(CONVERSATIONS)?;
+    let key = (parent.get(), child.get());
+    let mut siblings = Vec::new();
+    let mut collect = |id: u128| -> Result<bool, StorageError> {
+        let row = conversations
+            .get(id)?
+            .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
+        if JobSpec::decode_at(id, row.value())?.origin != (Origin::Agent { call }) {
+            return Ok(false);
+        }
+        if siblings.len() == MAX_LIVE_CHILDREN {
+            return Err(StorageError::corrupted("too many children from one call"));
+        }
+        siblings.push(JobId::new(id));
+        Ok(true)
+    };
+    for entry in groups.range((parent.get(), 0)..key)?.rev() {
+        if !collect(entry?.0.value().1)? {
+            break;
+        }
+    }
+    for entry in groups.range(key..=(parent.get(), u128::MAX))? {
+        if !collect(entry?.0.value().1)? {
+            break;
+        }
+    }
+    siblings.sort_unstable();
+    Ok(siblings)
+}
+
+fn collect_child_report(
+    tx: &impl TxRead,
+    parent: JobId,
+    child: JobId,
+) -> Result<Option<ChildReport>, StorageError> {
+    let Origin::Agent { call } = conversation_row(tx, child)?.origin else {
+        return Ok(None);
+    };
+    let mut results = Vec::new();
+    for child in call_siblings(tx, parent, child, call)? {
+        let Some(head) = turn_head(tx, child)? else {
+            return Ok(None);
+        };
+        let Some(outcome) = state::require(tx, head)?.state.outcome else {
+            return Ok(None);
+        };
+        if outcome.kind == OutcomeKind::Unknown {
+            return Ok(None);
+        }
+        let lifecycle = state::require(tx, child)?.lifecycle;
+        if lifecycle.reported != Some(head) {
+            results.push(ChildResult {
+                child,
+                head,
+                outcome: outcome.kind,
+                title: lifecycle.title.unwrap_or_else(|| child.to_string()),
+            });
+        }
+    }
+    if results.is_empty() {
+        return Ok(None);
+    }
+    let turn = child_report_turn(tx, parent, &results)?;
+    Ok(Some(ChildReport {
+        parent,
+        call,
+        results,
+        turn,
+    }))
+}
+
+fn child_report_text(tx: &impl TxRead, results: &[ChildResult]) -> Result<String, StorageError> {
+    let mut text = String::from(REPORT_HEADER);
+    let mut available = jobs::MAX_INPUT_BYTES - text.len();
+    let mut sections = Vec::new();
+    for result in results {
+        let child = result.child;
+        let title = &result.title[..result.title.floor_char_boundary(REPORT_TITLE_BYTES)];
+        let title = title.replace(jobs::invalid_input_character, " ");
+        let status = match result.outcome {
+            OutcomeKind::Completed => "completed",
+            OutcomeKind::Failed => "failed",
+            OutcomeKind::Cancelled => "cancelled",
+            OutcomeKind::Unknown => "unknown",
+        };
+        let header = format!("\n\n[{title}] conversation {child}: {status}\n");
+        let pointer = format!("\nFull answer in child conversation {child}.");
+        let answer: String = returned_answer(tx, result.head)?
+            .unwrap_or_default()
+            .chars()
+            .take(jobs::MAX_INPUT_BYTES + 1)
+            .map(|c| {
+                if jobs::invalid_input_character(c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        // At most MAX_LIVE_CHILDREN were opened by the call. Reserve every
+        // header plus enough for either the full answer or its pointer.
+        available -= header.len() + pointer.len().min(answer.len());
+        sections.push((header, answer, pointer));
+    }
+    for (header, answer, pointer) in sections {
+        text.push_str(&header);
+        available += pointer.len().min(answer.len());
+        if answer.len() <= available {
+            text.push_str(&answer);
+            available -= answer.len();
+        } else {
+            let end = answer.floor_char_boundary(available - pointer.len());
+            text.push_str(&answer[..end]);
+            text.push_str(&pointer);
+            available -= end + pointer.len();
+        }
+    }
+    Ok(text)
+}
+
+fn conversation_row(tx: &impl TxRead, id: JobId) -> Result<JobSpec, StorageError> {
+    read_conversation_row(tx, id)?.ok_or_else(|| {
+        StorageError::corrupted(format!("child report conversation {id} is missing"))
+    })
+}
+
+fn child_report_turn(
+    tx: &impl TxRead,
+    parent: JobId,
+    results: &[ChildResult],
+) -> Result<ReportTurn, StorageError> {
+    let runtime = state::require(tx, parent)?;
+    if runtime.lifecycle.closing.is_some()
+        || runtime.lifecycle.hidden_at.is_some()
+        || runtime.state.outcome.is_some()
+    {
+        return Ok(ReportTurn::Skip);
+    }
+    let (limits, _) = reads::conversations::conversation_limits(tx, parent)?
+        .ok_or_else(|| StorageError::corrupted("child report ancestor is missing"))?;
+    if runtime.lifecycle.loop_count >= limits.max_auto_turns {
+        return Ok(ReportTurn::Skip);
+    }
+    let previous = turn_head(tx, parent)?;
+    let head = previous
+        .map(|id| jobs::mutable_job_in(tx, id))
+        .transpose()?
+        .flatten();
+    let (configuration, priority) = match head_configuration(head) {
+        Ok(configuration) => configuration,
+        Err(reason) => return Ok(ReportTurn::Permanent(reason)),
+    };
+    let spec = conversation_row(tx, parent)?;
+    if let Err(reason) = jobs::require_open_turn_parent(&spec, &runtime) {
+        return Ok(ReportTurn::Permanent(reason));
+    }
+    match jobs::require_generative_history(tx, parent, previous, None) {
+        Ok(()) => {}
+        Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::Permanent(reason)),
+        Err(BatchError(Failure::Storage(error))) => return Err(error),
+    }
+    let input = host_input(child_report_text(tx, results)?, configuration, priority);
+    match jobs::validate_mutable_input(tx, &input) {
+        Ok(()) => {}
+        Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::InvalidInput(reason)),
+        Err(BatchError(Failure::Storage(error))) => return Err(error),
+    }
+    let frozen = match jobs::generative_execution(tx, &input) {
+        Ok(frozen) => frozen,
+        Err(BatchError(Failure::Rejected(_))) => return Ok(ReportTurn::WaitForConfiguration),
+        Err(BatchError(Failure::Storage(error))) => return Err(error),
+    };
+    if let Err(reason) =
+        jobs::require_conversation_agent(&spec, frozen.agent_ref.map(|reference| reference.id))
+    {
+        return Ok(ReportTurn::Permanent(reason));
+    }
+    Ok(ReportTurn::Post(input))
+}
+
+pub(crate) fn read_child_report_page(
+    database: &::redb::Database,
+    after: Option<(u128, u128)>,
+) -> Result<ChildReportPage, StorageError> {
+    use std::ops::Bound::{Excluded, Unbounded};
+    let tx = reads::read(database)?;
+    let groups = tx.open_table(CHILD_GROUPS)?;
+    let mut next = after;
+    let mut scanned = 0;
+    for entry in groups
+        .range((after.map_or(Unbounded, Excluded), Unbounded))?
+        .take(MAX_CHILD_SCAN)
+    {
+        let key = entry?.0.value();
+        scanned += 1;
+        if next.is_some_and(|cursor| key <= cursor) {
+            continue;
+        }
+        next = Some(key);
+        let (parent, child) = (JobId::new(key.0), JobId::new(key.1));
+        let Some(head) = turn_head(&tx, child)? else {
+            continue;
+        };
+        if state::require(&tx, child)?.lifecycle.reported == Some(head) {
+            continue;
+        }
+        if let Some(report) = collect_child_report(&tx, parent, child)? {
+            match report.turn {
+                // All calls on this parent would use the same unavailable configuration.
+                ReportTurn::WaitForConfiguration => next = Some((parent.get(), u128::MAX)),
+                ReportTurn::InvalidInput(_) => {}
+                ReportTurn::Skip | ReportTurn::Permanent(_) | ReportTurn::Post(_) => {
+                    // Re-read the parent head and loop count after each settlement.
+                    return Ok(ChildReportPage {
+                        next,
+                        candidate: Some((parent, child)),
+                    });
+                }
+            }
+        }
+    }
+    Ok(ChildReportPage {
+        next: next.filter(|_| scanned == MAX_CHILD_SCAN),
+        candidate: None,
+    })
 }
