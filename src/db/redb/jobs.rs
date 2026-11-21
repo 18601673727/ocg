@@ -1218,10 +1218,11 @@ impl Batch {
         Ok(())
     }
 
-    pub(crate) fn cancel_unsupported_queued_job(
+    pub(crate) fn cancel_queued_job(
         &mut self,
         id: JobId,
         expected_revision: u64,
+        unsupported_only: bool,
     ) -> Result<(), BatchError> {
         use crate::db::entities::{MutableJobContent, MutableJobPhase};
         self.require_allocation_durability()?;
@@ -1235,16 +1236,23 @@ impl Batch {
         if job.phase != MutableJobPhase::Queued
             || state.outcome.is_some()
             || self.pool_allocation(id)?.is_some()
-            || !matches!(job.input.content, MutableJobContent::Generative { .. })
         {
             return self.reject(Violation::InvalidValue(
                 "job",
                 "Job cannot be cancelled by this operation",
             ));
         }
-        if !self.inspect(|tx| {
-            has_decision_predecessors(tx, job.parent_id, job.previous, Some(job.id))
-        })? {
+        if !unsupported_only {
+            return self.end_queued_native_job(
+                &job,
+                OutcomeCause::Text("withdrawn by user before execution".to_owned()),
+            );
+        }
+        if !matches!(job.input.content, MutableJobContent::Generative { .. })
+            || !self.inspect(|tx| {
+                has_decision_predecessors(tx, job.parent_id, job.previous, Some(job.id))
+            })?
+        {
             return self.reject(Violation::InvalidValue(
                 "job",
                 "Job does not have unsupported Decision history",

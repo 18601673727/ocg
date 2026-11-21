@@ -398,6 +398,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         updatedAt: new Date(item.tip_created_at_us / 1000).toISOString(),
         archived,
         closed: item.state !== "open",
+        settled: item.state === "settled",
       },
     });
   }
@@ -642,6 +643,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           workType: "research",
           updatedAt: new Date().toISOString(),
           archived: state?.hidden_at_us != null,
+          settled: state !== undefined && state.settlement.state !== "unsettled",
           closed:
             state !== undefined &&
             (state.closing_at_us !== null || state.settlement.state !== "unsettled"),

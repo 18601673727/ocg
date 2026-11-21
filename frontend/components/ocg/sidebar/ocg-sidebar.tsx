@@ -283,6 +283,25 @@ export function OcgSidebar(props: OcgSidebarProps) {
       unitDisplay: "narrow",
     }).format(amount);
   };
+  const [closeTarget, setCloseTarget] = createSignal<string>();
+  const [closeState, setCloseState] = createSignal<"confirm" | "sending" | "closing">("confirm");
+  const [closeError, setCloseError] = createSignal<string>();
+  async function confirmClose() {
+    const id = closeTarget();
+    if (!props.api || !id || closeState() !== "confirm") return;
+    setCloseError(undefined);
+    setCloseState("sending");
+    try {
+      await props.api.closeConversation(id);
+      setCloseState("closing");
+    } catch (cause) {
+      setCloseError(cause instanceof Error ? cause.message : String(cause));
+      setCloseState("confirm");
+    }
+  }
+  const closeSettled = createMemo(() =>
+    props.sessions.some((session) => session.conversationId === closeTarget() && session.settled),
+  );
   const [hideTarget, setHideTarget] = createSignal<{
     id: string;
     title: string;
@@ -797,7 +816,8 @@ export function OcgSidebar(props: OcgSidebarProps) {
                               const pinId = session.conversationId ?? session.id;
                               const isPinned = selectedPinnedTogglePinned().pinned.has(pinId);
                               const hasActions = Boolean(
-                                session.conversationId && (props.onRename || props.onHide),
+                                (session.sessionId && (props.onRename || props.onHide)) ||
+                                  (props.api && session.conversationId && !session.closed),
                               );
                               const actions =
                                 "opacity-0 group-hover/session:opacity-100 group-focus-within/session:opacity-100 [@media(hover:none)]:opacity-100";
@@ -912,50 +932,60 @@ export function OcgSidebar(props: OcgSidebarProps) {
                                               <Pin class="size-3.5" />
                                             )}
                                           </button>
-                                          {(props.onRename || props.onHide) &&
-                                            session.sessionId && (
-                                              <DropdownMenu
-                                                open={isMenuOpen}
-                                                onOpenChange={(open) =>
-                                                  setOpenMenuId(open ? session.id : null)
-                                                }
+                                          <DropdownMenu
+                                            open={isMenuOpen}
+                                            onOpenChange={(open) =>
+                                              setOpenMenuId(open ? session.id : null)
+                                            }
+                                          >
+                                            <DropdownMenuTrigger asChild>
+                                              <button
+                                                type="button"
+                                                aria-label={i18n.t("sidebar.chatActions", {
+                                                  title: session.title || i18n.t("sidebar.newChat"),
+                                                })}
+                                                class="flex size-5 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
                                               >
-                                                <DropdownMenuTrigger asChild>
-                                                  <button
-                                                    type="button"
-                                                    aria-label={i18n.t("sidebar.chatActions", {
-                                                      title:
-                                                        session.title || i18n.t("sidebar.newChat"),
-                                                    })}
-                                                    class="flex size-5 items-center justify-center rounded text-muted-foreground hover:text-sidebar-foreground focus-visible:outline-ring"
+                                                <MoreVertical class="size-3.5" />
+                                              </button>
+                                            </DropdownMenuTrigger>
+                                            <DropdownMenuContent align="end">
+                                              {props.onRename && session.sessionId && (
+                                                <DropdownMenuItem
+                                                  onSelect={() =>
+                                                    openRename(
+                                                      session.id,
+                                                      session.title || "",
+                                                      "session",
+                                                    )
+                                                  }
+                                                >
+                                                  {i18n.t("sidebar.renameChat")}
+                                                </DropdownMenuItem>
+                                              )}
+                                              {props.onHide && session.sessionId && (
+                                                <DropdownMenuItem
+                                                  onSelect={() => openHide(session, jobState)}
+                                                >
+                                                  {i18n.t("sidebar.hideChat")}
+                                                </DropdownMenuItem>
+                                              )}
+                                              {props.api &&
+                                                session.conversationId &&
+                                                !session.closed && (
+                                                  <DropdownMenuItem
+                                                    destructive
+                                                    onSelect={() => {
+                                                      setCloseError(undefined);
+                                                      setCloseState("confirm");
+                                                      setCloseTarget(session.conversationId);
+                                                    }}
                                                   >
-                                                    <MoreVertical class="size-3.5" />
-                                                  </button>
-                                                </DropdownMenuTrigger>
-                                                <DropdownMenuContent align="end">
-                                                  {props.onRename && (
-                                                    <DropdownMenuItem
-                                                      onSelect={() =>
-                                                        openRename(
-                                                          session.id,
-                                                          session.title || "",
-                                                          "session",
-                                                        )
-                                                      }
-                                                    >
-                                                      {i18n.t("sidebar.renameChat")}
-                                                    </DropdownMenuItem>
-                                                  )}
-                                                  {props.onHide && (
-                                                    <DropdownMenuItem
-                                                      onSelect={() => openHide(session, jobState)}
-                                                    >
-                                                      {i18n.t("sidebar.hideChat")}
-                                                    </DropdownMenuItem>
-                                                  )}
-                                                </DropdownMenuContent>
-                                              </DropdownMenu>
-                                            )}
+                                                    {i18n.t("common.close")}
+                                                  </DropdownMenuItem>
+                                                )}
+                                            </DropdownMenuContent>
+                                          </DropdownMenu>
                                         </div>
                                       )}
                                     </div>
@@ -1101,6 +1131,43 @@ export function OcgSidebar(props: OcgSidebarProps) {
                     </Button>
                   </DialogFooter>
                 </form>
+              </DialogContent>
+            </Dialog>
+            <Dialog
+              open={Boolean(closeTarget())}
+              onOpenChange={(open) => {
+                if (!open && closeState() !== "sending") setCloseTarget(undefined);
+              }}
+            >
+              <DialogContent showCloseButton={closeState() !== "sending"}>
+                <DialogHeader>
+                  <DialogTitle>{i18n.t("sidebar.closeChat")}</DialogTitle>
+                  <DialogDescription>{i18n.t("sidebar.closeChatBody")}</DialogDescription>
+                </DialogHeader>
+                {closeError() && <DismissibleNotice message={closeError()!} />}
+                {closeState() === "closing" && (
+                  <p role="status">
+                    {i18n.t(closeSettled() ? "chat.child.settled" : "sidebar.closingChat")}
+                  </p>
+                )}
+                <DialogFooter>
+                  <Button
+                    variant="outline"
+                    disabled={closeState() === "sending"}
+                    onClick={() => setCloseTarget(undefined)}
+                  >
+                    {i18n.t(closeState() === "confirm" ? "common.cancel" : "common.close")}
+                  </Button>
+                  {(closeState() === "confirm" || closeState() === "sending") && (
+                    <Button
+                      variant="destructive"
+                      disabled={closeState() === "sending"}
+                      onClick={() => void confirmClose()}
+                    >
+                      {i18n.t("sidebar.closeChat")}
+                    </Button>
+                  )}
+                </DialogFooter>
               </DialogContent>
             </Dialog>
             <Dialog

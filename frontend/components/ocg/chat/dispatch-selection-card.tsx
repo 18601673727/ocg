@@ -37,41 +37,38 @@ export function DispatchSelectionCard(props: {
     const parsed = JSON.parse(props.arguments);
     if (parsed && typeof parsed === "object") request = parsed;
   } catch {}
-  createEffect(
-    () => [props.client, props.arguments, revision()],
-    () => {
-      const controller = new AbortController();
-      void Promise.all([
-        props.client.readProfiles(controller.signal),
-        props.client.readAllProjects(controller.signal),
-      ])
-        .then(([profiles, projects]) => {
-          if (controller.signal.aborted) return;
-          setCatalog({ profiles, projects });
-          setError(null);
-          try {
-            const request = JSON.parse(props.arguments);
-            const suggested: unknown[] = Array.isArray(request.projects)
-              ? request.projects
-              : request.project
-                ? [request.project]
-                : [];
-            setProjects(
-              projects
-                .filter((project) => suggested.includes(project.id))
-                .map((project) => project.id),
-            );
-          } catch {
-            setProjects([]);
-          }
-        })
-        .catch((cause) => {
-          if (!controller.signal.aborted)
-            setError(cause instanceof Error ? cause.message : String(cause));
-        });
-      return () => controller.abort();
-    },
-  );
+  createEffect(revision, () => {
+    const controller = new AbortController();
+    void Promise.all([
+      props.client.readProfiles(controller.signal),
+      props.client.readAllProjects(controller.signal),
+    ])
+      .then(([profiles, projects]) => {
+        if (controller.signal.aborted) return;
+        setCatalog({ profiles, projects });
+        setError(null);
+        try {
+          const request = JSON.parse(props.arguments);
+          const suggested: unknown[] = Array.isArray(request.projects)
+            ? request.projects
+            : request.project
+              ? [request.project]
+              : [];
+          setProjects(
+            projects
+              .filter((project) => suggested.includes(project.id))
+              .map((project) => project.id),
+          );
+        } catch {
+          setProjects([]);
+        }
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted)
+          setError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => controller.abort();
+  });
   const models = createMemo(() =>
     (catalog()?.profiles.llm_profiles ?? []).filter(
       (model) => model.enabled && model.declared_capabilities.includes("chat"),

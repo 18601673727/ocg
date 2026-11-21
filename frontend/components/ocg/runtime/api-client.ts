@@ -1682,6 +1682,18 @@ export function createApiClient(options: ApiClientOptions) {
         context,
       );
     },
+    async withdrawQueuedJob(context: string, job: string, revision: number): Promise<MutableJob> {
+      return mutableJob(
+        (
+          await send("POST", `/api/v1/jobs/${jobIdentity(job)}/withdraw`, {
+            context,
+            body: { revision: sequence(revision) },
+            sign: !programmatic,
+          })
+        ).input,
+        context,
+      );
+    },
     subscribeConversations(
       receive: Observer<Conversations>["receive"],
       error: Observer<Conversations>["error"],

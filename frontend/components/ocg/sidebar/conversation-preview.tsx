@@ -1,6 +1,7 @@
 import { Activity, CalendarDays, Folder, MessageSquare } from "@lucide/solid";
 import { type JSX, Portal } from "@solidjs/web";
 import { createMemo, createSignal, onCleanup, Show } from "solid-js";
+import { overlayDialog, positionOverlay } from "@/lib/overlay-position";
 import { composeButton } from "@/lib/ui-state";
 import { useI18n } from "../i18n";
 
@@ -21,7 +22,7 @@ export function ConversationPreview(
   },
 ) {
   const i18n = useI18n();
-  const [bounds, setBounds] = createSignal<DOMRect>();
+  const [anchor, setAnchor] = createSignal<HTMLElement>();
   const element = composeButton(props.trigger, {
     children: props.children,
     attrs: { "data-slot": "conversation-preview-trigger" },
@@ -32,12 +33,12 @@ export function ConversationPreview(
     const enter = () => {
       clearTimeout(timer);
       timer = setTimeout(() => {
-        if (!props.suppressed) setBounds(element.getBoundingClientRect());
+        if (!props.suppressed) setAnchor(element);
       }, PREVIEW_DELAY_MS);
     };
     const leave = () => {
       clearTimeout(timer);
-      setBounds(undefined);
+      setAnchor(undefined);
     };
     element.addEventListener("pointerenter", enter);
     element.addEventListener("pointerleave", leave);
@@ -50,16 +51,18 @@ export function ConversationPreview(
   return (
     <>
       {element}
-      <Show when={!props.suppressed && bounds()}>
-        {(anchor) => (
-          <Portal>
+      <Show when={!props.suppressed && anchor()}>
+        {(trigger) => (
+          <Portal mount={overlayDialog(trigger())}>
             <div
               data-slot="conversation-preview"
               class="pointer-events-none fixed z-40 w-80 max-w-[calc(100vw-1.5rem)] space-y-3 rounded-2xl border border-border bg-popover p-4 text-popover-foreground shadow-lg"
-              style={{
-                left: `${Math.min(anchor().right + 8, window.innerWidth - 332)}px`,
-                top: `${Math.max(12, anchor().top)}px`,
-              }}
+              ref={(preview) =>
+                positionOverlay(preview, trigger(), (bounds) => ({
+                  left: bounds.right + 8,
+                  top: bounds.top,
+                }))
+              }
             >
               <p class="text-sm leading-snug font-semibold [overflow-wrap:anywhere]">
                 {props.title}

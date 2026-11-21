@@ -347,26 +347,71 @@ export function MutableComposer(props: Props) {
       }),
     );
   };
+  const [queueError, setQueueError] = createSignal<string>();
+  let queueRead = 0;
   const refreshQueue = async () => {
     if (!api) return;
+    const version = ++queueRead;
+    // Each submit rotates the draft context. Earlier queued Jobs still belong to
+    // this composer when their turn is present in its conversation history.
+    const messages = client.getSnapshot().messagesBySession[props.sessionId] ?? [];
+    const conversationJobs = new Set(messages.map((message) => message.jobId));
+    const pointers = queuedPointers().filter(
+      ({ context, job }) => context === props.context || conversationJobs.has(job),
+    );
     const results = await Promise.allSettled(
-      queuedPointers().map(({ context, job }) => api.readMutableJob(context, job)),
+      pointers.map(({ context, job }) => api.readMutableJob(context, job)),
     );
-    if (!alive.current) return;
-    setQueued(
-      results.flatMap((result) =>
-        result.status === "fulfilled" &&
-        result.value.phase === "queued" &&
-        (scope.current.conversation
-          ? result.value.conversation === scope.current.conversation
-          : result.value.context === work.current.context)
-          ? [result.value]
-          : [],
-      ),
+    if (!alive.current || version !== queueRead) return;
+    const rows: MutableJob[] = [];
+    let failed = false;
+    for (const [index, result] of results.entries()) {
+      if (result.status === "fulfilled") {
+        if (result.value.phase !== "queued") forgetQueued(pointers[index].job);
+        else rows.push(result.value);
+      } else if (result.reason instanceof ApiError && result.reason.status === 404) {
+        forgetQueued(pointers[index].job);
+      } else {
+        failed = true;
+      }
+    }
+    setQueued(rows);
+    setQueueError(
+      failed ? "Some queued Jobs could not be loaded. Retry to see their latest state." : undefined,
     );
-    if (results.some((result) => result.status === "rejected"))
-      setError("Some queued Jobs could not be loaded. Retry to see their latest state.");
   };
+  const hasQueued = createMemo(() => queued().length > 0);
+  createEffect(hasQueued, (hasQueued) => {
+    if (!api || !hasQueued) return;
+    let reading = false;
+    let pending = false;
+    let active = true;
+    const refresh = async () => {
+      if (reading) {
+        pending = true;
+        return;
+      }
+      reading = true;
+      try {
+        do {
+          pending = false;
+          await refreshQueue();
+        } while (active && pending);
+      } finally {
+        reading = false;
+      }
+    };
+    const unsubscribe = api.subscribeCatalog(
+      () => void refresh(),
+      (cause) => {
+        if (active) setQueueError(cause instanceof Error ? cause.message : String(cause));
+      },
+    );
+    return () => {
+      active = false;
+      unsubscribe();
+    };
+  });
   const refreshUnfinished = async () => {
     if (!api) return;
     const results = await Promise.allSettled(
@@ -411,7 +456,10 @@ export function MutableComposer(props: Props) {
                 submitted.phase === "completed") &&
               (await inputFingerprint(submitted.input)) === pending.fingerprint
             ) {
-              savePointer({ context: props.context, job: submitted.id });
+              savePointer({
+                context: props.context,
+                job: submitted.id,
+              });
               bindComposerContext(props.sessionId, props.context, submitted.conversation);
               if (!client.presentMutableJob)
                 throw new Error("The submitted Job cannot yet be opened in history.");
@@ -1015,6 +1063,23 @@ export function MutableComposer(props: Props) {
       setQueuedLoading(false);
     }
   }
+  async function withdraw(job: MutableJob) {
+    if (!api || busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    try {
+      const result = await api.withdrawQueuedJob(job.context, job.id, job.revision);
+      if (result.phase !== "cancelled") throw new Error("Withdrawal was not confirmed.");
+      forgetQueued(job.id);
+      setStatus("Queued message withdrawn.");
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      await refreshQueue();
+      busyRef.current = false;
+      if (alive.current) setBusy(false);
+    }
+  }
   async function cancelUnsupported(job: MutableJob) {
     if (
       !api ||
@@ -1169,62 +1234,73 @@ export function MutableComposer(props: Props) {
             ))}
         </div>
       )}
-      {queued().length > 0 && (
+      <Show when={hasQueued()}>
         <div role="group" aria-label="Queued Jobs" class="space-y-1 text-sm">
-          {queued().map((job) => (
-            <div class="flex items-center gap-2">
-              <span
-                class="min-w-0 flex-1 truncate"
-                title={
-                  job.autonomous_loopback_eligibility &&
-                  !job.autonomous_loopback_eligibility.eligible
-                    ? `Not eligible for automatic dispatch (${job.autonomous_loopback_eligibility.code}): ${job.autonomous_loopback_eligibility.detail}`
-                    : undefined
-                }
-              >
-                {job.unsupported_decision_history ? "Blocked by Decision history" : job.phase}
-                {job.autonomous_loopback_eligibility &&
-                !job.autonomous_loopback_eligibility.eligible
-                  ? ` (not schedulable: ${job.autonomous_loopback_eligibility.code})`
-                  : ""}
-                : {job.input.text || "Image Job"}
-              </span>
-              <Button
-                type="button"
-                size="xs"
-                variant="outline"
-                disabled={
-                  job.phase !== "queued" ||
-                  queuedLoading() ||
-                  inputDisabled() ||
-                  pendingImages().length > 0 ||
-                  editingQueue()
-                }
-                onClick={() => void editQueued(job)}
-              >
-                Edit
-              </Button>
-              {job.unsupported_decision_history && (
+          <For each={queued()} keyed={(item) => item.id}>
+            {(row) => (
+              <div class="flex items-center gap-2">
+                <span
+                  class="min-w-0 flex-1 truncate"
+                  title={
+                    row().autonomous_loopback_eligibility &&
+                    !row().autonomous_loopback_eligibility!.eligible
+                      ? `Not eligible for automatic dispatch (${row().autonomous_loopback_eligibility!.code}): ${row().autonomous_loopback_eligibility!.detail}`
+                      : undefined
+                  }
+                >
+                  {row().unsupported_decision_history ? "Blocked by Decision history" : row().phase}
+                  {row().autonomous_loopback_eligibility &&
+                  !row().autonomous_loopback_eligibility!.eligible
+                    ? ` (not schedulable: ${row().autonomous_loopback_eligibility!.code})`
+                    : ""}
+                  : {row().input.text || "Image Job"}
+                </span>
                 <Button
                   type="button"
                   size="xs"
                   variant="outline"
                   disabled={
-                    job.phase !== "queued" ||
+                    row().phase !== "queued" ||
                     queuedLoading() ||
-                    busy() ||
-                    uncertain() ||
+                    inputDisabled() ||
+                    pendingImages().length > 0 ||
                     editingQueue()
                   }
-                  onClick={() => void cancelUnsupported(job)}
+                  onClick={() => void editQueued(row())}
                 >
-                  Cancel blocked Job
+                  Edit
                 </Button>
-              )}
-            </div>
-          ))}
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="outline"
+                  disabled={busy() || queuedLoading() || uncertain() || editingQueue()}
+                  onClick={() => void withdraw(row())}
+                >
+                  Withdraw
+                </Button>
+                {row().unsupported_decision_history && (
+                  <Button
+                    type="button"
+                    size="xs"
+                    variant="outline"
+                    disabled={
+                      row().phase !== "queued" ||
+                      queuedLoading() ||
+                      busy() ||
+                      uncertain() ||
+                      editingQueue()
+                    }
+                    onClick={() => void cancelUnsupported(row())}
+                  >
+                    Cancel blocked Job
+                  </Button>
+                )}
+              </div>
+            )}
+          </For>
         </div>
-      )}
+      </Show>
 
       <form
         class="aui-composer-root relative"
@@ -1489,6 +1565,14 @@ export function MutableComposer(props: Props) {
             onClick={() => void reconcileSubmission()}
           >
             Reconcile submission
+          </Button>
+        </div>
+      )}
+      {queueError() && (
+        <div role="alert" class="text-xs text-destructive">
+          {queueError()}
+          <Button type="button" size="xs" variant="ghost" onClick={() => void refreshQueue()}>
+            Retry
           </Button>
         </div>
       )}

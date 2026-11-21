@@ -281,6 +281,7 @@ export const ChatScreen: Component<ChatScreenProps> = (props) => {
                   onOpen={props.onOpenConversation}
                 />
                 <ConversationChildrenStrip
+                  conversationId={props.session.conversationId}
                   turn={props.session.sessionId}
                   plan={selectedPlanPlanJobId().plan}
                   onOpen={props.onOpenConversation}

@@ -16,6 +16,7 @@ export type ChatSession = {
   hasChildren?: boolean;
   archived?: boolean;
   closed?: boolean;
+  settled?: boolean;
 };
 
 type MessageRole = "user" | "assistant" | "call" | "tool";

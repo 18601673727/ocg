@@ -116,15 +116,13 @@ export function ConversationContext(props: {
       : undefined,
   );
   const policySummarizer = createMemo(() => status()?.policy.summarization_model);
-  const allowedModelIds = new Set<string>();
-  if (policySummarizer()) allowedModelIds.add(policySummarizer()!);
-  if (agent()) {
-    for (const target of agent()!.llm_targets) allowedModelIds.add(target);
-  }
+  const allowedModelIds = createMemo(
+    () => new Set([policySummarizer(), ...(agent()?.llm_targets ?? [])]),
+  );
   const selectableModels = createMemo(() =>
     profiles()
       ? selectableLlmProfiles(
-          profiles()!.llm_profiles.filter((p) => allowedModelIds.has(p.id)),
+          profiles()!.llm_profiles.filter((p) => allowedModelIds().has(p.id)),
           model(),
         )
       : [],
@@ -135,15 +133,18 @@ export function ConversationContext(props: {
       if (!request.current || request.current.model !== model())
         request.current = { model: model(), key: crypto.randomUUID() };
       setRetrying(true);
-      const result = await api.compactConversation(
-        props.conversation,
-        model(),
-        request.current.key,
-      );
-      request.current = null;
-      setRetrying(false);
-      setNotice(result.reason ?? undefined);
-      setStatus(await api.readContextStatus(props.conversation));
+      try {
+        const result = await api.compactConversation(
+          props.conversation,
+          model(),
+          request.current.key,
+        );
+        request.current = null;
+        setNotice(result.reason ?? undefined);
+        setStatus(await api.readContextStatus(props.conversation));
+      } finally {
+        setRetrying(false);
+      }
     });
   }
   return (
@@ -157,17 +158,7 @@ export function ConversationContext(props: {
           <button
             type="button"
             class="text-foreground underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring disabled:cursor-default disabled:text-muted-foreground"
-            disabled={
-              !api ||
-              !status() ||
-              running() ||
-              !(props.actionsSupported === undefined ? true : props.actionsSupported)
-            }
-            title={
-              (props.actionsSupported === undefined ? true : props.actionsSupported)
-                ? undefined
-                : i18n.t("context.nativeUnsupported")
-            }
+            disabled={!api || !status() || running()}
             onClick={() => (model() ? void compact() : setOpen(true))}
           >
             {i18n.t(running() ? "context.running" : "context.manual")}

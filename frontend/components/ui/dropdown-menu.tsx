@@ -1,5 +1,6 @@
 import { type JSX, Portal } from "@solidjs/web";
 import { createContext, createEffect, createSignal, onCleanup, Show, useContext } from "solid-js";
+import { overlayDialog, positionOverlay } from "@/lib/overlay-position";
 import { handleEvent, splitProps, type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
 
@@ -113,6 +114,31 @@ export function DropdownMenuContent(props: MenuContentProps) {
     "onCloseAutoFocus",
   ]);
   let content!: HTMLDivElement;
+  const [portalHost, setPortalHost] = createSignal<HTMLElement>();
+  function mount(element: HTMLDivElement) {
+    content = element;
+    if (!state?.trigger) return;
+    positionOverlay(element, state.trigger, (anchor, bounds, bottom) => {
+      const gap = local.sideOffset ?? 6;
+      let left =
+        local.align === "end"
+          ? anchor.right - bounds.width
+          : local.align === "center"
+            ? anchor.left + (anchor.width - bounds.width) / 2
+            : anchor.left;
+      let top = local.side === "top" ? anchor.top - bounds.height - gap : anchor.bottom + gap;
+      if (local.side === "right") {
+        left = anchor.right + gap;
+        top = local.align === "end" ? anchor.bottom - bounds.height : anchor.top;
+      }
+      if (local.side === "left") {
+        left = anchor.left - bounds.width - gap;
+        top = anchor.top;
+      }
+      if (!local.side && top + bounds.height > bottom) top = anchor.top - bounds.height - gap;
+      return { left, top };
+    });
+  }
   function focusItem(key: MenuNavigationKey) {
     const items = menuFocusables(content);
     const current = [...content.querySelectorAll('[role="menuitem"]')].indexOf(
@@ -131,33 +157,17 @@ export function DropdownMenuContent(props: MenuContentProps) {
   createEffect(
     () => state?.open() ?? false,
     (open) => {
-      if (!open) return;
-      const frame = requestAnimationFrame(() => {
-        const anchor = state?.trigger?.getBoundingClientRect();
-        if (!content || !anchor) return;
-        const bounds = content.getBoundingClientRect();
-        const gap = local.sideOffset ?? 6;
-        let left =
-          local.align === "end"
-            ? anchor.right - bounds.width
-            : local.align === "center"
-              ? anchor.left + (anchor.width - bounds.width) / 2
-              : anchor.left;
-        let top = local.side === "top" ? anchor.top - bounds.height - gap : anchor.bottom + gap;
-        if (local.side === "right") {
-          left = anchor.right + gap;
-          top = local.align === "end" ? anchor.bottom - bounds.height : anchor.top;
-        }
-        if (local.side === "left") {
-          left = anchor.left - bounds.width - gap;
-          top = anchor.top;
-        }
-        if (!local.side && top + bounds.height > window.innerHeight)
-          top = anchor.top - bounds.height - gap;
-        content.style.left = `${Math.max(4, Math.min(left, window.innerWidth - bounds.width - 4))}px`;
-        content.style.top = `${Math.max(4, Math.min(top, window.innerHeight - bounds.height - 4))}px`;
-        content.focus();
-        focusItem("Home");
+      if (!open) {
+        setPortalHost(undefined);
+        return;
+      }
+      // A controlled menu can open as its trigger is being mounted in a dialog.
+      let frame = requestAnimationFrame(() => {
+        setPortalHost(overlayDialog(state?.trigger) ?? document.body);
+        frame = requestAnimationFrame(() => {
+          content?.focus();
+          if (content) focusItem("Home");
+        });
       });
       const outside = (event: globalThis.PointerEvent) => {
         const node = event.target;
@@ -172,11 +182,11 @@ export function DropdownMenuContent(props: MenuContentProps) {
     },
   );
   return (
-    <Show when={state?.open()}>
-      <Portal>
+    <Show when={state?.open() && portalHost()}>
+      <Portal mount={portalHost()}>
         <div
           {...rest}
-          ref={content}
+          ref={mount}
           tabindex={-1}
           role="menu"
           class={cn(

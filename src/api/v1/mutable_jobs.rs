@@ -286,6 +286,7 @@ pub(super) enum Action {
     Edit(JobId),
     Submit(JobId),
     CancelQueued(JobId),
+    Withdraw(JobId),
     Discard(JobId),
     Stop(JobId),
 }
@@ -376,11 +377,16 @@ pub(super) async fn respond(
                 serde_json::json!({"discarded":id.to_string()}),
             )))
         }
-        Action::CancelQueued(id) => {
+        Action::Withdraw(id) | Action::CancelQueued(id) => {
             let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
             let input: CancelQueued = serde_json::from_slice(&body).map_err(|_| INVALID)?;
             let job = database
-                .cancel_unsupported_queued_job(context, id, input.revision)
+                .cancel_queued_job(
+                    context,
+                    id,
+                    input.revision,
+                    matches!(action, Action::CancelQueued(_)),
+                )
                 .await
                 .map_err(refusal)?;
             Ok(Reply::ok(view(job)))

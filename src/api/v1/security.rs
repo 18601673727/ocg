@@ -62,7 +62,7 @@ fn mutable_job_write(rest: &str) -> bool {
         ["jobs"]
             | ["jobs", _]
             | ["jobs", _, "submit"]
-            | ["jobs", _, "cancel-unsupported"]
+            | ["jobs", _, "cancel-unsupported" | "withdraw"]
             | ["jobs", _, "stop"]
     )
 }

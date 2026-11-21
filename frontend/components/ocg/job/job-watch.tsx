@@ -805,8 +805,16 @@ function JobWatchBody(props: {
       ) : null}
       {settlement()?.state === "unknown" ? (
         <div class="grid grid-cols-[5rem_minmax(0,1fr)] gap-x-3">
-          <dt>{i18n.t("job.fact.stopConfirmed")}</dt>
-          <dd class="min-w-0 break-all">{formatMicros(settlement()!.stop_confirmed_at_us)}</dd>
+          <dt>
+            {i18n.t(
+              settlement()!.stop_confirmed_at_us == null
+                ? "job.fact.stopUnconfirmed"
+                : "job.fact.stopConfirmed",
+            )}
+          </dt>
+          {settlement()!.stop_confirmed_at_us != null && (
+            <dd class="min-w-0 break-all">{formatMicros(settlement()!.stop_confirmed_at_us)}</dd>
+          )}
         </div>
       ) : null}
       {settlement()?.state === "unknown" ? (

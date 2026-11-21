@@ -1,5 +1,5 @@
 import { Pause, Play, Square, X } from "@lucide/solid";
-import { createEffect, createMemo, createSignal } from "solid-js";
+import { createEffect, createMemo, createSignal, For, Match, Show, Switch } from "solid-js";
 import { ElicitationForm } from "@/components/ocg/chat/ui/elicitation-form";
 import { Button } from "@/components/ui/button";
 import { elementRef } from "@/lib/ui-state";
@@ -12,30 +12,29 @@ import { useConversationError } from "./conversation-errors";
 import { DispatchSelectionCard } from "./dispatch-selection-card";
 import { outputDisplayText } from "./job-transcript-model";
 
-function useConversation(turn?: string) {
+function useConversation(turn: () => string | undefined) {
   const { api } = useOcgRuntime();
   const [conversation, setConversation] = createSignal<string | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   useConversationError(error);
-  createEffect(
-    () => [api, turn],
-    () => {
-      if (!api || !turn) return;
-      const controller = new AbortController();
-      void api
-        .readJob(turn, controller.signal)
-        .then((record) => {
-          if (!controller.signal.aborted)
-            setConversation(record.kind === "conversation" ? record.id : record.conversation);
-        })
-        .catch((cause) => {
-          if (!controller.signal.aborted)
-            setError(cause instanceof Error ? cause.message : String(cause));
-        });
-      return () => controller.abort();
-    },
-  );
-  return { conversation: conversation(), error: error() };
+  createEffect(turn, (id) => {
+    setConversation(null);
+    setError(null);
+    if (!api || !id) return;
+    const controller = new AbortController();
+    void api
+      .readJob(id, controller.signal)
+      .then((record) => {
+        if (!controller.signal.aborted)
+          setConversation(record.kind === "conversation" ? record.id : record.conversation);
+      })
+      .catch((cause) => {
+        if (!controller.signal.aborted)
+          setError(cause instanceof Error ? cause.message : String(cause));
+      });
+    return () => controller.abort();
+  });
+  return { conversation, error };
 }
 
 function ChildConversationCard(props: {
@@ -188,13 +187,17 @@ function ChildConversationCard(props: {
 }
 
 export function ConversationChildrenStrip(props: {
+  conversationId?: string;
   turn?: string;
   plan?: TaskPlan | null;
   onOpen: (conversation: string) => void;
 }) {
   const { api } = useOcgRuntime();
   const i18n = useI18n();
-  const { conversation } = useConversation(props.turn);
+  const { conversation: loaded } = useConversation(() =>
+    props.conversationId ? undefined : props.turn,
+  );
+  const conversation = createMemo(() => props.conversationId ?? loaded());
   const [children, setChildren] = createSignal<ChildConversation[]>([]);
   const [hasMore, setHasMore] = createSignal(false);
   const [pages, setPages] = createSignal(1);
@@ -233,11 +236,12 @@ export function ConversationChildrenStrip(props: {
     },
   );
   createEffect(
-    () => [api, conversation, pages(), revision()],
+    () => [api, conversation(), pages(), revision()],
     () => {
-      if (!api || !conversation) return;
+      const id = conversation();
+      if (!api || !id) return;
       return api.subscribeChildren(
-        conversation,
+        id,
         pages(),
         (reply) => {
           setChildren(reply.children.filter((child) => child.origin !== "system"));
@@ -358,10 +362,10 @@ export function ConversationCardStrip(props: {
 }) {
   const { api, client } = useOcgRuntime();
   const i18n = useI18n();
-  const { conversation: loadedConversation } = useConversation(
+  const { conversation: loadedConversation } = useConversation(() =>
     props.conversationId ? undefined : props.turn,
   );
-  const conversation = createMemo(() => props.conversationId ?? loadedConversation);
+  const conversation = createMemo(() => props.conversationId ?? loadedConversation());
   const [cards, setCards] = createSignal<ConversationCard[]>([]);
   const [revision, setRevision] = createSignal(0);
   const [pending, setPending] = createSignal(false);
@@ -375,8 +379,13 @@ export function ConversationCardStrip(props: {
       if (!api || !conversation()) return;
       const controller = new AbortController();
       let reading = false;
+      let refreshPending = false;
       const refresh = async () => {
-        if (reading) return;
+        if (reading) {
+          refreshPending = true;
+          return;
+        }
+        refreshPending = false;
         reading = true;
         try {
           const version = actionVersion.current;
@@ -390,6 +399,7 @@ export function ConversationCardStrip(props: {
             setError(cause instanceof Error ? cause.message : String(cause));
         } finally {
           reading = false;
+          if (refreshPending && !controller.signal.aborted) void refresh();
         }
       };
       const unsubscribe = api.subscribeCatalog(
@@ -461,27 +471,39 @@ export function ConversationCardStrip(props: {
       setPending(false);
     }
   }
-  const groups = new Map<string, { parent: string | null; cards: ConversationCard[] }>();
-  for (const card of cards()) {
-    let group = groups.get(card.conversation);
-    if (!group) {
-      group = { parent: card.parent, cards: [] };
-      groups.set(card.conversation, group);
+  const groupedCards = createMemo(() => {
+    const current = conversation();
+    const groups = new Map<string, { parent: string | null; cards: ConversationCard[] }>();
+    for (const card of cards()) {
+      let group = groups.get(card.conversation);
+      if (!group) {
+        group = { parent: card.parent, cards: [] };
+        groups.set(card.conversation, group);
+      }
+      group.parent = card.parent;
+      group.cards.push(card);
+      if (card.parent && card.parent !== current && !groups.has(card.parent))
+        groups.set(card.parent, { parent: current, cards: [] });
     }
-    group.parent = card.parent;
-    group.cards.push(card);
-    if (card.parent && card.parent !== conversation() && !groups.has(card.parent))
-      groups.set(card.parent, { parent: conversation(), cards: [] });
-  }
+    return groups;
+  });
+  const roots = createMemo(() =>
+    [...groupedCards()]
+      .filter(([, group]) => !group.parent || !groupedCards().has(group.parent))
+      .map(([id]) => id),
+  );
+
   function renderGroup(id: string, ancestors: Set<string>) {
     if (ancestors.has(id)) return null;
-    const group = groups.get(id);
-    if (!group) return null;
     const visited = new Set(ancestors).add(id);
-    const isCurrent = id === conversation();
+    const children = createMemo(() =>
+      [...groupedCards()]
+        .filter(([child, group]) => child !== id && group.parent === id)
+        .map(([child]) => child),
+    );
     return (
       <div class="flex flex-col gap-3" data-conversation={id}>
-        {!isCurrent && (
+        {id !== conversation() && (
           <div class="flex items-center gap-1.5">
             <Button
               size="xs"
@@ -493,84 +515,94 @@ export function ConversationCardStrip(props: {
             </Button>
           </div>
         )}
-        {group.cards.map((card) => {
-          const reject = () => void act(card, { decision: "reject" });
-          if (card.kind === "approval") {
+        <For each={groupedCards().get(id)?.cards} keyed={(card) => card.approval.join(":")}>
+          {(card) => {
+            function ofKind<K extends ConversationCard["kind"]>(kind: K) {
+              const current = card();
+              return current.kind === kind
+                ? (current as Extract<ConversationCard, { kind: K }>)
+                : undefined;
+            }
+            const reject = () => void act(card(), { decision: "reject" });
             return (
-              <ApprovalRequest
-                tool={card.tool}
-                arguments={card.arguments}
-                assessment={card.assessment}
-                disabled={pending()}
-                onApprove={() => void act(card, { decision: "approve" })}
-                onReject={reject}
-              />
+              <Switch>
+                <Match when={ofKind("approval")}>
+                  {(approval) => (
+                    <ApprovalRequest
+                      tool={approval().tool}
+                      arguments={approval().arguments}
+                      assessment={approval().assessment}
+                      disabled={pending()}
+                      onApprove={() => void act(card(), { decision: "approve" })}
+                      onReject={reject}
+                    />
+                  )}
+                </Match>
+                <Match when={ofKind("question")}>
+                  {(question) => (
+                    <ConversationQuestion
+                      question={question().question}
+                      disabled={pending()}
+                      answer={(text) => void act(card(), { answer: text })}
+                      dismiss={reject}
+                    />
+                  )}
+                </Match>
+                <Match when={ofKind("dispatch")}>
+                  {(dispatch) => (
+                    <div class="w-full rounded-xl border border-border bg-card p-4 text-xs shadow-xs">
+                      <div class="mb-2 flex items-center justify-between gap-2">
+                        <span class="text-sm font-medium text-foreground">
+                          {i18n.t("chat.card.dispatch")}
+                        </span>
+                      </div>
+                      <DispatchSelectionCard
+                        client={api!}
+                        arguments={dispatch().arguments}
+                        disabled={pending()}
+                        onSelect={(selection) =>
+                          void act(card(), { answer: JSON.stringify(selection) })
+                        }
+                      />
+                      <Button
+                        size="xs"
+                        variant="outline"
+                        class="mt-3"
+                        disabled={pending()}
+                        onClick={reject}
+                      >
+                        {i18n.t("chat.card.dismiss")}
+                      </Button>
+                    </div>
+                  )}
+                </Match>
+              </Switch>
             );
-          }
-          if (card.kind === "question") {
-            return (
-              <ConversationQuestion
-                question={card.question}
-                disabled={pending()}
-                answer={(text) => void act(card, { answer: text })}
-                dismiss={reject}
-              />
-            );
-          }
-          if (!api) return null;
-          return (
-            <div class="w-full rounded-xl border border-border bg-card p-4 text-xs shadow-xs">
-              <div class="mb-2 flex items-center justify-between gap-2">
-                <span class="text-sm font-medium text-foreground">
-                  {i18n.t("chat.card.dispatch")}
-                </span>
-              </div>
-              <DispatchSelectionCard
-                client={api}
-                arguments={card.arguments}
-                disabled={pending()}
-                onSelect={(selection) => void act(card, { answer: JSON.stringify(selection) })}
-              />
-              <Button
-                size="xs"
-                variant="outline"
-                class="mt-3"
-                disabled={pending()}
-                onClick={reject}
-              >
-                {i18n.t("chat.card.dismiss")}
-              </Button>
-            </div>
-          );
-        })}
-        {[...groups]
-          .filter(([child, value]) => child !== id && value.parent === id)
-          .map(([child]) => (
+          }}
+        </For>
+        <For each={children()} keyed>
+          {(child) => (
             <div class="ml-3 flex flex-col gap-3 border-l-2 border-border/60 pl-3">
               {renderGroup(child, visited)}
             </div>
-          ))}
+          )}
+        </For>
       </div>
     );
   }
   return (
-    <>
-      {(() => {
-        if (!api || !cards().length) return null;
-        return (
-          <section
-            class="w-full py-2"
-            aria-label={i18n.t("chat.card.cards")}
-            data-slot="conversation-cards"
-          >
-            <div class="flex flex-col gap-3">
-              {[...groups]
-                .filter(([, group]) => !group.parent || !groups.has(group.parent))
-                .map(([id]) => renderGroup(id, new Set()))}
-            </div>
-          </section>
-        );
-      })()}
-    </>
+    <Show when={api && cards().length > 0}>
+      <section
+        class="w-full py-2"
+        aria-label={i18n.t("chat.card.cards")}
+        data-slot="conversation-cards"
+      >
+        <div class="flex flex-col gap-3">
+          <For each={roots()} keyed>
+            {(id) => renderGroup(id, new Set())}
+          </For>
+        </div>
+      </section>
+    </Show>
   );
 }

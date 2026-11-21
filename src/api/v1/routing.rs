@@ -250,6 +250,9 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
         .collect::<Vec<_>>();
     if request.method() == Method::POST {
         let route = match segments.as_slice() {
+            ["jobs", job, "withdraw"] => {
+                Route::MutableJob(mutable_jobs::Action::Withdraw(job_id(job)?))
+            }
             ["jobs", job, "cancel-unsupported"] => {
                 Route::MutableJob(mutable_jobs::Action::CancelQueued(job_id(job)?))
             }

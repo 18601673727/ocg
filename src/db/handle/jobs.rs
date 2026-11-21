@@ -302,19 +302,23 @@ impl DatabaseHandle {
         .await
     }
 
-    pub(crate) async fn cancel_unsupported_queued_job(
+    pub(crate) async fn cancel_queued_job(
         &self,
         context: entities::ComposerContextId,
         id: JobId,
         revision: u64,
+        unsupported_only: bool,
     ) -> Result<entities::MutableJobRecord, DatabaseError> {
         self.write(
             8192,
             OperationKind::StopTurn,
-            (context, id, revision),
-            |batch, (context, id, revision)| {
+            (context, id, revision, unsupported_only),
+            |batch, (context, id, revision, unsupported_only)| {
                 batch.require_mutable_job_context(context, id)?;
-                batch.cancel_unsupported_queued_job(id, revision)?;
+                batch.cancel_queued_job(id, revision, unsupported_only)?;
+                if !unsupported_only {
+                    batch.settle_child_turns(&[id])?;
+                }
                 batch.read_mutable_job(id)?.ok_or_else(|| {
                     redb::BatchError(redb::Failure::Storage(redb::StorageError::corrupted(
                         "cancelled Job is missing",
