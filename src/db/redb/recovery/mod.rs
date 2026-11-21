@@ -885,11 +885,10 @@ fn check_execution_history(tx: &ReadTransaction) -> Result<(), StorageError> {
         }
         if let Some(job) = mutable.as_ref() {
             let expected = if job.phase != MutableJobPhase::Unsubmitted
-                && snapshot
-                    .outcome
-                    .as_ref()
-                    .is_none_or(|outcome| outcome.kind == OutcomeKind::Unknown)
-            {
+                && state::has_open_membership(
+                    snapshot.outcome.as_ref(),
+                    snapshot.allocation.as_ref(),
+                ) {
                 let waiting = u32::try_from(snapshot.dependencies.len())
                     .map_err(|_| StorageError::corrupted("native dependency count overflow"))?;
                 Some((waiting, 0))
@@ -1491,8 +1490,8 @@ fn initialize_batch(database: &Database, fresh: bool) -> Result<Batch, StorageEr
     };
 
     if fresh {
-        let pool_id = ExecutionPoolId::new(allocate(&tx)?);
-        let executor_id = ExecutorId::new(allocate(&tx)?);
+        let pool_id = ExecutionPoolId::new(allocate(&tx, None)?);
+        let executor_id = ExecutorId::new(allocate(&tx, None)?);
         let pool = crate::db::entities::AllocationPool {
             id: pool_id,
             name: "Default".to_owned(),
@@ -1532,10 +1531,10 @@ fn initialize_batch(database: &Database, fresh: bool) -> Result<Batch, StorageEr
     Ok(batch)
 }
 
-pub(super) fn allocate(tx: &WriteTransaction) -> Result<u128, StorageError> {
+pub(super) fn allocate(tx: &WriteTransaction, seed: Option<u128>) -> Result<u128, StorageError> {
     let mut table = tx.open_table(SEQUENCES)?;
     let previous = table.get("entity")?.map_or(0, |value| value.value());
-    let fresh = uuid::Uuid::now_v7().as_u128();
+    let fresh = seed.unwrap_or_else(|| uuid::Uuid::now_v7().as_u128());
     let next = if fresh > previous {
         fresh
     } else {

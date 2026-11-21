@@ -1031,8 +1031,9 @@ impl Batch {
             self.put_job_state(job, &state)?;
         }
         if let Some(proof) = proof {
-            self.release_with_proof(allocation, proof)?;
-        } else if allocation.phase != AllocationPhase::Uncertain {
+            return self.release_with_proof(allocation, proof);
+        }
+        if allocation.phase != AllocationPhase::Uncertain {
             let mut next = allocation.clone();
             next.phase = AllocationPhase::Uncertain;
             self.put_pool_allocation(&next, Some(&allocation))?;
@@ -1076,7 +1077,6 @@ impl Batch {
             ));
         }
         self.release_with_proof(allocation, proof)?;
-        self.child_turn_settled(token.job)?;
         Ok(true)
     }
 
@@ -1090,6 +1090,12 @@ impl Batch {
         next.stop_confirmed_at = Some(self.now);
         next.stop_proof = Some(proof);
         self.put_pool_allocation(&next, Some(&allocation))?;
+        let id = allocation.token.job;
+        let Some(job) = self.mutable_job(id)? else {
+            return self.corrupted(format!("released Unknown Allocation has no Job {id}"));
+        };
+        self.finish_job_membership(&job, false)?;
+        self.child_turn_settled(id)?;
         self.freed_capacity = true;
         Ok(())
     }
@@ -1126,7 +1132,7 @@ impl Batch {
                 "offline recovery source rows changed",
             ));
         }
-        let mut allocation = self.allocation_for_token(action.token)?;
+        let allocation = self.allocation_for_token(action.token)?;
         if allocation.phase != action.phase
             || allocation.stop_confirmed_at.is_some()
             || allocation.stop_proof.is_some()
@@ -1163,13 +1169,7 @@ impl Batch {
                 ));
             }
         }
-        let previous = allocation.clone();
-        allocation.phase = AllocationPhase::Released;
-        allocation.stop_confirmed_at = Some(self.now);
-        allocation.stop_proof = Some(action.proof);
-        self.put_pool_allocation(&allocation, Some(&previous))?;
-        self.freed_capacity = true;
-        Ok(())
+        self.release_with_proof(allocation, action.proof)
     }
 
     pub(crate) fn request_native_stop(

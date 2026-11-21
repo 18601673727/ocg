@@ -97,6 +97,7 @@ impl<T> BatchOutcome<T> {
 pub(crate) struct Batch {
     pub(super) tx: WriteTransaction,
     pub(super) now: Timestamp,
+    pub(super) recovery_id_seed: Option<u128>,
     pub(super) epoch: u64,
     pub(super) commit_mode: Option<Commit>,
     pub(super) touched_ready_or_delayed: bool,
@@ -277,6 +278,7 @@ impl Batch {
         Self {
             tx,
             now: Timestamp::now(),
+            recovery_id_seed: None,
             epoch,
             commit_mode: None,
             touched_ready_or_delayed: false,
@@ -405,7 +407,8 @@ impl Batch {
     }
 
     pub(crate) fn next_id(&mut self) -> Result<u128, BatchError> {
-        self.step(allocate)
+        let seed = self.recovery_id_seed;
+        self.step(|tx| allocate(tx, seed))
     }
 }
 

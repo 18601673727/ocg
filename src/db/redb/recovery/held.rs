@@ -2,11 +2,8 @@ use super::{
     check_identity, check_records, residual_ownership_in, resolved_unknown_ownership,
     verify_recovered,
 };
-use crate::db::entities::{ContentDigest, OutcomeKind, OutputKind, StopProof};
+use crate::db::entities::{ContentDigest, OutcomeKind, OutputKind, StopProof, Timestamp};
 use crate::db::redb::StorageError;
-use crate::db::redb::recovery::audit::{
-    verify_held_publication_preservation, verify_unrelated_recovery_rows,
-};
 use crate::db::redb::recovery::offline::{
     apply_reconciliation, finalization_copy, with_reconciliation_copy,
     with_verified_finalization_copy,
@@ -446,17 +443,8 @@ pub(crate) fn reconcile_held_apply(
                 "the plan contains no Allocation this command may release",
             ));
         }
-        apply_reconciliation(database, plan.epoch, "recovered", |batch| {
-            for action in &plan.actions {
-                batch.reconcile_stopped_allocation(action)?;
-            }
-            batch.step(|tx| {
-                tx.open_table(META)?
-                    .insert("clean_shutdown", [0u8].as_slice())?;
-                Ok(())
-            })
-        })?;
-        let audit = audit_held_recovery(&*database, &plan)?;
+        apply_held_plan(database, &plan, Timestamp::now())?;
+        let (audit, _) = audit_held_recovery(&*database, &plan)?;
         Ok(json!({
             "plan": plan.evidence,
             "plan_digest": plan.digest,
@@ -467,16 +455,46 @@ pub(crate) fn reconcile_held_apply(
     })
 }
 
+fn apply_held_plan(
+    database: &mut ::redb::Database,
+    plan: &HeldRecoveryPlan,
+    at: Timestamp,
+) -> Result<(), ReservedRefusal> {
+    // Closing a child can post a report turn. Replaying the plan must allocate the same IDs.
+    let digest = ContentDigest::of(plan.digest.as_bytes());
+    let entropy = std::array::from_fn(|i| digest.as_bytes()[i]);
+    let millis = u64::try_from(at.as_unix_micros()).map_err(|_| {
+        ReservedRefusal::new(
+            "invalid_timestamp",
+            "the release time precedes the Unix epoch",
+        )
+    })? / 1000;
+    let seed = uuid::Builder::from_unix_timestamp_millis(millis, &entropy).into_uuid();
+    apply_reconciliation(database, plan.epoch, "recovered", |batch| {
+        batch.now = at;
+        batch.recovery_id_seed = Some(seed.as_u128());
+        for action in &plan.actions {
+            batch.reconcile_stopped_allocation(action)?;
+        }
+        batch.step(|tx| {
+            tx.open_table(META)?
+                .insert("clean_shutdown", [0u8].as_slice())?;
+            Ok(())
+        })
+    })
+}
+
 fn audit_held_recovery(
     database: &impl ReadableDatabase,
     plan: &HeldRecoveryPlan,
-) -> Result<serde_json::Value, ReservedRefusal> {
+) -> Result<(serde_json::Value, Timestamp), ReservedRefusal> {
     use crate::db::entities::{AllocationPhase, OutcomeCause};
     use serde_json::json;
 
     let tx = database.begin_read().map_err(StorageError::from)?;
     check_records(&tx)?;
     let mut recovered = Vec::new();
+    let mut release_time = None;
     for action in &plan.actions {
         let job = action.token.job;
         let allocation_row = tx
@@ -499,22 +517,17 @@ fn audit_held_recovery(
             })?;
         let runtime = JobRuntime::decode_at(job.get(), state_row.value())?;
         let state = &runtime.state;
-        let exact_state = if action.preserve_unknown {
-            state_row.value() == action.expected_runtime
-        } else {
-            let mut expected = JobRuntime::decode_at(job.get(), &action.expected_runtime)?;
+        let mut expected = JobRuntime::decode_at(job.get(), &action.expected_runtime)?;
+        expected.pending = None;
+        if !action.preserve_unknown {
             expected.state.outcome = state.outcome.clone();
-            expected == runtime
-                && state
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| Some(outcome.at) == allocation.stop_confirmed_at)
-        };
+        }
         drop(state_row);
         let outcome_valid = state.outcome.as_ref().is_some_and(|outcome| {
             outcome.kind == OutcomeKind::Unknown
                 && (action.preserve_unknown
-                    || outcome.cause == Some(OutcomeCause::Uncertain(action.reason)))
+                    || (outcome.cause == Some(OutcomeCause::Uncertain(action.reason))
+                        && Some(outcome.at) == allocation.stop_confirmed_at))
         });
         let mut expected_allocation =
             allocations::decode_pool_allocation(job.get(), &action.expected_allocation)?;
@@ -546,10 +559,16 @@ fn audit_held_recovery(
                 break;
             }
         }
+        let at = allocation.stop_confirmed_at.ok_or_else(|| {
+            ReservedRefusal::new(
+                "audit_failed",
+                format!("{job} lacks a stop confirmation time"),
+            )
+        })?;
         if allocation != expected_allocation
-            || allocation.stop_confirmed_at.is_none()
+            || release_time.is_some_and(|previous| previous != at)
             || !outcome_valid
-            || !exact_state
+            || runtime != expected
             || ready
             || result_present
             || !resolved_unknown_ownership(&tx, state)?
@@ -559,6 +578,7 @@ fn audit_held_recovery(
                 format!("{job} does not have the exact recovered Unknown ownership"),
             ));
         }
+        release_time = Some(at);
         let active_key = (
             action.token.pool.get(),
             action.token.executor.get(),
@@ -583,7 +603,6 @@ fn audit_held_recovery(
                 .get(job.get())
                 .map_err(StorageError::from)?
                 .is_some()
-            || runtime.pending != Some((0, 0))
         {
             return Err(ReservedRefusal::new(
                 "audit_failed",
@@ -664,15 +683,24 @@ fn audit_held_recovery(
             "recovery did not leave clean_shutdown = 0",
         ));
     }
-    Ok(json!({
-        "recovered": recovered,
-        "remaining_held_allocations": held,
-        "remaining_unresolved_unknown": unresolved_unknown,
-        "resolved_unknown": resolved_unknown,
-        "allocation_indexes": "consistent with authoritative rows",
-        "ready_or_pending_recovered_jobs": 0,
-        "logical_checks": "every record header and native Allocation invariant verified",
-    }))
+    let at = release_time.ok_or_else(|| {
+        ReservedRefusal::new(
+            "no_eligible_allocations",
+            "the plan contains no released Allocation",
+        )
+    })?;
+    Ok((
+        json!({
+            "recovered": recovered,
+            "remaining_held_allocations": held,
+            "remaining_unresolved_unknown": unresolved_unknown,
+            "resolved_unknown": resolved_unknown,
+            "allocation_indexes": "consistent with authoritative rows",
+            "ready_or_pending_recovered_jobs": 0,
+            "logical_checks": "every record header and native Allocation invariant verified",
+        }),
+        at,
+    ))
 }
 
 pub(crate) fn verify_held_publication_delta(
@@ -696,30 +724,16 @@ pub(crate) fn verify_held_publication_delta(
         }
         with_verified_finalization_copy(published, "published", |database| {
             verify_recovered(&*database)?;
-            let targets = plan
-                .actions
-                .iter()
-                .map(|action| action.token.job.get())
-                .collect::<std::collections::BTreeSet<_>>();
-            let released = plan
-                .actions
-                .iter()
-                .map(|action| {
-                    (
-                        action.token.pool.get(),
-                        action.token.executor.get(),
-                        action.token.job.get(),
-                    )
-                })
-                .collect::<std::collections::BTreeSet<_>>();
-            verify_unrelated_recovery_rows(&*source_database, &*database, &targets, None)?;
-            verify_held_publication_preservation(&*source_database, &*database, &released)?;
-            let mut audit = audit_held_recovery(&*database, &plan)?;
+            let (mut audit, at) = audit_held_recovery(&*database, &plan)?;
+            let actual = database.begin_read().map_err(StorageError::from)?;
+            apply_held_plan(source_database, &plan, at)?;
+            let expected = source_database.begin_read().map_err(StorageError::from)?;
+            crate::db::redb::schema::check_required_tables(&expected)?;
+            crate::db::redb::schema::verify_identical_database(&expected, &actual)?;
             audit["unrelated_allocations_and_jobs"] =
                 json!("byte-identical to the rollback source");
-            audit["preserved_evidence_and_derived_rows"] = json!(
-                "byte-identical to the rollback source except authorized target and active-index deltas"
-            );
+            audit["preserved_evidence_and_derived_rows"] =
+                json!("all tables match the authorized release replayed on the rollback source");
             Ok(json!({
                 "plan": plan.evidence,
                 "plan_digest": plan.digest,

@@ -77,7 +77,6 @@ macro_rules! tables {
             Ok(())
         }
 
-        #[cfg(unix)]
         pub(super) fn verify_identical_database(expected: &ReadTransaction, published: &ReadTransaction) -> Result<(), recovery::reserved::ReservedRefusal> {
             $($(recovery::audit::verify_identical_table(expected, published, $name)?;)*)*
             Ok(())

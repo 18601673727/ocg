@@ -338,8 +338,19 @@ impl Batch {
             result.goal_reached,
             result.value,
         )?;
+        self.finish_job_membership(job, true)?;
+        self.advance_recurrence_on_settlement(job, kind)?;
+        self.settle_native_dependents(token.job, kind)?;
+        Ok((seq, id))
+    }
+
+    pub(super) fn finish_job_membership(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+        produced_result: bool,
+    ) -> Result<(), BatchError> {
         self.step(|tx| {
-            let mut child = state::require(tx, token.job)?;
+            let mut child = state::require(tx, job.id)?;
             if child.pending.take().is_none() {
                 return Err(StorageError::corrupted("native Job pending counts missing"));
             }
@@ -352,12 +363,11 @@ impl Batch {
                 StorageError::corrupted("native conversation child count underflow")
             })?;
             parent.pending = Some((dependencies, children));
-            parent.record_result(token.job);
+            if produced_result {
+                parent.record_result(job.id);
+            }
             state::write(tx, &parent)
-        })?;
-        self.advance_recurrence_on_settlement(job, kind)?;
-        self.settle_native_dependents(token.job, kind)?;
-        Ok((seq, id))
+        })
     }
 
     pub(super) fn dependency_outcome_state(

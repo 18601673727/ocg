@@ -2,7 +2,9 @@ use super::{StorageError, TxRead};
 use crate::db::entities::{
     DependencyCondition, JobId, JobLifecycle, JobLimits, JobState, OutcomeKind,
 };
-use crate::db::entities::{JobClosing, OutcomeCause, OutcomeRecord, UncertaintyReason};
+use crate::db::entities::{
+    JobClosing, OutcomeCause, OutcomeRecord, PoolAllocation, UncertaintyReason,
+};
 use crate::db::redb::codec::{Code, Dec, DecodeResult, Enc, TAG_JOB_RUNTIME};
 use crate::db::redb::schema::JOB_RUNTIME;
 use ::redb::{ReadableTable, WriteTransaction};
@@ -14,6 +16,16 @@ pub(crate) struct JobRuntime {
     pub lifecycle: JobLifecycle,
     pub pending: Option<(u32, u32)>,
     pub last_result: Option<JobId>,
+}
+
+pub(super) fn has_open_membership(
+    outcome: Option<&OutcomeRecord>,
+    allocation: Option<&PoolAllocation>,
+) -> bool {
+    outcome.is_none_or(|outcome| {
+        outcome.kind == OutcomeKind::Unknown
+            && allocation.is_some_and(PoolAllocation::holds_capacity)
+    })
 }
 
 impl JobRuntime {

@@ -415,18 +415,6 @@ pub(crate) fn verify_active_allocation_delta(
     Ok(())
 }
 
-pub(crate) fn verify_held_publication_preservation(
-    source: &impl ReadableDatabase,
-    published: &impl ReadableDatabase,
-    released: &std::collections::BTreeSet<(u128, u128, u128)>,
-) -> Result<(), ReservedRefusal> {
-    let source_tx = source.begin_read().map_err(StorageError::from)?;
-    let published_tx = published.begin_read().map_err(StorageError::from)?;
-    verify_recovery_sequences(&source_tx, &published_tx, None)?;
-    verify_identical_table(&source_tx, &published_tx, JOB_OUTPUTS)?;
-    verify_active_allocation_delta(&source_tx, &published_tx, released)
-}
-
 pub(crate) fn verify_reserved_output_delta(
     source_tx: &ReadTransaction,
     published_tx: &ReadTransaction,

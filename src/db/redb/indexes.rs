@@ -649,13 +649,14 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
             .get_mut(&job.parent_id.get())
             .ok_or_else(|| StorageError::corrupted("Job parent conversation is missing"))?;
         let submitted = job.phase != MutableJobPhase::Unsubmitted;
-        let unresolved = runtime
-            .state
-            .outcome
-            .as_ref()
-            .is_none_or(|outcome| outcome.kind == OutcomeKind::Unknown);
+        let allocation = allocations
+            .get(id)?
+            .map(|row| allocations::decode_pool_allocation(id, row.value()))
+            .transpose()?;
+        let unresolved =
+            state::has_open_membership(runtime.state.outcome.as_ref(), allocation.as_ref());
         if !submitted {
-            if runtime.pending.is_some() || allocations.get(id)?.is_some() {
+            if runtime.pending.is_some() || allocation.is_some() {
                 return Err(StorageError::corrupted(
                     "unsubmitted Job has execution membership",
                 ));
@@ -689,7 +690,7 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
             }
             if job.phase == MutableJobPhase::Queued
                 && runtime.state.outcome.is_none()
-                && allocations.get(id)?.is_none()
+                && allocation.is_none()
             {
                 pending.insert(id);
                 // This queue indexes dependency readiness. Dispatch checks other eligibility.
@@ -716,7 +717,7 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
             }
         }
         if result_jobs.remove(&id) {
-            if !submitted || unresolved {
+            if !submitted || !runtime.state.confirmed_terminal() {
                 return Err(StorageError::corrupted(
                     "Job result has no settled execution",
                 ));
@@ -734,21 +735,31 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
         let id = entry?.0.value();
         let runtime = state::require(tx, JobId::new(id))?;
         let facts = conversation_facts.get(&id).copied().unwrap_or_default();
-        let expected = if runtime.state.outcome.is_none() {
-            Some((0, facts.open_children))
+        let expected_pending = runtime
+            .state
+            .outcome
+            .is_none()
+            .then_some((0, facts.open_children));
+        let reason = if runtime.state.outcome.is_some() && facts.open_children != 0 {
+            "settled conversation still has open children"
+        } else if runtime.pending != expected_pending || runtime.last_result != facts.last_result {
+            "conversation child counts or latest Result disagree with its children"
         } else {
-            if facts.open_children != 0 {
-                return Err(StorageError::corrupted(
-                    "settled conversation still has open children",
-                ));
-            }
-            None
+            continue;
         };
-        if runtime.pending != expected || runtime.last_result != facts.last_result {
-            return Err(StorageError::corrupted(
-                "conversation child counts or latest Result disagree with its children",
-            ));
-        }
+        let result_id =
+            |id: Option<JobId>| id.map_or_else(|| "None".to_owned(), |id| id.to_string());
+        return Err(StorageError::corrupted(format!(
+            "{reason}: conversation {}, outcome {:?}, open children counted {}, \
+             pending (dependencies, children) stored {:?}, expected {expected_pending:?}, \
+             last_result stored {}, expected {}",
+            JobId::new(id),
+            runtime.state.outcome,
+            facts.open_children,
+            runtime.pending,
+            result_id(runtime.last_result),
+            result_id(facts.last_result),
+        )));
     }
 
     for entry in tx.open_table(DRAFT_CONTEXTS)?.iter()? {
