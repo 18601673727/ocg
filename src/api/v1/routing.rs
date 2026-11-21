@@ -9,8 +9,9 @@ use super::{
 };
 
 pub(super) enum Route {
-    Health,
+    Health(Option<crate::db::entities::AllocationCursor>),
     MutableJob(mutable_jobs::Action),
+    Release(JobId),
     Update(bool),
     StartUpdate,
     Jobs {
@@ -171,7 +172,8 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
         (Caller::Programmatic, _) => true,
         (
             Caller::Operator(_),
-            Route::Health
+            Route::Health(_)
+            | Route::Release(_)
             | Route::MutableJob(_)
             | Route::Update(_)
             | Route::StartUpdate
@@ -256,6 +258,7 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             ["jobs", job, "cancel-unsupported"] => {
                 Route::MutableJob(mutable_jobs::Action::CancelQueued(job_id(job)?))
             }
+            ["jobs", job, "release"] => Route::Release(job_id(job)?),
             ["jobs", job, "stop"] => Route::MutableJob(mutable_jobs::Action::Stop(job_id(job)?)),
             ["update"] => Route::StartUpdate,
             ["jobs"] => Route::MutableJob(mutable_jobs::Action::Create),
@@ -336,7 +339,26 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
             "latest=1" => Ok(Route::Update(true)),
             _ => Err(INVALID_REQUEST),
         },
-        ["health"] => no_query(query).map(|()| Route::Health),
+        ["health"] => {
+            if query.is_empty() {
+                return Ok(Route::Health(None));
+            }
+            let mut parts = query
+                .strip_prefix("after=")
+                .ok_or(INVALID_REQUEST)?
+                .split('.');
+            let mut part = || {
+                parts
+                    .next()
+                    .and_then(|s| u128::from_str_radix(s, 16).ok())
+                    .ok_or(INVALID_REQUEST)
+            };
+            let cursor = (part()?, part()?, part()?);
+            if parts.next().is_some() {
+                return Err(INVALID_REQUEST);
+            }
+            Ok(Route::Health(Some(cursor)))
+        }
         ["job-history"] => dashboard::jobs_query(query).map(|(before, limit, terms)| Route::Jobs {
             before,
             limit,
@@ -573,7 +595,8 @@ pub(super) async fn respond(
 ) -> Result<Reply, Refusal> {
     let database = &shared.database;
     match route {
-        Route::Health => Ok(Reply::ok(health(database).await)),
+        Route::Health(after) => Ok(Reply::ok(health(database, after).await)),
+        Route::Release(id) => mutable_jobs::release(id, payload, database).await,
         Route::MutableJob(action) => {
             mutable_jobs::respond(action, request, payload, database, &shared.native_stops).await
         }

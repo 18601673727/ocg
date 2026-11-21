@@ -568,6 +568,7 @@ pub enum StopProof {
     Settled,
     User,
     Operator,
+    HostExit,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

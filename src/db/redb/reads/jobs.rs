@@ -804,6 +804,27 @@ pub(crate) fn read_tool_evidence(
     tool_evidence(&read(database)?, job, after, limit)
 }
 
+pub(crate) fn unknown_execution_note(
+    tx: &impl crate::db::redb::TxRead,
+    job: JobId,
+) -> Result<String, StorageError> {
+    use std::fmt::Write;
+    let mut note = String::from(
+        "outcome unknown; it may have run or may still be running; do not assume it did not run. File writes or job tools may have applied.",
+    );
+    for entry in tx
+        .table(TOOL_CALLS)?
+        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, bytes) = entry?;
+        let call = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
+        if let Some(admission) = call.admission() {
+            let _ = write!(note, "\n{}: {}", call.name, admission.arguments.as_str());
+        }
+    }
+    Ok(note)
+}
+
 pub(crate) fn tool_evidence(
     rx: &ReadTransaction,
     job: JobId,

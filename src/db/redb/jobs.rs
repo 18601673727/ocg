@@ -605,6 +605,15 @@ impl Batch {
             return self.corrupted("invalid conversation predecessor".to_owned());
         }
         let state = self.require_job_state(id)?;
+        if state
+            .outcome
+            .as_ref()
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Unknown)
+        {
+            return Ok(self.pool_allocation(id)?.is_some_and(|allocation| {
+                allocation.phase == crate::db::entities::AllocationPhase::Released
+            }));
+        }
         if !state.confirmed_terminal() {
             return Ok(false);
         }

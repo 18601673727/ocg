@@ -17,7 +17,7 @@ use crate::workspace::ExecutionFailure as CommandFailure;
 use crate::workspace::blocking::Kind;
 use crate::workspace::files::read::{self, Refusal as PathRefusal, Workspace};
 use crate::workspace::process::{
-    self, FinishError, Finished, Process, StartingCall, StopSignal, ToolStart,
+    FinishError, Finished, Process, StartingCall, StopSignal, ToolStart,
 };
 
 pub const TOOL_NAME: &str = "workspace_run_command";
@@ -1009,20 +1009,20 @@ impl RunCommand {
             let supervised = stop.clone();
             let mutation = read::WorkspaceMutation::begin();
             let (proof, proven) = flume::bounded(1);
+            let starting = match call {
+                CommandCall::Job(_) => Some(
+                    start
+                        .take_starting()
+                        .ok_or(Failure::Refused(Refusal::NotStarted))?,
+                ),
+                CommandCall::Standalone(_) => None,
+            };
             let active_id = (self.workspace.root().to_path_buf(), call);
             active()
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .insert(active_id.clone(), (stop.clone(), proven));
             let process_start = start.clone();
-            let starting = match call {
-                CommandCall::Job(call_ref) => Some(
-                    start
-                        .take_starting()
-                        .unwrap_or_else(|| process::begin_call(call_ref)),
-                ),
-                CommandCall::Standalone(_) => None,
-            };
             thread::Builder::new()
                 .name("ocg-command".to_owned())
                 .spawn(move || {

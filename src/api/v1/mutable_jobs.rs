@@ -291,6 +291,41 @@ pub(super) enum Action {
     Stop(JobId),
 }
 
+pub(super) async fn release(
+    id: JobId,
+    payload: web::types::Payload,
+    database: &DatabaseHandle,
+) -> Result<Reply, Refusal> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Release {
+        pool: String,
+        executor: String,
+        epoch: u64,
+        generation: std::num::NonZeroU32,
+        job_revision: u64,
+    }
+    let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+    let release: Release = serde_json::from_slice(&body).map_err(|_| INVALID)?;
+    let token = crate::db::entities::AllocationToken {
+        job: id,
+        pool: super::pools::pool_id(&release.pool)?,
+        executor: super::pools::executor_id(&release.executor)?,
+        generation: release.generation,
+        epoch: release.epoch,
+    };
+    database
+        .release_interrupted(token, release.job_revision)
+        .await
+        .map_err(|e| match e {
+            DatabaseError::Rejected(Violation::StopAlreadyConfirmed(_)) => {
+                Refusal::new(StatusCode::CONFLICT, "already_released", "already released")
+            }
+            other => refusal(other),
+        })?;
+    Ok(Reply::ok(envelope(serde_json::json!({"released":true}))))
+}
+
 pub(super) async fn respond(
     action: Action,
     request: &HttpRequest,

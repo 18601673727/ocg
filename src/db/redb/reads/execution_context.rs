@@ -951,13 +951,26 @@ fn development_candidate_in(
                     .transpose()?
                     .as_ref(),
             )?;
+        let unknown = prior
+            .outcome
+            .as_ref()
+            .is_some_and(|o| o.kind == OutcomeKind::Unknown);
+        if unknown
+            && !rx
+                .open_table(POOL_ALLOCATIONS)?
+                .get(id.get())?
+                .map(|row| allocations::decode_pool_allocation(id.get(), row.value()))
+                .transpose()?
+                .is_some_and(|a| !a.holds_capacity())
+        {
+            return Err(context_unavailable(
+                "unknown predecessor still holds capacity",
+            ));
+        }
         if !ended_unstarted
             && (prior.job.parent_id != record.job.parent_id
                 || prior.job.phase != MutableJobPhase::Executing
-                || prior
-                    .outcome
-                    .as_ref()
-                    .is_none_or(|outcome| outcome.kind == OutcomeKind::Unknown))
+                || prior.outcome.is_none())
         {
             return Err(context_unavailable(
                 "predecessor is not settled in this conversation",
@@ -1024,6 +1037,7 @@ fn development_candidate_in(
             output_count += 1;
         }
         if !ended_unstarted
+            && !unknown
             && prior_outputs
                 .last()
                 .is_none_or(|output| output.kind != OutputKind::Result)
@@ -1032,8 +1046,11 @@ fn development_candidate_in(
                 "settled predecessor has no final output",
             ));
         }
-        let awaiting_batch =
-            read_awaiting_batch(rx, id, prior_outputs.last(), &mut selected_bytes)?;
+        let awaiting_batch = if unknown {
+            Vec::new()
+        } else {
+            read_awaiting_batch(rx, id, prior_outputs.last(), &mut selected_bytes)?
+        };
         let response_replay = if configuration.llm.provider.transport
             == crate::db::entities::LlmTransport::OpenAiResponses
             && matches!(&prior.job.frozen,
@@ -1056,10 +1073,16 @@ fn development_candidate_in(
         } else {
             Vec::new()
         };
-        let answer_text = match prior_outputs.last() {
-            Some(output) => super::super::observations::answer_text(rx, id, output)?,
-            None => None,
-        };
+        let answer_text = projected_answer(rx, &prior, prior_outputs.last())?;
+        if unknown {
+            selected_bytes =
+                selected_bytes.saturating_add(answer_text.as_ref().map_or(0, String::len));
+            if selected_bytes > 8 * 1024 * 1024 {
+                return Err(context_unavailable(
+                    "selected execution context exceeds byte limit",
+                ));
+            }
+        }
         previous = prior.job.previous;
         history.push(DevelopmentContextTurn {
             record: prior,
@@ -1112,4 +1135,22 @@ fn development_candidate_in(
             history,
         },
     ))
+}
+
+pub(in crate::db::redb) fn projected_answer(
+    tx: &impl crate::db::redb::TxRead,
+    record: &crate::db::entities::MutableJobRecord,
+    output: Option<&crate::db::entities::JobOutputRecord>,
+) -> Result<Option<String>, StorageError> {
+    if record
+        .outcome
+        .as_ref()
+        .is_some_and(|o| o.kind == OutcomeKind::Unknown)
+    {
+        return super::jobs::unknown_execution_note(tx, record.job.id).map(Some);
+    }
+    match output {
+        Some(output) => super::super::observations::answer_text(tx, record.job.id, output),
+        None => Ok(None),
+    }
 }

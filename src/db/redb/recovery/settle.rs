@@ -207,9 +207,36 @@ pub(super) fn settle_startup(
     batch: &mut Batch,
     deferred_groups: &std::collections::BTreeSet<JobId>,
 ) -> Result<(), StartupSettlementError> {
-    // Every held Allocation must be released by confirmed-answer settlement before
-    // Group recovery can defer queued work. Retrying a Group repeats these releases.
     settle_confirmed_answers(batch)?;
+    let epoch = batch.epoch;
+    let interrupted = batch
+        .step(|tx| {
+            let mut held = Vec::new();
+            for entry in tx.open_table(POOL_ALLOCATIONS)?.iter()? {
+                let (key, row) = entry?;
+                let allocation = allocations::decode_pool_allocation(key.value(), row.value())?;
+                if allocation.holds_capacity() && allocation.token.epoch == epoch {
+                    let commands = super::held::unfinished_commands(tx, allocation.token.job)?;
+                    held.push((allocation, commands));
+                } else if allocation.holds_capacity()
+                    && (allocation.token.epoch > epoch
+                        || allocation.phase != crate::db::entities::AllocationPhase::Uncertain)
+                {
+                    return Err(StorageError::corrupted("unexpected held Allocation epoch"));
+                }
+            }
+            Ok(held)
+        })
+        .map_err(|e| startup_read_error("scan interrupted jobs", e))?;
+    let host = crate::host::identity::current_host_id();
+    let boot = crate::host::identity::current_boot_id();
+    for (allocation, commands) in interrupted {
+        let proof =
+            super::held::stop_proof(&allocation, &commands, host.as_deref(), boot.as_deref());
+        batch
+            .recover_interrupted(allocation, proof)
+            .map_err(|e| startup_read_error("recover interrupted job", e))?;
+    }
     finish_closing_groups(batch, deferred_groups)?;
     batch.check_failure().map_err(|error| match error.0 {
         Failure::Storage(error) => StartupSettlementError::Storage(error),
@@ -230,17 +257,13 @@ fn settle_confirmed_answers(batch: &mut Batch) -> Result<(), StartupSettlementEr
                     continue;
                 }
                 let job = allocation.token.job;
-                let result = confirmed_answer(tx, &allocation)
-                    .map_err(|mut error| {
-                        error.detail = format!("read confirmed answer for {job}: {}", error.detail);
-                        error
-                    })?
-                    .ok_or_else(|| {
-                        StorageError::corrupted(format!(
-                            "{job} still holds capacity without a confirmed answer; inspect with `ocg inspect-held <data-directory>`"
-                        ))
-                    })?;
-                found.push((allocation, result));
+                let result = confirmed_answer(tx, &allocation).map_err(|mut error| {
+                    error.detail = format!("read confirmed answer for {job}: {}", error.detail);
+                    error
+                })?;
+                if let Some(result) = result {
+                    found.push((allocation, result));
+                }
             }
             Ok(found)
         })
@@ -348,6 +371,7 @@ fn finish_closing_groups(
             )));
         }
         if spec.is_chunk_group()
+            && !group_holds_capacity(&batch.tx, group).map_err(StartupSettlementError::Storage)?
             && let Err(error) = batch.recover_chunk_group(&spec)
         {
             return Err(match settlement_failure(batch, error) {
@@ -359,21 +383,6 @@ fn finish_closing_groups(
                     StartupSettlementError::Storage(error)
                 }
                 Failure::Rejected(reason) => {
-                    // A deferred Group is retried on the next start, so it may only
-                    // wait while it owns no capacity. Confirmed answers were settled
-                    // earlier in this transaction and startup refused every other
-                    // held Allocation, so this can only fail if an invariant broke.
-                    if group_holds_capacity(&batch.tx, group).map_err(|error| {
-                        StartupSettlementError::Storage(StorageError::corrupted(format!(
-                            "cannot prove closing Chunk Group {group} holds no capacity: {error}"
-                        )))
-                    })? {
-                        return Err(StartupSettlementError::Storage(StorageError::corrupted(
-                            format!(
-                                "closing Chunk Group {group} was rejected and still holds capacity: {reason}. Capacity remains held; inspect with `ocg inspect-held <data-directory>`"
-                            ),
-                        )));
-                    }
                     StartupSettlementError::ClosingGroupRejected(group, reason)
                 }
             });

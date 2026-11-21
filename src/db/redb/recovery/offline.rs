@@ -289,7 +289,7 @@ pub(crate) fn verify_compaction_ref_publication_delta(
                 "plan": plan.evidence,
                 "plan_digest": plan.digest,
                 "other_tables_byte_identical": true,
-                "residual_ownership": residual.ownership.facts(),
+                "residual_ownership": residual.facts(),
             }))
         })
     })
@@ -376,14 +376,10 @@ fn residual_logical_report(directory: &Path, database: &impl ReadableDatabase) -
         Ok(residual) => (
             serde_json::json!({
                 "passed": true,
-                "held_allocations": residual.ownership.held.len(),
-                "retained_unknown_outcomes": residual.ownership.retained_unknown.len(),
-                "resolved_unknown_outcomes": residual.ownership.resolved_unknown.len(),
-                "normal_startup": if residual.normal_startup_accepts {
-                    "accepted"
-                } else {
-                    "refused_residual_held_ownership"
-                },
+                "held_allocations": residual.held.len(),
+                "retained_unknown_outcomes": residual.retained_unknown.len(),
+                "resolved_unknown_outcomes": residual.resolved_unknown.len(),
+                "normal_startup": "accepted",
             }),
             true,
         ),
@@ -807,7 +803,14 @@ fn inspect_held_in(
             .as_ref()
             .zip(inspector_boot.as_ref())
             .map(|(claimed, current)| claimed == current);
-        if boot_matches == Some(false) {
+        let commands = super::held::unfinished_commands(&tx, job)?;
+        let proof = super::held::stop_proof(
+            allocation,
+            &commands,
+            inspector_host.as_deref(),
+            inspector_boot.as_deref(),
+        );
+        if host_matches == Some(true) && boot_matches == Some(false) {
             inferred.push(
                 "The claiming boot differs from this machine's boot, so the claiming process cannot still be running here. This says nothing about the provider."
                     .to_owned(),
@@ -820,6 +823,7 @@ fn inspect_held_in(
                 "executor": allocation.token.executor.to_string(),
                 "generation": allocation.token.generation.get(),
                 "epoch": allocation.token.epoch,
+                "available_stop_proof": proof.map(super::held::recovery_proof_name),
                 "job_revision": allocation.job_revision,
                 "phase": text(&allocation.phase),
                 "holds_capacity": allocation.holds_capacity(),

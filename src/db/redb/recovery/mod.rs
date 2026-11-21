@@ -154,7 +154,7 @@ pub(super) fn check_identity(
             .map(u64::from_le_bytes)
             .map_err(|_| unsupported_format("database format marker is malformed"))?,
     };
-    if matches!(found, 1 | 2) {
+    if (1..FORMAT_VERSION).contains(&found) {
         let action = if cfg!(unix) {
             "run ocg migrate <data-directory> --dry-run"
         } else {
@@ -248,7 +248,7 @@ fn startup_checks(
     } else {
         check_records(&tx)?;
     }
-    refuse_unresolved_ownership(&tx)?;
+    residual_ownership_in(&tx)?;
     Ok(Verification::Full)
 }
 
@@ -290,10 +290,6 @@ pub(crate) struct ResidualOwnership {
 }
 
 impl ResidualOwnership {
-    fn unresolved(&self) -> bool {
-        !self.held.is_empty() || !self.retained_unknown.is_empty()
-    }
-
     fn facts(&self) -> serde_json::Value {
         let ids = |set: &std::collections::BTreeSet<u128>| {
             set.iter()
@@ -381,23 +377,13 @@ fn residual_ownership_in(tx: &ReadTransaction) -> Result<ResidualOwnership, Stor
     Ok(ownership)
 }
 
-pub(crate) struct ReservedResidual {
-    pub(crate) ownership: ResidualOwnership,
-    pub(crate) normal_startup_accepts: bool,
-}
-
 pub(crate) fn verify_reserved_residual(
     database: &impl ::redb::ReadableDatabase,
-) -> Result<ReservedResidual, StorageError> {
+) -> Result<ResidualOwnership, StorageError> {
     let tx = database.begin_read()?;
     startup_metadata(&tx)?;
     check_records(&tx)?;
-    let ownership = residual_ownership_in(&tx)?;
-    let normal_startup_accepts = !ownership.unresolved();
-    Ok(ReservedResidual {
-        ownership,
-        normal_startup_accepts,
-    })
+    residual_ownership_in(&tx)
 }
 
 fn check_records(tx: &ReadTransaction) -> Result<(), StorageError> {
@@ -1040,17 +1026,6 @@ fn check_settled_job_effects(tx: &ReadTransaction, job: JobId) -> Result<(), Sto
     Ok(())
 }
 
-fn refuse_unresolved_ownership(tx: &ReadTransaction) -> Result<(), StorageError> {
-    let ownership = residual_ownership_in(tx)?;
-    if ownership.unresolved() {
-        return Err(held_ownership(
-            ownership.held.len() as u64,
-            ownership.retained_unknown.len() as u64,
-        ));
-    }
-    Ok(())
-}
-
 fn unknown_outcomes_exist(tx: &impl TxRead) -> Result<bool, StorageError> {
     for entry in tx.table(JOB_RUNTIME)?.iter()? {
         let (key, value) = entry?;
@@ -1098,16 +1073,6 @@ fn resolved_unknown_ownership(
                 && record.job.revision == allocation.job_revision
         }),
     )
-}
-
-fn held_ownership(held: u64, unknown: u64) -> StorageError {
-    StorageError {
-        kind: StorageErrorKind::Other,
-        os_error: None,
-        detail: format!(
-            "refusing to start: {held} Allocation(s) still hold capacity and {unknown} Job outcome(s) are Unknown. Inspect with `ocg inspect-held <data-directory>`. To plan offline release, run `ocg reconcile-held <data-directory> --dry-run`"
-        ),
-    }
 }
 
 pub(super) fn check_preflight_header(bytes: &[u8], tags: &[u8]) -> Result<(), StorageError> {
@@ -1482,7 +1447,14 @@ fn initialize(database: &Database, fresh: bool) -> Result<u64, StorageError> {
             }
         }
     };
-    let epoch = batch.epoch;
+    let epoch = batch
+        .epoch
+        .checked_add(1)
+        .ok_or_else(|| StorageError::corrupted("open epoch overflow"))?;
+    batch
+        .tx
+        .open_table(META)?
+        .insert("open_epoch", epoch.to_le_bytes().as_slice())?;
     batch.tx.commit()?;
     Ok(epoch)
 }
@@ -1514,12 +1486,8 @@ fn initialize_batch(database: &Database, fresh: bool) -> Result<Batch, StorageEr
             .and_then(|value| <[u8; 8]>::try_from(value.value()).ok())
             .map(u64::from_le_bytes)
             .ok_or_else(|| StorageError::corrupted("missing or invalid open epoch"))?;
-        let epoch = previous
-            .checked_add(1)
-            .ok_or_else(|| StorageError::corrupted("open epoch overflow"))?;
-        meta.insert("open_epoch", epoch.to_le_bytes().as_slice())?;
         meta.insert("clean_shutdown", [0u8].as_slice())?;
-        epoch
+        previous
     };
 
     if fresh {

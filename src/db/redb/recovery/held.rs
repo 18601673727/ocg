@@ -1,5 +1,5 @@
 use super::{
-    check_identity, check_records, refuse_unresolved_ownership, resolved_unknown_ownership,
+    check_identity, check_records, residual_ownership_in, resolved_unknown_ownership,
     verify_recovered,
 };
 use crate::db::entities::{ContentDigest, OutcomeKind, OutputKind, StopProof};
@@ -51,13 +51,14 @@ fn recovery_phase_name(phase: crate::db::entities::AllocationPhase) -> &'static 
     }
 }
 
-fn recovery_proof_name(proof: StopProof) -> &'static str {
+pub(super) fn recovery_proof_name(proof: StopProof) -> &'static str {
     match proof {
         StopProof::Proof => "proof",
         StopProof::Reboot => "reboot",
         StopProof::Settled => "settled",
         StopProof::User => "user",
         StopProof::Operator => "operator",
+        StopProof::HostExit => "host_exit",
     }
 }
 
@@ -106,13 +107,6 @@ fn held_recovery_plan_in(
             held.push((allocation, value.value().to_vec()));
         }
     }
-    if clean && !held.is_empty() {
-        return Err(ReservedRefusal::new(
-            "unguarded_source",
-            "a clean-shutdown database with held Allocations is not a supported recovery source",
-        ));
-    }
-
     let current_host = current_host_id();
     let current_boot = current_boot_id();
     let mut actions = Vec::new();
@@ -196,6 +190,56 @@ fn sha256_bytes(bytes: &[u8]) -> String {
     ContentDigest::of(bytes).to_string()
 }
 
+pub(crate) fn unfinished_commands(
+    tx: &impl crate::db::redb::TxRead,
+    job: crate::db::entities::JobId,
+) -> Result<Vec<Option<crate::db::entities::CommandGroup>>, StorageError> {
+    let mut groups = Vec::new();
+    for entry in tx
+        .table(TOOL_CALLS)?
+        .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
+    {
+        let (key, row) = entry?;
+        let call = rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, row.value())?;
+        if call.spawns
+            && call.admission().is_some()
+            && call
+                .outcome
+                .as_ref()
+                .is_none_or(|outcome| !outcome.fact.is_definite())
+        {
+            groups.push(call.group);
+        }
+    }
+    Ok(groups)
+}
+
+pub(crate) fn stop_proof(
+    allocation: &crate::db::entities::PoolAllocation,
+    commands: &[Option<crate::db::entities::CommandGroup>],
+    host: Option<&str>,
+    boot: Option<&str>,
+) -> Option<StopProof> {
+    if host.is_none() || allocation.host_id.as_deref() != host {
+        return None;
+    }
+    if let (Some(recorded), Some(current)) = (allocation.boot_id.as_deref(), boot)
+        && recorded != current
+    {
+        return Some(StopProof::Reboot);
+    }
+    if commands.is_empty() {
+        return Some(StopProof::HostExit);
+    }
+    if boot.is_none() || allocation.boot_id.as_deref() != boot {
+        return None;
+    }
+    commands
+        .iter()
+        .all(|group| group.is_some_and(crate::workspace::process::recorded_group_stopped))
+        .then_some(StopProof::Proof)
+}
+
 fn recovery_action_in(
     tx: &ReadTransaction,
     epoch: u64,
@@ -207,7 +251,7 @@ fn recovery_action_in(
 ) -> Result<Result<RecoveryAction, (&'static str, String)>, ReservedRefusal> {
     use crate::db::entities::{
         AllocationPhase, ExecutionOperation, MutableFrozenConfiguration, MutableJobPhase,
-        OutcomeCause, UncertaintyReason,
+        UncertaintyReason,
     };
 
     macro_rules! ineligible {
@@ -223,7 +267,9 @@ fn recovery_action_in(
             "an unstarted Reservation belongs to `ocg reconcile-reserved`; it is left untouched"
         );
     }
-    if allocation.token.epoch != epoch {
+    if allocation.token.epoch != epoch
+        && !(allocation.token.epoch < epoch && allocation.phase == AllocationPhase::Uncertain)
+    {
         ineligible!(
             "epoch_mismatch",
             "the database has intervening open history that this recovery cannot see"
@@ -235,10 +281,6 @@ fn recovery_action_in(
             "the Allocation is not owned by this identified host"
         );
     }
-    let same_boot = current_boot.is_some() && allocation.boot_id.as_deref() == current_boot;
-    let boot_changed = current_boot.is_some()
-        && allocation.boot_id.is_some()
-        && allocation.boot_id.as_deref() != current_boot;
     if allocation.started_at.is_none()
         || allocation.stop_confirmed_at.is_some()
         || allocation.stop_proof.is_some()
@@ -343,114 +385,27 @@ fn recovery_action_in(
         );
     }
 
-    let (proof, reason, preserve_unknown) = match allocation.phase {
-        AllocationPhase::Running => {
-            if record.outcome.is_some() {
-                ineligible!(
-                    "outcome_present",
-                    "a Running Allocation cannot have a final outcome"
-                );
-            }
-            if !boot_changed {
-                ineligible!(
-                    "same_boot_running",
-                    "Running recovery requires a genuine, identified Boot-ID change"
-                );
-            }
-            (StopProof::Reboot, UncertaintyReason::Unclassified, false)
-        }
-        AllocationPhase::StopRequested => {
-            if record.outcome.is_some() {
-                ineligible!(
-                    "outcome_present",
-                    "a StopRequested Allocation cannot have a final outcome"
-                );
-            }
-            if !boot_changed {
-                ineligible!(
-                    "same_boot_stop_requested",
-                    "StopRequested recovery requires a genuine, identified Boot-ID change"
-                );
-            }
-            (
-                StopProof::Reboot,
-                UncertaintyReason::StopRequestedWithoutConfirmedTermination,
-                false,
-            )
-        }
-        AllocationPhase::Uncertain => {
-            let Some(outcome) = record.outcome.as_ref() else {
-                ineligible!(
-                    "outcome_missing",
-                    "an Uncertain Allocation must preserve an Unknown outcome"
-                );
-            };
-            if outcome.kind != OutcomeKind::Unknown {
-                ineligible!(
-                    "outcome_not_unknown",
-                    "an Uncertain Allocation cannot have a known outcome"
-                );
-            }
-            if boot_changed {
-                (StopProof::Reboot, UncertaintyReason::Unclassified, true)
-            } else if same_boot {
-                let returned = outcome.cause.as_ref().is_some_and(|cause| {
-                    matches!(
-                        cause,
-                        OutcomeCause::Uncertain(
-                            UncertaintyReason::RequestPossiblySent
-                                | UncertaintyReason::ConnectionInterrupted
-                                | UncertaintyReason::ResponseIncompleteOrInvalid
-                                | UncertaintyReason::StopRequestedWithoutConfirmedTermination
-                                | UncertaintyReason::HostShutdown
-                                | UncertaintyReason::DeadlineExceeded
-                        )
-                    )
-                });
-                if !returned {
-                    ineligible!(
-                        "local_return_unproven",
-                        "same-Boot Uncertain recovery requires a durable typed local-return reason"
-                    );
-                }
-                (StopProof::Proof, UncertaintyReason::Unclassified, true)
-            } else {
-                ineligible!(
-                    "boot_unproven",
-                    "neither a genuine Boot-ID change nor same-Boot local return is proved"
-                );
-            }
-        }
-        AllocationPhase::Reserved | AllocationPhase::Released => {
-            return Err(ReservedRefusal::new(
-                "inconsistent_or_corrupt",
-                "unreachable held Allocation phase",
-            ));
-        }
-    };
-    if proof == StopProof::Proof {
-        for entry in tx
-            .open_table(TOOL_CALLS)
-            .map_err(StorageError::from)?
-            .range((job_id.get(), 0, 0)..=(job_id.get(), u32::MAX, u32::MAX))
-            .map_err(StorageError::from)?
-        {
-            let (key, row) = entry.map_err(StorageError::from)?;
-            let tool = rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, row.value())?;
-            if tool.admission().is_some()
-                && tool.reconciliation.is_none()
-                && tool
-                    .outcome
-                    .as_ref()
-                    .is_none_or(|outcome| !outcome.fact.is_definite())
-            {
-                ineligible!(
-                    "tool_effect_unproven",
-                    "an admitted tool effect is unconfirmed and a local process may still be running on this boot"
-                );
-            }
-        }
+    let preserve_unknown = allocation.phase == AllocationPhase::Uncertain;
+    if preserve_unknown
+        && !record
+            .outcome
+            .as_ref()
+            .is_some_and(|o| o.kind == OutcomeKind::Unknown)
+        || !preserve_unknown && record.outcome.is_some()
+    {
+        ineligible!(
+            "outcome_inconsistent",
+            "the Allocation phase disagrees with the outcome"
+        );
     }
+    let commands = unfinished_commands(tx, job_id)?;
+    let Some(proof) = stop_proof(&allocation, &commands, current_host, current_boot) else {
+        ineligible!(
+            "termination_unproven",
+            "an unfinished command may still be running"
+        );
+    };
+    let reason = UncertaintyReason::HostExited;
     Ok(Ok(RecoveryAction {
         token: allocation.token,
         phase: allocation.phase,
@@ -696,9 +651,7 @@ fn audit_held_recovery(
             }
         }
     }
-    if held == 0 && unresolved_unknown == 0 {
-        refuse_unresolved_ownership(&tx)?;
-    }
+    residual_ownership_in(&tx)?;
     let clean = tx
         .open_table(META)
         .map_err(StorageError::from)?

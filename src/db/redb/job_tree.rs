@@ -1038,6 +1038,7 @@ impl Batch {
             return Ok(false);
         };
         if outcome.kind == OutcomeKind::Unknown {
+            self.report_settled_child(parent, conversation)?;
             return Ok(false);
         }
         let is_head = self.group_head(conversation)? == Some(job);
@@ -1475,7 +1476,7 @@ fn report_segment(
     let Some((first, head)) = first.zip(head) else {
         return Ok(None);
     };
-    if !state::require(tx, head)?.state.confirmed_terminal() {
+    if state::require(tx, head)?.state.outcome.is_none() {
         return Ok(None);
     }
     Ok(Some(ReportSegment { first, head }))
@@ -1668,8 +1669,12 @@ fn child_report_text(tx: &impl TxRead, results: &[ChildResult]) -> Result<String
         };
         let header = format!("\n\n[{title}] conversation {child}: {status}\n");
         let pointer = format!("\nFull answer in child conversation {child}.");
-        let answer: String = returned_answer(tx, result.head)?
-            .unwrap_or_default()
+        let body = if result.outcome == OutcomeKind::Unknown {
+            reads::jobs::unknown_execution_note(tx, result.head)?
+        } else {
+            returned_answer(tx, result.head)?.unwrap_or_default()
+        };
+        let answer: String = body
             .chars()
             .take(jobs::MAX_INPUT_BYTES + 1)
             .map(|c| {

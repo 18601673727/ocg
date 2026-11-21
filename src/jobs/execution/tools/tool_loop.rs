@@ -306,7 +306,7 @@ pub(crate) async fn answer_calls(
             continue;
         }
         let spawns = decided.spawns();
-        let mut starting = spawns.then(|| crate::workspace::process::begin_call(reference));
+        let mut starting = spawns.then(|| site.database.command_start(site.handoff, reference));
         if let Some(starting) = &mut starting {
             starting.admission_pending();
         }

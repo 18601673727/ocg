@@ -238,12 +238,21 @@ pub struct Recorded<T> {
     pub at: Timestamp,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CommandGroup {
+    pub pid: u32,
+    pub leader_start: u64,
+    pub sentinel_inode: u64,
+    pub pid_namespace: Option<u64>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolEvidenceRecord {
     pub call: ToolCallRef,
     pub tool_call_id: String,
     pub name: String,
     pub spawns: bool,
+    pub group: Option<CommandGroup>,
     pub decision: Recorded<ToolDecision>,
     pub outcome: Option<Recorded<ToolOutcome>>,
     pub reconciliation: Option<Recorded<ToolReconciliation>>,

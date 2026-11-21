@@ -252,6 +252,7 @@ impl Allocator {
     pub(super) async fn dispatch(
         &self,
         database_changed: bool,
+        recheck: bool,
     ) -> Result<Option<Duration>, DatabaseError> {
         if database_changed {
             let mut rescan = self.rescan.get();
@@ -270,6 +271,9 @@ impl Allocator {
             if task.await.is_err() {
                 self.halt("a dispatch ended without a report");
             }
+        }
+        if recheck {
+            self.database.recheck_interrupted().await?;
         }
         if crate::workspace::process::groups_tracked()
             && let Err(error) =

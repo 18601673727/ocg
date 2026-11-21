@@ -1978,8 +1978,18 @@ export function createApiClient(options: ApiClientOptions) {
       ).input as Api.Logs;
     },
 
-    async readHealth(signal?: AbortSignal) {
-      return (await send("GET", "/api/v1/health", { signal })).input as Api.Health;
+    async readHealth(signal?: AbortSignal, after?: string) {
+      const query = after ? `?after=${encodeURIComponent(after)}` : "";
+      return (await send("GET", `/api/v1/health${query}`, { signal })).input as Api.Health;
+    },
+
+    async releaseAllocation(item: NonNullable<Api.Health["quarantined"]>[number]) {
+      jobIdentity(item.job);
+      const { pool, executor, generation, epoch, job_revision } = item;
+      await send("POST", `/api/v1/jobs/${item.job}/release`, {
+        body: { pool, executor, generation, epoch, job_revision },
+        sign: true,
+      });
     },
 
     async readUpdate(latest: boolean, signal?: AbortSignal) {

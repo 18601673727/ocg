@@ -32,6 +32,7 @@ impl Scheduler {
     pub(super) async fn run(self, scheduler: &Allocator) {
         let mut previous_batch = None;
         let mut next_due = None;
+        let mut recheck_at = Instant::now();
         loop {
             if self.shutdown.is_cancelled() {
                 return;
@@ -50,7 +51,8 @@ impl Scheduler {
             }
             if let Some(previous) = previous_batch {
                 if !recovered {
-                    let timer = batch_delay(previous, next_due);
+                    let timer = batch_delay(previous, next_due)
+                        .min(recheck_at.saturating_duration_since(Instant::now()));
                     let waking = select(
                         self.wake.recv_async(),
                         select(self.protection.changed(), ntex::time::sleep(timer)),
@@ -75,7 +77,11 @@ impl Scheduler {
             while self.wake.try_recv().is_ok() {
                 database_changed = true;
             }
-            let result = scheduler.dispatch(database_changed).await;
+            let recheck = Instant::now() >= recheck_at;
+            if recheck {
+                recheck_at = Instant::now() + RECONCILE;
+            }
+            let result = scheduler.dispatch(database_changed, recheck).await;
             previous_batch = Some(Instant::now());
             match result {
                 Ok(due) => next_due = due,

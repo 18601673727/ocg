@@ -906,7 +906,8 @@ const en = {
   "observations.runtimeHealth": "Runtime health",
   "observations.quarantinedCapacity": "Quarantined capacity",
   "observations.quarantinedNote":
-    "These jobs hold capacity until stop is proven or machine reboots.",
+    "The command may still be running. Release capacity when you are sure it stopped. File writes or job tools may have applied.",
+  "observations.release": "Release capacity",
   "observations.noQuarantined": "No quarantined slots.",
   "observations.quarantinedUnreadable": "Unknown: the quarantined capacity could not be read.",
   "observations.job": "Job",
@@ -2203,7 +2204,9 @@ const zh: Dictionary = {
     "{from}至{until}的平均延迟：首字节 {ttfb}，总耗时 {duration}。",
   "observations.runtimeHealth": "运行时健康",
   "observations.quarantinedCapacity": "隔离容量",
-  "observations.quarantinedNote": "这些任务会一直占用容量，直到确认停止或机器重启。",
+  "observations.quarantinedNote":
+    "命令可能仍在运行。请在确认命令已停止后释放容量。文件写入或任务工具的操作可能已生效。",
+  "observations.release": "释放容量",
   "observations.noQuarantined": "没有隔离槽位。",
   "observations.quarantinedUnreadable": "未知：无法读取隔离容量。",
   "observations.job": "任务",

@@ -54,7 +54,13 @@ pub(crate) struct ProcessView {
 #[ts(rename = "Quarantined")]
 pub(crate) struct QuarantinedView {
     job: String,
-    pool: Option<String>,
+    pool: String,
+    executor: String,
+    generation: u32,
+    epoch: u64,
+    job_revision: u64,
+    releasable: bool,
+    evidence: String,
     since: i64,
 }
 
@@ -75,9 +81,13 @@ pub(crate) struct HealthView {
     process: ProcessView,
     quarantined: Option<Vec<QuarantinedView>>,
     quarantined_error: Option<QuarantinedErrorView>,
+    next_after: Option<String>,
 }
 
-pub(super) async fn health(database: &DatabaseHandle) -> Value {
+pub(super) async fn health(
+    database: &DatabaseHandle,
+    after: Option<crate::db::entities::AllocationCursor>,
+) -> Value {
     let status = match database.status() {
         DatabaseStatus::Open => "open",
         DatabaseStatus::Protected => "protected",
@@ -99,25 +109,34 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
         }
     };
     let (commit_us_mean, commit_us_max) = database.commit_timing();
-    let (quarantined, quarantined_error) = match database.uncertain_allocations().await {
-        Ok(uncertain) => (
-            Some(
-                uncertain
-                    .into_iter()
-                    .map(|allocation| QuarantinedView {
-                        job: allocation.job.to_string(),
-                        pool: Some(allocation.pool.to_string()),
-                        since: allocation.since.as_unix_micros(),
-                    })
-                    .collect::<Vec<_>>(),
+    let (quarantined, quarantined_error, next_after) =
+        match database.uncertain_allocations(after).await {
+            Ok(uncertain) => (
+                Some(
+                    uncertain
+                        .records
+                        .into_iter()
+                        .map(|allocation| QuarantinedView {
+                            job: allocation.allocation.token.job.to_string(),
+                            pool: allocation.allocation.token.pool.to_string(),
+                            executor: allocation.allocation.token.executor.to_string(),
+                            epoch: allocation.allocation.token.epoch,
+                            generation: allocation.allocation.token.generation.get(),
+                            job_revision: allocation.allocation.job_revision,
+                            releasable: allocation.allocation.token.epoch < database.open_epoch(),
+                            evidence: allocation.evidence,
+                            since: allocation.since.as_unix_micros(),
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                None,
+                uncertain.next.map(|(p, e, j)| format!("{p:x}.{e:x}.{j:x}")),
             ),
-            None,
-        ),
-        Err(error) => {
-            log::warn!("failed to read uncertain allocations for health: {error}");
-            (None, Some(QuarantinedErrorView::Unreadable))
-        }
-    };
+            Err(error) => {
+                log::warn!("failed to read uncertain allocations for health: {error}");
+                (None, Some(QuarantinedErrorView::Unreadable), None)
+            }
+        };
     envelope(serde_json::json!(HealthView {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         host: "running".to_owned(),
@@ -144,5 +163,6 @@ pub(super) async fn health(database: &DatabaseHandle) -> Value {
         },
         quarantined,
         quarantined_error,
+        next_after,
     }))
 }

@@ -327,18 +327,14 @@ fn verify_reserved_residual_against(
     expected: &ResidualOwnership,
 ) -> Result<serde_json::Value, ReservedRefusal> {
     let verified = verify_reserved_residual(database)?;
-    if &verified.ownership != expected {
+    if &verified != expected {
         return Err(audit_delta(
             "the residual ownership differs from the rollback source without the target",
         ));
     }
     Ok(serde_json::json!({
-        "residual_ownership": verified.ownership.facts(),
-        "normal_startup": if verified.normal_startup_accepts {
-            "accepted: no Allocation holds capacity and no Unknown outcome is unresolved; full startup verification passed"
-        } else {
-            "refused: residual held ownership remains, as normal startup requires"
-        },
+        "residual_ownership": verified.facts(),
+        "normal_startup": "accepted",
     }))
 }
 

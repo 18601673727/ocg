@@ -65,6 +65,8 @@ pub(super) fn affects_scheduling(kind: OperationKind) -> bool {
         | OperationKind::RecordSentRequest
         | OperationKind::RecordProviderAnswer
         | OperationKind::ConsumeTokenUsage
+        | OperationKind::ReleaseCapacity
+        | OperationKind::RecordCommandGroup
         | OperationKind::RecordToolDecision
         | OperationKind::CreateAttachment => false,
     }

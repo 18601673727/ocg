@@ -1,7 +1,7 @@
 use crate::db::commands::Command;
 use crate::db::entities::{
-    AllocationExecutor, AllocationPool, CursorPage, ExecutionPoolId, PoolAllocationPage,
-    UncertainAllocation,
+    AllocationCursor, AllocationExecutor, AllocationPool, CursorPage, ExecutionPoolId,
+    PoolAllocationPage, UncertainPage,
 };
 use crate::db::entities::{ExecutorId, OperationKind, Violation};
 use crate::db::errors::{CommandOutcome, DatabaseError};
@@ -14,8 +14,91 @@ impl DatabaseHandle {
         self.shared.native_stops.clone()
     }
 
-    pub async fn uncertain_allocations(&self) -> Result<Vec<UncertainAllocation>, DatabaseError> {
-        self.read(redb::read_uncertain_allocations).await
+    pub(crate) async fn uncertain_allocations(
+        &self,
+        after: Option<AllocationCursor>,
+    ) -> Result<UncertainPage, DatabaseError> {
+        self.read(move |db| redb::read_uncertain_allocations(db, after))
+            .await
+    }
+
+    pub(crate) fn open_epoch(&self) -> u64 {
+        self.shared.epoch.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub(crate) async fn release_interrupted(
+        &self,
+        token: entities::AllocationToken,
+        revision: u64,
+    ) -> Result<bool, DatabaseError> {
+        self.write(
+            0,
+            OperationKind::ReleaseCapacity,
+            (token, revision),
+            |batch, (token, revision)| {
+                batch.release_uncertain(token, revision, entities::StopProof::User, None)
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn recheck_interrupted(&self) -> Result<(), DatabaseError> {
+        let mut after = None;
+        let epoch = self.open_epoch();
+        loop {
+            let page = self.uncertain_allocations(after).await?;
+            let candidates = page
+                .records
+                .into_iter()
+                .filter(|row| row.allocation.token.epoch < epoch)
+                .collect::<Vec<_>>();
+            if !candidates.is_empty() {
+                let proved = ntex::rt::spawn_blocking(move || {
+                    let host = crate::host::identity::current_host_id();
+                    let boot = crate::host::identity::current_boot_id();
+                    candidates
+                        .into_iter()
+                        .filter_map(|row| {
+                            redb::stop_proof(
+                                &row.allocation,
+                                &row.commands,
+                                host.as_deref(),
+                                boot.as_deref(),
+                            )
+                            .map(|proof| {
+                                (
+                                    row.allocation.token,
+                                    row.allocation.job_revision,
+                                    row.allocation_bytes,
+                                    proof,
+                                )
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+                match proved {
+                    Ok(proved) => {
+                        for candidate in proved {
+                            self.write(
+                                0,
+                                OperationKind::ReleaseCapacity,
+                                candidate,
+                                |batch, (token, revision, bytes, proof)| {
+                                    batch.release_uncertain(token, revision, proof, Some(&bytes))
+                                },
+                            )
+                            .await?;
+                        }
+                    }
+                    Err(error) => log::warn!("interrupted allocation proof worker failed: {error}"),
+                }
+            }
+            after = page.next;
+            if after.is_none() {
+                return Ok(());
+            }
+        }
     }
 
     pub(crate) async fn scheduled_external_policy(

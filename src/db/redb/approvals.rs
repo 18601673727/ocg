@@ -491,6 +491,7 @@ impl Batch {
             ) => {}
         }
         let record = ToolEvidenceRecord {
+            group: None,
             call,
             tool_call_id: tool_call_id.to_owned(),
             name: name.to_owned(),
@@ -533,6 +534,30 @@ impl Batch {
         }
         self.probe = Some(Probe::ToolCall(call));
         Ok(())
+    }
+
+    pub(crate) fn record_command_group(
+        &mut self,
+        proof: &crate::db::handoff::DevelopmentWriteProof,
+        call: ToolCallRef,
+        group: crate::db::entities::CommandGroup,
+    ) -> Result<(), BatchError> {
+        self.require_development_call(proof, call)?;
+        let Some(mut record) = self.tool_evidence(call)? else {
+            return self.reject(Violation::ToolCallNotFound(call));
+        };
+        if record.admission().is_none()
+            || !record.spawns
+            || record.outcome.is_some()
+            || record.group.is_some()
+        {
+            return self.reject(Violation::InvalidValue(
+                "command group",
+                "requires an unfinished spawning admission without a group",
+            ));
+        }
+        record.group = Some(group);
+        self.put_tool_evidence(&record)
     }
 
     pub(crate) fn tool_outcome(

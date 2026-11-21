@@ -1007,14 +1007,19 @@ pub(crate) fn read_native_resource_catalog(
 
 pub(crate) fn read_uncertain_allocations(
     database: &Database,
-) -> Result<Vec<UncertainAllocation>, StorageError> {
+    after: Option<crate::db::entities::AllocationCursor>,
+) -> Result<crate::db::entities::UncertainPage, StorageError> {
     use crate::db::entities::MutableJobPhase;
     let rx = read(database)?;
     let active = rx.open_table(ACTIVE_ALLOCATIONS)?;
     let allocations = rx.open_table(POOL_ALLOCATIONS)?;
     let mut uncertain = Vec::new();
-    for entry in active.iter()? {
+    let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+    let mut entries = active.range((start, Bound::Unbounded))?;
+    let mut next = None;
+    for entry in entries.by_ref().take(64) {
         let (pool, executor, job) = entry?.0.value();
+        next = Some((pool, executor, job));
         let allocation = indexed_allocation(&allocations, pool, executor, job)?;
         if allocation.phase != AllocationPhase::Uncertain {
             continue;
@@ -1040,12 +1045,25 @@ pub(crate) fn read_uncertain_allocations(
                 "an Uncertain Allocation has no Unknown outcome",
             ));
         };
+        let allocation_bytes = allocations
+            .get(job)?
+            .ok_or_else(|| StorageError::corrupted("uncertain Allocation missing"))?
+            .value()
+            .to_vec();
         uncertain.push(UncertainAllocation {
-            job: JobId::new(job),
-            pool: allocation.token.pool,
-            epoch: allocation.token.epoch,
+            allocation_bytes,
+            evidence: super::reads::jobs::unknown_execution_note(&rx, allocation.token.job)?,
+            commands: super::recovery::held::unfinished_commands(&rx, allocation.token.job)?,
+            allocation,
             since: outcome.at,
         });
     }
-    Ok(uncertain)
+    Ok(CursorPage {
+        records: uncertain,
+        next: if entries.next().transpose()?.is_some() {
+            next
+        } else {
+            None
+        },
+    })
 }

@@ -30,6 +30,40 @@ export function ObservationsSurface(props: {
   const [loadingMore, setLoadingMore] = createSignal(false);
   const loadMoreRef = elementRef<() => void>(() => {});
   const i18n = useI18n();
+  const [heldPage, setHeldPage] = createSignal<Api.Health | null>(null);
+  const [heldAfter, setHeldAfter] = createSignal<string>();
+  const [heldBusy, setHeldBusy] = createSignal(false);
+  const [heldError, setHeldError] = createSignal("");
+  const held = () => heldPage() ?? props.health;
+  const readHeld = async (after?: string) => {
+    setHeldBusy(true);
+    setHeldError("");
+    try {
+      setHeldPage(await props.client.readHealth(undefined, after));
+      setHeldAfter(after);
+    } catch (cause) {
+      setHeldError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setHeldBusy(false);
+    }
+  };
+  createEffect(
+    () => props.health,
+    () => {
+      if (!heldAfter()) setHeldPage(null);
+    },
+  );
+  const release = async (item: NonNullable<Api.Health["quarantined"]>[number]) => {
+    setHeldBusy(true);
+    try {
+      await props.client.releaseAllocation(item);
+      await readHeld(heldAfter());
+    } catch (cause) {
+      setHeldError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setHeldBusy(false);
+    }
+  };
   const numberFormat = createMemo(() => new Intl.NumberFormat(i18n.locale));
   const number = (value: number | null) => (value === null ? "—" : numberFormat().format(value));
   const dateTime = createMemo(
@@ -247,12 +281,12 @@ export function ObservationsSurface(props: {
             <p class="my-2 text-sm text-muted-foreground">
               {i18n.t("observations.quarantinedNote")}
             </p>
-            {!props.health || !props.health.quarantined || props.health.quarantined.length === 0 ? (
+            {!held()?.quarantined?.length ? (
               <p class="py-2 text-sm text-muted-foreground">
                 {i18n.t(
-                  !props.health
+                  !held()
                     ? "common.unknown"
-                    : props.health.quarantined
+                    : held()?.quarantined
                       ? "observations.noQuarantined"
                       : "observations.quarantinedUnreadable",
                 )}
@@ -265,10 +299,11 @@ export function ObservationsSurface(props: {
                       <th class={cell}>{i18n.t("observations.job")}</th>
                       <th class={cell}>{i18n.t("observations.pool")}</th>
                       <th class={cell}>{i18n.t("observations.quarantinedSince")}</th>
+                      <th class={cell}>{i18n.t("observations.release")}</th>
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-border">
-                    {props.health.quarantined.map((item) => (
+                    {held()?.quarantined?.map((item) => (
                       <tr>
                         <td class={cell}>
                           <button
@@ -282,11 +317,36 @@ export function ObservationsSurface(props: {
                         <td class={`${cell} whitespace-nowrap`}>
                           {item.since ? dateTime().format(item.since / 1000) : "—"}
                         </td>
+                        <td class={cell}>
+                          <p class="whitespace-pre-wrap break-words">{item.evidence}</p>
+                          {item.releasable && (
+                            <button
+                              class="underline"
+                              disabled={heldBusy()}
+                              onClick={() => void release(item)}
+                            >
+                              {i18n.t("observations.release")}
+                            </button>
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
+            )}
+            {heldError() && <p role="alert">{heldError()}</p>}
+            {heldAfter() && (
+              <button disabled={heldBusy()} class="underline" onClick={() => void readHeld()}>
+                {i18n.t("settings.pools.allocationsRefresh")}
+              </button>
+            )}
+            {held()?.next_after && (
+              <LoadMore
+                auto={false}
+                loading={heldBusy()}
+                onLoad={() => void readHeld(held()?.next_after ?? undefined)}
+              />
             )}
           </section>
         </>

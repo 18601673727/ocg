@@ -788,6 +788,42 @@ impl DatabaseHandle {
         Ok((guard, proof))
     }
 
+    pub(crate) fn command_start(
+        &self,
+        handoff: &DevelopmentHandoff,
+        call: ToolCallRef,
+    ) -> crate::workspace::process::StartingCall {
+        let database = self.clone();
+        let proof = DevelopmentWriteProof {
+            token: handoff.token(),
+            revision: handoff.started.revision,
+        };
+        let (send, groups) = flume::bounded(1);
+        let (reply, committed) = flume::bounded(1);
+        ntex::rt::spawn(async move {
+            if let Ok(group) = groups.recv_async().await {
+                let result = database
+                    .write(
+                        0,
+                        OperationKind::RecordCommandGroup,
+                        (proof, call, group),
+                        |batch, (proof, call, group)| {
+                            batch.record_command_group(&proof, call, group)
+                        },
+                    )
+                    .await;
+                if let Err(error) = &result {
+                    log::error!("cannot record command group for {call}: {error}");
+                }
+                let _ = reply.send_async(result.is_ok()).await;
+            }
+        });
+        // Called synchronously only on the dedicated command thread, before reaping.
+        crate::workspace::process::begin_call(call, move |group| {
+            send.send(group).is_ok() && committed.recv() == Ok(true)
+        })
+    }
+
     pub(crate) async fn record_development_tool_decision(
         &self,
         handoff: &DevelopmentHandoff,

@@ -577,6 +577,12 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
         e.str(&fact.evidence);
         e.str(&fact.explanation);
     });
+    e.opt(record.group.as_ref(), |e, group| {
+        e.u32(group.pid);
+        e.u64(group.leader_start);
+        e.u64(group.sentinel_inode);
+        e.opt(group.pid_namespace.as_ref(), |e, ns| e.u64(*ns));
+    });
     e.0
 }
 
@@ -649,8 +655,31 @@ pub(super) fn decode_tool_evidence(
         };
         Ok(Recorded { fact, at })
     })?;
+    let group = d.opt(|d| {
+        Ok(crate::db::entities::CommandGroup {
+            pid: d.u32()?,
+            leader_start: d.u64()?,
+            sentinel_inode: d.u64()?,
+            pid_namespace: d.opt(|d| d.u64())?,
+        })
+    })?;
+    if group.is_some_and(|group| {
+        group.pid == 0
+            || group.pid > i32::MAX as u32
+            || group
+                .pid_namespace
+                .is_some_and(|ns| ns == 0 || group.sentinel_inode == 0)
+    }) {
+        return Err(StorageError::corrupted("invalid recorded command identity"));
+    }
+    if group.is_some() && !(spawns && matches!(decision, ToolDecision::Admitted(_))) {
+        return Err(StorageError::corrupted(
+            "a recorded command group requires a spawning admission",
+        ));
+    }
     d.end()?;
     Ok(ToolEvidenceRecord {
+        group,
         call,
         tool_call_id,
         name,

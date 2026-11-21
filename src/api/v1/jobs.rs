@@ -423,6 +423,7 @@ fn stop_proof_name(proof: crate::db::entities::StopProof) -> &'static str {
         StopProof::Settled => "settled",
         StopProof::User => "user",
         StopProof::Operator => "operator",
+        StopProof::HostExit => "host_exit",
     }
 }
 

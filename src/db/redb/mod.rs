@@ -21,6 +21,7 @@ mod jobs;
 mod observations;
 pub(crate) mod reads;
 mod recovery;
+pub(crate) use recovery::held::stop_proof;
 mod reservations;
 mod rows;
 mod scheduled_external;

@@ -232,13 +232,16 @@ pub(crate) struct PoolAllocationPage {
     pub next: Option<(u128, u128)>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct UncertainAllocation {
-    pub job: JobId,
-    pub pool: ExecutionPoolId,
-    pub epoch: u64,
+pub(crate) struct UncertainAllocation {
+    pub allocation: PoolAllocation,
     pub since: Timestamp,
+    pub allocation_bytes: Vec<u8>,
+    pub commands: Vec<Option<super::CommandGroup>>,
+    pub evidence: String,
 }
+
+pub(crate) type AllocationCursor = (u128, u128, u128);
+pub(crate) type UncertainPage = super::CursorPage<UncertainAllocation, AllocationCursor>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScheduledExternalPolicyRecord {

@@ -60,6 +60,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
     let from = match (source_format, fingerprint) {
         (Some(1), Some(b"ocg-native-format-1")) => 1,
         (Some(2), Some(b"ocg-native-format-2")) => 2,
+        (Some(3), Some(b"ocg-native-format-3")) => 3,
         (Some(FORMAT_VERSION), Some(SCHEMA_FINGERPRINT)) => {
             return Err(ReservedRefusal::new(
                 "already_migrated",
@@ -69,7 +70,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         _ => {
             return Err(ReservedRefusal::new(
                 "unsupported_source",
-                "migration requires Format 1 or 2 with its matching schema fingerprint",
+                "migration requires Format 1, 2 or 3 with its matching schema fingerprint",
             ));
         }
     };
@@ -96,6 +97,9 @@ fn promote_header(versions: Versions, bytes: &mut [u8], tags: &[u8]) -> Result<(
 fn promote_record(versions: Versions, bytes: &[u8], tags: &[u8]) -> Result<Vec<u8>, StorageError> {
     let mut row = bytes.to_vec();
     promote_header(versions, &mut row, tags)?;
+    if versions.crosses(4) && row[0] == crate::db::redb::codec::TAG_TOOL_CALL {
+        row.push(0); // Historical commands have no recorded process identity.
+    }
     if row[0] == TAG_EXECUTION_EVENT {
         let mut d = Dec::payload(&row[2..]);
         d.u128()?;
@@ -760,7 +764,13 @@ fn migrate_chain(
     } else {
         ConversionCounts::default()
     };
-    let plan = json!({"kind": "storage-migration", "source_sha256": sha, "source_format": versions.from,
+    use ::redb::ReadableTableMetadata;
+    let historical_calls = source
+        .open_table(TOOL_CALLS)
+        .map_err(StorageError::from)?
+        .len()
+        .map_err(StorageError::from)?;
+    let plan = json!({"command_groups_not_recorded": historical_calls, "kind": "storage-migration", "source_sha256": sha, "source_format": versions.from,
         "target_format": versions.to, "submitted_by": authors, "creation_classes": classes,
         "converted_summary_links": counts.converted_summary_links, "retained_summary_links": counts.retained_summary_links,
         "kept_text_job_count": counts.kept_text_jobs.len(), "kept_text_jobs": counts.kept_text_jobs.iter().map(ToString::to_string).collect::<Vec<_>>(),

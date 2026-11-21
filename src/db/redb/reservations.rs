@@ -718,11 +718,12 @@ impl Batch {
                         }
                         Ok(Some(outputs))
                     })?;
-                    let answer = self.step(|tx| match turn.outputs.last() {
-                        Some(output) => {
-                            super::observations::answer_text(tx, turn.record.job.id, output)
-                        }
-                        None => Ok(None),
+                    let answer = self.step(|tx| {
+                        reads::execution_context::projected_answer(
+                            tx,
+                            &turn.record,
+                            turn.outputs.last(),
+                        )
                     })?;
                     if answer != turn.answer_text || outputs.as_ref() != Some(&turn.outputs) {
                         return Err(stale());
@@ -998,6 +999,100 @@ impl Batch {
         ))
     }
 
+    pub(crate) fn recover_interrupted(
+        &mut self,
+        allocation: crate::db::entities::PoolAllocation,
+        proof: Option<crate::db::entities::StopProof>,
+    ) -> Result<(), BatchError> {
+        if allocation.token.epoch != self.epoch {
+            return self.corrupted("interrupted allocation epoch mismatch".to_owned());
+        }
+        let job = allocation.token.job;
+        if allocation.phase == AllocationPhase::Reserved {
+            self.fail_unstarted_reservation(
+                allocation.token,
+                crate::db::entities::UnstartedCause::HostShutdown,
+            )?;
+            self.child_turn_settled(job)?;
+            return Ok(());
+        }
+        if allocation.phase != AllocationPhase::Uncertain {
+            let mut state = self.require_job_state(job)?;
+            if state.outcome.is_some() {
+                return self.corrupted("interrupted Job already settled".to_owned());
+            }
+            state.outcome = Some(OutcomeRecord {
+                kind: OutcomeKind::Unknown,
+                at: self.now,
+                cause: Some(OutcomeCause::Uncertain(
+                    crate::db::entities::UncertaintyReason::HostExited,
+                )),
+            });
+            self.put_job_state(job, &state)?;
+        }
+        if let Some(proof) = proof {
+            self.release_with_proof(allocation, proof)?;
+        } else if allocation.phase != AllocationPhase::Uncertain {
+            let mut next = allocation.clone();
+            next.phase = AllocationPhase::Uncertain;
+            self.put_pool_allocation(&next, Some(&allocation))?;
+        }
+        self.child_turn_settled(job)?;
+        Ok(())
+    }
+
+    pub(crate) fn release_uncertain(
+        &mut self,
+        token: crate::db::entities::AllocationToken,
+        revision: u64,
+        proof: crate::db::entities::StopProof,
+        expected: Option<&[u8]>,
+    ) -> Result<bool, BatchError> {
+        self.require_allocation_durability()?;
+        if let Some(expected) = expected
+            && !self.step(|tx| {
+                Ok(tx
+                    .open_table(POOL_ALLOCATIONS)?
+                    .get(token.job.get())?
+                    .is_some_and(|row| row.value() == expected))
+            })?
+        {
+            return Ok(false);
+        }
+        let allocation = self.allocation_for_token(token)?;
+        if allocation.job_revision != revision || token.epoch >= self.epoch {
+            return self.reject(Violation::InvalidValue(
+                "allocation",
+                "the allocation revision or epoch does not match an interrupted job",
+            ));
+        }
+        if allocation.phase == AllocationPhase::Released {
+            return self.reject(Violation::StopAlreadyConfirmed(token.job));
+        }
+        if allocation.phase != AllocationPhase::Uncertain || allocation.stop_proof.is_some() {
+            return self.reject(Violation::InvalidValue(
+                "allocation",
+                "requires an interrupted, uncertain allocation at this revision",
+            ));
+        }
+        self.release_with_proof(allocation, proof)?;
+        Ok(true)
+    }
+
+    fn release_with_proof(
+        &mut self,
+        allocation: crate::db::entities::PoolAllocation,
+        proof: crate::db::entities::StopProof,
+    ) -> Result<(), BatchError> {
+        let mut next = allocation.clone();
+        next.phase = AllocationPhase::Released;
+        next.stop_confirmed_at = Some(self.now);
+        next.stop_proof = Some(proof);
+        self.put_pool_allocation(&next, Some(&allocation))?;
+        self.freed_capacity = true;
+        Ok(())
+    }
+
     pub(crate) fn reconcile_stopped_allocation(
         &mut self,
         action: &super::recovery::held::RecoveryAction,
@@ -1005,7 +1100,9 @@ impl Batch {
         use crate::db::entities::{AllocationPhase, MutableJobPhase, OutcomeRecord};
 
         self.require_allocation_durability()?;
-        if action.token.epoch != self.epoch {
+        if action.token.epoch != self.epoch
+            && !(action.phase == AllocationPhase::Uncertain && action.token.epoch < self.epoch)
+        {
             return self.reject(Violation::InvalidValue(
                 "allocation",
                 "stale offline recovery epoch",

@@ -59,6 +59,8 @@ pub enum OperationKind {
     RecordProviderAnswer,
     ConsumeTokenUsage,
     RecordToolDecision,
+    RecordCommandGroup,
+    ReleaseCapacity,
     RecordToolOutcome,
     CreateAttachment,
     ClaimExecution,
@@ -155,7 +157,7 @@ pub enum Violation {
     #[error("the execution of {0} was already confirmed stopped")]
     StopAlreadyConfirmed(JobId),
     #[error(
-        "the external work of {0} was left unresolved by an OCG restart and holds quarantined capacity; nothing alive can confirm that it stopped"
+        "the command for {0} may still be running. Release capacity when you are sure it stopped. File writes or job tools may have applied."
     )]
     StopUnresolved(JobId),
     #[error("{0} was submitted without an LLM configuration")]

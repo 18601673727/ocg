@@ -16,7 +16,7 @@ mod statistics;
 mod usage;
 
 pub use approvals::{
-    ApprovalDecision, ApprovalRecord, AuthorizationBasis, EffectConclusion,
+    ApprovalDecision, ApprovalRecord, AuthorizationBasis, CommandGroup, EffectConclusion,
     MAX_FUNCTION_NAME_BYTES, MAX_HANDLER_VERSION_BYTES, MAX_STORED_TOOL_ARGUMENTS_BYTES,
     MAX_TOOL_CALL_ID_BYTES, MAX_TOOL_DEFINITION_BYTES, NotInvokedReason, Recorded, ToolAdmission,
     ToolCallRef, ToolCallRefusal, ToolDecision, ToolEffect, ToolEvidence, ToolEvidenceRecord,

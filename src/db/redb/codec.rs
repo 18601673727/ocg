@@ -652,7 +652,7 @@ codes!(EffectConclusion { EffectConclusion::Applied = 1, EffectConclusion::NotAp
 codes!(AttachmentOrigin { AttachmentOrigin::UserProvided = 1, AttachmentOrigin::ModelProduced = 2 });
 codes!(CleanupKind { CleanupKind::Manual = 1, CleanupKind::Automatic = 2 });
 codes!(OutcomeKind { OutcomeKind::Completed = 1, OutcomeKind::Failed = 2, OutcomeKind::Cancelled = 3, OutcomeKind::Unknown = 4 });
-codes!(StopProof { StopProof::Proof = 0, StopProof::Reboot = 1, StopProof::Settled = 2, StopProof::User = 3, StopProof::Operator = 4 });
+codes!(StopProof { StopProof::Proof = 0, StopProof::Reboot = 1, StopProof::Settled = 2, StopProof::User = 3, StopProof::Operator = 4, StopProof::HostExit = 5 });
 codes!(ConfigKind {
     ConfigKind::Connection = 1, ConfigKind::Model = 2, ConfigKind::Agent = 3,
     ConfigKind::DecisionModel = 5, ConfigKind::DecisionAgent = 6,

@@ -542,6 +542,7 @@ pub enum UncertaintyReason {
     StopRequestedWithoutConfirmedTermination,
     Unclassified,
     HostShutdown,
+    HostExited,
     DeadlineExceeded,
 }
 
@@ -557,6 +558,7 @@ impl UncertaintyReason {
             Self::Unclassified => 7,
             Self::HostShutdown => 8,
             Self::DeadlineExceeded => 9,
+            Self::HostExited => 10,
         }
     }
 
@@ -571,12 +573,16 @@ impl UncertaintyReason {
             7 => Some(Self::Unclassified),
             8 => Some(Self::HostShutdown),
             9 => Some(Self::DeadlineExceeded),
+            10 => Some(Self::HostExited),
             _ => None,
         }
     }
 
     pub const fn description(self) -> &'static str {
         match self {
+            Self::HostExited => {
+                "OCG exited during execution. File writes or job tools may have applied."
+            }
             Self::LocalExecutionDropped => {
                 "The local execution task was lost before it returned; whether the Provider received the request is unknown."
             }
@@ -617,6 +623,7 @@ impl UncertaintyReason {
             }
             Self::Unclassified => "unclassified",
             Self::HostShutdown => "host_shutdown",
+            Self::HostExited => "host_exited",
             Self::DeadlineExceeded => "deadline_exceeded",
         }
     }

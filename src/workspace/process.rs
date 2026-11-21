@@ -11,7 +11,7 @@ use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::pipe::pipe;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions};
 
-use crate::db::entities::{JobId, ToolCallRef};
+use crate::db::entities::{CommandGroup, JobId, ToolCallRef};
 use crate::workspace::blocking::{self, Kind, Permit, Queued};
 
 const COMMAND_WAIT: Duration = Duration::from_secs(10 * 60);
@@ -145,9 +145,13 @@ pub(crate) struct StartingCall {
     call: ToolCallRef,
     armed: bool,
     admitted: bool,
+    record: Option<Box<dyn FnOnce(CommandGroup) -> bool + Send>>,
 }
 
-pub(crate) fn begin_call(call: ToolCallRef) -> StartingCall {
+pub(crate) fn begin_call(
+    call: ToolCallRef,
+    record: impl FnOnce(CommandGroup) -> bool + Send + 'static,
+) -> StartingCall {
     CALLS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -156,6 +160,7 @@ pub(crate) fn begin_call(call: ToolCallRef) -> StartingCall {
         call,
         armed: true,
         admitted: false,
+        record: Some(Box::new(record)),
     }
 }
 
@@ -424,7 +429,7 @@ impl Process {
         mut command: Command,
         kind: Kind,
         stop_signal: StopSignal,
-        starting: Option<StartingCall>,
+        mut starting: Option<StartingCall>,
     ) -> std::io::Result<Self> {
         use std::os::unix::process::CommandExt;
 
@@ -448,6 +453,12 @@ impl Process {
         };
         let group = Pid::from_child(&child);
         drop(sentinel.write);
+        if let Some(record) = starting.as_mut().and_then(|start| start.record.take())
+            && !command_group(child.id(), &sentinel.read).is_ok_and(record)
+        {
+            // The child already exists. Keep the normal finish/proof and outcome path.
+            stop_signal.request();
+        }
         let job = starting.as_ref().map(StartingCall::job);
         let running = starting.map(|starting| starting.running(group));
         Ok(Self {
@@ -701,6 +712,159 @@ fn prove_empty_timeout(pid: Pid, sentinel: &OwnedFd, timeout: Duration) -> std::
         }
         thread::sleep(POLL);
     }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn recorded_group_stopped(_: CommandGroup) -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn recorded_group_stopped(group: CommandGroup) -> bool {
+    inspect_recorded_group(group).unwrap_or(false)
+}
+
+// These observations identify group members and holders of the inherited pipe.
+// A descendant that leaves the group and closes the pipe loses both identifiers.
+#[cfg(target_os = "linux")]
+fn inspect_recorded_group(group: CommandGroup) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    use std::path::PathBuf;
+    let vanished = |err: &std::io::Error| {
+        err.kind() == std::io::ErrorKind::NotFound || err.raw_os_error() == Some(libc::ESRCH)
+    };
+    if group.pid_namespace != Some(std::fs::metadata("/proc/self/ns/pid")?.ino()) {
+        return Ok(false);
+    }
+    // A restricted process listing can silently omit entire process directories.
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    let Some(proc_mount) = mounts
+        .lines()
+        .find(|line| line.split_whitespace().nth(4) == Some("/proc") && line.contains(" - proc "))
+    else {
+        return Ok(false);
+    };
+    if proc_mount.split([',', ' ']).any(|option| {
+        option
+            .strip_prefix("hidepid=")
+            .is_some_and(|v| v != "0" && v != "off")
+    }) {
+        return Ok(false);
+    }
+    match process_identity(&PathBuf::from(format!("/proc/{}/stat", group.pid))) {
+        Ok((_, _, start)) if start == group.leader_start => return Ok(false),
+        Ok(_) => {}
+        Err(error) if vanished(&error) => {}
+        Err(error) => return Err(error),
+    }
+    let pipe = PathBuf::from(format!("pipe:[{}]", group.sentinel_inode));
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .as_encoded_bytes()
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        let path = entry.path();
+        let (zombie, pgrp, start) = match process_identity(&path.join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if vanished(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if !zombie && pgrp == group.pid {
+            return Ok(false);
+        }
+        if start < group.leader_start {
+            continue;
+        }
+        let fds = match std::fs::read_dir(path.join("fd")) {
+            Ok(fds) => fds,
+            Err(error) if vanished(&error) && !path.try_exists()? => continue,
+            Err(error) => return Err(error),
+        };
+        for fd in fds {
+            match std::fs::read_link(fd?.path()) {
+                Ok(target) if target == pipe => return Ok(false),
+                Ok(_) => {}
+                Err(error) if vanished(&error) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn command_group(pid: u32, sentinel: &OwnedFd) -> std::io::Result<CommandGroup> {
+    let (leader_start, pid_namespace) = leader_identity(pid)?;
+    Ok(CommandGroup {
+        pid,
+        leader_start,
+        sentinel_inode: rustix::fs::fstat(sentinel)?.st_ino,
+        pid_namespace,
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn leader_identity(pid: u32) -> std::io::Result<(u64, Option<u64>)> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of_val(&info) as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            (&mut info as *mut libc::proc_bsdinfo).cast(),
+            size,
+        )
+    };
+    if read != size {
+        return Err(std::io::Error::other(
+            "incomplete leader process information",
+        ));
+    }
+    Ok((
+        info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec,
+        None,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity(path: &std::path::Path) -> std::io::Result<(bool, u32, u64)> {
+    let stat = std::fs::read(path)?;
+    let invalid = || std::io::Error::other("invalid process stat");
+    // The command name is arbitrary bytes, including spaces and closing parentheses.
+    let end = stat
+        .windows(2)
+        .rposition(|s| s == b") ")
+        .ok_or_else(invalid)?;
+    let mut fields = std::str::from_utf8(&stat[end + 2..])
+        .map_err(|_| invalid())?
+        .split_whitespace();
+    let zombie = fields.next().ok_or_else(invalid)? == "Z";
+    let group = fields
+        .nth(1)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(invalid)?;
+    let start = fields
+        .nth(16)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(invalid)?;
+    Ok((zombie, group, start))
+}
+
+#[cfg(target_os = "linux")]
+fn leader_identity(pid: u32) -> std::io::Result<(u64, Option<u64>)> {
+    use std::os::unix::fs::MetadataExt;
+    let (_, _, start) = process_identity(&std::path::PathBuf::from(format!("/proc/{pid}/stat")))?;
+    Ok((start, Some(std::fs::metadata("/proc/self/ns/pid")?.ino())))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn leader_identity(_: u32) -> std::io::Result<(u64, Option<u64>)> {
+    Err(std::io::Error::other("unsupported process identity"))
 }
 
 #[cfg(target_os = "linux")]
