@@ -14,7 +14,9 @@ import { bindElementRef, elementRef } from "@/lib/ui-state";
 import type { ChatImage, ChatModelSelection } from "../contracts";
 import { useI18n } from "../i18n";
 import { ApiError, type MutableJob, type MutableJobInput } from "../runtime/api-client";
+import { executionLabel } from "../runtime/job-status";
 import { useOcgRuntime } from "../runtime/runtime-context";
+import { useConversationView } from "./conversation-view";
 import { type ModelImageSupport, ModelSelector } from "./model-selector";
 
 export const MUTABLE_CONTEXT_KEY = "ocg.mutable-composer.context.v1";
@@ -247,7 +249,18 @@ export function MutableComposer(props: Props) {
   const [input, setInput] = createSignal<MutableJobInput>(empty);
   const [confirmed, setConfirmed] = createSignal<MutableJob | null>(null);
   const [ready, setReady] = createSignal(false);
-  const [status, setStatus] = createSignal("Loading saved Job…");
+  const [status, setStatus] = createSignal<string | { submittedJob: string }>("Loading saved Job…");
+  const { byJob } = useConversationView();
+  const statusText = createMemo(() => {
+    const current = status();
+    if (typeof current === "string") return current;
+    const execution = byJob()
+      .get(current.submittedJob)
+      ?.find((message) => message.execution)?.execution;
+    return execution
+      ? `Job ${current.submittedJob} · ${executionLabel(i18n.t, execution)}`
+      : `Job ${current.submittedJob}`;
+  });
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
   const busyRef = elementRef(false);
@@ -927,7 +940,7 @@ export function MutableComposer(props: Props) {
       setInput(empty());
       setConfirmed(null);
       setImages([]);
-      setStatus(`Job ${result.id} is ${result.phase}.`);
+      setStatus({ submittedJob: result.id });
       await refreshQueue();
       await refreshUnfinished();
     } catch (cause) {
@@ -994,7 +1007,7 @@ export function MutableComposer(props: Props) {
       setImages([]);
       setConfirmed(null);
       setUncertain(false);
-      setStatus(`Job ${result.id} is ${result.phase}.`);
+      setStatus({ submittedJob: result.id });
       await refreshQueue();
       await refreshUnfinished();
     } catch (cause) {
@@ -1550,7 +1563,7 @@ export function MutableComposer(props: Props) {
       </form>
 
       <p role="status" class="text-xs text-muted-foreground">
-        {pendingImages().length ? "Images not yet saved" : status()}
+        {pendingImages().length ? "Images not yet saved" : statusText()}
         {confirmed() ? ` · revision ${confirmed()!.revision}` : ""}
         {uploading() ? ` · uploading ${uploading()}` : ""}
       </p>

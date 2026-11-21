@@ -696,16 +696,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       },
     });
     this.publish(id);
-    for (const turn of conversation.turns)
-      if (
-        (turn.native_decision ||
-          turn.job.id === job ||
-          this.turns.get(turn.job.id)?.details?.mutable_phase !== "queued") &&
-        (turn.job.settlement.state === "unsettled" ||
-          (turn.native_decision && turn.job.settlement.state === "unknown") ||
-          taskPlanActive(this.turns.get(turn.job.id)?.details?.task_plan))
-      )
-        this.watch(turn.job.id);
+    for (const turn of conversation.turns) this.watch(turn.job.id);
     return id;
   }
 
@@ -824,12 +815,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           if (!turn || !this.historyTurnIsCurrent(turn)) continue;
           for (const image of turn.images) this.images.set(image.id, image);
           this.turns.set(turn.state.job.id, turn.state);
-          if (
-            turn.state.planning_target &&
-            (turn.state.job.settlement.state === "unsettled" ||
-              turn.state.job.settlement.state === "unknown")
-          )
-            this.watch(turn.state.job.id);
+          this.watch(turn.state.job.id);
         }
         this.earlier.set(sessionId, next);
         this.publish(sessionId);
@@ -1041,12 +1027,18 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         },
       ];
     }
+    const execution = nativeExecutionStatus(
+      turn.job.execution_phase,
+      turn.details,
+      turnCanRetry(turn),
+    );
     const entries = turn.entries ?? [];
     const queued =
       turn.job.previous !== null &&
       turn.job.started_at_us === null &&
       turn.job.settlement.state === "unsettled";
     const inputs: ChatMessage[] = entries.map((entry) => ({
+      execution,
       queued,
       id: `${turn.job.id}:entry:${entry.seq}`,
       jobId: turn.job.id,
@@ -1087,11 +1079,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         intermediate: message.intermediate,
         activity: turn.details?.activity,
         taskPlan: turn.details?.task_plan,
-        execution: nativeExecutionStatus(
-          turn.job.execution_phase,
-          turn.details,
-          turnCanRetry(turn),
-        ),
+        execution,
         createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
         ...(message.role === "user"
           ? { images: turn.input.attachments.flatMap((id) => this.images.get(id) ?? []) }
@@ -1196,6 +1184,12 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   private watch(jobId: string) {
     const turn = this.turns.get(jobId);
     if (!turn || this.streams.has(jobId) || this.disposed) return;
+    if (
+      turn.job.settlement.state !== "unsettled" &&
+      !(turn.native_decision && turn.job.settlement.state === "unknown") &&
+      !taskPlanActive(turn.details?.task_plan)
+    )
+      return;
     const entry: StreamEntry = {
       subscription: null,
       unsubscribeCatalog: null,
@@ -1253,17 +1247,18 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         const details = await this.api.readJobDetails(jobId, this.lifetime.signal);
         const readReplies = turn.outputs.firstSeq === 1;
         const evidenceRevision = turn.evidenceRevision;
-        const evidence = turn.native_decision
-          ? null
-          : await readTranscriptEvidence(this.api, jobId, {
-              signal: this.lifetime.signal,
-              previous: turn.responses,
-              settled:
-                readReplies &&
-                details.settlement.state !== "unsettled" &&
-                details.settlement.state !== "unknown",
-              readReplies,
-            });
+        const evidence =
+          turn.native_decision || details.mutable_phase === "queued"
+            ? null
+            : await readTranscriptEvidence(this.api, jobId, {
+                signal: this.lifetime.signal,
+                previous: turn.responses,
+                settled:
+                  readReplies &&
+                  details.settlement.state !== "unsettled" &&
+                  details.settlement.state !== "unknown",
+                readReplies,
+              });
         if (entry.stopped || this.disposed) return;
         if (turn.job.conversation) {
           const page = await this.api.readConversationTurns(
@@ -1361,7 +1356,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           turn.job.settlement.state === "unsettled" ||
           turn.job.settlement.state === "unknown" ||
           taskPlanActive(turn.details?.task_plan);
-        if (needsReplay && active) {
+        if (active && details.mutable_phase !== "queued" && (needsReplay || !entry.subscription)) {
           needsReplay = false;
           replayThrough = 0;
           recoveryAfter = 0;
@@ -1445,7 +1440,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         }
       });
     };
-    connect();
+    // Queued turns share the catalog subscription until they have output to stream.
+    if (turn.details?.mutable_phase !== "queued") connect();
     entry.unsubscribeCatalog = this.api.subscribeCatalog(scheduleCatalogTick, (error) => {
       if (this.disposed || entry.stopped) return;
       turn.error = `Catalog subscription unavailable: ${error instanceof Error ? error.message : String(error)}`;
