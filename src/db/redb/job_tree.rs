@@ -20,7 +20,8 @@ use ::redb::ReadableTable;
 const MAX_LIVE_CHILDREN: usize = 16;
 const MAX_LIVE_SUBTREE: usize = 64;
 pub(super) const MAX_AGENT_RETRIES: usize = 2;
-const RETURNED_RESULT_CHARS: usize = 4000;
+const REPORT_HEADER: &str = "The conversations you opened have finished. Their answers follow; use them, and do not claim a failed or cancelled one completed.";
+const REPORT_TITLE_BYTES: usize = 128;
 const MAX_CHILD_SCAN: usize = 256;
 
 pub(crate) const HELD_BY_USER: u32 = 1;
@@ -37,6 +38,47 @@ pub(crate) fn tool_submission(call: ToolCallRef, purpose: &[u8], n: u32) -> Subm
     Submission {
         key: SubmissionKey::from_digest(digest),
         fingerprint: RequestFingerprint::from_digest(digest),
+    }
+}
+
+struct ChildResult {
+    child: JobId,
+    head: JobId,
+    outcome: OutcomeKind,
+    title: String,
+}
+
+enum ReportTurn {
+    Skip,
+    Permanent(Violation),
+    Wait,
+    Post(MutableJobInput),
+}
+
+struct ChildReport {
+    parent: JobId,
+    call: ToolCallRef,
+    results: Vec<ChildResult>,
+    turn: ReportTurn,
+}
+
+struct ChildReportPage {
+    next: Option<(u128, u128)>,
+    report: Option<ChildReport>,
+}
+
+pub(super) fn host_input(
+    text: String,
+    configuration: ExecutionConfiguration,
+    priority: JobQueuePriority,
+) -> MutableJobInput {
+    MutableJobInput {
+        priority,
+        content: MutableJobContent::Generative {
+            text,
+            attachments: Vec::new(),
+            configuration: Some(configuration),
+        },
     }
 }
 
@@ -180,23 +222,13 @@ impl Batch {
         }
     }
 
-    pub(crate) fn host_turn(
+    pub(super) fn host_turn(
         &mut self,
         conversation: JobId,
-        text: String,
-        configuration: ExecutionConfiguration,
-        priority: JobQueuePriority,
+        input: MutableJobInput,
         create: Submission,
         submit: Submission,
     ) -> Result<JobId, BatchError> {
-        let input = MutableJobInput {
-            priority,
-            content: MutableJobContent::Generative {
-                text,
-                attachments: Vec::new(),
-                configuration: Some(configuration),
-            },
-        };
         let context = ComposerContextId::new(self.next_id()?);
         let id = self.create_job_as(context, input, create, Some(conversation), None, false)?;
         self.submit_mutable_job(id, 1, submit)?;
@@ -214,9 +246,7 @@ impl Batch {
         let (configuration, priority) = self.conversation_configuration(conversation)?;
         self.host_turn(
             conversation,
-            text,
-            configuration,
-            priority,
+            host_input(text, configuration, priority),
             tool_submission(call, purpose, 0),
             tool_submission(call, purpose, 1),
         )
@@ -1021,7 +1051,7 @@ impl Batch {
             self.auto_close_if_done(conversation)?;
         }
         self.end_impossible_dependents(parent, conversation)?;
-        self.return_child_results(parent, conversation)?;
+        self.report_settled_child(parent, conversation)?;
         Ok(true)
     }
 
@@ -1106,13 +1136,13 @@ impl Batch {
             self.wake_scheduler();
         }
         for sibling in ended {
-            self.return_child_results(parent, sibling)?;
+            self.report_settled_child(parent, sibling)?;
         }
         Ok(())
     }
 
     fn returned_answer(&mut self, turn: JobId) -> Result<Option<String>, BatchError> {
-        let answer = self.step(|tx| {
+        self.step(|tx| {
             let outputs = tx.open_table(JOB_OUTPUTS)?;
             let mut result = None;
             for entry in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
@@ -1126,119 +1156,295 @@ impl Batch {
                     .or_else(|| record.display_text())),
                 None => Ok(None),
             }
-        })?;
-        Ok(answer
-            .filter(|text| !text.is_empty())
-            .map(|text| text.chars().take(RETURNED_RESULT_CHARS).collect()))
+        })
     }
 
-    fn return_child_results(&mut self, parent: JobId, child: JobId) -> Result<(), BatchError> {
-        let Origin::Agent { call } = self.require_mutable_conversation(child)?.origin else {
-            return Ok(());
-        };
-        let siblings = self.step(|tx| {
-            tx.open_table(CHILD_GROUPS)?
-                .range((parent.get(), 0)..=(parent.get(), u128::MAX))?
-                .take(MAX_CHILD_SCAN)
-                .map(|entry| Ok(JobId::new(entry?.0.value().1)))
-                .collect::<Result<Vec<_>, StorageError>>()
-        })?;
-        let mut report = Vec::new();
-        for sibling in siblings {
-            let spec = self.require_mutable_conversation(sibling)?;
-            if !matches!(spec.origin, Origin::Agent { call: opened } if opened == call) {
-                continue;
-            }
-            let Some(head) = self.group_head(sibling)? else {
-                return Ok(());
+    // Children from one call are allocated together in a single write. Their
+    // keys are contiguous within their parent, even after the children close.
+    fn call_siblings(
+        &mut self,
+        parent: JobId,
+        child: JobId,
+        call: ToolCallRef,
+    ) -> Result<Vec<JobId>, BatchError> {
+        self.step(|tx| {
+            let groups = tx.open_table(CHILD_GROUPS)?;
+            let conversations = tx.open_table(CONVERSATIONS)?;
+            let key = (parent.get(), child.get());
+            let mut siblings = Vec::new();
+            let mut collect = |id: u128| -> Result<bool, StorageError> {
+                let row = conversations
+                    .get(id)?
+                    .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
+                if JobSpec::decode_at(id, row.value())?.origin != (Origin::Agent { call }) {
+                    return Ok(false);
+                }
+                if siblings.len() == MAX_LIVE_CHILDREN {
+                    return Err(StorageError::corrupted("too many children from one call"));
+                }
+                siblings.push(JobId::new(id));
+                Ok(true)
             };
-            let state = self.require_job_state(head)?;
-            let Some(outcome) = state.outcome else {
-                return Ok(());
+            for entry in groups.range((parent.get(), 0)..key)?.rev() {
+                if !collect(entry?.0.value().1)? {
+                    break;
+                }
+            }
+            for entry in groups.range(key..=(parent.get(), u128::MAX))? {
+                if !collect(entry?.0.value().1)? {
+                    break;
+                }
+            }
+            siblings.sort_unstable();
+            Ok(siblings)
+        })
+    }
+
+    fn collect_child_report(
+        &mut self,
+        parent: JobId,
+        child: JobId,
+    ) -> Result<Option<ChildReport>, BatchError> {
+        let Origin::Agent { call } = self.require_mutable_conversation(child)?.origin else {
+            return Ok(None);
+        };
+        let mut results = Vec::new();
+        for child in self.call_siblings(parent, child, call)? {
+            let Some(head) = self.group_head(child)? else {
+                return Ok(None);
+            };
+            let Some(outcome) = self.require_job_state(head)?.outcome else {
+                return Ok(None);
             };
             if outcome.kind == OutcomeKind::Unknown {
-                return Ok(());
+                return Ok(None);
             }
-            if self.job_lifecycle(sibling)?.reported != Some(head) {
-                report.push((sibling, head, outcome.kind));
+            let lifecycle = self.job_lifecycle(child)?;
+            if lifecycle.reported != Some(head) {
+                results.push(ChildResult {
+                    child,
+                    head,
+                    outcome: outcome.kind,
+                    title: lifecycle.title.unwrap_or_else(|| child.to_string()),
+                });
             }
         }
-        if report.is_empty() {
-            return Ok(());
+        if results.is_empty() {
+            return Ok(None);
         }
-        let mut lines = vec![
-            "The conversations you opened have finished. Their answers follow; use them, and do not claim a failed or cancelled one completed."
-                .to_owned(),
-        ];
-        for (sibling, head, kind) in &report {
-            let title = self
-                .job_lifecycle(*sibling)?
-                .title
-                .unwrap_or_else(|| sibling.to_string());
-            let answer = self.returned_answer(*head)?.unwrap_or_default();
-            lines.push(format!(
-                "\n[{title}] conversation {sibling}: {}\n{answer}",
-                match kind {
-                    OutcomeKind::Completed => "completed",
-                    OutcomeKind::Failed => "failed",
-                    OutcomeKind::Cancelled => "cancelled",
-                    OutcomeKind::Unknown => "unknown",
-                }
-            ));
-        }
-        for (sibling, head, _) in &report {
-            let mut lifecycle = self.job_lifecycle(*sibling)?;
-            lifecycle.reported = Some(*head);
-            self.put_job_lifecycle(*sibling, &lifecycle)?;
-        }
-        let mut lifecycle = self.job_lifecycle(parent)?;
-        let parent_state = self.require_job_state(parent)?;
-        if lifecycle.closing.is_some()
-            || lifecycle.hidden_at.is_some()
-            || parent_state.outcome.is_some()
-            || lifecycle.loop_count >= self.group_limits(parent)?.0.max_auto_turns
-        {
-            return Ok(());
-        }
-        let (configuration, priority) = self.conversation_configuration(parent)?;
-        let marker = report.iter().fold(0u32, |marker, (_, head, _)| {
-            marker ^ u32::try_from(head.get() & u128::from(u32::MAX)).unwrap_or(0)
-        });
-        self.host_turn(
+        let turn = self.child_report_turn(parent, &results)?;
+        Ok(Some(ChildReport {
             parent,
-            lines.join("\n"),
-            configuration,
-            priority,
-            tool_submission(call, b"results create", marker),
-            tool_submission(call, b"results submit", marker),
-        )?;
-        lifecycle = self.job_lifecycle(parent)?;
-        lifecycle.loop_count = lifecycle.loop_count.saturating_add(1);
-        self.put_job_lifecycle(parent, &lifecycle)
+            call,
+            results,
+            turn,
+        }))
     }
 
-    pub(crate) fn unreported_child_turns(&mut self) -> Result<Vec<JobId>, BatchError> {
-        let children = self.step(|tx| {
+    fn child_report_text(&mut self, results: &[ChildResult]) -> Result<String, BatchError> {
+        let mut text = String::from(REPORT_HEADER);
+        let mut available = jobs::MAX_INPUT_BYTES - text.len();
+        let mut sections = Vec::new();
+        for result in results {
+            let child = result.child;
+            let title = &result.title[..result.title.floor_char_boundary(REPORT_TITLE_BYTES)];
+            let title = title.replace(jobs::invalid_input_character, " ");
+            let status = match result.outcome {
+                OutcomeKind::Completed => "completed",
+                OutcomeKind::Failed => "failed",
+                OutcomeKind::Cancelled => "cancelled",
+                OutcomeKind::Unknown => "unknown",
+            };
+            let header = format!("\n\n[{title}] conversation {child}: {status}\n");
+            let pointer = format!("\nFull answer in child conversation {child}.");
+            let answer: String = self
+                .returned_answer(result.head)?
+                .unwrap_or_default()
+                .chars()
+                .take(jobs::MAX_INPUT_BYTES + 1)
+                .map(|c| {
+                    if jobs::invalid_input_character(c) {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            // At most MAX_LIVE_CHILDREN were opened by the call. Reserve every
+            // header plus enough for either the full answer or its pointer.
+            available -= header.len() + pointer.len().min(answer.len());
+            sections.push((header, answer, pointer));
+        }
+        for (header, answer, pointer) in sections {
+            text.push_str(&header);
+            available += pointer.len().min(answer.len());
+            if answer.len() <= available {
+                text.push_str(&answer);
+                available -= answer.len();
+            } else {
+                let end = answer.floor_char_boundary(available - pointer.len());
+                text.push_str(&answer[..end]);
+                text.push_str(&pointer);
+                available -= end + pointer.len();
+            }
+        }
+        Ok(text)
+    }
+
+    fn child_report_turn(
+        &mut self,
+        parent: JobId,
+        results: &[ChildResult],
+    ) -> Result<ReportTurn, BatchError> {
+        let lifecycle = self.job_lifecycle(parent)?;
+        if lifecycle.closing.is_some()
+            || lifecycle.hidden_at.is_some()
+            || self.require_job_state(parent)?.outcome.is_some()
+            || lifecycle.loop_count >= self.group_limits(parent)?.0.max_auto_turns
+        {
+            return Ok(ReportTurn::Skip);
+        }
+        let (configuration, priority) = match self.conversation_configuration(parent) {
+            Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::Permanent(reason)),
+            other => other?,
+        };
+        let input = host_input(self.child_report_text(results)?, configuration, priority);
+        let spec = self.require_mutable_conversation(parent)?;
+        match self.require_open_turn_parent(&spec) {
+            Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::Permanent(reason)),
+            other => other?,
+        }
+        let previous = self.group_head(parent)?;
+        match self.require_generative_history(parent, previous, None) {
+            Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::Permanent(reason)),
+            other => other?,
+        }
+        match self.validate_mutable_input(&input) {
+            Err(BatchError(Failure::Rejected(reason))) => {
+                log::warn!("invalid child report input for parent {parent}: {reason}");
+                return Ok(ReportTurn::Wait);
+            }
+            other => other?,
+        }
+        let frozen = match self.mutable_execution(&input) {
+            Err(BatchError(Failure::Rejected(_))) => return Ok(ReportTurn::Wait),
+            other => other?,
+        };
+        let agent = match frozen {
+            crate::db::entities::FrozenConfiguration::Generative(frozen) => frozen.agent_ref,
+            crate::db::entities::FrozenConfiguration::Decision(frozen) => frozen.agent_ref(),
+        };
+        match self.require_conversation_agent(&spec, agent.map(|reference| reference.id)) {
+            Ok(()) => Ok(ReportTurn::Post(input)),
+            Err(BatchError(Failure::Rejected(reason))) => Ok(ReportTurn::Permanent(reason)),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn return_child_results(&mut self, report: ChildReport) -> Result<usize, BatchError> {
+        let ChildReport {
+            parent,
+            call,
+            results,
+            turn,
+        } = report;
+        if matches!(turn, ReportTurn::Wait) {
+            return Ok(0);
+        }
+        for result in &results {
+            let mut lifecycle = self.job_lifecycle(result.child)?;
+            lifecycle.reported = Some(result.head);
+            self.put_job_lifecycle(result.child, &lifecycle)?;
+        }
+        match turn {
+            ReportTurn::Post(input) => {
+                let marker = results
+                    .iter()
+                    .fold(0u32, |marker, r| marker ^ r.head.get() as u32);
+                self.host_turn(
+                    parent,
+                    input,
+                    tool_submission(call, b"results create", marker),
+                    tool_submission(call, b"results submit", marker),
+                )?;
+                let mut lifecycle = self.job_lifecycle(parent)?;
+                lifecycle.loop_count = lifecycle.loop_count.saturating_add(1);
+                self.put_job_lifecycle(parent, &lifecycle)?;
+            }
+            ReportTurn::Permanent(reason) => {
+                log::warn!("child results for parent {parent} remain on the child cards: {reason}")
+            }
+            ReportTurn::Skip | ReportTurn::Wait => {}
+        }
+        Ok(results.len())
+    }
+
+    pub(crate) fn report_settled_child(
+        &mut self,
+        parent: JobId,
+        child: JobId,
+    ) -> Result<usize, BatchError> {
+        match self.collect_child_report(parent, child)? {
+            Some(report) => self.return_child_results(report),
+            None => Ok(0),
+        }
+    }
+
+    fn unreported_child_turns(
+        &mut self,
+        after: Option<(u128, u128)>,
+    ) -> Result<ChildReportPage, BatchError> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let keys = self.step(|tx| {
             tx.open_table(CHILD_GROUPS)?
-                .iter()?
-                .take(4 * MAX_CHILD_SCAN)
-                .map(|entry| Ok(JobId::new(entry?.0.value().1)))
+                .range((after.map_or(Unbounded, Excluded), Unbounded))?
+                .take(MAX_CHILD_SCAN)
+                .map(|entry| Ok(entry?.0.value()))
                 .collect::<Result<Vec<_>, StorageError>>()
         })?;
-        let mut turns = Vec::new();
-        for child in children {
+        let mut next = after;
+        for &key in &keys {
+            if next.is_some_and(|cursor| key <= cursor) {
+                continue;
+            }
+            next = Some(key);
+            let (parent, child) = (JobId::new(key.0), JobId::new(key.1));
             let Some(head) = self.group_head(child)? else {
                 continue;
             };
-            let settled = self
-                .require_job_state(head)?
-                .outcome
-                .is_some_and(|outcome| outcome.kind != OutcomeKind::Unknown);
-            if settled && self.job_lifecycle(child)?.reported != Some(head) {
-                turns.push(head);
+            if self.job_lifecycle(child)?.reported == Some(head) {
+                continue;
+            }
+            if let Some(report) = self.collect_child_report(parent, child)? {
+                if matches!(report.turn, ReportTurn::Post(_)) {
+                    // Posting changes the head and loop count. Resume with those
+                    // committed values before considering another call.
+                    return Ok(ChildReportPage {
+                        next,
+                        report: Some(report),
+                    });
+                }
+                // The parent cannot accept a report in this snapshot. Skip it
+                // across page boundaries as well as within the current page.
+                next = Some((parent.get(), u128::MAX));
             }
         }
-        Ok(turns)
+        Ok(ChildReportPage {
+            next: next.filter(|_| keys.len() == MAX_CHILD_SCAN),
+            report: None,
+        })
+    }
+
+    pub(crate) fn settle_unreported_children(
+        &mut self,
+        after: Option<(u128, u128)>,
+    ) -> Result<(Option<(u128, u128)>, usize), BatchError> {
+        let page = self.unreported_child_turns(after)?;
+        let marked = match page.report {
+            Some(report) => self.return_child_results(report)?,
+            None => 0,
+        };
+        Ok((page.next, marked))
     }
 
     pub(crate) fn settle_child_turns(&mut self, turns: &[JobId]) -> Result<usize, BatchError> {
@@ -1249,12 +1455,6 @@ impl Batch {
             }
         }
         Ok(settled)
-    }
-
-    pub(crate) fn settle_unreported_children(&mut self, limit: usize) -> Result<usize, BatchError> {
-        let mut turns = self.unreported_child_turns()?;
-        turns.truncate(limit);
-        self.settle_child_turns(&turns)
     }
 
     pub(crate) fn idle_worker(&mut self, caller: JobId, worker: JobId) -> Result<bool, BatchError> {

@@ -19,6 +19,12 @@ use crate::db::redb::{indexes, reads, state};
 use ::redb::ReadableTable;
 use std::collections::BTreeSet;
 
+pub(super) const MAX_INPUT_BYTES: usize = 32 * 1024;
+
+pub(super) fn invalid_input_character(c: char) -> bool {
+    c.is_control() && !matches!(c, '\t' | '\n' | '\r')
+}
+
 pub(super) fn mutable_priority(priority: crate::db::entities::JobQueuePriority) -> u8 {
     use crate::db::entities::JobQueuePriority;
     match priority {
@@ -173,10 +179,8 @@ fn decode_mutable_input(d: &mut Dec<'_>) -> DecodeResult<crate::db::entities::Mu
                     llm_profile: ProfileId::new(d.u128()?),
                 })
             })?;
-            if text.len() > 32 * 1024
-                || text
-                    .chars()
-                    .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+            if text.len() > MAX_INPUT_BYTES
+                || text.chars().any(invalid_input_character)
                 || attachments.iter().copied().collect::<BTreeSet<_>>().len() != attachments.len()
             {
                 return Err(StorageError::corrupted("invalid generative Job input"));
@@ -550,7 +554,16 @@ impl Batch {
         &mut self,
         job: &crate::db::entities::MutableJob,
     ) -> Result<(), BatchError> {
-        if self.has_decision_predecessors(job)? {
+        self.require_generative_history(job.parent_id, job.previous, Some(job.id))
+    }
+
+    pub(super) fn require_generative_history(
+        &mut self,
+        parent: JobId,
+        previous: Option<JobId>,
+        current: Option<JobId>,
+    ) -> Result<(), BatchError> {
+        if self.has_decision_predecessors(parent, previous, current)? {
             return self.reject(Violation::InvalidValue(
                 "execution_context",
                 "Generative Jobs cannot follow Decision history",
@@ -561,9 +574,12 @@ impl Batch {
 
     fn has_decision_predecessors(
         &mut self,
-        job: &crate::db::entities::MutableJob,
+        parent: JobId,
+        previous: Option<JobId>,
+        current: Option<JobId>,
     ) -> Result<bool, BatchError> {
-        let result = self.step(|tx| decision_predecessors(&tx.open_table(JOBS)?, job))?;
+        let result = self
+            .step(|tx| decision_predecessors(&tx.open_table(JOBS)?, parent, previous, current))?;
         result.map_err(|reason| {
             BatchError(Failure::Rejected(Violation::InvalidValue(
                 "execution_context",
@@ -720,7 +736,7 @@ impl Batch {
         Ok(())
     }
 
-    fn validate_mutable_input(
+    pub(super) fn validate_mutable_input(
         &mut self,
         input: &crate::db::entities::MutableJobInput,
     ) -> Result<(), BatchError> {
@@ -736,11 +752,8 @@ impl Batch {
             }
             return Ok(());
         }
-        if input.text().len() > 32 * 1024
-            || input
-                .text()
-                .chars()
-                .any(|c| c.is_control() && !matches!(c, '\t' | '\n' | '\r'))
+        if input.text().len() > MAX_INPUT_BYTES
+            || input.text().chars().any(invalid_input_character)
             || input.attachments().len() > 8
         {
             return self.reject(Violation::InvalidValue("input", "invalid Job input"));
@@ -813,7 +826,7 @@ impl Batch {
         }
     }
 
-    fn mutable_execution(
+    pub(super) fn mutable_execution(
         &mut self,
         input: &crate::db::entities::MutableJobInput,
     ) -> Result<FrozenConfiguration, BatchError> {
@@ -963,6 +976,36 @@ impl Batch {
         self.create_job_as(context, input, submission, conversation, project, true)
     }
 
+    pub(super) fn require_conversation_agent(
+        &mut self,
+        parent: &JobSpec,
+        selected: Option<ConfigId>,
+    ) -> Result<(), BatchError> {
+        if parent.agent != selected {
+            return self.reject(Violation::InvalidValue(
+                "conversation",
+                "Agent differs from the conversation",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn require_open_turn_parent(&mut self, row: &JobSpec) -> Result<(), BatchError> {
+        let lifecycle = self.job_lifecycle(row.id)?;
+        if row.is_chunk_group()
+            || row.is_standalone_decision_group()
+            || self.require_job_state(row.id)?.outcome.is_some()
+            || lifecycle.closing.is_some()
+            || lifecycle.hidden_at.is_some()
+        {
+            return self.reject(Violation::InvalidValue(
+                "conversation",
+                "conversation is not open",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn create_job_as(
         &mut self,
         context: crate::db::entities::ComposerContextId,
@@ -1024,18 +1067,7 @@ impl Batch {
                         ));
                     }
                 }
-                let lifecycle = self.job_lifecycle(parent)?;
-                if row.is_chunk_group()
-                    || row.is_standalone_decision_group()
-                    || self.require_job_state(parent)?.outcome.is_some()
-                    || lifecycle.closing.is_some()
-                    || lifecycle.hidden_at.is_some()
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "conversation",
-                        "conversation is not open",
-                    ));
-                }
+                self.require_open_turn_parent(&row)?;
                 parent
             }
             None => self.create_mutable_conversation(project)?,
@@ -1328,7 +1360,7 @@ impl Batch {
                 "Job cannot be cancelled by this operation",
             ));
         }
-        if !self.has_decision_predecessors(&job)? {
+        if !self.has_decision_predecessors(job.parent_id, job.previous, Some(job.id))? {
             return self.reject(Violation::InvalidValue(
                 "job",
                 "Job does not have unsupported Decision history",
@@ -1522,21 +1554,16 @@ impl Batch {
                 if job.previous.is_none() && parent.agent.is_none() {
                     parent.agent = selected;
                     self.insert(CONVERSATIONS, parent.id.get(), parent.encode().as_slice())?;
-                } else if parent.agent != selected {
-                    return self.reject(Violation::InvalidValue(
-                        "conversation",
-                        "Agent differs from the conversation",
-                    ));
+                } else {
+                    self.require_conversation_agent(&parent, selected)?;
                 }
             }
             FrozenConfiguration::Decision(frozen) => {
-                if parent.agent.is_some()
-                    && frozen.agent_ref().map(|reference| reference.id) != parent.agent
-                {
-                    return self.reject(Violation::InvalidValue(
-                        "conversation",
-                        "Agent differs from the conversation",
-                    ));
+                if parent.agent.is_some() {
+                    self.require_conversation_agent(
+                        &parent,
+                        frozen.agent_ref().map(|reference| reference.id),
+                    )?;
                 }
             }
         }
@@ -1928,26 +1955,29 @@ impl Batch {
 
 pub(super) fn decision_predecessors(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
-    job: &crate::db::entities::MutableJob,
+    parent: JobId,
+    mut previous: Option<JobId>,
+    current: Option<JobId>,
 ) -> Result<Result<bool, &'static str>, StorageError> {
     use crate::db::entities::MutableJobContent;
 
-    let mut previous = job.previous;
+    // Reserve a slot for a proposed report turn before it has an allocated id.
+    let limit = 4096 - usize::from(current.is_none());
     let mut seen = BTreeSet::new();
     while let Some(id) = previous {
-        if seen.len() == 4096 {
+        if seen.len() == limit {
             return Ok(Err(
                 "conversation history exceeds the supported admission limit",
             ));
         }
-        if id == job.id || !seen.insert(id) {
+        if Some(id) == current || !seen.insert(id) {
             return Err(StorageError::corrupted("conversation predecessor cycle"));
         }
         let row = jobs
             .get(id.get())?
             .ok_or_else(|| StorageError::corrupted("conversation predecessor missing"))?;
         let prior = decode_mutable_job(id.get(), row.value())?;
-        if prior.parent_id != job.parent_id || prior.submitted_at.is_none() {
+        if prior.parent_id != parent || prior.submitted_at.is_none() {
             return Err(StorageError::corrupted("invalid conversation predecessor"));
         }
         if matches!(prior.input.content, MutableJobContent::Decision { .. }) {

@@ -363,9 +363,7 @@ impl Batch {
             let n = u32::try_from(index).unwrap_or(u32::MAX);
             let turn = self.host_turn(
                 child,
-                step.objective,
-                configuration,
-                priority,
+                job_tree::host_input(step.objective, configuration, priority),
                 job_tree::tool_submission(call, b"plan create", n),
                 job_tree::tool_submission(call, b"plan submit", n),
             )?;
@@ -554,9 +552,7 @@ impl Batch {
             let n = u32::try_from(index).unwrap_or(u32::MAX);
             let turn = self.host_turn(
                 child,
-                objective.clone(),
-                configuration,
-                asked.input.priority,
+                job_tree::host_input(objective.clone(), configuration, asked.input.priority),
                 job_tree::tool_submission(approval, b"dispatch create", n),
                 job_tree::tool_submission(approval, b"dispatch submit", n),
             )?;

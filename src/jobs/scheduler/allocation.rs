@@ -147,13 +147,20 @@ pub(crate) async fn run(
         return;
     }
     log::info!("native scheduler running with configured Provider endpoints");
+    let catalog = database.subscribe_catalog();
     if let Err(error) = database.settle_unreported_children().await {
         log::warn!("native scheduler: unreported child conversations were not settled ({error})");
     }
     let scheduler = Allocator::new(database.clone(), shutdown.clone(), stops, workspace_tools);
-    Scheduler::new(&database, wake, shutdown)
-        .run(&scheduler)
-        .await;
+    let wake = Scheduler::new(&database, wake, shutdown);
+    let reports = async {
+        while catalog.changed().await.is_ok() {
+            if let Err(error) = database.settle_unreported_children().await {
+                log::warn!("native scheduler: could not return pending child results ({error})");
+            }
+        }
+    };
+    ntex::util::select(wake.run(&scheduler), reports).await;
     scheduler.drain().await;
     log::info!("native scheduler stopped");
 }

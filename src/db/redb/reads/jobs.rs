@@ -1111,7 +1111,12 @@ pub(crate) fn mutable_job_details_in(
                 crate::db::entities::MutableJobContent::Generative { .. }
             );
         Some(if queued_generative {
-            super::super::jobs::decision_predecessors(&rx.open_table(JOBS)?, job)?
+            super::super::jobs::decision_predecessors(
+                &rx.open_table(JOBS)?,
+                job.parent_id,
+                job.previous,
+                Some(job.id),
+            )?
         } else {
             Ok(false)
         })

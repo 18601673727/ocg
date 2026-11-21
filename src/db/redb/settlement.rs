@@ -859,9 +859,7 @@ impl Batch {
             };
             match self.host_turn(
                 conv,
-                objective,
-                cfg,
-                priority,
+                super::job_tree::host_input(objective, cfg, priority),
                 sub(b"recurrence-turn-create"),
                 sub(b"recurrence-turn-submit"),
             ) {

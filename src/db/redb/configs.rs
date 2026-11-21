@@ -620,6 +620,7 @@ impl Batch {
     }
 
     fn put_config(&mut self, row: &ConfigRow) -> Result<(), BatchError> {
+        self.catalog_changed = true;
         self.insert(CONFIGS, row.id.get(), row.encode().as_slice())
     }
 
@@ -649,7 +650,6 @@ impl Batch {
         *value = enabled;
         row.updated_at = self.now;
         row.edit_seq += 1;
-        self.catalog_changed = true;
         self.put_config(&row)
     }
 

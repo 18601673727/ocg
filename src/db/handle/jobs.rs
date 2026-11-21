@@ -429,19 +429,22 @@ impl DatabaseHandle {
         .await
     }
 
-    pub(crate) async fn settle_unreported_children(&self) -> Result<(), DatabaseError> {
-        const BATCH: usize = 8;
+    pub(crate) async fn settle_unreported_children(&self) -> Result<usize, DatabaseError> {
+        let mut cursor = None;
+        let mut reported = 0;
         loop {
-            let settled = self
+            let (next, count) = self
                 .write(
-                    byte_count(BATCH).saturating_mul(64 * 1024),
+                    64 * 1024,
                     OperationKind::SettleChildTurns,
-                    (),
-                    |batch, ()| batch.settle_unreported_children(BATCH),
+                    cursor,
+                    |batch, after| batch.settle_unreported_children(after),
                 )
                 .await?;
-            if settled < BATCH {
-                return Ok(());
+            reported += count;
+            cursor = next;
+            if cursor.is_none() {
+                return Ok(reported);
             }
         }
     }
