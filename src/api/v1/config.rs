@@ -46,6 +46,8 @@ impl Token {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ConfigError {
+    #[error("obsolete API environment settings: rename {0}")]
+    LegacyVariables(String),
     #[error("{PORT_VARIABLE} is set but {TOKEN_VARIABLE} is not; the API server needs both")]
     TokenMissing,
     #[error("{TOKEN_VARIABLE} is set but {PORT_VARIABLE} is not; the API server needs both")]
@@ -78,6 +80,18 @@ impl ServerConfig {
     pub fn from_source(
         source: impl Fn(&str) -> Option<Result<String, std::ffi::OsString>>,
     ) -> Result<Option<Self>, ConfigError> {
+        let renames = [
+            ("OCG_CONTROL_PORT", PORT_VARIABLE),
+            ("OCG_CONTROL_TOKEN", TOKEN_VARIABLE),
+        ]
+        .into_iter()
+        .filter(|(old, _)| source(old).is_some())
+        .map(|(old, new)| format!("{old} to {new}"))
+        .collect::<Vec<_>>();
+        if !renames.is_empty() {
+            return Err(ConfigError::LegacyVariables(renames.join(" and ")));
+        }
+
         match (source(PORT_VARIABLE), source(TOKEN_VARIABLE)) {
             (None, None) => Ok(None),
             (Some(_), None) => Err(ConfigError::TokenMissing),
