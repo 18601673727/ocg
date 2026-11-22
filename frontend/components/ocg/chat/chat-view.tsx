@@ -4,7 +4,7 @@ import { ElicitationForm } from "@/components/ocg/chat/ui/elicitation-form";
 import { Button } from "@/components/ui/button";
 import { elementRef } from "@/lib/ui-state";
 import type { ChildConversation, ConversationCard, TaskPlan } from "../contracts";
-import { useI18n } from "../i18n";
+import { runtimeStateLabel, useI18n } from "../i18n";
 import { type ApiClient, ApiError } from "../runtime/api-client";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { ApprovalRequest } from "./approval-request";
@@ -46,7 +46,7 @@ function ChildConversationCard(props: {
   onAct: (child: ChildConversation, action: "stop" | "close" | "hold" | "unhold") => Promise<void>;
 }) {
   const i18n = useI18n();
-  const [preview, setPreview] = createSignal<{ model?: string; text: string }>();
+  const [preview, setPreview] = createSignal<{ model?: string; text: string; earlier: boolean }>();
   const [error, setError] = createSignal<string | null>(null);
   useConversationError(error, () => props.child.id);
   createEffect(
@@ -64,6 +64,7 @@ function ChildConversationCard(props: {
       const load = async () => {
         let before: string | undefined;
         let model: string | undefined;
+        let earlier = false;
         do {
           const page = await props.api.readConversationTurns(
             props.child.id,
@@ -72,19 +73,23 @@ function ChildConversationCard(props: {
             signal,
           );
           for (const turn of page.turns) {
-            if (turn.planning_target) continue;
+            if (turn.planning_target) {
+              earlier = true;
+              continue;
+            }
             model ??= turn.input.configuration?.model;
             const result = turn.outputs.find((output) => output.kind === "result");
             let text = outputDisplayText(result);
             if (!result && (turn.outputs_truncated || turn.job.settlement.state === "unknown")) {
               const detail = await props.api.readJobDetails(turn.job.id, signal);
-              text = outputDisplayText(detail.result) || detail.unknown_reason || "";
+              text = outputDisplayText(detail.result) || (!earlier && detail.unknown_reason) || "";
             }
-            if (text || props.child.state !== "settled") return { model, text };
+            if (text || props.child.state !== "settled") return { model, text, earlier };
+            earlier = true;
           }
           before = page.next_before ?? undefined;
         } while (before);
-        return { model, text: "" };
+        return { model, text: "", earlier: false };
       };
       setPreview(undefined);
       setError(null);
@@ -99,7 +104,7 @@ function ChildConversationCard(props: {
       return () => controller.abort();
     },
   );
-  const status = createMemo(() => i18n.t(`chat.child.${props.child.state}`));
+  const status = createMemo(() => runtimeStateLabel(i18n.t, props.child.job_state));
   const title = createMemo(() => props.child.title || i18n.t("chat.child.untitled"));
   const summary = createMemo(() =>
     (preview()?.text ?? "")
@@ -133,6 +138,9 @@ function ChildConversationCard(props: {
             : ""}
         </span>
         <span class="line-clamp-3 text-muted-foreground">
+          {summary() && preview()?.earlier && (
+            <strong>{i18n.t("chat.child.earlierAnswer")} · </strong>
+          )}
           {summary() ||
             error() ||
             i18n.t(

@@ -1582,28 +1582,13 @@ pub(super) fn waiting_child_reports(
     parent: JobId,
 ) -> Result<Vec<JobId>, StorageError> {
     let mut waiting = Vec::new();
-    let mut has_draft = None;
     for child in unreported_calls(tx, parent, None)?.0 {
         let Some(report) = collect_child_report(tx, parent, child)? else {
             continue;
         };
-        match report.turn {
-            ReportTurn::AtLimit => {}
-            ReportTurn::Post(_) => {
-                let blocked = match has_draft {
-                    Some(blocked) => blocked,
-                    None => *has_draft.insert(has_current_draft(tx, parent)?),
-                };
-                if blocked {
-                    continue;
-                }
-            }
-            ReportTurn::Skip
-            | ReportTurn::Permanent(_)
-            | ReportTurn::WaitForConfiguration
-            | ReportTurn::InvalidInput(_) => continue,
+        if matches!(report.turn, ReportTurn::AtLimit) {
+            waiting.extend(report.results.into_iter().map(|result| result.child));
         }
-        waiting.extend(report.results.into_iter().map(|result| result.child));
     }
     Ok(waiting)
 }

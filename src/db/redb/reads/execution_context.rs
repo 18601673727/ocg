@@ -1093,7 +1093,7 @@ fn development_candidate_in(
             response_replay,
         });
     }
-    if record.job.summary_source.is_none() || is_merge {
+    if record.job.summary_source.is_none() {
         covered_inputs.reverse();
     }
     history.reverse();

@@ -686,7 +686,7 @@ export function createApiClient(options: ApiClientOptions) {
     };
   }
 
-  function streamAttempt(parent: AbortSignal, lockName?: string) {
+  function streamAttempt(parent: AbortSignal, holdsSnapshotSlot: boolean, lockName?: string) {
     const controller = new AbortController();
     let rotated = false;
     let complete = programmatic;
@@ -712,8 +712,8 @@ export function createApiClient(options: ApiClientOptions) {
     const abort = () => controller.abort();
     parent.addEventListener("abort", abort, { once: true });
     if (parent.aborted) abort();
-    if (!programmatic) holders.add(holder);
-    const timer = programmatic ? undefined : setTimeout(() => holder.check(), 5000);
+    if (holdsSnapshotSlot) holders.add(holder);
+    const timer = holdsSnapshotSlot ? setTimeout(() => holder.check(), 5000) : undefined;
     const poll = lockName
       ? setInterval(() => {
           const locks = browserLocks();
@@ -980,7 +980,7 @@ export function createApiClient(options: ApiClientOptions) {
       const runAttempt = async (
         lockName?: string,
       ): Promise<{ keepGoing: boolean; wait: number }> => {
-        const attempt = streamAttempt(signal, lockName);
+        const attempt = streamAttempt(signal, !programmatic, lockName);
         const remaining = initialTopics ? new Set(initialTopics) : null;
         const started = new Set<string>();
         let initialComplete = false;
@@ -3036,7 +3036,7 @@ export function createApiClient(options: ApiClientOptions) {
         try {
           while (!signal.aborted) {
             let failure = new ApiError("premature_end", 0, true);
-            const attempt = streamAttempt(signal);
+            const attempt = streamAttempt(signal, false);
             try {
               const end = await connection(jobId, attempt.signal, listener, cursor);
               if (end) return end;

@@ -666,14 +666,27 @@ pub(crate) fn read_context_state(
         }
         crate::db::entities::MutableContextSelection::FullHistory => None,
     });
-    for entry in rx
-        .open_table(CHILDREN)?
+    let jobs = rx.open_table(JOBS)?;
+    let children = rx.open_table(CHILDREN)?;
+    let mut entries = children
         .range((conversation.get(), 0)..(conversation.get(), before.map_or(u128::MAX, JobId::get)))?
-        .rev()
-        .take(limit)
-    {
+        .rev();
+    let mut last_scanned = None;
+    let mut scanned = 0;
+    let next_before = loop {
+        if scanned == MAX_PAGE {
+            break last_scanned;
+        }
+        let Some(entry) = entries.next() else {
+            break None;
+        };
         let child_id = JobId::new(entry?.0.value().1);
-        let Some(bytes) = rx.open_table(JOBS)?.get(child_id.get())? else {
+        if work.len() == limit {
+            break last_scanned;
+        }
+        scanned += 1;
+        last_scanned = Some(child_id);
+        let Some(bytes) = jobs.get(child_id.get())? else {
             continue;
         };
         let job = crate::db::redb::jobs::decode_mutable_job(child_id.get(), bytes.value())?;
@@ -762,7 +775,7 @@ pub(crate) fn read_context_state(
                 turn_count: manifest.sources.len(),
             },
         });
-    }
+    };
     Ok(Some(ContextState {
         steer_blocked_by: None,
         policy,
@@ -777,7 +790,7 @@ pub(crate) fn read_context_state(
         prediction_unavailable,
         last_use: None,
         work,
-        next_before: None,
+        next_before,
     }))
 }
 
