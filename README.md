@@ -117,7 +117,7 @@ Then open the local URL above.
 
 Keep the OCG data directory separate from project workspaces. The [data layout](src/system/data_directory.rs) places `ocg.redb` and `credentials.json` in the data root, with logs in `ocg_logs/` and attachments in `ocg_attachments/`.
 
-> **Storage:** This implementation starts with **Format 1** and requires a new database. It has no historical migration or compatibility reader. `ocg verify <data-directory>` checks an existing database without modifying it; the installer runs this check before switching versions. Keep existing data separately rather than opening it as a new database.
+> **Storage:** This release uses database **Format 5**. `ocg migrate <data-directory> --dry-run | --apply <plan-digest> | --finalize` converts Format 1-4 databases offline (Unix only). Databases from 0.5.x releases (formats 16-18) and unmarked databases are not supported; start those with a new data directory. `ocg verify <data-directory>` checks an existing database without modifying it; the installer runs this check before switching versions and stops if it fails.
 
 ## Performance
 
