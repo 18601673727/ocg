@@ -201,6 +201,9 @@ fn refusal(error: DatabaseError) -> Refusal {
         ))
         | DatabaseError::Rejected(Violation::SubmissionKeyUsed { .. }) => CONFLICT,
         DatabaseError::Rejected(Violation::NotFound(_)) => NOT_FOUND,
+        DatabaseError::Rejected(reason @ Violation::ConnectionHeaders { .. }) => {
+            profiles::INVALID_HEADERS.with_reason(reason.to_string())
+        }
         DatabaseError::Rejected(reason) => INVALID.with_reason(reason.to_string()),
         DatabaseError::OutcomeUnknown { .. } => UNCERTAIN,
         other => other.into(),

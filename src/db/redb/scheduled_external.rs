@@ -157,7 +157,7 @@ impl Batch {
                 "scheduled external policy revision exhausted",
             )))
         })?;
-        updated.updated_at = self.now;
+        updated.updated_at = self.now.max(updated.created_at);
         let bytes = encode_scheduled_external_policy(&updated);
         self.step(|tx| {
             tx.open_table(SCHEDULED_EXTERNAL_POLICY)?

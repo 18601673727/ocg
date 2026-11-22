@@ -2,7 +2,9 @@ use super::{
     check_identity, check_records, residual_ownership_in, resolved_unknown_ownership,
     verify_recovered,
 };
-use crate::db::entities::{ContentDigest, OutcomeKind, OutputKind, StopProof, Timestamp};
+use crate::db::entities::{
+    ContentDigest, OutcomeKind, OutputKind, PoolAllocation, StopProof, Timestamp,
+};
 use crate::db::redb::StorageError;
 use crate::db::redb::recovery::offline::{
     apply_reconciliation, finalization_copy, with_reconciliation_copy,
@@ -69,9 +71,15 @@ fn sha256_json(value: &serde_json::Value) -> Result<String, ReservedRefusal> {
     Ok(ContentDigest::of(&bytes).to_string())
 }
 
+enum Observation<'a> {
+    Fresh,
+    Recorded(&'a serde_json::Value),
+}
+
 fn held_recovery_plan_in(
     database: &impl ReadableDatabase,
     source_sha256: &str,
+    observation: Observation<'_>,
 ) -> Result<HeldRecoveryPlan, ReservedRefusal> {
     use serde_json::json;
 
@@ -104,8 +112,31 @@ fn held_recovery_plan_in(
             held.push((allocation, value.value().to_vec()));
         }
     }
-    let current_host = current_host_id();
-    let current_boot = current_boot_id();
+    let (current_host, current_boot, recorded_proofs) = match observation {
+        Observation::Fresh => (current_host_id(), current_boot_id(), None),
+        Observation::Recorded(plan) => {
+            let invalid = || {
+                ReservedRefusal::new(
+                    "plan_digest_mismatch",
+                    "invalid recorded recovery observations",
+                )
+            };
+            let mut proofs = std::collections::BTreeMap::new();
+            for action in plan["actions"].as_array().ok_or_else(invalid)? {
+                let job = action["job"].as_str().ok_or_else(invalid)?;
+                let proof = [StopProof::Proof, StopProof::Reboot, StopProof::HostExit]
+                    .into_iter()
+                    .find(|p| action["stop_proof"] == recovery_proof_name(*p))
+                    .ok_or_else(invalid)?;
+                proofs.insert(job, proof);
+            }
+            (
+                plan["current_host_id"].as_str().map(str::to_owned),
+                plan["current_boot_id"].as_str().map(str::to_owned),
+                Some(proofs),
+            )
+        }
+    };
     let mut actions = Vec::new();
     let mut action_facts = Vec::new();
     let mut refusals = Vec::new();
@@ -131,7 +162,15 @@ fn held_recovery_plan_in(
             &tx,
             epoch,
             current_host.as_deref(),
-            current_boot.as_deref(),
+            |allocation| match &recorded_proofs {
+                Some(proofs) => Ok(proofs.get(job.to_string().as_str()).copied()),
+                None => Ok(stop_proof(
+                    allocation,
+                    &unfinished_commands(&tx, job)?,
+                    current_host.as_deref(),
+                    current_boot.as_deref(),
+                )),
+            },
             allocation,
             allocation_bytes,
             state_bytes,
@@ -241,7 +280,7 @@ fn recovery_action_in(
     tx: &ReadTransaction,
     epoch: u64,
     current_host: Option<&str>,
-    current_boot: Option<&str>,
+    observe_stop: impl FnOnce(&PoolAllocation) -> Result<Option<StopProof>, StorageError>,
     allocation: crate::db::entities::PoolAllocation,
     allocation_bytes: Vec<u8>,
     state_bytes: Vec<u8>,
@@ -395,8 +434,7 @@ fn recovery_action_in(
             "the Allocation phase disagrees with the outcome"
         );
     }
-    let commands = unfinished_commands(tx, job_id)?;
-    let Some(proof) = stop_proof(&allocation, &commands, current_host, current_boot) else {
+    let Some(proof) = observe_stop(&allocation)? else {
         ineligible!(
             "termination_unproven",
             "an unfinished command may still be running"
@@ -419,7 +457,7 @@ pub(crate) fn reconcile_held_preflight(
     source_sha256: &str,
 ) -> Result<HeldRecoveryPlan, ReservedRefusal> {
     with_reconciliation_copy(file, |database| {
-        held_recovery_plan_in(&*database, source_sha256)
+        held_recovery_plan_in(&*database, source_sha256, Observation::Fresh)
     })
 }
 
@@ -430,7 +468,7 @@ pub(crate) fn reconcile_held_apply(
 ) -> Result<serde_json::Value, ReservedRefusal> {
     use serde_json::json;
     with_reconciliation_copy(file, |database| {
-        let plan = held_recovery_plan_in(&*database, source_sha256)?;
+        let plan = held_recovery_plan_in(&*database, source_sha256, Observation::Fresh)?;
         if plan.digest != expected_digest {
             return Err(ReservedRefusal::new(
                 "plan_digest_mismatch",
@@ -715,7 +753,11 @@ pub(crate) fn verify_held_publication_delta(
     let source = finalization_copy(source)?;
     let published = finalization_copy(published)?;
     with_verified_finalization_copy(source, "rollback", |source_database| {
-        let plan = held_recovery_plan_in(&*source_database, source_sha256)?;
+        let plan = held_recovery_plan_in(
+            &*source_database,
+            source_sha256,
+            Observation::Recorded(expected_plan),
+        )?;
         if plan.digest != expected_digest || &plan.evidence != expected_plan {
             return Err(ReservedRefusal::new(
                 "plan_digest_mismatch",

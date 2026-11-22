@@ -122,6 +122,11 @@ pub enum Violation {
     ValueOutOfRange(&'static str),
     #[error("{0} is invalid: {1}")]
     InvalidValue(&'static str, &'static str),
+    #[error("outbound headers for Connection {connection:?}: {error}")]
+    ConnectionHeaders {
+        connection: String,
+        error: super::HeaderError,
+    },
     #[error("the Profile changed while it was being validated; reload and retry")]
     ProfileChanged,
     #[error("{0}")]

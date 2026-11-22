@@ -1,22 +1,23 @@
 use super::offline::{finalization_copy, verify_payloads, with_verified_rebuild_copy};
 use super::reserved::ReservedRefusal;
 use crate::db::entities::{
-    Actor, ContentDigest, JobId, JobOutputId, JobOutputRecord, MutableJob, MutableJobContent,
-    NativeSummaryResultLink, Origin, OutcomeKind, OutputKind, Recurrence, RequestNumber,
-    SubmissionKey, SubmissionRecord, ToolCallRef,
+    Actor, ContentDigest, JobId, JobOutputId, JobOutputRecord, JobSpec, MutableJob,
+    MutableJobContent, MutableJobPhase, NativeSummaryResultLink, Origin, OutcomeKind, OutputKind,
+    Recurrence, RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef,
 };
 use crate::db::redb::codec::{
     Code, Dec, Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME, TAG_OUTPUT,
 };
 use crate::db::redb::execution::TAG_EXECUTION_EVENT;
 use crate::db::redb::schema::{
-    APPROVALS, DATABASE_FORMAT_KEY, FORMAT_VERSION, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MESSAGES, META,
-    RECURRENCES, REQUEST_EVENTS, SCHEMA_FINGERPRINT, SCHEMA_FINGERPRINT_KEY, SUBMISSIONS,
-    TOOL_CALLS, TURNS, check_required_tables, record_version_byte, rewrite_record_headers,
-    verify_identical_database, verify_record_headers,
+    APPROVALS, CONVERSATIONS, DATABASE_FORMAT_KEY, FORMAT_VERSION, JOB_OUTPUTS, JOB_RUNTIME, JOBS,
+    MESSAGES, META, POOL_ALLOCATIONS, RECURRENCES, REQUEST_EVENTS, SCHEMA_FINGERPRINT,
+    SCHEMA_FINGERPRINT_KEY, SUBMISSIONS, TOOL_CALLS, TURNS, check_required_tables,
+    record_version_byte, rewrite_record_headers, verify_identical_database, verify_record_headers,
 };
 use crate::db::redb::{
-    StorageError, TxRead, approvals, job_tree, jobs, observations, reads, rows, settlement, state,
+    StorageError, TxRead, allocations, approvals, job_tree, jobs, observations, reads, rows,
+    settlement, state,
 };
 use ::redb::{
     Database, Durability, Key, ReadTransaction, ReadableDatabase, ReadableTable, TableDefinition,
@@ -40,7 +41,8 @@ impl Versions {
     fn changes_body(self, tags: &[u8]) -> bool {
         match tags {
             [TAG_OUTPUT] => self.crosses(2),
-            [TAG_JOB] | [TAG_JOB_RUNTIME] => self.crosses(3),
+            [TAG_JOB] => self.crosses(3),
+            [TAG_JOB_RUNTIME] => self.crosses(3) || self.crosses(5),
             _ => false,
         }
     }
@@ -61,6 +63,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         (Some(1), Some(b"ocg-native-format-1")) => 1,
         (Some(2), Some(b"ocg-native-format-2")) => 2,
         (Some(3), Some(b"ocg-native-format-3")) => 3,
+        (Some(4), Some(b"ocg-native-format-4")) => 4,
         (Some(FORMAT_VERSION), Some(SCHEMA_FINGERPRINT)) => {
             return Err(ReservedRefusal::new(
                 "already_migrated",
@@ -70,7 +73,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         _ => {
             return Err(ReservedRefusal::new(
                 "unsupported_source",
-                "migration requires Format 1, 2 or 3 with its matching schema fingerprint",
+                "migration requires Format 1, 2, 3 or 4 with its matching schema fingerprint",
             ));
         }
     };
@@ -638,6 +641,9 @@ fn migrate_job(
 
 fn migrate_runtime(versions: Versions, key: u128, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
     let mut row = promote_record(versions, bytes, &[TAG_JOB_RUNTIME])?;
+    if !versions.crosses(3) {
+        return Ok(row);
+    }
     let mut d = Dec::new(&row, TAG_JOB_RUNTIME)?;
     state::JobRuntime::decode_state_and_lifecycle(key, &mut d)?;
     let offset = d.position();
@@ -658,6 +664,14 @@ fn migrate_turn_authors(
         let (row, _, _) = migrate_job(versions, k.value(), v.value(), tx, evidence, source)?;
         jobs.insert(k.value(), row.as_slice())?;
     }
+    Ok(())
+}
+
+fn promote_runtimes(
+    versions: Versions,
+    source: &ReadTransaction,
+    tx: &WriteTransaction,
+) -> Result<(), StorageError> {
     let mut runtime = tx.open_table(JOB_RUNTIME)?;
     for entry in source.open_table(JOB_RUNTIME)?.iter()? {
         let (k, v) = entry?;
@@ -667,6 +681,127 @@ fn migrate_turn_authors(
         )?;
     }
     Ok(())
+}
+
+enum Membership {
+    Job { open: bool },
+    Conversation { children: u32 },
+}
+
+fn add_child(members: &mut BTreeMap<JobId, Membership>, id: JobId) -> Result<(), StorageError> {
+    let Some(Membership::Conversation { children }) = members.get_mut(&id) else {
+        return Err(StorageError::corrupted(format!(
+            "missing parent conversation {id}"
+        )));
+    };
+    *children = children.checked_add(1).ok_or_else(|| {
+        StorageError::corrupted(format!("conversation {id} child count overflow"))
+    })?;
+    Ok(())
+}
+
+fn execution_membership(tx: &impl TxRead) -> Result<BTreeMap<JobId, Membership>, StorageError> {
+    let mut members = BTreeMap::new();
+    // Conversation keys precede their children.
+    for entry in tx.table(CONVERSATIONS)?.iter()? {
+        let (key, bytes) = entry?;
+        let row = JobSpec::decode_at(key.value(), bytes.value())?;
+        if let Some(parent) = row.parent_id
+            && state::require(tx, row.id)?.state.outcome.is_none()
+        {
+            add_child(&mut members, parent)?;
+        }
+        members.insert(row.id, Membership::Conversation { children: 0 });
+    }
+    let allocations = tx.table(POOL_ALLOCATIONS)?;
+    for entry in tx.table(JOBS)?.iter()? {
+        let (key, bytes) = entry?;
+        let job = jobs::decode_mutable_job(key.value(), bytes.value())?;
+        let allocation = allocations
+            .get(key.value())?
+            .map(|row| allocations::decode_pool_allocation(key.value(), row.value()))
+            .transpose()?;
+        let open = job.phase != MutableJobPhase::Unsubmitted
+            && state::has_open_membership(
+                state::require(tx, job.id)?.state.outcome.as_ref(),
+                allocation.as_ref(),
+            );
+        if open {
+            add_child(&mut members, job.parent_id)?;
+        }
+        members.insert(job.id, Membership::Job { open });
+    }
+    Ok(members)
+}
+
+#[derive(Default)]
+struct MembershipChanges {
+    jobs: usize,
+    conversations: usize,
+    closing: Vec<String>,
+}
+
+impl Membership {
+    fn pending(&self, row: &state::JobRuntime) -> Result<Option<(u32, u32)>, StorageError> {
+        let id = row.state.job_id;
+        match self {
+            Self::Job { open: false } => Ok(None),
+            Self::Job { open: true } => {
+                let (dependencies, _) = row.pending.ok_or_else(|| {
+                    StorageError::corrupted(format!("open Job {id} has no pending counts"))
+                })?;
+                Ok(Some((dependencies, 0)))
+            }
+            Self::Conversation { children } => {
+                if row
+                    .pending
+                    .is_some_and(|(dependencies, _)| dependencies != 0)
+                {
+                    return Err(StorageError::corrupted(format!(
+                        "conversation {id} has nonzero stored dependencies"
+                    )));
+                }
+                Ok(row.state.outcome.is_none().then_some((0, *children)))
+            }
+        }
+    }
+}
+
+fn membership_for(
+    members: &BTreeMap<JobId, Membership>,
+    id: JobId,
+) -> Result<&Membership, StorageError> {
+    members
+        .get(&id)
+        .ok_or_else(|| StorageError::corrupted(format!("runtime {id} has no Job or conversation")))
+}
+
+fn migrate_membership(
+    source: &ReadTransaction,
+    tx: &WriteTransaction,
+) -> Result<MembershipChanges, StorageError> {
+    let members = execution_membership(tx)?;
+    let mut changes = MembershipChanges::default();
+    for entry in source.open_table(JOB_RUNTIME)?.iter()? {
+        let id = JobId::new(entry?.0.value());
+        let mut row = state::require(tx, id)?;
+        let member = membership_for(&members, id)?;
+        let pending = member.pending(&row)?;
+        match member {
+            Membership::Job { .. } => changes.jobs += usize::from(pending != row.pending),
+            Membership::Conversation { .. } => {
+                changes.conversations += usize::from(pending != row.pending);
+                if pending == Some((0, 0)) && row.lifecycle.closing.is_some() {
+                    changes.closing.push(id.to_string());
+                }
+            }
+        }
+        if pending != row.pending {
+            row.pending = pending;
+            state::write(tx, &row)?;
+        }
+    }
+    Ok(changes)
 }
 
 fn migrate_outputs(
@@ -729,6 +864,8 @@ fn migrate_chain(
     } else {
         None
     };
+    promote_runtimes(versions, &source, &tx)?;
+    let changes = migrate_membership(&source, &tx)?;
     // Format 1 output conversion reads the final Job and runtime layouts.
     if versions.crosses(2) {
         migrate_outputs(versions, &source, &tx)?;
@@ -755,26 +892,35 @@ fn migrate_chain(
             *classes.entry(class).or_insert(0u64) += 1;
             Ok(row)
         })?;
-        verify_transformed(&source, &result, JOB_RUNTIME, |key, bytes| {
-            migrate_runtime(versions, key, bytes)
-        })?;
     }
+    let members = execution_membership(&result)?;
+    verify_transformed(&source, &result, JOB_RUNTIME, |key, bytes| {
+        let prior = migrate_runtime(versions, key, bytes)?;
+        let mut row = state::JobRuntime::decode_at(key, &prior)?;
+        row.pending = membership_for(&members, row.state.job_id)?.pending(&row)?;
+        Ok(row.encode())
+    })?;
     let counts = if versions.crosses(2) {
         verify_outputs(versions, &source, &result)?
     } else {
         ConversionCounts::default()
     };
     use ::redb::ReadableTableMetadata;
-    let historical_calls = source
-        .open_table(TOOL_CALLS)
-        .map_err(StorageError::from)?
-        .len()
-        .map_err(StorageError::from)?;
+    let historical_calls = if versions.crosses(4) {
+        source
+            .open_table(TOOL_CALLS)
+            .map_err(StorageError::from)?
+            .len()
+            .map_err(StorageError::from)?
+    } else {
+        0
+    };
     let plan = json!({"command_groups_not_recorded": historical_calls, "kind": "storage-migration", "source_sha256": sha, "source_format": versions.from,
         "target_format": versions.to, "submitted_by": authors, "creation_classes": classes,
         "converted_summary_links": counts.converted_summary_links, "retained_summary_links": counts.retained_summary_links,
         "kept_text_job_count": counts.kept_text_jobs.len(), "kept_text_jobs": counts.kept_text_jobs.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "kept_text_details": counts.kept_text_details});
+        "jobs_changed": changes.jobs, "conversations_changed": changes.conversations,
+        "closing_without_children": changes.closing, "kept_text_details": counts.kept_text_details});
     let encoded = serde_json::to_vec(&plan)
         .map_err(|e| ReservedRefusal::new("invalid_plan", e.to_string()))?;
     Ok(json!({"plan": plan, "plan_digest": ContentDigest::of(&encoded).to_string()}))

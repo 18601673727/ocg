@@ -443,7 +443,7 @@ fn apply_allocation_event(
                     "Job execution started more than once",
                 ));
             }
-            allocation.started_at = Some(event.at);
+            allocation.started_at = Some(event.at.max(allocation.claimed_at));
             allocation.phase = AllocationPhase::Running;
         }
         ExecutionEventKind::AllocationPhaseChanged { phase } => {
@@ -801,7 +801,7 @@ impl Batch {
         if previous.started_at != next.started_at {
             if previous.phase != AllocationPhase::Reserved
                 || previous.started_at.is_some()
-                || next.started_at != Some(self.now)
+                || next.started_at != Some(self.now.max(previous.claimed_at))
                 || next.phase != AllocationPhase::Running
             {
                 return self.corrupted("Job start evidence cannot be overwritten".into());

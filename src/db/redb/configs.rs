@@ -2,9 +2,9 @@ use crate::db::entities::{
     AgentConfig, CompactionPolicy, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConfigRef,
     ConnectionConfig, DecisionCapability, DecisionModelConfig, ExecutionConfiguration,
     ExecutionOperation, FrozenConfiguration, FrozenDecisionConfig, FrozenExecutionConfig,
-    FrozenHeaders, FrozenLlmConfig, GlobalHeaders, JobId, LlmConfig, LlmTransport, ModelConfig,
-    NativeDecisionConfig, ProjectDecisionConfig, ProviderSnapshot, RecordRef, Violation, merge,
-    valid_credential_ref,
+    FrozenHeaders, FrozenLlmConfig, GlobalHeaders, HeaderScope, JobId, LlmConfig, LlmTransport,
+    ModelConfig, NativeDecisionConfig, OutboundHeader, ProjectDecisionConfig, ProviderSnapshot,
+    RecordRef, Violation, merge, valid_credential_ref, validate_fields,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::codec::{Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS};
@@ -205,7 +205,10 @@ impl Batch {
             Ok(found)
         })?;
         match existing {
-            Some(id) => Ok(id),
+            Some(id) => {
+                effective_headers(&name, &self.global_headers()?.fields, &body)?;
+                Ok(id)
+            }
             None => self.create_config(name, ConfigBody::Connection(body)),
         }
     }
@@ -524,7 +527,9 @@ impl Batch {
             return self.reject(Violation::InvalidValue("name", "must be 1 to 255 bytes"));
         }
         match body {
-            ConfigBody::Connection(_) => {}
+            ConfigBody::Connection(connection) => {
+                effective_headers(name, &self.global_headers()?.fields, connection)?;
+            }
             ConfigBody::Model(model) => {
                 self.require_config_kind(model.connection_id, ConfigKind::Connection)?;
             }
@@ -1224,6 +1229,21 @@ impl Batch {
     }
 }
 
+fn effective_headers(
+    name: &str,
+    global: &[OutboundHeader],
+    connection: &ConnectionConfig,
+) -> Result<Vec<OutboundHeader>, Violation> {
+    let fields = merge(global, &connection.headers);
+    validate_fields(&fields, HeaderScope::Connection).map_err(|error| {
+        Violation::ConnectionHeaders {
+            connection: name.to_owned(),
+            error,
+        }
+    })?;
+    Ok(fields)
+}
+
 pub(super) struct ConfigurationResolver<'a, Tx> {
     tx: &'a Tx,
     global_headers: GlobalHeaders,
@@ -1239,11 +1259,15 @@ impl<'a, Tx: TxRead> ConfigurationResolver<'a, Tx> {
         Ok(Self::new(tx, headers))
     }
 
-    fn frozen_headers(&self, connection: &ConnectionConfig) -> FrozenHeaders {
-        FrozenHeaders {
+    fn frozen_headers(
+        &self,
+        name: &str,
+        connection: &ConnectionConfig,
+    ) -> Result<FrozenHeaders, Violation> {
+        Ok(FrozenHeaders {
             global_revision: self.global_headers.revision,
-            fields: merge(&self.global_headers.fields, &connection.headers),
-        }
+            fields: effective_headers(name, &self.global_headers.fields, connection)?,
+        })
     }
 
     fn require_config(&mut self, id: ConfigId) -> Result<ConfigRecord, BatchError> {
@@ -1355,7 +1379,7 @@ impl<'a, Tx: TxRead> ConfigurationResolver<'a, Tx> {
         let ConfigBody::Connection(connection_body) = connection.body else {
             return self.corrupted(format!("{} has a mismatched body", connection.id));
         };
-        let headers = self.frozen_headers(&connection_body);
+        let headers = self.frozen_headers(&connection.name, &connection_body)?;
         let decision_profile = if let Some(id) = configuration.agent_profile {
             let row = self.require_config(id.into())?;
             if row.archived_at.is_some() {
@@ -1509,7 +1533,7 @@ impl<'a, Tx: TxRead> ConfigurationResolver<'a, Tx> {
         let ConfigBody::Connection(connection_body) = connection.body else {
             return self.corrupted("mismatched connection".into());
         };
-        let headers = self.frozen_headers(&connection_body);
+        let headers = self.frozen_headers(&connection.name, &connection_body)?;
         Ok(FrozenDecisionConfig::Native(NativeDecisionConfig {
             agent: agent_body,
             agent_ref,
@@ -1629,7 +1653,6 @@ impl Batch {
         expected_revision: u32,
         fields: Vec<crate::db::entities::OutboundHeader>,
     ) -> Result<crate::db::entities::GlobalHeaders, BatchError> {
-        use crate::db::entities::{HeaderScope, validate_fields};
         let current = self.global_headers()?;
         if current.revision != expected_revision {
             return self.reject(Violation::InvalidValue(
@@ -1640,6 +1663,19 @@ impl Batch {
         if let Err(error) = validate_fields(&fields, HeaderScope::Global) {
             return self.reject(Violation::InvalidValue("headers", error.reason()));
         }
+        self.inspect(|tx| {
+            let configs = tx.open_table(CONFIGS).map_err(StorageError::from)?;
+            for entry in configs.iter().map_err(StorageError::from)? {
+                let (id, bytes) = entry.map_err(StorageError::from)?;
+                let row = ConfigRow::decode_at(id.value(), bytes.value())?;
+                if row.archived_at.is_none()
+                    && let ConfigBody::Connection(connection) = row.body
+                {
+                    effective_headers(&row.name, &fields, &connection)?;
+                }
+            }
+            Ok(())
+        })?;
         let Some(revision) = current.revision.checked_add(1) else {
             return self.corrupted("global header revision exhausted".into());
         };

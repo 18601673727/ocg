@@ -877,7 +877,7 @@ impl Batch {
         let mut allocation = allocation.clone();
         job.phase = MutableJobPhase::Executing;
         allocation.phase = AllocationPhase::Running;
-        allocation.started_at = Some(self.now);
+        allocation.started_at = Some(self.now.max(allocation.claimed_at));
         self.store_mutable_job(&job)?;
         let previous = self.allocation_for_token(allocation.token)?;
         self.put_pool_allocation(&allocation, Some(&previous))?;

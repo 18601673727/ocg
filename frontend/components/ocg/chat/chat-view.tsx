@@ -169,7 +169,7 @@ function ChildConversationCard(props: {
           variant="ghost"
           title={i18n.t("common.close")}
           aria-label={i18n.t("common.close")}
-          disabled={props.pending || props.child.state !== "open"}
+          disabled={props.pending || props.child.state === "settled"}
           onClick={() => void props.onAct(props.child, "close")}
         >
           <X aria-hidden="true" />

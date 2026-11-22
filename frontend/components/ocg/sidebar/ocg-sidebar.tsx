@@ -817,7 +817,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
                               const isPinned = selectedPinnedTogglePinned().pinned.has(pinId);
                               const hasActions = Boolean(
                                 (session.sessionId && (props.onRename || props.onHide)) ||
-                                  (props.api && session.conversationId && !session.closed),
+                                  (props.api && session.conversationId && !session.settled),
                               );
                               const actions =
                                 "opacity-0 group-hover/session:opacity-100 group-focus-within/session:opacity-100 [@media(hover:none)]:opacity-100";
@@ -972,7 +972,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
                                               )}
                                               {props.api &&
                                                 session.conversationId &&
-                                                !session.closed && (
+                                                !session.settled && (
                                                   <DropdownMenuItem
                                                     destructive
                                                     onSelect={() => {

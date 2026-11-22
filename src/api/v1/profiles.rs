@@ -375,6 +375,9 @@ pub(crate) fn map_mutation_error(error: DatabaseError) -> Refusal {
         }
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
         DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
+        DatabaseError::Rejected(reason @ Violation::ConnectionHeaders { .. }) => {
+            INVALID_HEADERS.with_reason(reason.to_string())
+        }
         DatabaseError::Rejected(Violation::ProfileChanged) => PROFILE_CHANGED,
         DatabaseError::Rejected(Violation::ProfileArchiveRefused(reason)) => Refusal::new(
             StatusCode::CONFLICT,
@@ -505,7 +508,7 @@ fn resolve_credential_input(
     }
 }
 
-const INVALID_HEADERS: Refusal = Refusal::new(
+pub(super) const INVALID_HEADERS: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "invalid_headers",
     "invalid custom request headers",

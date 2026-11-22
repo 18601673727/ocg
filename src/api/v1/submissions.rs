@@ -775,7 +775,9 @@ fn not_admitted(error: &DatabaseError) -> Refusal {
                 "a referenced record was not found",
             )
             .with_reason(violation.to_string()),
-            Violation::WrongConfigKind { .. } | Violation::NotAConfiguredTarget { .. } => {
+            Violation::ConnectionHeaders { .. }
+            | Violation::WrongConfigKind { .. }
+            | Violation::NotAConfiguredTarget { .. } => {
                 CONFIGURATION_REFUSED.with_reason(violation.to_string())
             }
             violation => Refusal::new(

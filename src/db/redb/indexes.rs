@@ -630,9 +630,10 @@ pub(super) fn verify_job_indexes(tx: &ReadTransaction) -> Result<(), StorageErro
         let job = jobs::decode_mutable_job(id, bytes.value())?;
         let runtime = state::require(tx, job.id)?;
         if runtime.last_result.is_some() {
-            return Err(StorageError::corrupted(
-                "executable Job has a child result pointer",
-            ));
+            return Err(StorageError::corrupted(format!(
+                "executable Job {} has a child result pointer",
+                job.id
+            )));
         }
         if let Some(previous) = job.previous {
             let prior = jobs
