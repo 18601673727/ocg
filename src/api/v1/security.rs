@@ -1,154 +1,26 @@
+use super::config::UiAuthMode;
 use super::{
-    BODY_NOT_ACCEPTED, FORBIDDEN_HOST, FORBIDDEN_ORIGIN, HEADERS_TOO_LARGE, HeaderMap, HttpRequest,
-    MAX_ATTACHMENT_UPLOAD_BYTES, MAX_HEADER_BYTES, MAX_HEADERS, MAX_PATH_BYTES, MAX_QUERY_BYTES,
-    MAX_SUBMISSION_BYTES, METHOD_NOT_ALLOWED, Method, ONLY_POST, PROFILE_METHODS, Refusal,
-    SESSION_METHODS, Shared, Token, UNAUTHENTICATED, URI_TOO_LONG, browser, header, single,
-    submission_body, update,
+    ApiRequest, BODY_NOT_ACCEPTED, FORBIDDEN_HOST, FORBIDDEN_ORIGIN, HEADERS_TOO_LARGE, HeaderMap,
+    HttpRequest, MAX_HEADER_BYTES, MAX_HEADERS, MAX_PATH_BYTES, MAX_QUERY_BYTES,
+    METHOD_NOT_ALLOWED, Method, Refusal, Token, UNAUTHENTICATED, URI_TOO_LONG, browser, header,
+    route, single, submission_body,
 };
-
-const MEMBER_COLLECTIONS: [&str; 5] = [
-    "profiles",
-    "projects",
-    "pools",
-    "executors",
-    "conversations",
-];
-
-fn member(rest: &str, collection: &str) -> bool {
-    rest.strip_prefix(collection)
-        .and_then(|rest| rest.strip_prefix('/'))
-        .is_some_and(|id| !id.is_empty() && !id.contains('/'))
-}
-
-fn executor_archive(rest: &str) -> bool {
-    let segments: Vec<_> = rest.split('/').collect();
-    matches!(segments.as_slice(), ["executors", id, "archive"] if !id.is_empty())
-}
-
-fn pool_archive(rest: &str) -> bool {
-    let segments: Vec<_> = rest.split('/').collect();
-    matches!(segments.as_slice(), ["pools", id, "archive"] if !id.is_empty())
-}
-
-fn decision(rest: &str) -> bool {
-    let segments: Vec<_> = rest.split('/').collect();
-    matches!(segments.as_slice(), ["projects", id, "decision"] if !id.is_empty())
-}
-
-fn profile_availability(rest: &str) -> bool {
-    let segments: Vec<_> = rest.split('/').collect();
-    matches!(segments.as_slice(), ["profiles", id, "availability"] if !id.is_empty())
-}
-
-fn conversation_action(rest: &str) -> bool {
-    let mut segments = rest.split('/');
-    matches!((segments.next(), segments.next(), segments.next(), segments.next()), (Some("conversations"), Some(id), Some("stop" | "close" | "hold" | "unhold" | "retry" | "compact"), None) if !id.is_empty())
-}
-
-fn approval_route(rest: &str) -> bool {
-    let segments = rest.split('/').collect::<Vec<_>>();
-    match segments.as_slice() {
-        ["approvals", job, request, index] => {
-            !job.is_empty() && !request.is_empty() && !index.is_empty()
-        }
-        _ => false,
-    }
-}
-
-fn mutable_job_write(rest: &str) -> bool {
-    let segments = rest.split('/').collect::<Vec<_>>();
-    matches!(
-        segments.as_slice(),
-        ["jobs"]
-            | ["jobs", _]
-            | ["jobs", _, "submit"]
-            | ["jobs", _, "cancel-unsupported" | "withdraw"]
-            | ["jobs", _, "stop" | "release"]
-    )
-}
-
-fn takes_post(path: &str) -> bool {
-    if path == "/api/v1/executors" || path == "/api/v1/pools" {
-        return true;
-    }
-    match path.strip_prefix("/api/v1/") {
-        Some(
-            "update"
-            | "jobs"
-            | "decisions"
-            | "profiles"
-            | "projects"
-            | "provider-models"
-            | "attachments"
-            | "settings/compaction"
-            | "settings/outbound-headers",
-        ) => true,
-        Some(rest) => {
-            mutable_job_write(rest)
-                || conversation_action(rest)
-                || executor_archive(rest)
-                || pool_archive(rest)
-                || decision(rest)
-                || profile_availability(rest)
-                || approval_route(rest)
-                || MEMBER_COLLECTIONS
-                    .iter()
-                    .any(|collection| member(rest, collection))
-        }
-        None => false,
-    }
-}
-
-fn takes_delete(path: &str) -> bool {
-    path.strip_prefix("/api/v1/").is_some_and(|rest| {
-        member(rest, "profiles") || member(rest, "providers") || member(rest, "jobs")
-    })
-}
-
-fn json_post_limit(path: &str) -> Option<usize> {
-    if path == "/api/v1/executors" || path == "/api/v1/pools" {
-        return Some(MAX_SUBMISSION_BYTES);
-    }
-    match path.strip_prefix("/api/v1/") {
-        Some("attachments") => Some(MAX_ATTACHMENT_UPLOAD_BYTES),
-        Some("update") => Some(update::UPDATE_BODY_LIMIT),
-        Some(
-            "jobs"
-            | "decisions"
-            | "profiles"
-            | "projects"
-            | "provider-models"
-            | "settings/compaction"
-            | "settings/outbound-headers",
-        ) => Some(MAX_SUBMISSION_BYTES),
-        Some(rest) => (mutable_job_write(rest)
-            || executor_archive(rest)
-            || pool_archive(rest)
-            || decision(rest)
-            || profile_availability(rest)
-            || conversation_action(rest)
-            || approval_route(rest)
-            || MEMBER_COLLECTIONS
-                .iter()
-                .any(|collection| member(rest, collection)))
-        .then_some(MAX_SUBMISSION_BYTES),
-        None => None,
-    }
-}
-
-pub(super) enum Destination {
-    Asset,
-    Api(Caller),
-}
 
 #[derive(Clone)]
 pub(super) enum Caller {
     Programmatic,
     Operator(browser::Session),
+    BeginSession,
     Anonymous,
 }
 
-pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destination, Refusal> {
+pub(super) fn admit(
+    request: &HttpRequest,
+    port: u16,
+    token: &Token,
+    browser: &browser::State,
+    has_assets: bool,
+) -> Result<Option<ApiRequest>, Refusal> {
     let headers = request.headers();
     let header_bytes = headers
         .iter()
@@ -160,62 +32,66 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
     if request.path().len() > MAX_PATH_BYTES || request.query_string().len() > MAX_QUERY_BYTES {
         return Err(URI_TOO_LONG);
     }
-    let path = request.path();
-    let session_route = path == "/api/v1/session";
-    let api = path.starts_with("/api/");
-    let takes_post = takes_post(path);
-    let takes_delete = takes_delete(path);
+    if !request.path().starts_with("/api/") {
+        if request.method() != Method::GET {
+            return Err(METHOD_NOT_ALLOWED);
+        }
+        names_listener(headers, port).ok_or(FORBIDDEN_HOST)?;
+        return Ok(None);
+    }
+    route(request, |session_route, post_limit| {
+        let host = names_listener(headers, port).ok_or(FORBIDDEN_HOST)?;
+        if !same_origin(headers, &host) {
+            return Err(FORBIDDEN_ORIGIN);
+        }
+        admit_caller(
+            request,
+            token,
+            browser,
+            has_assets,
+            session_route,
+            post_limit,
+        )
+    })
+    .map(Some)
+}
+
+fn admit_caller(
+    request: &HttpRequest,
+    token: &Token,
+    browser: &browser::State,
+    has_assets: bool,
+    session_route: bool,
+    post_limit: Option<usize>,
+) -> Result<Caller, Refusal> {
     let method = request.method();
-    let allowed = if session_route {
-        *method == Method::GET || *method == Method::DELETE
-    } else if api {
-        *method == Method::GET
-            || (takes_post && *method == Method::POST)
-            || (takes_delete && *method == Method::DELETE)
-    } else {
-        *method == Method::GET
-    };
-    if !allowed {
-        return Err(if session_route {
-            SESSION_METHODS
-        } else if takes_post {
-            if takes_delete {
-                PROFILE_METHODS
-            } else {
-                ONLY_POST
-            }
-        } else {
-            METHOD_NOT_ALLOWED
-        });
-    }
-    let Some(host) = names_listener(headers, shared.port) else {
-        return Err(FORBIDDEN_HOST);
-    };
-    if api && !same_origin(headers, &host) {
-        return Err(FORBIDDEN_ORIGIN);
-    }
-    if !api {
-        return Ok(Destination::Asset);
-    }
-    let caller = if shared.assets.is_some()
-        && session_route
+    let headers = request.headers();
+    let caller = if session_route
         && *method == Method::GET
-        && headers.get_all(header::AUTHORIZATION).count() == 0
+        && (has_assets || token.ui_auth_mode == UiAuthMode::Token)
     {
-        authenticate(headers, shared).unwrap_or(Caller::Anonymous)
+        match authenticate(headers, token, browser) {
+            Ok(Caller::Programmatic) if token.ui_auth_mode == UiAuthMode::Token => {
+                Caller::BeginSession
+            }
+            Err(_) if !headers.contains_key(header::AUTHORIZATION) => match token.ui_auth_mode {
+                UiAuthMode::Auto => Caller::BeginSession,
+                UiAuthMode::Token => Caller::Anonymous,
+            },
+            result => result?,
+        }
     } else {
-        authenticate(headers, shared)?
+        authenticate(headers, token, browser)?
     };
     if let Caller::Operator(session) = &caller
         && method != Method::GET
-        && !shared.browser.csrf_matches(session, headers)
+        && !browser.csrf_matches(session, headers)
     {
         return Err(browser::FORBIDDEN_CSRF);
     }
-    if method == Method::POST
-        && let Some(limit) = json_post_limit(path)
-    {
-        return submission_body(headers, limit).map(|()| Destination::Api(caller));
+    if let Some(limit) = post_limit {
+        submission_body(headers, limit)?;
+        return Ok(caller);
     }
     let length = headers.get_all(header::CONTENT_LENGTH).collect::<Vec<_>>();
     if headers.contains_key(header::TRANSFER_ENCODING)
@@ -226,19 +102,20 @@ pub(super) fn admit(request: &HttpRequest, shared: &Shared) -> Result<Destinatio
     {
         return Err(BODY_NOT_ACCEPTED);
     }
-    Ok(Destination::Api(caller))
+    Ok(caller)
 }
 
-fn authenticate(headers: &HeaderMap, shared: &Shared) -> Result<Caller, Refusal> {
+fn authenticate(
+    headers: &HeaderMap,
+    token: &Token,
+    browser: &browser::State,
+) -> Result<Caller, Refusal> {
     let credentials = headers.get_all(header::AUTHORIZATION).count();
     let presented = browser::presented(headers);
     match (credentials, &presented) {
         (0, browser::Presented::None) => Err(UNAUTHENTICATED),
-        (1, browser::Presented::None) if authenticated(headers, &shared.token) => {
-            Ok(Caller::Programmatic)
-        }
-        (0, browser::Presented::One(_)) => shared
-            .browser
+        (1, browser::Presented::None) if authenticated(headers, token) => Ok(Caller::Programmatic),
+        (0, browser::Presented::One(_)) => browser
             .session(&presented)
             .map(Caller::Operator)
             .ok_or(UNAUTHENTICATED),
@@ -281,4 +158,342 @@ fn authenticated(headers: &HeaderMap, token: &Token) -> bool {
         return false;
     };
     scheme.eq_ignore_ascii_case(b"bearer ") && token.matches(presented)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::{
+        INVALID_REQUEST, MAX_ATTACHMENT_UPLOAD_BYTES, MAX_SUBMISSION_BYTES, NOT_FOUND, ONLY_POST,
+        PROFILE_METHODS, Route, SESSION_METHODS, authorize, config::ServerConfig, update, wire,
+    };
+    use super::*;
+    use ntex::web::test::TestRequest;
+
+    const SECRET: &str = "test-token-0123456789-abcdef-OCG-1234";
+    const HOST: &str = "localhost:18080";
+
+    struct Listener {
+        token: Token,
+        browser: browser::State,
+    }
+
+    impl Listener {
+        fn new(mode: &str) -> Self {
+            let config = ServerConfig::from_source(|name| match name {
+                "OCG_API_PORT" => Some(Ok("18080".into())),
+                "OCG_API_TOKEN" => Some(Ok(SECRET.into())),
+                "OCG_UI_AUTH_MODE" => Some(Ok(mode.into())),
+                _ => None,
+            })
+            .unwrap()
+            .unwrap();
+            Self {
+                token: config.token,
+                browser: browser::State::default(),
+            }
+        }
+
+        fn admit(&self, request: TestRequest) -> Result<Option<ApiRequest>, Refusal> {
+            admit(
+                &request.to_http_request(),
+                18080,
+                &self.token,
+                &self.browser,
+                false,
+            )
+        }
+    }
+
+    fn request(method: Method, path: &str) -> TestRequest {
+        TestRequest::with_uri(path)
+            .method(method)
+            .header(header::HOST, HOST)
+    }
+
+    fn bearer(request: TestRequest) -> TestRequest {
+        request.header(header::AUTHORIZATION, format!("Bearer {SECRET}"))
+    }
+
+    fn json(request: TestRequest, bytes: usize) -> TestRequest {
+        request
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CONTENT_LENGTH, bytes.to_string())
+    }
+
+    #[test]
+    fn host_and_origin_checks_precede_authentication() {
+        let listener = Listener::new("token");
+        let path = "/api/v1/health";
+        for host in ["example.test:18080", "localhost:80", "127.0.0.1"] {
+            assert_eq!(
+                listener
+                    .admit(TestRequest::with_uri(path).header(header::HOST, host))
+                    .err(),
+                Some(FORBIDDEN_HOST)
+            );
+        }
+        assert_eq!(
+            listener
+                .admit(request(Method::GET, path).header(header::HOST, HOST))
+                .err(),
+            Some(FORBIDDEN_HOST)
+        );
+        for (name, value) in [
+            ("origin", "http://127.0.0.1:18080"),
+            ("origin", "https://localhost:18080"),
+            ("sec-fetch-site", "same-site"),
+        ] {
+            assert_eq!(
+                listener
+                    .admit(request(Method::GET, path).header(name, value))
+                    .err(),
+                Some(FORBIDDEN_ORIGIN)
+            );
+        }
+        assert_eq!(
+            listener
+                .admit(
+                    request(Method::GET, path)
+                        .header(header::ORIGIN, "http://localhost:18080")
+                        .header(header::ORIGIN, "http://localhost:18080")
+                )
+                .err(),
+            Some(FORBIDDEN_ORIGIN)
+        );
+        assert_eq!(
+            listener
+                .admit(
+                    request(Method::GET, path)
+                        .header(header::ORIGIN, "http://LOCALHOST:18080")
+                        .header("sec-fetch-site", "same-origin")
+                )
+                .err(),
+            Some(UNAUTHENTICATED)
+        );
+        assert!(matches!(
+            listener.admit(request(Method::GET, "/").header("origin", "null")),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn method_refusals_and_unknown_paths_preserve_precedence() {
+        let listener = Listener::new("token");
+        for (method, path, error) in [
+            (Method::POST, "/api/v1/session", SESSION_METHODS),
+            (Method::PUT, "/api/v1/profiles/import", PROFILE_METHODS),
+            (Method::DELETE, "/api/v1/jobs/", ONLY_POST),
+            (Method::DELETE, "/api/v1/attachments", ONLY_POST),
+            (
+                Method::POST,
+                "/api/v1/conversations//compact",
+                METHOD_NOT_ALLOWED,
+            ),
+            (Method::POST, "/api/v1/approvals/a//0", METHOD_NOT_ALLOWED),
+            (Method::POST, "/api/v1/providers/a", METHOD_NOT_ALLOWED),
+            (Method::POST, "/", METHOD_NOT_ALLOWED),
+        ] {
+            // With no Host or credentials, these requests still receive their method-specific 405.
+            assert_eq!(
+                listener
+                    .admit(TestRequest::with_uri(path).method(method))
+                    .err(),
+                Some(error),
+                "{path}"
+            );
+        }
+        for path in ["/api/v1/missing", "/api/v2/health"] {
+            assert_eq!(
+                listener.admit(request(Method::GET, path)).err(),
+                Some(UNAUTHENTICATED)
+            );
+            assert_eq!(
+                listener
+                    .admit(bearer(request(Method::GET, path)).header(header::CONTENT_LENGTH, "1"))
+                    .err(),
+                Some(BODY_NOT_ACCEPTED)
+            );
+            assert_eq!(
+                listener.admit(bearer(request(Method::GET, path))).err(),
+                Some(NOT_FOUND)
+            );
+        }
+        for path in [
+            "/api/v1/jobs/current",
+            "/api/v1/conversations/search",
+            "/api/v1/conversations/archived",
+            "/api/v1/jobs//stop",
+        ] {
+            assert_eq!(
+                listener.admit(request(Method::POST, path)).err(),
+                Some(UNAUTHENTICATED)
+            );
+            assert_eq!(
+                listener.admit(bearer(request(Method::POST, path))).err(),
+                Some(wire::LENGTH_REQUIRED)
+            );
+            assert_eq!(
+                listener
+                    .admit(json(bearer(request(Method::POST, path)), 0))
+                    .err(),
+                Some(INVALID_REQUEST)
+            );
+        }
+    }
+
+    #[test]
+    fn route_limit_governs_admission_and_the_dispatched_body() {
+        let listener = Listener::new("token");
+        for (path, limit) in [
+            ("/api/v1/update", update::UPDATE_BODY_LIMIT),
+            ("/api/v1/attachments", MAX_ATTACHMENT_UPLOAD_BYTES),
+            ("/api/v1/jobs", MAX_SUBMISSION_BYTES),
+        ] {
+            assert_eq!(
+                listener
+                    .admit(json(bearer(request(Method::POST, path)), limit + 1))
+                    .err(),
+                Some(wire::BODY_TOO_LARGE),
+                "{path}"
+            );
+            let api = listener
+                .admit(json(bearer(request(Method::POST, path)), limit))
+                .unwrap()
+                .unwrap();
+            assert_eq!(api.body_limit, limit, "{path}");
+            assert_eq!(
+                listener
+                    .admit(
+                        json(bearer(request(Method::POST, path)), 1)
+                            .header(header::TRANSFER_ENCODING, "chunked")
+                    )
+                    .err(),
+                Some(wire::LENGTH_REQUIRED)
+            );
+        }
+        let path = "/api/v1/jobs/invalid/submit?unexpected=1";
+        assert_eq!(
+            listener
+                .admit(json(
+                    bearer(request(Method::POST, path)),
+                    MAX_SUBMISSION_BYTES + 1
+                ))
+                .err(),
+            Some(wire::BODY_TOO_LARGE)
+        );
+        assert_eq!(
+            listener
+                .admit(bearer(request(
+                    Method::GET,
+                    "/api/v1/jobs/invalid/outputs/latest?unexpected=1"
+                )))
+                .err(),
+            Some(NOT_FOUND)
+        );
+    }
+
+    #[test]
+    fn token_session_credentials_and_mutations_are_scoped_to_their_caller() {
+        let listener = Listener::new("token");
+        let session = "/api/v1/session";
+        let anonymous = listener
+            .admit(request(Method::GET, session))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(anonymous.caller, Caller::Anonymous));
+        assert!(matches!(
+            authorize(&anonymous.caller, anonymous.route),
+            Ok(Route::SessionStatus)
+        ));
+        assert!(
+            matches!(authorize(&anonymous.caller, Route::Health(None)), Err(error) if error == NOT_FOUND)
+        );
+        assert_eq!(
+            listener.admit(request(Method::GET, "/api/v1/health")).err(),
+            Some(UNAUTHENTICATED)
+        );
+        assert_eq!(
+            listener
+                .admit(
+                    request(Method::GET, session).header(header::AUTHORIZATION, "Bearer invalid")
+                )
+                .err(),
+            Some(UNAUTHENTICATED)
+        );
+        assert!(matches!(
+            listener
+                .admit(bearer(request(Method::GET, session)))
+                .unwrap()
+                .unwrap()
+                .caller,
+            Caller::BeginSession
+        ));
+        let auto = Listener::new("auto");
+        assert_eq!(
+            auto.admit(request(Method::GET, session)).err(),
+            Some(UNAUTHENTICATED)
+        );
+        assert!(matches!(
+            admit(
+                &request(Method::GET, session).to_http_request(),
+                18080,
+                &auto.token,
+                &auto.browser,
+                true
+            )
+            .unwrap()
+            .unwrap()
+            .caller,
+            Caller::BeginSession
+        ));
+
+        let reply = listener.browser.begin_session().unwrap();
+        let csrf = reply.body["session"]["csrf_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let response = reply.into_response(4096);
+        let cookie = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap();
+        let signed_in = || request(Method::GET, session).header(header::COOKIE, cookie);
+        let logout = || request(Method::DELETE, session).header(header::COOKIE, cookie);
+        assert!(matches!(
+            listener.admit(signed_in()).unwrap().unwrap().caller,
+            Caller::Operator(_)
+        ));
+        assert_eq!(
+            listener.admit(bearer(signed_in())).err(),
+            Some(UNAUTHENTICATED)
+        );
+        assert_eq!(
+            listener.admit(logout()).err(),
+            Some(browser::FORBIDDEN_CSRF)
+        );
+        assert_eq!(
+            listener
+                .admit(logout().header(browser::CSRF_HEADER, "mismatched"))
+                .err(),
+            Some(browser::FORBIDDEN_CSRF)
+        );
+        let api = listener
+            .admit(logout().header(browser::CSRF_HEADER, csrf))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            authorize(&api.caller, api.route),
+            Ok(Route::SessionRevoke)
+        ));
+        let api = listener
+            .admit(bearer(request(Method::DELETE, session)))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(authorize(&api.caller, api.route), Err(error) if error == NOT_FOUND));
+    }
 }

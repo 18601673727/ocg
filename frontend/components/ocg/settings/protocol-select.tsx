@@ -34,9 +34,6 @@ export function ProtocolSelect(props: {
         <SelectItem value="openai_responses">OpenAI Responses</SelectItem>
         <SelectItem value="anthropic_messages">Anthropic Messages</SelectItem>
       </Select>
-      {props.value === "anthropic_messages" && (
-        <span>{i18n.t("settings.llm.executionUnavailable")}</span>
-      )}
     </label>
   );
 }

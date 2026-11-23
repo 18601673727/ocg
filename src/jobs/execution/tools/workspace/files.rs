@@ -180,7 +180,7 @@ struct WriteFile(write::WriteFile);
 
 impl ToolHandler for WriteFile {
     fn version(&self) -> &str {
-        "workspace_write_file-3"
+        "workspace_write_file-4"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -220,7 +220,7 @@ pub(crate) fn register_write(
         registry,
         write::TOOL_NAME,
         Some(
-            "Create a new UTF-8 text file, replace the whole content of an existing one, replace exact text in a file, or delete a file in the authorized Workspace. Operations: `create` {path, content} fails if the file exists. `update` {path, content, expected_content} requires the whole file to match `expected_content`. `replace` {path, old, new} replaces `old` (must occur exactly once) with `new` (up to 8 KiB each, in files up to 1 MiB). `delete` {path, expected_content} deletes a file matching `expected_content` (up to 64 KiB). Directories are never created or deleted.",
+            "Edit UTF-8 text files in the authorized Workspace. `create` {path, content} creates a new file. `update` {path, content, expected_content} replaces a whole file matching `expected_content`. Each content field is limited to 48 KiB. `replace` {path, old, new} replaces one unique occurrence of `old` in a file up to 1 MiB (up to 48 KiB per field). `multi_replace` {path, edits: [{old, new}, ...]} applies 1 to 32 edits atomically. Each `old` must occur exactly once in the original file, and matches must not overlap. All edits together may contain up to 48 KiB of old and new text. The original and resulting files may each be up to 1 MiB. `delete` {path, expected_content} deletes a file matching `expected_content` (up to 64 KiB). Directories are never created or deleted.",
         ),
         write::parameters(),
         Arc::new(WriteFile(write::WriteFile::new(workspace))),

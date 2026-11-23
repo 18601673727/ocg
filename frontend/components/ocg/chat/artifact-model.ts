@@ -1,9 +1,12 @@
 import type { ToolCall } from "../contracts";
 
+type FileHunk = { before: string; after: string };
+
 export type FileArtifact = {
   path: string;
   before?: string;
   after?: string;
+  hunks?: FileHunk[];
   patch?: string;
   truncated?: boolean;
   excerpt: boolean;
@@ -48,6 +51,15 @@ export function fileArtifact(call: ToolCall): FileArtifact | null {
         return typeof args.old === "string" && typeof args.new === "string"
           ? { path: args.path, before: args.old, after: args.new, excerpt: true }
           : null;
+      case "multi_replace": {
+        if (!Array.isArray(args.edits) || !args.edits.length) return null;
+        const hunks: FileHunk[] = [];
+        for (const edit of args.edits) {
+          if (typeof edit?.old !== "string" || typeof edit.new !== "string") return null;
+          hunks.push({ before: edit.old, after: edit.new });
+        }
+        return { path: args.path, hunks, excerpt: true };
+      }
       case "delete":
         return expected === undefined
           ? null
@@ -113,6 +125,28 @@ export function changedLines(
     }
   }
   return { added: added - common[added], removed: removed - common[added] };
+}
+
+export function artifactHunks(artifact: FileArtifact | null): FileHunk[] {
+  if (artifact?.hunks) return artifact.hunks;
+  if (artifact?.before !== undefined && artifact.after !== undefined)
+    return [{ before: artifact.before, after: artifact.after }];
+  return [];
+}
+
+export function artifactChangedLines(
+  artifact: FileArtifact,
+): { added: number; removed: number } | null {
+  const hunks = artifactHunks(artifact);
+  if (!hunks.length) return null;
+  const total = { added: 0, removed: 0 };
+  for (const { before, after } of hunks) {
+    const count = changedLines(before, after);
+    if (!count) return null;
+    total.added += count.added;
+    total.removed += count.removed;
+  }
+  return total;
 }
 
 export function managedArtifactImages(text: string): { name: string; url: string }[] {

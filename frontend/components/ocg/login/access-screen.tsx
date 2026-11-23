@@ -1,3 +1,8 @@
+import { RotateCw } from "@lucide/solid";
+import { createSignal, Show } from "solid-js";
+import { ApiError } from "@/components/ocg/runtime/api/transport";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { type View } from "@/lib/ui-state";
 import { LanguageSwitcher, useI18n } from "../i18n";
 import { OcgLogo } from "../primitives/ocg-logo";
@@ -31,5 +36,94 @@ export function AccessScreen(props: { title: string; description: string; childr
         </div>
       </main>
     </div>
+  );
+}
+
+export function SessionAccess(props: {
+  phase: "token" | "out" | "unreachable";
+  signIn: (token: string) => Promise<void>;
+}) {
+  const i18n = useI18n();
+  if (props.phase === "token") return <TokenSignIn signIn={props.signIn} />;
+  const out = () => props.phase === "out";
+  return (
+    <AccessScreen
+      title={i18n.t(out() ? "session.signedOutTitle" : "session.offlineTitle")}
+      description={i18n.t(out() ? "session.signedOutDescription" : "session.unreachable")}
+    >
+      <Button class="self-start" onClick={() => window.location.reload()}>
+        <RotateCw aria-hidden="true" />
+        {i18n.t(out() ? "session.reopen" : "session.retry")}
+      </Button>
+    </AccessScreen>
+  );
+}
+
+function TokenSignIn(props: { signIn: (token: string) => Promise<void> }) {
+  const i18n = useI18n();
+  const [token, setToken] = createSignal("");
+  const [submitting, setSubmitting] = createSignal(false);
+  const [error, setError] = createSignal<"session.tokenRejected" | "session.unreachable" | null>(
+    null,
+  );
+
+  async function submit(event: SubmitEvent) {
+    event.preventDefault();
+    const value = token().trim();
+    if (submitting() || !value) return;
+    setError(null);
+    setSubmitting(true);
+    setToken("");
+    try {
+      await props.signIn(value);
+    } catch (cause) {
+      setError(
+        cause instanceof ApiError &&
+          (cause.status === 401 || cause.status === 403 || cause.code === "credential_unavailable")
+          ? "session.tokenRejected"
+          : "session.unreachable",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <AccessScreen
+      title={i18n.t("session.tokenTitle")}
+      description={i18n.t("session.tokenDescription")}
+    >
+      <form
+        class="flex flex-col items-start gap-3"
+        aria-busy={submitting() ? "true" : "false"}
+        onSubmit={submit}
+      >
+        <label for="operator-api-token" class="text-sm font-medium">
+          {i18n.t("session.tokenLabel")}
+        </label>
+        <Input
+          id="operator-api-token"
+          type="password"
+          autocomplete="current-password"
+          value={token()}
+          disabled={submitting()}
+          required
+          onInput={(event) => {
+            setToken(event.currentTarget.value);
+            setError(null);
+          }}
+        />
+        <Show when={error()} keyed>
+          {(key) => (
+            <p role="alert" class="text-sm text-destructive">
+              {i18n.t(key)}
+            </p>
+          )}
+        </Show>
+        <Button type="submit" disabled={submitting() || !token().trim()}>
+          {i18n.t("session.tokenSubmit")}
+        </Button>
+      </form>
+    </AccessScreen>
   );
 }

@@ -16,6 +16,8 @@ pub(crate) const NAMES: [&str; 2] = ["web_fetch", "web_search"];
 const TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_REDIRECTS: usize = 10;
+const DEFAULT_ACCEPT: &str = "text/html, application/json, application/xml, text/plain, */*";
+const SEARCH_URL_VARIABLE: &str = "OCG_WEB_SEARCH_URL";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,7 +130,7 @@ fn redirect_url(current: &Uri, location: &str) -> Result<Uri, ToolFailure> {
     parse_url(&format!("{scheme}://{authority}/{path}{query}"))
 }
 
-async fn request(url: &str) -> Result<Response, ToolFailure> {
+async fn request(url: &str, accept: &str) -> Result<Response, ToolFailure> {
     let mut url = parse_url(url)?;
     ntex::time::timeout(TIMEOUT, async {
         let non_public = Arc::new(AtomicBool::new(false));
@@ -139,10 +141,7 @@ async fn request(url: &str) -> Result<Response, ToolFailure> {
             non_public.store(false, Ordering::SeqCst);
             let response = client
                 .get(url.clone())
-                .set_header(
-                    "Accept",
-                    "text/html, application/json, application/xml, text/plain, */*",
-                )
+                .set_header("Accept", accept)
                 .set_header("Accept-Encoding", "identity")
                 .send()
                 .await
@@ -276,7 +275,7 @@ impl ToolHandler for Fetch {
         Box::pin(async move {
             let arguments: FetchArguments = serde_json::from_value(arguments)
                 .map_err(|_| ToolFailure::not_applied("invalid web_fetch arguments"))?;
-            let response = request(&arguments.url).await?;
+            let response = request(&arguments.url, DEFAULT_ACCEPT).await?;
             crate::workspace::blocking::run(crate::workspace::blocking::Kind::Cpu, move || {
                 let source = String::from_utf8_lossy(&response.body);
                 let text = match arguments.format {
@@ -337,6 +336,51 @@ fn xml_field(item: &str, name: &str) -> Option<String> {
     Some(decode_entities(value))
 }
 
+fn configured_search_url(endpoint: &str, query: &str) -> Result<String, ToolFailure> {
+    let endpoint = endpoint.split('#').next().unwrap_or(endpoint);
+    if let Some((prefix, _)) = endpoint.split_once("{query}") {
+        if !prefix
+            .split_once("://")
+            .is_some_and(|(_, rest)| rest.contains(['/', '?']))
+        {
+            return Err(ToolFailure::not_applied(
+                "the search query placeholder must be in the endpoint path or query",
+            ));
+        }
+        return Ok(endpoint.replace("{query}", query));
+    }
+    let url = parse_url(endpoint)?;
+    let separator = if url.query().is_some() { '&' } else { '?' };
+    Ok(format!("{url}{separator}format=json&q={query}"))
+}
+
+fn json_search_results(body: &[u8], limit: usize) -> Result<Value, ToolFailure> {
+    #[derive(Deserialize)]
+    struct SearchResponse {
+        results: Vec<SearchResult>,
+    }
+    #[derive(Deserialize)]
+    struct SearchResult {
+        title: String,
+        url: String,
+        content: Option<String>,
+        snippet: Option<String>,
+    }
+    let response: SearchResponse = serde_json::from_slice(body).map_err(|_| {
+        ToolFailure::not_applied("configured search returned an invalid JSON result")
+    })?;
+    let truncated = response.results.len() > limit;
+    let mut results = Vec::new();
+    for item in response.results.into_iter().take(limit) {
+        parse_url(&item.url)?;
+        results.push(json!({
+            "title": item.title, "url": item.url,
+            "snippet": item.content.or(item.snippet).unwrap_or_default(),
+        }));
+    }
+    Ok(json!({"provider":"configured", "results":results, "truncated":truncated}))
+}
+
 impl ToolHandler for Search {
     fn version(&self) -> &str {
         "web_search-1"
@@ -351,16 +395,37 @@ impl ToolHandler for Search {
             if arguments.query.trim().is_empty() {
                 return Err(ToolFailure::not_applied("search query must not be empty"));
             }
-            let response = request(&format!(
-                "https://www.bing.com/search?format=rss&q={}",
-                encode_query(&arguments.query)
-            ))
-            .await?;
+            let query = encode_query(&arguments.query);
+            let endpoint = std::env::var_os(SEARCH_URL_VARIABLE);
+            let (url, accept) = match &endpoint {
+                Some(endpoint) => (
+                    configured_search_url(
+                        endpoint.to_str().ok_or_else(|| {
+                            ToolFailure::not_applied("the configured search URL must be UTF-8")
+                        })?,
+                        &query,
+                    )?,
+                    "application/json",
+                ),
+                None => (
+                    format!("https://www.bing.com/search?format=rss&q={query}"),
+                    DEFAULT_ACCEPT,
+                ),
+            };
+            let response = request(&url, accept).await?;
             if !(200..300).contains(&response.status) {
                 return Err(ToolFailure::not_applied(format!(
                     "public search returned HTTP {}",
                     response.status
                 )));
+            }
+            if endpoint.is_some() {
+                if response.truncated {
+                    return Err(ToolFailure::not_applied(
+                        "configured search response exceeds the body limit",
+                    ));
+                }
+                return json_search_results(&response.body, arguments.limit);
             }
             let source = String::from_utf8_lossy(&response.body);
             if response.truncated || !source.contains("<rss") || !source.contains("</rss>") {
@@ -414,7 +479,7 @@ pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError>
         registry,
         "web_search",
         Some(
-            "Search the public web with Bing's RSS search through OCG's configured proxy; no API key is needed. Returns titles, source URLs and snippets. Use web_fetch on result URLs to read and verify sources. Public search may be unavailable or rate limited; it does not execute JavaScript."
+            "Search the public web through OCG's configured proxy using the configured JSON search endpoint or Bing RSS by default. Returns titles, source URLs and snippets. Use web_fetch on result URLs to read and verify sources."
         ),
         json!({
             "type":"object", "additionalProperties":false,

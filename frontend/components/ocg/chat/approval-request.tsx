@@ -1,4 +1,4 @@
-import { createMemo } from "solid-js";
+import { createMemo, Show } from "solid-js";
 import { ApprovalCard } from "@/components/ocg/chat/ui/approval-card";
 import type { ApprovalAssessment } from "../contracts/api";
 import { type I18nKey, useI18n } from "../i18n";
@@ -65,9 +65,10 @@ export function ApprovalRequest(props: {
         })
       : null,
   );
-  const plan = createMemo(() =>
-    steps()?.length && steps()!.every((step) => step !== null) ? steps() : null,
-  );
+  const plan = createMemo(() => {
+    const current = steps();
+    return current?.length && current.every((step) => step !== null) ? current : null;
+  });
   const target = createMemo(() =>
     props.tool === "workspace_run_command" && typeof args.command === "string"
       ? args.command
@@ -100,53 +101,60 @@ export function ApprovalRequest(props: {
       onAllowOnce={props.onApprove}
       onDeny={props.onReject}
     >
-      {plan() && (
-        <ol class="space-y-3 py-1" aria-label={i18n.t("chat.card.plan")}>
-          {plan()!.map((step, index) => (
-            <li class="rounded-lg border border-border p-3">
-              <div class="flex items-start gap-2.5">
-                <span
-                  class="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium tabular-nums"
-                  aria-hidden="true"
-                >
-                  {index + 1}
-                </span>
-                <div class="min-w-0 space-y-2">
-                  <h3 class="text-sm font-medium break-words">{step!.title}</h3>
-                  <p class="text-xs text-muted-foreground">
-                    {step!.dependencies.length
-                      ? i18n.t("job.activity.dependsOn", {
-                          steps: step!.dependencies
-                            .map((dependency) => `${dependency + 1}. ${plan()![dependency]!.title}`)
-                            .join(" · "),
-                        })
-                      : i18n.t("chat.card.independentStep")}
-                  </p>
-                  <p class="text-sm leading-relaxed whitespace-pre-wrap break-words">
-                    {step!.objective}
-                  </p>
-                  {(step!.agent || step!.model) && (
-                    <dl class="space-y-1 text-xs text-muted-foreground">
-                      {step!.agent && (
-                        <div>
-                          <dt class="inline font-medium">{i18n.t("chat.agent")}: </dt>
-                          <dd class="inline break-all">{step!.agent}</dd>
-                        </div>
-                      )}
-                      {step!.model && (
-                        <div>
-                          <dt class="inline font-medium">{i18n.t("chat.model")}: </dt>
-                          <dd class="inline break-all">{step!.model}</dd>
-                        </div>
-                      )}
-                    </dl>
-                  )}
+      <Show when={plan()}>
+        {(currentPlan) => (
+          <ol class="space-y-3 py-1" aria-label={i18n.t("chat.card.plan")}>
+            {currentPlan().map((step, index, items) => (
+              <li class="rounded-lg border border-border p-3">
+                <div class="flex items-start gap-2.5">
+                  <span
+                    class="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted text-xs font-medium tabular-nums"
+                    aria-hidden="true"
+                  >
+                    {index + 1}
+                  </span>
+                  <div class="min-w-0 space-y-2">
+                    <h3 class="text-sm font-medium break-words">{step.title}</h3>
+                    <p class="text-xs text-muted-foreground">
+                      {step.dependencies.length
+                        ? i18n.t("job.activity.dependsOn", {
+                            steps: step.dependencies
+                              .map((dependency) => {
+                                const title = items[dependency]?.title;
+                                return title === undefined
+                                  ? String(dependency + 1)
+                                  : `${dependency + 1}. ${title}`;
+                              })
+                              .join(" · "),
+                          })
+                        : i18n.t("chat.card.independentStep")}
+                    </p>
+                    <p class="text-sm leading-relaxed whitespace-pre-wrap break-words">
+                      {step.objective}
+                    </p>
+                    {(step.agent || step.model) && (
+                      <dl class="space-y-1 text-xs text-muted-foreground">
+                        {step.agent && (
+                          <div>
+                            <dt class="inline font-medium">{i18n.t("chat.agent")}: </dt>
+                            <dd class="inline break-all">{step.agent}</dd>
+                          </div>
+                        )}
+                        {step.model && (
+                          <div>
+                            <dt class="inline font-medium">{i18n.t("chat.model")}: </dt>
+                            <dd class="inline break-all">{step.model}</dd>
+                          </div>
+                        )}
+                      </dl>
+                    )}
+                  </div>
                 </div>
-              </div>
-            </li>
-          ))}
-        </ol>
-      )}
+              </li>
+            ))}
+          </ol>
+        )}
+      </Show>
       {props.assessment && (
         <div
           class="rounded-md border border-border bg-muted/30 px-3 py-2 text-muted-foreground"

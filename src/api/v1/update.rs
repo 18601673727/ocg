@@ -285,7 +285,9 @@ fn launch(mut state: crate::host::update::State) -> Result<std::process::Child, 
     let child = child.map_err(|error| {
         state.phase = Phase::Failed;
         state.message = Some(format!("failed to spawn updater: {error}"));
-        let _ = update::write_state(&install.prefix, &state);
+        if let Err(write_err) = update::write_state(&install.prefix, &state) {
+            log::warn!("failed to persist failed update state: {write_err}");
+        }
         INTERNAL
     });
     drop(lock);

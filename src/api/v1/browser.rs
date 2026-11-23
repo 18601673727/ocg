@@ -1,3 +1,4 @@
+use super::config::UiAuthMode;
 use super::contracts::envelope;
 
 use std::collections::HashMap;
@@ -107,20 +108,16 @@ impl State {
         ))
     }
 
-    pub(super) fn logout(&self, session: &Session) -> Reply {
+    pub(super) fn logout(&self, session: &Session, mode: UiAuthMode) -> Reply {
         self.sessions
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&session.key);
-        Reply::with_cookie(
-            StatusCode::OK,
-            envelope(serde_json::json!(SessionResponseView {
-                session: SessionView::SignedOut(SignedOutView {
-                    authenticated: false,
-                }),
-            })),
-            format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
-        )
+        let reply = signed_out(true);
+        match mode {
+            UiAuthMode::Auto => reply,
+            UiAuthMode::Token => reply.with_bearer_challenge(),
+        }
     }
 }
 
@@ -162,6 +159,23 @@ pub(super) fn described(session: &Session) -> Value {
             expires_at_us: session.expires_at_us,
         }),
     }))
+}
+
+pub(super) fn signed_out(clear_cookie: bool) -> Reply {
+    let body = envelope(serde_json::json!(SessionResponseView {
+        session: SessionView::SignedOut(SignedOutView {
+            authenticated: false,
+        }),
+    }));
+    if clear_cookie {
+        Reply::with_cookie(
+            StatusCode::OK,
+            body,
+            format!("{COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0"),
+        )
+    } else {
+        Reply::ok(body)
+    }
 }
 
 pub(super) fn presented(headers: &HeaderMap) -> Presented {

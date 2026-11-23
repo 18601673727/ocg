@@ -165,7 +165,15 @@ pub(crate) async fn supervise_development_generative(
                 "incomplete execution evidence; ownership remains held",
             )));
         }
-        record_answered_request(database, &execution, token.job, request, &result).await?;
+        record_answered_request(
+            database,
+            &execution,
+            token.job,
+            request,
+            &result,
+            frozen.llm.provider.transport,
+        )
+        .await?;
         if let Some(failure) = providers::responses::terminal_failure(&result) {
             return database
                 .finalize_development_failure(
@@ -223,7 +231,9 @@ pub(crate) async fn supervise_development_generative(
                 return settle_tool_stop(database, handoff, output_seq, Some(&result), stop).await;
             }
         };
-        conversation.messages.push(assistant_message(&result));
+        conversation
+            .messages
+            .push(assistant_message(&result, frozen.llm.provider.transport));
         for (call, content) in result.tool_calls.iter().zip(answers) {
             conversation
                 .messages
@@ -511,11 +521,21 @@ async fn record_answered_request(
     job: crate::db::entities::JobId,
     request: RequestNumber,
     result: &ProviderExecutionResult,
+    transport: crate::db::entities::LlmTransport,
 ) -> Result<(), DatabaseError> {
     let response = if let Some(output) = &result.response_output {
-        MessageBody::new_exact(&serde_json::json!({"output": output.items}))
+        let message = match transport {
+            crate::db::entities::LlmTransport::AnthropicMessages => {
+                providers::anthropic::assistant_content(&output.items)
+            }
+            crate::db::entities::LlmTransport::OpenAiChatCompletions
+            | crate::db::entities::LlmTransport::OpenAiResponses => {
+                serde_json::json!({"output":output.items})
+            }
+        };
+        MessageBody::new_exact(&message)
     } else {
-        serde_json::to_value(assistant_message(result))
+        serde_json::to_value(assistant_message(result, transport))
             .and_then(|message| MessageBody::new_exact(&message))
     }
     .map_err(|_| {
@@ -1187,16 +1207,26 @@ const PROVIDER_REJECTED: &str = "provider_rejected";
 const NOT_DELIVERED: &str = "not_delivered";
 const BUILD_FAILED: &str = "build_failed";
 const NOT_SENT: &str = "not_sent";
-fn assistant_message(result: &ProviderExecutionResult) -> ChatMessage {
-    if let Some(output) = &result.response_output {
+fn assistant_message(
+    result: &ProviderExecutionResult,
+    transport: crate::db::entities::LlmTransport,
+) -> ChatMessage {
+    if let Some(output) = &result.response_output
+        && transport == crate::db::entities::LlmTransport::OpenAiResponses
+    {
         return ChatMessage::responses(output.items.clone());
     }
-    ChatMessage::assistant(
+    let mut message = ChatMessage::assistant(
         Some(result.text.clone()).filter(|text| !text.is_empty()),
         result
             .tool_calls
             .iter()
             .map(ChatToolCallWire::from)
             .collect(),
-    )
+    );
+    message.response_items = result
+        .response_output
+        .as_ref()
+        .map(|output| output.items.clone());
+    message
 }

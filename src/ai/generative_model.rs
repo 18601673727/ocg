@@ -16,8 +16,8 @@ use super::providers::openai_compatible::{
 use super::providers::{
     CredentialResolver, MAX_SSE_LINE_BYTES, OutputSinkError, ProviderExecutionConfig,
     ProviderExecutionError, ProviderExecutionResult, ProviderFact, ProviderObservation,
-    ProviderOutputSink, ResponseFacts, UsageCapture, announce, endpoint, incomplete_tool_calls,
-    openai_compatible, responses, unannounced_fact,
+    ProviderOutputSink, ResponseFacts, UsageCapture, announce, anthropic, endpoint,
+    incomplete_tool_calls, openai_compatible, responses, unannounced_fact,
 };
 use crate::db::entities::{ChatFinishReason, NormalizedUsage, ProviderFailure};
 use crate::db::entities::{
@@ -119,11 +119,7 @@ pub(crate) fn request_body(
     match frozen.provider.transport {
         LlmTransport::OpenAiResponses => return responses::request_body(frozen, conversation),
         LlmTransport::OpenAiChatCompletions => {}
-        LlmTransport::AnthropicMessages => {
-            return Err(ProviderExecutionError::Build {
-                message: "the configured transport does not support generative execution".into(),
-            });
-        }
+        LlmTransport::AnthropicMessages => return anthropic::request_body(frozen, conversation),
     }
     let model = &frozen.config.model;
     let parameters = &frozen.config.parameters;
@@ -221,23 +217,14 @@ async fn exchange(
     announced: &mut bool,
 ) -> Result<ProviderExecutionResult, ProviderExecutionError> {
     let provider = &frozen.llm.provider;
-    let resource = match provider.transport {
-        LlmTransport::OpenAiChatCompletions => "chat/completions",
-        LlmTransport::OpenAiResponses => "responses",
-        LlmTransport::AnthropicMessages => {
-            return Err(ProviderExecutionError::Build {
-                message: "Anthropic Messages execution is unavailable".into(),
-            });
+    let (base, resource) = match provider.transport {
+        LlmTransport::OpenAiChatCompletions => {
+            (openai_compatible::DEFAULT_ENDPOINT, "chat/completions")
         }
+        LlmTransport::OpenAiResponses => (openai_compatible::DEFAULT_ENDPOINT, "responses"),
+        LlmTransport::AnthropicMessages => (anthropic::DEFAULT_ENDPOINT, "messages"),
     };
-    let endpoint = endpoint(
-        provider
-            .endpoint
-            .as_deref()
-            .unwrap_or(openai_compatible::DEFAULT_ENDPOINT),
-        resource,
-    )?;
-
+    let endpoint = endpoint(provider.endpoint.as_deref().unwrap_or(base), resource)?;
     let (response, started, redactor) = super::providers::send(
         endpoint,
         (provider.credential_ref.as_deref(), &provider.headers),
@@ -245,13 +232,21 @@ async fn exchange(
         config,
         body,
         borrow_output_sink(sink),
-        true,
+        Some(provider.transport),
     )
     .await?;
     *announced = true;
     announce(borrow_output_sink(sink), ProviderFact::Delivered).await;
     let status = response.status().as_u16();
-    let request_id = redactor.request_id(&response);
+    let request_id = if provider.transport == LlmTransport::AnthropicMessages {
+        response
+            .header("request-id")
+            .and_then(|value| value.to_str().ok())
+            .map(|id| redactor.text(id))
+            .or_else(|| redactor.request_id(&response))
+    } else {
+        redactor.request_id(&response)
+    };
     if response.status() != StatusCode::OK {
         return Err(observe::reject_response(
             response,
@@ -263,23 +258,20 @@ async fn exchange(
         .await);
     }
 
+    let json = response
+        .header("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|mime| {
+            let mime = mime.trim().to_ascii_lowercase();
+            mime == "application/json" || mime.ends_with("+json")
+        });
     let format = match provider.transport {
-        LlmTransport::OpenAiResponses
-            if response
-                .header("content-type")
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(';').next())
-                .is_some_and(|mime| {
-                    let mime = mime.trim().to_ascii_lowercase();
-                    mime == "application/json" || mime.ends_with("+json")
-                }) =>
-        {
-            ResponseFormat::ResponsesJson
-        }
+        LlmTransport::OpenAiChatCompletions => ResponseFormat::ChatSse,
+        LlmTransport::OpenAiResponses if json => ResponseFormat::ResponsesJson,
         LlmTransport::OpenAiResponses => ResponseFormat::ResponsesSse,
-        LlmTransport::OpenAiChatCompletions | LlmTransport::AnthropicMessages => {
-            ResponseFormat::ChatSse
-        }
+        LlmTransport::AnthropicMessages if json => ResponseFormat::AnthropicJson,
+        LlmTransport::AnthropicMessages => ResponseFormat::AnthropicSse,
     };
     read_response(
         (response.take_payload(), format),
@@ -292,17 +284,19 @@ async fn exchange(
     )
     .await
     .map(|mut result| {
-        if let Some(output) = &mut result.response_output {
+        if provider.transport != LlmTransport::OpenAiChatCompletions {
             result.raw_finish_reason = result
                 .raw_finish_reason
                 .as_deref()
                 .map(|reason| redactor.text(reason));
-            if let Some(mut failure) = output.failure.take() {
-                if conversation.carries_images() {
-                    failure.message = "provider terminated the image request".to_owned();
-                }
-                output.failure = Some(redactor.failure(failure));
+        }
+        if let Some(output) = &mut result.response_output
+            && let Some(mut failure) = output.failure.take()
+        {
+            if conversation.carries_images() {
+                failure.message = "provider terminated the image request".to_owned();
             }
+            output.failure = Some(redactor.failure(failure));
         }
         result
     })
@@ -314,6 +308,8 @@ enum ResponseFormat {
     ChatSse,
     ResponsesSse,
     ResponsesJson,
+    AnthropicSse,
+    AnthropicJson,
 }
 
 async fn read_response(
@@ -591,6 +587,8 @@ async fn parse_stream_body(
     let mut buffer = Vec::with_capacity(MAX_SSE_LINE_BYTES);
     let mut frame = Vec::new();
     let mut responses_stream = responses::Stream::default();
+    let mut anthropic_stream =
+        anthropic::Stream::new(status_code, request_id.as_deref(), config.max_output_bytes);
     let wire_limit = if format == ResponseFormat::ChatSse {
         MAX_SSE_LINE_BYTES
     } else {
@@ -681,10 +679,13 @@ async fn parse_stream_body(
         }
         let chunk = chunk.map_err(|error| response.unknown(error.to_string(), status_code))?;
         first_byte.get_or_insert_with(Instant::now);
-        if format == ResponseFormat::ResponsesJson {
+        if matches!(
+            format,
+            ResponseFormat::ResponsesJson | ResponseFormat::AnthropicJson
+        ) {
             if buffer.len().saturating_add(chunk.len()) > wire_limit {
                 return Err(
-                    response.incomplete("Responses JSON exceeded its wire limit", status_code)
+                    response.incomplete("provider JSON exceeded its wire limit", status_code)
                 );
             }
             buffer.extend_from_slice(&chunk);
@@ -702,11 +703,14 @@ async fn parse_stream_body(
             }
             let line = buffer.strip_suffix(b"\n").unwrap_or(&buffer);
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if format == ResponseFormat::ResponsesSse {
+            if matches!(
+                format,
+                ResponseFormat::ResponsesSse | ResponseFormat::AnthropicSse
+            ) {
                 if let Some(data) = line.strip_prefix(b"data:") {
                     if frame.len().saturating_add(data.len()).saturating_add(1) > wire_limit {
                         return Err(response.incomplete(
-                            "Responses SSE event exceeded its wire limit",
+                            "provider SSE event exceeded its wire limit",
                             status_code,
                         ));
                     }
@@ -718,27 +722,39 @@ async fn parse_stream_body(
                         break 'stream;
                     }
                     let event = serde_json::from_slice(data).map_err(|_| {
-                        response.incomplete("malformed Responses SSE event", status_code)
+                        response.incomplete("malformed provider SSE event", status_code)
                     })?;
                     frame.clear();
-                    match responses_stream.event(
-                        event,
-                        status_code,
-                        request_id.as_deref(),
-                        config.max_output_bytes,
-                    )? {
-                        responses::Event::Terminal(value) => {
-                            terminal = Some(value);
-                            break 'stream;
+                    if format == ResponseFormat::AnthropicSse {
+                        match anthropic_stream.event(&event, output).await? {
+                            anthropic::Event::Ignore => {}
+                            anthropic::Event::Progress => saw_delta = true,
+                            anthropic::Event::Stop => {
+                                saw_event = true;
+                                buffer.clear();
+                                break 'stream;
+                            }
                         }
-                        responses::Event::Progress => saw_delta = true,
-                        responses::Event::Delta(kind, part, delta) => {
-                            saw_delta = true;
-                            output.buffer(kind, part, &delta).await.map_err(|error| {
-                                local_stop(&error.message, status_code, None, None)
-                            })?;
+                    } else {
+                        match responses_stream.event(
+                            event,
+                            status_code,
+                            request_id.as_deref(),
+                            config.max_output_bytes,
+                        )? {
+                            responses::Event::Terminal(value) => {
+                                terminal = Some(value);
+                                break 'stream;
+                            }
+                            responses::Event::Progress => saw_delta = true,
+                            responses::Event::Delta(kind, part, delta) => {
+                                saw_delta = true;
+                                output.buffer(kind, part, &delta).await.map_err(|error| {
+                                    local_stop(&error.message, status_code, None, None)
+                                })?;
+                            }
+                            responses::Event::Ignore => {}
                         }
-                        responses::Event::Ignore => {}
                     }
                 }
                 buffer.clear();
@@ -846,6 +862,7 @@ async fn parse_stream_body(
         }
     }
     let mut response_output = None;
+    let mut anthropic_blocks = None;
     let terminal = match format {
         ResponseFormat::ResponsesJson => Some(serde_json::from_slice(&buffer).map_err(|_| {
             response.incomplete("malformed or incomplete Responses JSON", status_code)
@@ -856,6 +873,30 @@ async fn parse_stream_body(
                 status_code,
             )
         })?),
+        ResponseFormat::AnthropicJson | ResponseFormat::AnthropicSse => {
+            if format == ResponseFormat::AnthropicJson {
+                let message = serde_json::from_slice(&buffer).map_err(|_| {
+                    response.incomplete("malformed or incomplete Anthropic JSON", status_code)
+                })?;
+                anthropic_stream.json(&message, output).await?;
+                buffer.clear();
+            } else if !saw_event {
+                return Err(
+                    response.unknown("Anthropic stream ended before message_stop", status_code)
+                );
+            }
+            let (finish, raw) = anthropic_stream
+                .reason
+                .ok_or_else(|| response.incomplete("missing Anthropic stop reason", status_code))?;
+            response.finish_reason = Some(finish);
+            response.raw_finish_reason = Some(raw);
+            response.text = anthropic_stream.text;
+            response.tool_calls = anthropic_stream.calls;
+            anthropic_blocks = Some(anthropic_stream.blocks);
+            response.usage = anthropic_stream.usage;
+            saw_event = true;
+            None
+        }
         ResponseFormat::ChatSse => None,
     };
     if let Some(terminal) = terminal {
@@ -917,6 +958,17 @@ async fn parse_stream_body(
                 };
                 incomplete_tool_calls(error, facts)
             })?;
+    if let Some(blocks) = anthropic_blocks {
+        response_output = Some(anthropic::complete_blocks(
+            blocks,
+            &tool_calls,
+            ResponseFacts {
+                status_code,
+                finish_reason: response.finish_reason,
+                raw_finish_reason: response.raw_finish_reason.clone(),
+            },
+        )?);
+    }
     let finished_in = started.elapsed();
     Ok(ProviderExecutionResult {
         text: response.text,

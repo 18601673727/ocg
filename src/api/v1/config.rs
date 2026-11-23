@@ -3,6 +3,7 @@ use super::{Arc, Duration, PathBuf, SHA256, digest, events, fmt, verify_slices_a
 pub const PORT_VARIABLE: &str = "OCG_API_PORT";
 pub const TOKEN_VARIABLE: &str = "OCG_API_TOKEN";
 pub const UI_VARIABLE: &str = "OCG_UI_DIR";
+const UI_AUTH_MODE_VARIABLE: &str = "OCG_UI_AUTH_MODE";
 
 pub const API_VERSION: u32 = 1;
 
@@ -27,8 +28,17 @@ const RESPONSE_BYTES: usize = 1024 * 1024;
 
 const ADMISSION_WAIT: Duration = Duration::from_secs(3);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum UiAuthMode {
+    Auto,
+    Token,
+}
+
 #[derive(Clone)]
-pub(super) struct Token(pub(super) Arc<str>);
+pub(super) struct Token {
+    secret: Arc<str>,
+    pub(super) ui_auth_mode: UiAuthMode,
+}
 
 impl fmt::Debug for Token {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -38,7 +48,7 @@ impl fmt::Debug for Token {
 
 impl Token {
     pub(super) fn matches(&self, presented: &[u8]) -> bool {
-        let expected = digest(&SHA256, self.0.as_bytes());
+        let expected = digest(&SHA256, self.secret.as_bytes());
         let presented = digest(&SHA256, presented);
         verify_slices_are_equal(expected.as_ref(), presented.as_ref()).is_ok()
     }
@@ -60,6 +70,8 @@ pub enum ConfigError {
     InvalidToken,
     #[error("{UI_VARIABLE} must name an existing directory of the exported frontend")]
     InvalidUiDirectory,
+    #[error("{UI_AUTH_MODE_VARIABLE} must be auto or token")]
+    InvalidUiAuthMode,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +104,11 @@ impl ServerConfig {
             return Err(ConfigError::LegacyVariables(renames.join(" and ")));
         }
 
+        let ui_auth_mode = match source(UI_AUTH_MODE_VARIABLE).as_ref().map(Result::as_deref) {
+            None | Some(Ok("auto")) => UiAuthMode::Auto,
+            Some(Ok("token")) => UiAuthMode::Token,
+            Some(Ok(_) | Err(_)) => return Err(ConfigError::InvalidUiAuthMode),
+        };
         match (source(PORT_VARIABLE), source(TOKEN_VARIABLE)) {
             (None, None) => Ok(None),
             (Some(_), None) => Err(ConfigError::TokenMissing),
@@ -114,7 +131,10 @@ impl ServerConfig {
                         Some(directory)
                     }
                 };
-                Self::new(port, &token).map(|config| Some(Self { ui_dir, ..config }))
+                let mut config = Self::new(port, &token)?;
+                config.ui_dir = ui_dir;
+                config.token.ui_auth_mode = ui_auth_mode;
+                Ok(Some(config))
             }
         }
     }
@@ -135,7 +155,10 @@ impl ServerConfig {
         }
         Ok(Self {
             port,
-            token: Token(token.into()),
+            token: Token {
+                secret: token.into(),
+                ui_auth_mode: UiAuthMode::Auto,
+            },
             ui_dir: None,
             response_bytes: RESPONSE_BYTES,
             admission_wait: ADMISSION_WAIT,

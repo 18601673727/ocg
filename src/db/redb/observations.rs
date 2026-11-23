@@ -691,7 +691,11 @@ fn raw_answer(body: &Value) -> Option<String> {
         }
         Some(text)
     } else if body["role"] == "assistant" {
-        body["content"].as_str().map(str::to_owned)
+        if let Some(parts) = body["content"].as_array() {
+            anthropic_text(parts)
+        } else {
+            body["content"].as_str().map(str::to_owned)
+        }
     } else {
         None
     }
@@ -718,6 +722,16 @@ pub(super) fn received_part(
             OutputKind::Reasoning if item["type"] == "reasoning" => {
                 item["summary"][part as usize]["text"].as_str()
             }
+            _ => None,
+        }
+    } else if let Some(parts) = body["content"].as_array()
+        && output == 0
+        && body["role"] == "assistant"
+    {
+        let block = parts.get(part as usize)?;
+        match (kind, block["type"].as_str()?) {
+            (OutputKind::Progress, "text") => block["text"].as_str(),
+            (OutputKind::Reasoning, "thinking") => block["thinking"].as_str(),
             _ => None,
         }
     } else if kind == OutputKind::Progress
@@ -960,6 +974,14 @@ fn evict_least_recently_used(cache: &mut MessageCache) -> bool {
     }
 }
 
+fn anthropic_text(parts: &[Value]) -> Option<String> {
+    parts
+        .iter()
+        .filter(|part| part["type"] == "text")
+        .map(|part| part["text"].as_str())
+        .collect()
+}
+
 fn requests_tools(message: &Value) -> bool {
     message["output"].as_array().is_some_and(|items| {
         items.iter().any(|item| {
@@ -968,10 +990,14 @@ fn requests_tools(message: &Value) -> bool {
                     .as_array()
                     .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_use"))
         })
-    }) || message
-        .get("tool_calls")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|calls| !calls.is_empty())
+    }) || (message["role"] == "assistant"
+        && message["content"]
+            .as_array()
+            .is_some_and(|parts| parts.iter().any(|part| part["type"] == "tool_use")))
+        || message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
 }
 
 fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, StorageError> {
@@ -990,6 +1016,8 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
     let text = match message.get("content") {
         None | Some(serde_json::Value::Null) => String::new(),
         Some(serde_json::Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) if message["role"] == "assistant" => anthropic_text(parts)
+            .ok_or_else(|| StorageError::corrupted("invalid Anthropic text block"))?,
         Some(_) => return Err(StorageError::corrupted("response content is not text")),
     };
     let output = message.get("output").and_then(serde_json::Value::as_array);

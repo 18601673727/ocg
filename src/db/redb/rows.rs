@@ -512,26 +512,23 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
     e.str(&record.name);
     e.bool(record.spawns);
     e.ts(record.decision.at);
-    match &record.decision.fact {
+    let admission = match &record.decision.fact {
         ToolDecision::Refused(refusal) => {
             e.u8(1);
             e.u8(refusal.code());
+            None
         }
-        ToolDecision::Admitted(admission)
-        | ToolDecision::AwaitingApproval(admission)
-        | ToolDecision::AwaitingAnswer(admission) => {
-            e.u8(match record.decision.fact {
-                ToolDecision::Admitted(_) => 2,
-                ToolDecision::AwaitingApproval(_) => 3,
-                ToolDecision::AwaitingAnswer(_) => 4,
-                ToolDecision::Refused(_) => unreachable!(),
-            });
-            e.str(&admission.handler_version);
-            e.u8(admission.effect.code());
-            e.str(&admission.parameters);
-            e.str(admission.arguments.as_str());
-            e.u8(admission.authorization.code());
-        }
+        ToolDecision::Admitted(admission) => Some((2, admission)),
+        ToolDecision::AwaitingApproval(admission) => Some((3, admission)),
+        ToolDecision::AwaitingAnswer(admission) => Some((4, admission)),
+    };
+    if let Some((tag, admission)) = admission {
+        e.u8(tag);
+        e.str(&admission.handler_version);
+        e.u8(admission.effect.code());
+        e.str(&admission.parameters);
+        e.str(admission.arguments.as_str());
+        e.u8(admission.authorization.code());
     }
     e.opt(record.outcome.as_ref(), |e, outcome| {
         e.ts(outcome.at);

@@ -9,7 +9,7 @@ import { useI18n } from "../i18n";
 import { highlightCode } from "../markdown/markdown-pipeline";
 import type { ApiClient } from "../runtime/api-client";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { artifactTitle, fileArtifact, toolObject } from "./artifact-model";
+import { artifactHunks, artifactTitle, fileArtifact, toolObject } from "./artifact-model";
 import { CommandTool } from "./command-tool";
 import { SearchTool } from "./search-tool";
 import type { ToolCallMessagePartComponent } from "./tool-part";
@@ -224,28 +224,31 @@ export function WorkspaceTool(props: {
           );
         }
         const file = createMemo(() => fileArtifact(current()));
-        if (file()?.before !== undefined && file()!.after !== undefined) {
+        const hunks = createMemo(() => artifactHunks(file()));
+        if (hunks().length) {
           return (
             <div class="min-w-0" data-slot="workspace-file-diff">
               {file()!.excerpt && (
                 <p class="mb-2 text-xs text-muted-foreground">{i18n.t("chat.artifacts.excerpt")}</p>
               )}
               <div
-                class="ocg-subtle-scrollbar max-h-96 overflow-auto"
+                class="ocg-subtle-scrollbar max-h-96 space-y-3 overflow-auto"
                 tabindex={0}
                 role="region"
                 aria-label={path() ?? undefined}
               >
                 <Loading fallback={null}>
-                  <DiffViewer
-                    oldFile={{ name: path()!, content: file()!.before! }}
-                    newFile={{ name: path()!, content: file()!.after! }}
-                    viewMode="unified"
-                    size="sm"
-                    showLineNumbers={!file()!.excerpt}
-                    maxCollapsedLines={80}
-                    class="max-w-full rounded-lg"
-                  />
+                  {hunks().map((hunk) => (
+                    <DiffViewer
+                      oldFile={{ name: path()!, content: hunk.before }}
+                      newFile={{ name: path()!, content: hunk.after }}
+                      viewMode="unified"
+                      size="sm"
+                      showLineNumbers={!file()!.excerpt}
+                      maxCollapsedLines={80}
+                      class="max-w-full rounded-lg"
+                    />
+                  ))}
                 </Loading>
               </div>
             </div>

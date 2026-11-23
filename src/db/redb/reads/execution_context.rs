@@ -1051,9 +1051,11 @@ fn development_candidate_in(
         } else {
             read_awaiting_batch(rx, id, prior_outputs.last(), &mut selected_bytes)?
         };
-        let response_replay = if configuration.llm.provider.transport
-            == crate::db::entities::LlmTransport::OpenAiResponses
-            && matches!(&prior.job.frozen,
+        let response_replay = if matches!(
+            configuration.llm.provider.transport,
+            crate::db::entities::LlmTransport::OpenAiResponses
+                | crate::db::entities::LlmTransport::AnthropicMessages
+        ) && matches!(&prior.job.frozen,
                 Some(crate::db::entities::MutableFrozenConfiguration::Generative(previous))
                     if previous.llm.provider == configuration.llm.provider
                         && previous.llm.config.model == configuration.llm.config.model

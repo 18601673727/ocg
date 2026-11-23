@@ -208,6 +208,11 @@ const EXECUTOR_CAPABILITIES: {
     capability: { operation: "llm_request", protocol: "openai_responses" },
   },
   {
+    key: "anthropic_messages",
+    label: "Anthropic Messages",
+    capability: { operation: "llm_request", protocol: "anthropic_messages" },
+  },
+  {
     key: "decision",
     label: null,
     capability: { operation: "decision", protocol: null },

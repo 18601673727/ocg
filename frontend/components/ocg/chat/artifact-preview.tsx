@@ -4,7 +4,7 @@ import { DiffViewer } from "@/components/ui/diff-viewer";
 import type { ToolCall } from "../contracts";
 import { useI18n } from "../i18n";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { fileArtifact } from "./artifact-model";
+import { artifactHunks, fileArtifact } from "./artifact-model";
 
 export type Artifact = { id: string; title: string } & (
   | { job: string; call: ToolCall }
@@ -84,6 +84,7 @@ export function ArtifactPreview(props: { artifact: Artifact }) {
         if (needsRead() && (call()?.arguments_cut || call()?.result_cut))
           return <p role="status">{i18n.t("common.loading")}</p>;
         const file = createMemo(() => (call() ? fileArtifact(call()!) : null));
+        const hunks = createMemo(() => artifactHunks(file()));
         if (!file()) return <p>{i18n.t("chat.artifacts.unavailable")}</p>;
         if (file()!.patch !== undefined)
           return (
@@ -106,15 +107,19 @@ export function ArtifactPreview(props: { artifact: Artifact }) {
             {file()!.excerpt && (
               <p class="mb-2 text-xs text-muted-foreground">{i18n.t("chat.artifacts.excerpt")}</p>
             )}
-            {file()!.before !== undefined && file()!.after !== undefined ? (
-              <DiffViewer
-                oldFile={{ content: file()!.before!, name: file()!.path }}
-                newFile={{ content: file()!.after!, name: file()!.path }}
-                viewMode="split"
-                size="sm"
-                showLineNumbers={!file()!.excerpt}
-                class="max-w-full rounded-md"
-              />
+            {hunks().length ? (
+              <div class="space-y-3">
+                {hunks().map((hunk) => (
+                  <DiffViewer
+                    oldFile={{ content: hunk.before, name: file()!.path }}
+                    newFile={{ content: hunk.after, name: file()!.path }}
+                    viewMode="split"
+                    size="sm"
+                    showLineNumbers={!file()!.excerpt}
+                    class="max-w-full rounded-md"
+                  />
+                ))}
+              </div>
             ) : (
               <>
                 <p class="mb-2 break-all font-mono text-xs text-muted-foreground">{file()!.path}</p>

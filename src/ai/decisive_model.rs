@@ -48,7 +48,7 @@ async fn execute_native_with_sink(
         config,
         body,
         Some(sink),
-        false,
+        None,
     )
     .await?;
     let status = response.status();
@@ -640,7 +640,15 @@ pub(crate) async fn execute_decision_with_sink(
                 availability: observe::success_observation(&execution),
                 raw: execution.response_output.as_ref().map_or_else(
                     || json!({"text": execution.text, "response_items": []}),
-                    |output| json!({"output": output.items}),
+                    |output| match generative.llm.provider.transport {
+                        crate::db::entities::LlmTransport::AnthropicMessages => {
+                            super::providers::anthropic::assistant_content(&output.items)
+                        }
+                        crate::db::entities::LlmTransport::OpenAiChatCompletions
+                        | crate::db::entities::LlmTransport::OpenAiResponses => {
+                            json!({"output":output.items})
+                        }
+                    },
                 ),
                 result: Ok(result),
                 usage: execution.usage,

@@ -42,10 +42,13 @@ pub(crate) struct DevelopmentExecution {
 
 impl DevelopmentExecution {
     pub(crate) fn new(handoff: DevelopmentHandoff, conversation: Option<ChatConversation>) -> Self {
+        let transport = handoff
+            .generative_inputs()
+            .map(|(frozen, _, _)| frozen.llm.provider.transport);
         Self {
             handoff,
             conversation,
-            recorder: Mutex::new(RequestRecorder::default()),
+            recorder: Mutex::new(RequestRecorder::for_transport(transport)),
         }
     }
 
@@ -332,25 +335,25 @@ pub(crate) fn prepare_development_handoff(
                 ));
             }
             for turn in &snapshot.history {
-                let mut replay = turn
-                    .response_replay
-                    .iter()
-                    .map(|message| {
-                        if let Some(items) = message["output"]
-                            .as_array()
-                            .filter(|items| !items.is_empty())
-                        {
-                            return Ok(ChatMessage::responses(items.clone()));
-                        }
-                        if message["type"] == "function_call_output"
-                            && let (Some(call_id), Some(output)) =
-                                (message["call_id"].as_str(), message["output"].as_str())
-                        {
-                            return Ok(ChatMessage::tool(call_id, output));
-                        }
-                        Err(unavailable())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut replay = Vec::new();
+                for message in &turn.response_replay {
+                    if frozen.llm.provider.transport == entities::LlmTransport::AnthropicMessages {
+                        super::providers::anthropic::replay(message, &mut replay)
+                            .map_err(|_| unavailable())?;
+                    } else if let Some(items) = message["output"]
+                        .as_array()
+                        .filter(|items| !items.is_empty())
+                    {
+                        replay.push(ChatMessage::responses(items.clone()));
+                    } else if message["type"] == "function_call_output"
+                        && let (Some(id), Some(output)) =
+                            (message["call_id"].as_str(), message["output"].as_str())
+                    {
+                        replay.push(ChatMessage::tool(id, output));
+                    } else {
+                        return Err(unavailable());
+                    }
+                }
                 let mut answer = if turn
                     .record
                     .outcome
@@ -405,7 +408,7 @@ pub(crate) fn prepare_development_handoff(
                 ContextNotices::default(),
             )
             .ok_or_else(unavailable)?;
-            if !responses
+            if frozen.llm.provider.transport == entities::LlmTransport::OpenAiChatCompletions
                 && offer.is_none_or(|offer| offer.grant.is_none())
                 && let Some(project) = &snapshot.project
             {

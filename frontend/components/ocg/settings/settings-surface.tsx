@@ -757,9 +757,6 @@ export function SettingsSurface(props: {
                               {profile.credential_ref
                                 ? ` · ${i18n.t("settings.credentialRef", { ref: profile.credential_ref })}`
                                 : ""}
-                              {kind === "llm" && profile.protocol === "anthropic_messages"
-                                ? ` · ${i18n.t("settings.llm.executionUnavailable")}`
-                                : ""}
                             </p>
                             <div class="flex flex-wrap items-center gap-1.5 pt-0.5">
                               {profile.declared_capabilities.map((cap) => (

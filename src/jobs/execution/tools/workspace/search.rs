@@ -88,7 +88,7 @@ struct CodeSearch(lsp::WorkspaceCode);
 #[cfg(any(target_os = "linux", target_os = "android", target_vendor = "apple"))]
 impl ToolHandler for CodeSearch {
     fn version(&self) -> &str {
-        "workspace_code-1"
+        "workspace_code-2"
     }
 
     fn effect(&self) -> ToolEffect {
@@ -112,7 +112,7 @@ pub(crate) fn register_lsp(
         registry,
         lsp::TOOL_NAME,
         Some(
-            "Use workspace_code before reading files. Read symbols with body instead of whole files, and batch every question you already have into one call (up to 8 queries). find returns definitions/signatures by Name, Type::name or prefix*; refs returns identifier uses, optionally kind=call/type/import; body takes name or path+line, signature=true includes docs and signature; outline takes a file/folder (depth 2); errors takes path or path=changed since this Job's previous call. Every query supports a path prefix. Compact text shares max_bytes (default 6144, capped at the Job's 16 KiB result limit). Rust, TypeScript/TSX and Python only. Results are by name, not by type: macros, trait dispatch, aliases and runtime attributes may be unresolved, so confirm renames/deletions with cargo check or tests.",
+            "Use workspace_code before reading files. Read symbols with body instead of whole files, and batch every question you already have into one call (up to 8 queries). find returns definitions/signatures by Name, Type::name or prefix*; refs returns identifier uses, optionally kind=call/type/import; body takes name or path+line, signature=true includes docs and signature; outline takes a file/folder (depth 2); errors takes path or path=changed since this Job's previous call. Every query supports a path prefix. Compact text shares max_bytes (default 6144, capped at the Job's 16 KiB result limit). Supports Rust, JavaScript/JSX, TypeScript/TSX and Python. Results are by name, not by type: macros, trait dispatch, aliases and runtime attributes may be unresolved, so confirm renames/deletions with cargo check or tests.",
         ),
         lsp::parameters(),
         Arc::new(CodeSearch(code)),

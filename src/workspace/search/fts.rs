@@ -1556,3 +1556,109 @@ pub(crate) fn run_call(
         Instant::now() + fts.limits.query_time,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{fs, path::PathBuf};
+
+    struct Corpus {
+        index: WorkspaceFts,
+        directory: PathBuf,
+    }
+
+    impl Corpus {
+        fn new(files: &[(&str, &str)]) -> Self {
+            let directory = std::env::temp_dir().join(format!("ocg-fts-{}", uuid::Uuid::now_v7()));
+            let root = directory.join("workspace");
+            let data = directory.join("data");
+            fs::create_dir(&directory).unwrap();
+            fs::create_dir(&root).unwrap();
+            fs::create_dir(&data).unwrap();
+            let corpus = Self {
+                index: WorkspaceFts::new(
+                    Workspace::authorize(&root, &data).unwrap(),
+                    FtsLimits::default(),
+                ),
+                directory,
+            };
+            for (name, text) in files {
+                fs::write(root.join(name), text).unwrap();
+            }
+            corpus.index.build().unwrap();
+            corpus
+        }
+
+        fn hits(&self, query: &str) -> Vec<Value> {
+            self.index.search(query, 16).unwrap()["results"]
+                .as_array()
+                .unwrap()
+                .clone()
+        }
+    }
+
+    impl Drop for Corpus {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
+
+    #[test]
+    fn bm25_intersects_rare_terms_and_orders_ties_by_path() {
+        let corpus = Corpus::new(&[
+            ("z.txt", "common rare filler"),
+            ("common.txt", "common common common"),
+            ("dense.txt", "common rare rare"),
+            ("a.txt", "common rare filler"),
+        ]);
+        let hits = corpus.hits("common rare");
+        assert_eq!(
+            hits.iter()
+                .map(|hit| hit["path"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["dense.txt", "a.txt", "z.txt"]
+        );
+        assert!(hits[0]["score"].as_f64().unwrap() > hits[1]["score"].as_f64().unwrap());
+        assert_eq!(hits[1]["score"], hits[2]["score"]);
+        corpus.index.rebuild().unwrap();
+        assert_eq!(corpus.hits("rare common"), hits);
+    }
+
+    #[test]
+    fn phrase_with_rare_middle_term_requires_both_adjacent_positions() {
+        let corpus = Corpus::new(&[
+            ("adjacent.txt", "rare right left left rare right right"),
+            ("separate.txt", "left left rare filler right right"),
+            ("reversed.txt", "rare right left left right"),
+        ]);
+        let hits = corpus.hits("\"left rare right\"");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "adjacent.txt");
+        assert_eq!(hits[0]["offset"], "rare right left ".len());
+    }
+
+    #[test]
+    fn offsets_and_clipped_excerpts_use_utf8_byte_boundaries() {
+        let prefix = "界".repeat(73);
+        let line = format!("{prefix} needle {}", "é".repeat(120));
+        let text = format!("intro\r\n{line}\r\nshort needle\r\n");
+        let corpus = Corpus::new(&[("unicode.txt", &text)]);
+        let hits = corpus.hits("needle");
+        assert_eq!(hits.len(), 2);
+        let long = &hits[0];
+        assert_eq!(long["line"], 2);
+        let offset = long["offset"].as_u64().unwrap() as usize;
+        assert_eq!(offset, prefix.len() + 1);
+        let start = long["excerpt_offset"].as_u64().unwrap() as usize;
+        let excerpt = long["excerpt"].as_str().unwrap();
+        assert!(start > 0 && excerpt.len() <= MAX_EXCERPT_BYTES);
+        assert_eq!(&line[start..start + excerpt.len()], excerpt);
+        assert!(excerpt[offset - start..].starts_with("needle"));
+        assert_eq!(long["excerpt_truncated"], true);
+        assert_eq!(hits[1]["line"], 3);
+        assert_eq!(hits[1]["offset"], 6);
+        assert_eq!(hits[1]["excerpt"], "short needle");
+        assert_eq!(hits[1]["excerpt_offset"], 0);
+        assert_eq!(hits[1]["excerpt_truncated"], false);
+    }
+}

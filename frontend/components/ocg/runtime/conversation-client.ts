@@ -1,277 +1,35 @@
-import {
-  jobTranscript,
-  type PartialToolBoundary,
-  TranscriptAccumulator,
-  type TranscriptTurn,
-} from "../chat/job-transcript-model";
 import type {
   ChatImage,
   ChatImageUploadRequest,
   ChatModelSelection,
-  Conversation,
   ConversationTurn,
-  Job,
-  JobDetails,
   Output,
-  ProviderResponse,
-  ToolCall,
 } from "../contracts";
-import { ContractError } from "../contracts";
 import type * as Api from "../contracts/api";
-import { fileSnapshots } from "../markdown/file-snapshot";
-import type { ChatMessage, ChatSession, OcgRuntimeEvent } from "../types";
-import {
-  type ApiClient,
-  type JobStreamSubscription,
-  readOutputWindow,
-  readTranscriptEvidence,
-} from "./api-client";
+import type { ChatSession, OcgRuntimeEvent } from "../types";
+import { type ApiClient, readOutputWindow, readTranscriptEvidence } from "./api-client";
+import { TurnProjection } from "./conversation/projection";
+import { PublishScheduler } from "./conversation/publish-scheduler";
+import { TURN_PAGE_SIZE, type Turn, turnAttachments, turnCanRetry } from "./conversation/turn";
+import { applyTranscriptEvidence, TurnReader } from "./conversation/turn-reader";
+import { TurnStreams } from "./conversation/turn-stream";
 import { pageTurns } from "./history-page";
-import { nativeExecutionStatus, reconcileJob, taskPlanActive } from "./job-status";
-import {
-  mergeOutputHistory,
-  type OutputHistory,
-  type OutputSequence,
-  type OutputView,
-} from "./output-history";
+import { reconcileJob } from "./job-status";
+import { mergeOutputHistory } from "./output-history";
 import { RuntimeClientBase } from "./runtime-client-base";
 import type { CreateSessionInput, HideSessionOutcome } from "./runtime-types";
 
-const TURN_PAGE_SIZE = 20;
-const CATALOG_REFRESH_DELAY_MS = 750;
-const MAX_RECOVERY_DELAY_MS = 10_000;
-const TOOL_TIME_CACHE_LIMIT = 128;
-const TOOL_TIME_BATCH_SIZE = 4;
 const ARCHIVE_STOP_TIMEOUT_MS = 15_000;
-
-function reuseEvidence<T>(previous: T[], next: T[] | null | undefined): T[] {
-  if (!next || next === previous) return previous;
-  return JSON.stringify(previous) === JSON.stringify(next) ? previous : next;
-}
-
-class ToolTimeGate {
-  private active = 0;
-  private wake: () => void = () => {};
-  private changed = new Promise<void>((resolve) => {
-    this.wake = resolve;
-  });
-
-  async read<T>(signal: AbortSignal, operation: () => Promise<T>): Promise<T> {
-    while (this.active >= TOOL_TIME_BATCH_SIZE) {
-      signal.throwIfAborted();
-      await new Promise<void>((resolve, reject) => {
-        const abort = () => reject(signal.reason);
-        signal.addEventListener("abort", abort, { once: true });
-        this.changed.then(() => {
-          signal.removeEventListener("abort", abort);
-          resolve();
-        });
-        if (signal.aborted) abort();
-      });
-    }
-    signal.throwIfAborted();
-    this.active++;
-    try {
-      return await operation();
-    } finally {
-      this.active--;
-      const wake = this.wake;
-      this.changed = new Promise<void>((resolve) => {
-        this.wake = resolve;
-      });
-      wake();
-    }
-  }
-}
-
-function rememberToolTime(times: Map<number, number>, request: number, at: number) {
-  if (!times.has(request) && times.size >= TOOL_TIME_CACHE_LIMIT) {
-    const oldest = Math.min(...times.keys());
-    if (request <= oldest) return;
-    times.delete(oldest);
-  }
-  times.set(request, at);
-}
-
-async function readMissingOutputs(
-  api: ApiClient,
-  job: string,
-  after: number,
-  through: number,
-  signal: AbortSignal,
-): Promise<Output[]> {
-  const outputs: Output[] = [];
-  while (after < through) {
-    const page = await api.readOutputs(job, { afterSeq: after, limit: 100, signal });
-    signal.throwIfAborted();
-    const next = page.outputs.filter((output) => output.seq <= through);
-    for (const output of next) {
-      if (output.seq !== after + 1) throw new Error("Stored output sequence has a gap.");
-      outputs.push(output);
-      after = output.seq;
-    }
-    if (!next.length || (!page.has_more && after < through))
-      throw new Error("Stored output sequence could not be fully reconciled.");
-  }
-  return outputs;
-}
-
-async function readPartialToolBoundaries(
-  api: ApiClient,
-  job: string,
-  tools: readonly ToolCall[],
-  outputs: OutputSequence,
-  signal: AbortSignal,
-  times: Map<number, number>,
-  responses: readonly ProviderResponse[],
-  gate: ToolTimeGate,
-): Promise<PartialToolBoundary[] | null> {
-  const first = outputs.at(0)?.created_at_us;
-  if (!tools.length || first === undefined) return null;
-  try {
-    const requests = [...new Set(tools.map((call) => call.request))].sort((a, b) => b - a);
-    const boundaries: PartialToolBoundary[] = [];
-    const recorded = new Map(
-      responses
-        .filter((response) => response.requests_tools)
-        .map((response) => [response.request, response.created_at_us]),
-    );
-    for (let offset = 0; offset < requests.length; ) {
-      const count = offset === 0 ? 1 : TOOL_TIME_BATCH_SIZE;
-      let batch = requests.slice(offset, offset + count);
-      const knownBoundary = batch.findIndex((request) => {
-        const at = recorded.get(request) ?? times.get(request);
-        return at !== undefined && at < first;
-      });
-      if (knownBoundary >= 0) batch = batch.slice(0, knownBoundary + 1);
-      const controller = new AbortController();
-      const abort = () => controller.abort();
-      signal.addEventListener("abort", abort, { once: true });
-      if (signal.aborted) abort();
-      try {
-        const values = batch.map((request) => {
-          const known = recorded.get(request) ?? times.get(request);
-          return Promise.resolve(
-            known === undefined
-              ? gate.read(controller.signal, () =>
-                  api.readToolResponseTime(job, request, controller.signal),
-                )
-              : known,
-          ).then(
-            (value) => ({ value }),
-            (error: unknown) => ({ error }),
-          );
-        });
-        for (let i = 0; i < batch.length; i++) {
-          const result = await values[i];
-          signal.throwIfAborted();
-          if ("error" in result) throw result.error;
-          const at = result.value;
-          if (at === null) return null;
-          const request = batch[i];
-          rememberToolTime(times, request, at);
-          boundaries.push({ request, at });
-          if (at < first) return boundaries.reverse();
-        }
-      } finally {
-        controller.abort();
-        signal.removeEventListener("abort", abort);
-      }
-      offset += batch.length;
-    }
-    return boundaries.reverse();
-  } catch {
-    signal.throwIfAborted();
-    return null;
-  }
-}
-
-type Turn = {
-  content_kind?: ConversationTurn["content_kind"];
-  native_decision?: ConversationTurn["native_decision"];
-  planning_target?: ConversationTurn["planning_target"];
-  compaction?: ConversationTurn["compaction"];
-  details?: JobDetails;
-  entries?: ConversationTurn["entries"];
-  sessionId: string;
-  job: Job;
-  input: ConversationTurn["input"];
-  outputs: OutputHistory;
-  outputRevision?: number;
-  evidenceRevision: number;
-  tools: ToolCall[];
-  responses: ProviderResponse[];
-  partialToolBoundaries?: PartialToolBoundary[] | null;
-  partialToolTimes?: ReadonlyMap<number, number>;
-  error?: string;
-  toolError?: string;
-  unknownReason?: string | null;
-};
-
-function needsWatch(turn: Turn): boolean {
-  return (
-    turn.job.settlement.state === "unsettled" ||
-    (turn.job.settlement.state === "unknown" &&
-      (Boolean(turn.native_decision) ||
-        (turn.details?.allocation?.holds_capacity ?? turn.job.stop_confirmed_at_us === null))) ||
-    taskPlanActive(turn.details?.task_plan)
-  );
-}
-
-function turnCanRetry(turn: Turn): boolean {
-  if (turn.content_kind !== "generative" || turn.native_decision || !turn.details) return false;
-  if (turn.details.allocation?.holds_capacity) return false;
-  switch (turn.job.settlement.state) {
-    case "failed":
-    case "cancelled":
-      return true;
-    case "unknown":
-    case "unsettled":
-    case "completed":
-      return false;
-  }
-}
-
-function* turnAttachments(turn: Turn): Iterable<string> {
-  yield* turn.input.attachments;
-  for (const entry of turn.entries ?? []) yield* entry.attachments;
-}
-
-type WatchPages = Map<string, Promise<Conversation>>;
-
-type PublicationWindow = {
-  dirty: boolean;
-  frame?: number;
-};
-
-type StreamEntry = {
-  subscription: JobStreamSubscription | null;
-  catalogChanged: (pages: WatchPages) => void;
-  stopped: boolean;
-  stop: () => void;
-};
 
 export class ConversationRuntimeClient extends RuntimeClientBase {
   private started = false;
   private disposed = false;
   private readonly lifetime = new AbortController();
-  private readonly toolTimeGate = new ToolTimeGate();
-  private readonly publicationWindows = new Map<string, PublicationWindow>();
   private readonly turns = new Map<string, Turn>();
-  private readonly projections = new WeakMap<
-    Turn,
-    {
-      outputs: OutputHistory;
-      length: number;
-      aggregate: TranscriptAccumulator;
-      arguments?: readonly unknown[];
-      transcript?: TranscriptTurn[];
-    }
-  >();
-  private readonly messageProjections = new WeakMap<
-    Turn,
-    { inputs: readonly unknown[]; messages: ChatMessage[] }
-  >();
+  private readonly reader: TurnReader;
+  private readonly projections: TurnProjection;
+  private readonly streams: TurnStreams;
+  private readonly publications = new PublishScheduler((id) => this.publishSnapshot(id));
   private readonly roots = new Map<string, string>();
   private listedRoots = new Set<string>();
   private readonly hiddenRoots = new Set<string>();
@@ -285,13 +43,16 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   private readonly loading = new Map<string, Promise<string>>();
   private readonly earlier = new Map<string, string | null>();
   private readonly loadingEarlier = new Map<string, Promise<void>>();
-  private readonly streams = new Map<string, StreamEntry>();
-  private unsubscribeWatchCatalog?: () => void;
   private conversationListLoaded = false;
   private unsubscribeConversations: (() => void) | null = null;
 
   constructor(readonly api: ApiClient) {
     super();
+    this.reader = new TurnReader(api, this.lifetime.signal);
+    this.projections = new TurnProjection(this.reader.images);
+    this.streams = new TurnStreams(this.reader, this.turns, this.publications, (job) =>
+      this.openConversation(job),
+    );
   }
 
   override subscribe(listener: (event: OcgRuntimeEvent) => void) {
@@ -444,7 +205,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   }
 
   private removeSession(sessionId: string) {
-    this.cancelPublication(sessionId);
+    this.publications.cancel(sessionId);
     this.emit({ type: "conversation.session-deleted", sessionId });
   }
 
@@ -460,13 +221,13 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     for (const [jobId, turn] of this.turns) {
       if (!shouldEvict(jobId, turn)) continue;
       for (const id of turnAttachments(turn)) attachments.add(id);
-      this.streams.get(jobId)?.stop();
+      this.streams.stop(jobId);
       this.turns.delete(jobId);
     }
     for (const turn of this.turns.values()) {
       for (const id of turnAttachments(turn)) attachments.delete(id);
     }
-    for (const id of attachments) this.images.delete(id);
+    for (const id of attachments) this.reader.images.delete(id);
   }
 
   private claimConversation(root: string, sessionId: string) {
@@ -483,7 +244,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       if (turn.sessionId === stray.id) turn.sessionId = sessionId;
     }
     this.removeSession(stray.id);
-    this.publish(sessionId);
+    this.publications.publish(sessionId);
   }
 
   async renameSession(sessionId: string, title: string): Promise<void> {
@@ -686,7 +447,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       conversation.turns.map(async (turn) => {
         const loaded = await this.readHistoryTurn(id, turn, isCurrent);
         if (!loaded || !isCurrent() || !this.historyTurnIsCurrent(loaded)) return;
-        for (const image of loaded.images) this.images.set(image.id, image);
+        for (const image of loaded.images) this.reader.images.set(image.id, image);
         this.turns.set(turn.job.id, loaded.state);
       }),
     );
@@ -720,8 +481,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         model: lastConfig?.model,
       },
     });
-    this.publish(id);
-    for (const turn of conversation.turns) this.watch(turn.job.id);
+    this.publications.publish(id);
+    for (const turn of conversation.turns) this.streams.watch(turn.job.id);
     return id;
   }
 
@@ -786,7 +547,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
               signal: this.lifetime.signal,
             });
             if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
-            this.applyTranscriptEvidence(partial, evidenceRevision, evidence, true);
+            applyTranscriptEvidence(partial, evidenceRevision, evidence, true);
           } else {
             if (partial.outputs.firstSeq !== previousFirstSeq) {
               partial.partialToolBoundaries = undefined;
@@ -795,16 +556,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
               const evidenceRevision = partial.evidenceRevision;
               const firstSeq = partial.outputs.firstSeq;
               const times = new Map(partial.partialToolTimes);
-              const boundaries = await readPartialToolBoundaries(
-                this.api,
-                partial.job.id,
-                partial.tools,
-                partial.outputs,
-                this.lifetime.signal,
-                times,
-                partial.responses,
-                this.toolTimeGate,
-              );
+              const boundaries = await this.reader.readPartialToolBoundaries(partial, times);
               if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
               if (
                 partial.evidenceRevision === evidenceRevision &&
@@ -815,7 +567,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
               }
             }
           }
-          this.publish(sessionId);
+          this.publications.publish(sessionId);
           return;
         }
         if (!cursor) return;
@@ -838,12 +590,12 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         if (!isCurrent()) return;
         for (const turn of loaded) {
           if (!turn || !this.historyTurnIsCurrent(turn)) continue;
-          for (const image of turn.images) this.images.set(image.id, image);
+          for (const image of turn.images) this.reader.images.set(image.id, image);
           this.turns.set(turn.state.job.id, turn.state);
-          this.watch(turn.state.job.id);
+          this.streams.watch(turn.state.job.id);
         }
         this.earlier.set(sessionId, next);
-        this.publish(sessionId);
+        this.publications.publish(sessionId);
       } catch (error) {
         if (isCurrent()) throw error;
       }
@@ -868,13 +620,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     let outputs = mergeOutputHistory(window);
     if (previous?.outputs.length && window.length) {
       const last = previous.outputs.lastSeq;
-      const gap = await readMissingOutputs(
-        this.api,
-        turn.job.id,
-        last,
-        window[0].seq - 1,
-        this.lifetime.signal,
-      );
+      const gap = await this.reader.readMissingOutputs(turn.job.id, last, window[0].seq - 1);
       outputs = mergeOutputHistory(previous.outputs, gap, window);
     }
     const complete = outputs.firstSeq === 1;
@@ -906,15 +652,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     };
     if (!complete && turn.job.settlement.state === "completed" && state.tools.length) {
       const times = new Map(previous?.partialToolTimes);
-      state.partialToolBoundaries = await readPartialToolBoundaries(
-        this.api,
-        turn.job.id,
-        state.tools,
-        outputs,
-        this.lifetime.signal,
+      state.partialToolBoundaries = await this.reader.readPartialToolBoundaries(
+        state,
         times,
         previous?.responses ?? [],
-        this.toolTimeGate,
       );
       state.partialToolTimes = times;
     }
@@ -924,33 +665,9 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         state.unknownReason = details.unknown_reason ?? null;
       state.job = reconcileJob(state.job, details);
     }
-    const images = await this.readImages(state);
+    const images = await this.reader.readImages(state);
     if (!isCurrent()) return null;
     return { state, images, previous, snapshot };
-  }
-
-  private applyTranscriptEvidence(
-    turn: Turn,
-    baseRevision: number,
-    evidence: Awaited<ReturnType<typeof readTranscriptEvidence>>,
-    readReplies: boolean,
-  ): boolean {
-    if (turn.evidenceRevision !== baseRevision) return false;
-    if (!readReplies && turn.outputs.firstSeq === 1) return false;
-    turn.evidenceRevision++;
-    const previousTools = turn.tools;
-    turn.tools = reuseEvidence(turn.tools, evidence.tools);
-    if (readReplies) {
-      turn.responses = reuseEvidence(turn.responses, evidence.responses);
-    }
-    turn.toolError = evidence.error;
-    if (turn.outputs.firstSeq === 1) {
-      turn.partialToolTimes = undefined;
-      turn.partialToolBoundaries = undefined;
-    } else if (turn.tools !== previousTools) {
-      turn.partialToolBoundaries = undefined;
-    }
-    return true;
   }
 
   private historyTurnIsCurrent(loaded: {
@@ -968,251 +685,6 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     );
   }
 
-  private readonly images = new Map<string, ChatImage>();
-  private projectTurn(turn: Turn): { transcript: TranscriptTurn[]; result: OutputView | null } {
-    let cached = this.projections.get(turn);
-    if (!cached || cached.outputs !== turn.outputs || cached.length > turn.outputs.length) {
-      cached = { outputs: turn.outputs, length: 0, aggregate: new TranscriptAccumulator() };
-      this.projections.set(turn, cached);
-    }
-    while (cached.length < turn.outputs.length) {
-      const output = turn.outputs.at(cached.length++);
-      if (!output) throw new Error("Stored output projection is incomplete.");
-      cached.aggregate.append(output);
-    }
-    const args = [
-      turn.outputs,
-      turn.outputs.length,
-      turn.job,
-      turn.input,
-      turn.entries,
-      turn.tools,
-      turn.responses,
-      turn.partialToolBoundaries,
-      turn.details?.mutable_phase,
-    ];
-    if (!cached.arguments || args.some((value, index) => value !== cached!.arguments![index])) {
-      const transcript = jobTranscript(
-        turn.job.id,
-        turn.entries && turn.entries.length > 0 ? null : turn.input.objective,
-        turn.outputs,
-        turn.job.settlement,
-        turn.job.settlement.state === "unsettled" && turn.job.started_at_us !== null,
-        undefined,
-        turn.tools,
-        turn.job.previous === null,
-        turn.responses,
-        turn.partialToolBoundaries,
-        cached.aggregate,
-      );
-      cached.transcript =
-        turn.details?.mutable_phase === "queued"
-          ? transcript.filter(
-              (message) =>
-                !(message.role === "assistant" && message.status === "pending" && !message.content),
-            )
-          : transcript;
-      cached.arguments = args;
-    }
-    return { transcript: cached.transcript ?? [], result: cached.aggregate.result };
-  }
-
-  private async readImages(turn: Turn) {
-    return Promise.all(
-      [...new Set(turnAttachments(turn))].map(async (id) => {
-        const cached = this.images.get(id);
-        if (cached) return cached;
-        const attachment = await this.api.readAttachment(id, this.lifetime.signal);
-        return {
-          id,
-          name: attachment.display_name ?? id,
-          media_type: attachment.mime,
-          url: this.api.attachmentContentUrl(id),
-        };
-      }),
-    );
-  }
-
-  private projectMessages(turn: Turn): ChatMessage[] {
-    if (turn.native_decision) {
-      const state = turn.job.settlement.state;
-      return [
-        {
-          id: `${turn.job.id}:decision`,
-          jobId: turn.job.id,
-          commandId: turn.job.id,
-          role: "assistant" as const,
-          content: "",
-          decision: turn.native_decision,
-          planningTarget: turn.planning_target,
-          failureReason: turn.unknownReason ?? undefined,
-          status: state === "unsettled" ? ("pending" as const) : state,
-          execution: nativeExecutionStatus(turn.job.execution_phase, turn.details),
-          createdAt: new Date(turn.job.created_at_us / 1000).toISOString(),
-        },
-      ];
-    }
-    const execution = nativeExecutionStatus(
-      turn.job.execution_phase,
-      turn.details,
-      turnCanRetry(turn),
-    );
-    const entries = turn.entries ?? [];
-    const queued =
-      turn.job.previous !== null &&
-      turn.job.started_at_us === null &&
-      turn.job.settlement.state === "unsettled";
-    const inputs: ChatMessage[] = entries.map((entry) => ({
-      execution,
-      queued,
-      id: `${turn.job.id}:entry:${entry.seq}`,
-      jobId: turn.job.id,
-      commandId: turn.job.id,
-      role: "user",
-      content: entry.text ?? "",
-      status: "completed",
-      createdAt: new Date(entry.at_us / 1000).toISOString(),
-      images: entry.attachments.flatMap((id) => this.images.get(id) ?? []),
-    }));
-    const boundary: ChatMessage[] = turn.compaction
-      ? [
-          {
-            id: `${turn.job.id}:compaction`,
-            jobId: turn.job.id,
-            commandId: turn.job.id,
-            role: "assistant",
-            content: "",
-            status: "completed",
-            intermediate: true,
-            createdAt: new Date(turn.compaction.at_us / 1000).toISOString(),
-            compaction: turn.compaction,
-          },
-        ]
-      : [];
-    const projected = this.projectTurn(turn);
-    const transcript = projected.transcript;
-    return [
-      ...boundary,
-      ...inputs,
-      ...transcript.map((message) => ({
-        id: message.id,
-        jobId: turn.job.id,
-        commandId: turn.job.id,
-        role: message.role,
-        content: message.content,
-        status: message.status,
-        intermediate: message.intermediate,
-        activity: turn.details?.activity,
-        taskPlan: turn.details?.task_plan,
-        execution,
-        createdAt: new Date((message.createdAtUs ?? turn.job.created_at_us) / 1000).toISOString(),
-        ...(message.role === "user"
-          ? { images: turn.input.attachments.flatMap((id) => this.images.get(id) ?? []) }
-          : {
-              toolCalls: [...(message.tools ?? [])],
-              reasoning: message.reasoning,
-              sourceSnapshots: message.intermediate
-                ? undefined
-                : fileSnapshots(projected.result?.value),
-              reasoningDurationMs: message.reasoningDurationMs,
-              failureReason: message.intermediate
-                ? undefined
-                : (turn.error ??
-                  turn.toolError ??
-                  message.detail ??
-                  (message.status === "unknown"
-                    ? (turn.details?.allocation?.holds_capacity
-                        ? "Execution outcome uncertain; ownership is held and capacity is not released."
-                        : turn.job.stop_confirmed_at_us === null
-                          ? "Outcome unknown; stop is not yet confirmed."
-                          : "Execution stopped; final outcome unknown.") +
-                      (turn.unknownReason ? ` ${turn.unknownReason}` : "")
-                    : undefined)),
-              failureAt:
-                !message.intermediate &&
-                !turn.error &&
-                !turn.toolError &&
-                message.status !== "completed" &&
-                message.status !== "streaming" &&
-                message.status !== "pending" &&
-                turn.job.settlement.settled_at_us !== null
-                  ? turn.job.settlement.settled_at_us / 1000
-                  : undefined,
-            }),
-      })),
-    ];
-  }
-
-  private messagesForTurn(turn: Turn): ChatMessage[] {
-    // OutputHistory grows in place, so its length is part of the projection inputs.
-    const inputs = [
-      turn.job,
-      turn.input,
-      turn.details,
-      turn.entries,
-      turn.outputs,
-      turn.outputs.length,
-      turn.tools,
-      turn.responses,
-      turn.partialToolBoundaries,
-      turn.compaction,
-      turn.content_kind,
-      turn.native_decision,
-      turn.planning_target,
-      turn.error,
-      turn.toolError,
-      turn.unknownReason,
-      ...Array.from(turnAttachments(turn), (id) => this.images.get(id)),
-    ];
-    const cached = this.messageProjections.get(turn);
-    if (
-      cached &&
-      cached.inputs.length === inputs.length &&
-      inputs.every((input, index) => input === cached.inputs[index])
-    ) {
-      return cached.messages;
-    }
-    const messages = this.projectMessages(turn);
-    this.messageProjections.set(turn, { inputs, messages });
-    return messages;
-  }
-
-  private schedulePublication(sessionId: string) {
-    if (this.disposed) return;
-    const active = this.publicationWindows.get(sessionId);
-    if (active) {
-      active.dirty = true;
-      return;
-    }
-    const window: PublicationWindow = { dirty: false };
-    this.publicationWindows.set(sessionId, window);
-    const nextFrame = () => {
-      if (this.publicationWindows.get(sessionId) !== window) return;
-      this.publicationWindows.delete(sessionId);
-      if (window.dirty) this.schedulePublication(sessionId);
-    };
-    // Arm this session's next frame before publishing to synchronous listeners.
-    if (typeof requestAnimationFrame === "function") {
-      window.frame = requestAnimationFrame(nextFrame);
-    } else {
-      queueMicrotask(nextFrame);
-    }
-    this.publishSnapshot(sessionId);
-  }
-
-  private cancelPublication(sessionId: string): boolean {
-    const active = this.publicationWindows.get(sessionId);
-    if (!active) return false;
-    this.publicationWindows.delete(sessionId);
-    if (active.frame !== undefined) cancelAnimationFrame(active.frame);
-    return active.dirty;
-  }
-
-  private publish(sessionId: string) {
-    this.cancelPublication(sessionId);
-    if (!this.disposed) this.publishSnapshot(sessionId);
-  }
-
   private publishSnapshot(sessionId: string) {
     if (!this.getSnapshot().sessions.some((session) => session.id === sessionId)) return;
     const turns = [...this.turns.values()]
@@ -1223,7 +695,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
             (b.input.submitted_at_us ?? b.job.created_at_us) ||
           (a.job.id < b.job.id ? -1 : a.job.id > b.job.id ? 1 : 0),
       );
-    const messages = turns.flatMap((turn) => this.messagesForTurn(turn));
+    const messages = turns.flatMap((turn) => this.projections.messagesForTurn(turn));
     this.emit({ type: "conversation.history-loaded", sessionId, messages });
     // A listener may have disposed the client, removed this session, or published newer history.
     if (this.disposed || this.getSnapshot().messagesBySession[sessionId] !== messages) return;
@@ -1236,7 +708,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           id: `${turn.job.id}:entry:${entry.seq}`,
           input: {
             content: entry.text ?? "",
-            images: entry.attachments.flatMap((id) => this.images.get(id) ?? []),
+            images: entry.attachments.flatMap((id) => this.reader.images.get(id) ?? []),
             mode: "queue" as const,
           },
         })),
@@ -1271,309 +743,6 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     this.emit({ type: "conversation.queue-updated", sessionId, queue, paused: false });
   }
 
-  private readWatchPage(conversation: string, pages?: WatchPages) {
-    const cached = pages?.get(conversation);
-    if (cached) return cached;
-    const page = this.api.readConversationTurns(
-      conversation,
-      undefined,
-      TURN_PAGE_SIZE,
-      this.lifetime.signal,
-    );
-    pages?.set(conversation, page);
-    return page;
-  }
-
-  private subscribeWatchCatalog() {
-    this.unsubscribeWatchCatalog ??= this.api.subscribeCatalog(
-      () => {
-        const pages: WatchPages = new Map();
-        for (const stream of this.streams.values()) stream.catalogChanged(pages);
-      },
-      (error) => {
-        for (const job of this.streams.keys()) {
-          const turn = this.turns.get(job);
-          if (!turn) continue;
-          turn.error = `Catalog subscription unavailable: ${error instanceof Error ? error.message : String(error)}`;
-          this.publish(turn.sessionId);
-        }
-      },
-    );
-  }
-
-  private watch(jobId: string) {
-    const turn = this.turns.get(jobId);
-    if (!turn || this.streams.has(jobId) || this.disposed) return;
-    if (!needsWatch(turn)) return;
-    const entry: StreamEntry = {
-      subscription: null,
-      catalogChanged: (pages) => {
-        pendingPages = pages;
-        scheduleCatalogTick();
-      },
-      stopped: false,
-      stop: () => {},
-    };
-    let pendingPages: WatchPages | undefined;
-    let inFlight = false;
-    let queued = false;
-    let catalogDirty = false;
-    let catalogTimer: ReturnType<typeof setTimeout> | undefined;
-    let needsReplay = false;
-    let replayThrough = 0;
-    let recoveryDelay = CATALOG_REFRESH_DELAY_MS;
-    let recoveryAfter = 0;
-    let loadedContinuation = false;
-    const finish = () => {
-      entry.stopped = true;
-      if (catalogTimer !== undefined) clearTimeout(catalogTimer);
-      entry.subscription?.close();
-      if (this.streams.get(jobId) === entry) this.streams.delete(jobId);
-      if (!this.streams.size) {
-        this.unsubscribeWatchCatalog?.();
-        this.unsubscribeWatchCatalog = undefined;
-      }
-    };
-    entry.stop = finish;
-    const requestTick = () => {
-      if (entry.stopped || this.disposed) return;
-      if (Date.now() < recoveryAfter) {
-        scheduleCatalogTick();
-        return;
-      }
-      if (inFlight) {
-        queued = true;
-        return;
-      }
-      void tick();
-    };
-    const scheduleCatalogTick = () => {
-      catalogDirty = true;
-      if (entry.stopped || this.disposed || inFlight || catalogTimer !== undefined) return;
-      catalogTimer = setTimeout(
-        () => {
-          catalogTimer = undefined;
-          if (inFlight) return;
-          catalogDirty = false;
-          requestTick();
-        },
-        recoveryAfter > Date.now() ? recoveryAfter - Date.now() : CATALOG_REFRESH_DELAY_MS,
-      );
-    };
-    const tick = async () => {
-      if (inFlight || entry.stopped || this.disposed) return;
-      inFlight = true;
-      try {
-        if (this.cancelPublication(turn.sessionId)) {
-          this.publishSnapshot(turn.sessionId);
-          if (entry.stopped || this.disposed) return;
-        }
-        const pages = pendingPages;
-        pendingPages = undefined;
-        const conversation = turn.job.conversation;
-        const page = conversation ? await this.readWatchPage(conversation, pages) : undefined;
-        if (entry.stopped || this.disposed) return;
-        const stored = page?.turns.find((item) => item.job.id === jobId);
-        const details =
-          pages &&
-          !recoveryAfter &&
-          !needsReplay &&
-          turn.details?.mutable_phase === "queued" &&
-          stored?.job.execution_phase === "queued" &&
-          stored.job.event_seq === turn.details.event_seq
-            ? turn.details
-            : await this.api.readJobDetails(jobId, this.lifetime.signal);
-        const readReplies = turn.outputs.firstSeq === 1;
-        const evidenceRevision = turn.evidenceRevision;
-        const evidence =
-          turn.native_decision || details.mutable_phase === "queued"
-            ? null
-            : await readTranscriptEvidence(this.api, jobId, {
-                signal: this.lifetime.signal,
-                previous: turn.responses,
-                settled:
-                  readReplies &&
-                  details.settlement.state !== "unsettled" &&
-                  details.settlement.state !== "unknown",
-                readReplies,
-              });
-        if (entry.stopped || this.disposed) return;
-        if (stored) {
-          turn.content_kind = stored.content_kind;
-          turn.native_decision = stored.native_decision;
-          turn.planning_target = stored.planning_target;
-          turn.entries = stored.entries;
-          turn.compaction = stored.compaction;
-          turn.input = stored.input;
-          const images = await this.readImages(turn);
-          if (entry.stopped || this.disposed) return;
-          const attachments = new Set(turnAttachments(turn));
-          for (const image of images) {
-            if (attachments.has(image.id)) this.images.set(image.id, image);
-          }
-        }
-        if (entry.stopped || this.disposed) return;
-        turn.job = reconcileJob(turn.job, details);
-        if (turn.job === details) {
-          turn.details = details;
-          turn.unknownReason = details.unknown_reason;
-        }
-        const last = turn.outputs.lastSeq;
-        const through = Math.max(
-          details.activity.last_output_seq,
-          details.result?.seq ?? 0,
-          replayThrough,
-        );
-        if (through > last) {
-          let missing: Output[];
-          try {
-            missing = await readMissingOutputs(
-              this.api,
-              jobId,
-              last,
-              through,
-              this.lifetime.signal,
-            );
-          } catch (error) {
-            needsReplay = true;
-            replayThrough = Math.max(replayThrough, through);
-            entry.subscription?.close();
-            throw error;
-          }
-          if (entry.stopped || this.disposed) return;
-          for (const output of missing) {
-            if (output.seq <= turn.outputs.lastSeq) continue;
-            turn.outputs.append(output);
-            turn.outputRevision = (turn.outputRevision ?? 0) + 1;
-          }
-        }
-        const evidenceApplied =
-          evidence && this.applyTranscriptEvidence(turn, evidenceRevision, evidence, readReplies);
-        if (
-          turn.outputs.firstSeq > 1 &&
-          details.settlement.state === "completed" &&
-          turn.tools.length &&
-          turn.partialToolBoundaries == null
-        ) {
-          const boundaryRevision = turn.evidenceRevision;
-          const firstSeq = turn.outputs.firstSeq;
-          const times = new Map(turn.partialToolTimes);
-          const boundaries = await readPartialToolBoundaries(
-            this.api,
-            jobId,
-            turn.tools,
-            turn.outputs,
-            this.lifetime.signal,
-            times,
-            turn.responses,
-            this.toolTimeGate,
-          );
-          if (entry.stopped || this.disposed) return;
-          if (turn.evidenceRevision === boundaryRevision && turn.outputs.firstSeq === firstSeq) {
-            turn.partialToolTimes = times;
-            turn.partialToolBoundaries = boundaries;
-          }
-        }
-        turn.error = undefined;
-        this.publish(turn.sessionId);
-        if (details.task_plan && !loadedContinuation) {
-          loadedContinuation = true;
-          await this.openConversation(details.task_plan.continuation);
-          if (entry.stopped || this.disposed) return;
-        }
-        const active = needsWatch(turn);
-        recoveryAfter = 0;
-        recoveryDelay = CATALOG_REFRESH_DELAY_MS;
-        if (active && details.mutable_phase !== "queued" && (needsReplay || !entry.subscription)) {
-          needsReplay = false;
-          replayThrough = 0;
-          connect();
-        }
-        const evidenceCurrent =
-          evidence === null ||
-          (evidenceApplied &&
-            turn.evidenceRevision === evidenceRevision + 1 &&
-            (readReplies || turn.outputs.firstSeq > 1));
-        if (!evidenceCurrent) {
-          queued = true;
-        } else if (!active) {
-          finish();
-        }
-      } catch (error) {
-        if (!this.disposed && !entry.stopped) {
-          recoveryAfter = Date.now() + recoveryDelay;
-          recoveryDelay = Math.min(recoveryDelay * 2, MAX_RECOVERY_DELAY_MS);
-          turn.error = `Status refresh unavailable: ${error instanceof Error ? error.message : String(error)}. Displayed state may be stale.${needsReplay ? " Reload to retry now." : ""}`;
-          this.publish(turn.sessionId);
-        }
-      } finally {
-        inFlight = false;
-        if (queued) {
-          queued = false;
-          requestTick();
-        } else if (catalogDirty || needsReplay || recoveryAfter) scheduleCatalogTick();
-      }
-    };
-    this.streams.set(jobId, entry);
-    const connect = () => {
-      const subscription = this.api.subscribeJobEvents(
-        jobId,
-        (event) => {
-          if (this.disposed || entry.stopped) return;
-          if (event.type === "heartbeat") return;
-          if (event.type === "job") turn.job = reconcileJob(turn.job, event.job);
-          if (event.type === "output") {
-            if (event.output.seq <= turn.outputs.lastSeq) return;
-            if (event.output.seq !== turn.outputs.lastSeq + 1) {
-              replayThrough = Math.max(replayThrough, event.output.seq);
-              throw new ContractError("output.seq", "the next stored sequence without a gap");
-            }
-            turn.outputs.append(event.output);
-            turn.outputRevision = (turn.outputRevision ?? 0) + 1;
-            this.schedulePublication(turn.sessionId);
-            return;
-          }
-          if (event.type === "settlement") {
-            turn.job = reconcileJob(turn.job, {
-              ...turn.job,
-              event_seq: event.event_seq,
-              settlement: event.settlement,
-              stop_confirmed_at_us: event.stop_confirmed_at_us,
-            });
-          }
-          if (event.type === "stream_error")
-            turn.error = `${event.error.code}: ${event.error.message}`;
-          this.publish(turn.sessionId);
-          requestTick();
-        },
-        {
-          signal: this.lifetime.signal,
-          afterSeq: turn.outputs.lastSeq,
-          onReconnect: (error) => {
-            if (this.disposed || entry.stopped) return;
-            turn.error = `Reconnecting: ${error.code}`;
-            this.publish(turn.sessionId);
-            requestTick();
-          },
-        },
-      );
-      entry.subscription = subscription;
-      void subscription.closed.then(requestTick).catch((error) => {
-        if (this.disposed || entry.stopped) return;
-        turn.error = `Stream unavailable: ${error instanceof Error ? error.message : String(error)}. Recovering stored status.`;
-        this.publish(turn.sessionId);
-        if (error instanceof ContractError && error.path === "output.seq") {
-          needsReplay = true;
-          scheduleCatalogTick();
-        }
-      });
-    };
-    // Queued turns share the catalog subscription until they have output to stream.
-    if (turn.details?.mutable_phase !== "queued") connect();
-    this.subscribeWatchCatalog();
-    void tick();
-  }
-
   private async trackTurn(sessionId: string, job: string) {
     const previous = this.turns.get(job);
     const snapshot = previous ? { ...previous } : undefined;
@@ -1596,12 +765,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         : (await readOutputWindow(this.api, job, { signal: this.lifetime.signal })).outputs;
     let outputs = mergeOutputHistory(window);
     if (previous?.outputs.length && window.length) {
-      const gap = await readMissingOutputs(
-        this.api,
+      const gap = await this.reader.readMissingOutputs(
         job,
         previous.outputs.lastSeq,
         window[0].seq - 1,
-        this.lifetime.signal,
       );
       outputs = mergeOutputHistory(previous.outputs, gap, window);
     }
@@ -1630,15 +797,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     };
     if (outputs.firstSeq > 1 && record.settlement.state === "completed" && turn.tools.length) {
       const times = new Map(previous?.partialToolTimes);
-      turn.partialToolBoundaries = await readPartialToolBoundaries(
-        this.api,
-        job,
-        turn.tools,
-        outputs,
-        this.lifetime.signal,
+      turn.partialToolBoundaries = await this.reader.readPartialToolBoundaries(
+        turn,
         times,
         previous?.responses ?? [],
-        this.toolTimeGate,
       );
       turn.partialToolTimes = times;
     }
@@ -1655,8 +817,8 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       if (current) turn.job = reconcileJob(current.job, turn.job);
       this.turns.set(job, turn);
     }
-    this.publish(sessionId);
-    this.watch(job);
+    this.publications.publish(sessionId);
+    this.streams.watch(job);
   }
 
   override async retryMessage(sessionId: string, messageId: string): Promise<void> {
@@ -1726,7 +888,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
                 : stop.request === "already_requested"
                   ? "A stop was already requested; the execution is not confirmed stopped."
                   : "Stop requested; the execution is not confirmed stopped.";
-          this.publish(sessionId);
+          this.publications.publish(sessionId);
         }
       } finally {
         this.stopping.delete(sessionId);
@@ -1743,26 +905,23 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         result.status === "requested"
           ? "Stop requested; awaiting the host's settlement."
           : "The host reports this turn already settled.";
-      this.publish(sessionId);
+      this.publications.publish(sessionId);
     }
   }
 
   override dispose() {
     if (this.disposed) return;
     this.disposed = true;
-    for (const id of this.publicationWindows.keys()) this.cancelPublication(id);
+    this.publications.dispose();
     this.lifetime.abort();
     this.api.close();
     if (this.unsubscribeConversations) {
       this.unsubscribeConversations();
       this.unsubscribeConversations = null;
     }
-    for (const entry of this.streams.values()) {
-      entry.stop();
-    }
-    this.streams.clear();
+    this.streams.close();
     this.turns.clear();
-    this.images.clear();
+    this.reader.images.clear();
     super.dispose();
   }
 }

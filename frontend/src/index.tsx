@@ -44,17 +44,33 @@ function App() {
   });
 
   const initial = new AbortController();
-  void client
-    .readSession(initial.signal)
-    .then((signed) => {
+  function openSession(signed: OperatorSession) {
+    csrf = signed.csrfToken;
+    setSession(signed);
+    setPhase("in");
+  }
+
+  function leaveSession(next: "out" | "token" | "unreachable") {
+    csrf = "";
+    setSession(null);
+    setHealth(null);
+    setPhase(next);
+  }
+
+  void client.probeSession(initial.signal).then(
+    (signed) => {
       if (initial.signal.aborted) return;
-      csrf = signed.csrfToken;
-      setSession(signed);
-      setPhase("in");
-    })
-    .catch(() => {
-      if (!initial.signal.aborted) setPhase("unreachable");
-    });
+      if (signed) openSession(signed);
+      else leaveSession("token");
+    },
+    () => {
+      if (!initial.signal.aborted) leaveSession("unreachable");
+    },
+  );
+  async function signIn(token: string) {
+    const signed = await client.signInWithToken(token, initial.signal);
+    if (!initial.signal.aborted) openSession(signed);
+  }
   onCleanup(() => {
     initial.abort();
     client.close();
@@ -68,12 +84,6 @@ function App() {
       const { signal } = controller;
       let reading = false;
 
-      const disconnected = () => {
-        csrf = "";
-        setSession(null);
-        setPhase("unreachable");
-      };
-
       const read = async () => {
         if (reading) return;
         reading = true;
@@ -85,19 +95,22 @@ function App() {
           setHealth(null);
           if (!unauthorized(error)) return;
           try {
-            const renewed = await client.readSession(signal);
+            const renewed = await client.probeSession(signal);
             if (signal.aborted) return;
-            csrf = renewed.csrfToken;
-            setSession(renewed);
+            if (!renewed) {
+              leaveSession("token");
+              return;
+            }
+            openSession(renewed);
           } catch {
-            if (!signal.aborted) disconnected();
+            if (!signal.aborted) leaveSession("unreachable");
             return;
           }
           try {
             const answer = await client.readHealth(signal);
             if (!signal.aborted) setHealth(answer);
           } catch (retry: unknown) {
-            if (!signal.aborted && unauthorized(retry)) disconnected();
+            if (!signal.aborted && unauthorized(retry)) leaveSession("unreachable");
           }
         } finally {
           reading = false;
@@ -124,17 +137,28 @@ function App() {
     if (phase() !== "in" || signingOut()) return;
     setSigningOut(true);
     setSignOutErrorCode(null);
-    try {
+    const revoke = async () => {
       try {
-        await client.deleteSession(initial.signal);
+        return await client.signOutBrowserSession(initial.signal);
       } catch (error: unknown) {
-        if (!unauthorized(error)) throw error;
+        if (unauthorized(error)) return null;
+        throw error;
       }
+    };
+    try {
+      let next = await revoke();
       if (initial.signal.aborted) return;
-      csrf = "";
-      setSession(null);
-      setHealth(null);
-      setPhase("out");
+      if (next === null) {
+        const renewed = await client.probeSession(initial.signal);
+        if (initial.signal.aborted) return;
+        if (renewed) {
+          openSession(renewed);
+          next = (await revoke()) ?? "out";
+        } else {
+          next = "token";
+        }
+      }
+      if (!initial.signal.aborted) leaveSession(next);
     } catch (error: unknown) {
       if (initial.signal.aborted) return;
       setSignOutErrorCode(error instanceof ApiError ? error.code : "invalid_response");
@@ -155,6 +179,7 @@ function App() {
               sessionExpiresAtUs={session()?.expiresAtUs ?? null}
               signingOut={signingOut()}
               signOutErrorCode={signOutErrorCode()}
+              signIn={signIn}
               signOut={signOut}
             />
           </I18nProvider>

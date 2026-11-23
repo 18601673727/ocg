@@ -2,10 +2,10 @@ use super::contracts::envelope;
 use super::{
     Arc, AttachmentId, Caller, DEFAULT_OUTPUT_PAGE, ExecutionPoolId, HttpRequest, INTERNAL,
     INVALID_REQUEST, JOB_NOT_FOUND, JobId, MAX_ATTACHMENT_UPLOAD_BYTES, MAX_OUTPUT_PAGE,
-    MAX_SUBMISSION_BYTES, Method, NOT_FOUND, ProfileId, ProjectId, Refusal, Reply, RequestNumber,
-    Shared, attachments, browser, catalog, dashboard, events, health, jobs, mutable_jobs, outputs,
-    pools, profiles, projects, read_body, responses, submissions, subscriptions, tools, update,
-    web,
+    MAX_SUBMISSION_BYTES, METHOD_NOT_ALLOWED, Method, NOT_FOUND, ONLY_POST, PROFILE_METHODS,
+    ProfileId, ProjectId, Refusal, Reply, RequestNumber, SESSION_METHODS, Shared, attachments,
+    browser, catalog, dashboard, events, health, jobs, mutable_jobs, outputs, pools, profiles,
+    projects, responses, submissions, subscriptions, tools, update, wire::LimitedBody,
 };
 
 pub(super) enum Route {
@@ -167,7 +167,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::NativeExecutorArchive(_)
             | Route::NativePoolCreate,
         ) => true,
-        (Caller::Anonymous, Route::SessionStatus) => true,
+        (Caller::Anonymous | Caller::BeginSession, Route::SessionStatus) => true,
         (Caller::Programmatic, Route::SessionStatus | Route::SessionRevoke) => false,
         (Caller::Programmatic, _) => true,
         (
@@ -237,109 +237,97 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::SessionStatus
             | Route::SessionRevoke,
         ) => true,
-        (Caller::Anonymous, _) => false,
+        (Caller::Anonymous | Caller::BeginSession, _) => false,
     };
     if allowed { Ok(route) } else { Err(NOT_FOUND) }
 }
 
-pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
-    let path = request.path();
+pub(super) struct ApiRequest {
+    pub(super) caller: Caller,
+    pub(super) route: Route,
+    pub(super) body_limit: usize,
+}
+
+type ParseRoute<'a> = &'a dyn Fn() -> Result<Route, Refusal>;
+
+#[derive(Clone, Copy, Default)]
+struct Endpoint<'a> {
+    get: Option<ParseRoute<'a>>,
+    post: Option<(usize, ParseRoute<'a>)>,
+    delete: Option<ParseRoute<'a>>,
+    session: bool,
+}
+
+impl<'a> Endpoint<'a> {
+    fn get(mut self, parse: ParseRoute<'a>) -> Self {
+        self.get = Some(parse);
+        self
+    }
+
+    fn post(mut self, limit: usize, parse: ParseRoute<'a>) -> Self {
+        self.post = Some((limit, parse));
+        self
+    }
+
+    fn delete(mut self, parse: ParseRoute<'a>) -> Self {
+        self.delete = Some(parse);
+        self
+    }
+}
+
+pub(super) fn route(
+    request: &HttpRequest,
+    admit: impl Fn(bool, Option<usize>) -> Result<Caller, Refusal>,
+) -> Result<ApiRequest, Refusal> {
     let query = request.query_string();
-    let segments = path
+    let segments = request
+        .path()
         .strip_prefix("/api/v1/")
-        .ok_or(NOT_FOUND)?
-        .split('/')
-        .collect::<Vec<_>>();
-    if request.method() == Method::POST {
-        let route = match segments.as_slice() {
-            ["jobs", job, "withdraw"] => {
-                Route::MutableJob(mutable_jobs::Action::Withdraw(job_id(job)?))
-            }
-            ["jobs", job, "cancel-unsupported"] => {
-                Route::MutableJob(mutable_jobs::Action::CancelQueued(job_id(job)?))
-            }
-            ["jobs", job, "release"] => Route::Release(job_id(job)?),
-            ["jobs", job, "stop"] => Route::MutableJob(mutable_jobs::Action::Stop(job_id(job)?)),
-            ["update"] => Route::StartUpdate,
-            ["jobs"] => Route::MutableJob(mutable_jobs::Action::Create),
-            ["jobs", job] => Route::MutableJob(mutable_jobs::Action::Edit(job_id(job)?)),
-            ["jobs", job, "submit"] => {
-                Route::MutableJob(mutable_jobs::Action::Submit(job_id(job)?))
-            }
-            ["decisions"] => Route::DecisionSubmit,
-            ["approvals", job, request, index] => {
-                Route::DecideApproval(crate::db::entities::ToolCallRef {
-                    job: job_id(job)?,
-                    request: decimal::<u32>(request)
-                        .and_then(RequestNumber::new)
-                        .ok_or(INVALID_REQUEST)?,
-                    index: decimal::<u32>(index).ok_or(INVALID_REQUEST)?,
-                })
-            }
-            ["conversations", conversation, "compact"] => {
-                Route::ConversationCompact(job_id(conversation)?)
-            }
-            ["conversations", conversation, action] => {
-                let action = match *action {
-                    "stop" => "stop",
-                    "close" => "close",
-                    "hold" => "hold",
-                    "unhold" => "unhold",
-                    "retry" => "retry",
-                    _ => return Err(NOT_FOUND),
-                };
-                Route::JobAction(job_id(conversation)?, action)
-            }
-            ["settings", "compaction"] => Route::SaveGlobalCompactionSettings,
-            ["settings", "outbound-headers"] => Route::SaveGlobalOutboundHeaders,
-            ["profiles"] => Route::ProfileCreate,
-            ["pools"] => Route::NativePoolCreate,
-            ["executors"] => Route::NativeExecutorCreate,
-            ["profiles", "import"] => Route::ProfileImport,
-            ["profiles", profile, "availability"] => {
-                Route::ProfileAvailability(profiles::profile_id(profile)?)
-            }
-            ["provider-models"] => Route::ProviderModels,
-            ["profiles", profile] => Route::ProfileUpdate(profiles::profile_id(profile)?),
-            ["projects"] => Route::ProjectCreate,
-            ["projects", project, "decision"] => {
-                Route::ProjectDecision(projects::project_id(project)?)
-            }
-            ["projects", project] => Route::ProjectUpdate(projects::project_id(project)?),
-            ["pools", pool, "archive"] => Route::NativePoolArchive(pools::pool_id(pool)?),
-            ["pools", pool] => Route::PoolUpdate(pools::pool_id(pool)?),
-            ["executors", executor] => Route::NativeExecutorUpdate(pools::executor_id(executor)?),
-            ["executors", executor, "archive"] => {
-                Route::NativeExecutorArchive(pools::executor_id(executor)?)
-            }
-            ["conversations", job] => Route::JobEdit(job_id(job)?),
-            ["attachments"] => Route::AttachmentUpload,
-            _ => return Err(NOT_FOUND),
+        .map(|path| path.split('/').collect::<Vec<_>>())
+        .unwrap_or_default();
+    let endpoint = Endpoint::default();
+    let resolve = |endpoint: Endpoint<'_>| {
+        let (limit, parse) = match (request.method(), endpoint.post, endpoint.delete) {
+            (&Method::GET, _, _) => (None, endpoint.get),
+            (&Method::POST, Some((limit, parse)), _) => (Some(limit), Some(parse)),
+            (&Method::DELETE, _, Some(parse)) => (None, Some(parse)),
+            _ if endpoint.session => return Err(SESSION_METHODS),
+            (_, Some(_), Some(_)) => return Err(PROFILE_METHODS),
+            (_, Some(_), None) => return Err(ONLY_POST),
+            _ => return Err(METHOD_NOT_ALLOWED),
         };
-        no_query(query)?;
-        return Ok(route);
-    }
-    if request.method() == Method::DELETE {
-        let route = match segments.as_slice() {
-            ["jobs", job] => Route::MutableJob(mutable_jobs::Action::Discard(job_id(job)?)),
-            ["providers", id] => Route::ProviderDelete(profiles::profile_id(id)?),
-            ["session"] => Route::SessionRevoke,
-            ["profiles", id] => Route::ProfileDelete(profiles::profile_id(id)?),
-            _ => return Err(NOT_FOUND),
-        };
-        no_query(query)?;
-        return Ok(route);
-    }
-    match segments.as_slice() {
-        ["jobs", "current"] => {
-            no_query(query).map(|()| Route::MutableJob(mutable_jobs::Action::Current))
+        // Authentication and body-header checks precede ID and query parsing, even for unknown GETs.
+        let caller = admit(endpoint.session, limit)?;
+        let route = parse.ok_or(NOT_FOUND)?()?;
+        if request.method() != Method::GET {
+            no_query(query)?;
         }
-        ["update"] => match query {
-            "" => Ok(Route::Update(false)),
-            "latest=1" => Ok(Route::Update(true)),
-            _ => Err(INVALID_REQUEST),
-        },
-        ["health"] => {
+        Ok(ApiRequest {
+            caller,
+            route,
+            body_limit: limit.unwrap_or(0),
+        })
+    };
+    let conversations = |archived| {
+        catalog::conversations_query(query).map(|(before, limit)| Route::Conversations {
+            before,
+            limit,
+            archived,
+        })
+    };
+    let get = |parse: ParseRoute<'_>| resolve(endpoint.get(parse));
+    let post = |limit, parse: ParseRoute<'_>| resolve(endpoint.post(limit, parse));
+    match segments.as_slice() {
+        ["update"] => resolve(
+            endpoint
+                .get(&|| match query {
+                    "" => Ok(Route::Update(false)),
+                    "latest=1" => Ok(Route::Update(true)),
+                    _ => Err(INVALID_REQUEST),
+                })
+                .post(update::UPDATE_BODY_LIMIT, &|| Ok(Route::StartUpdate)),
+        ),
+        ["health"] => get(&|| {
             if query.is_empty() {
                 return Ok(Route::Health(None));
             }
@@ -358,99 +346,167 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 return Err(INVALID_REQUEST);
             }
             Ok(Route::Health(Some(cursor)))
-        }
-        ["job-history"] => dashboard::jobs_query(query).map(|(before, limit, terms)| Route::Jobs {
-            before,
-            limit,
-            terms,
         }),
-        ["job-history", "events"] => subscriptions::JobsQuery::parse(query)
-            .map(|query| Route::Subscription(subscriptions::Topic::Jobs(query))),
-        ["catalog", "events"] => {
-            no_query(query).map(|()| Route::Subscription(subscriptions::Topic::Catalog))
-        }
-        ["observation-changes", "events"] => subscriptions::change_cursor(query)
-            .map(|cursor| Route::Subscription(subscriptions::Topic::ObservationChanges(cursor))),
-        ["sidebar", "events"] => subscriptions::SidebarQuery::parse(query)
-            .map(|query| Route::Subscription(subscriptions::Topic::Sidebar(query))),
-        ["logs", "events"] => dashboard::LogQuery::parse(query)
-            .map(|query| Route::Subscription(subscriptions::Topic::Logs(query))),
-        ["usage", "events"] => dashboard::ObservationQuery::parse(query)
-            .map(|query| Route::Subscription(subscriptions::Topic::Usage(query))),
-        ["availability", "events"] => dashboard::ObservationQuery::parse(query)
-            .map(|query| Route::Subscription(subscriptions::Topic::Availability(query))),
-        ["conversations"] | ["conversations", "archived"] => catalog::conversations_query(query)
-            .map(|(before, limit)| Route::Conversations {
+        ["job-history"] => get(&|| {
+            dashboard::jobs_query(query).map(|(before, limit, terms)| Route::Jobs {
                 before,
                 limit,
-                archived: segments.len() == 2,
-            }),
-        ["conversations", "search"] => {
-            catalog::conversation_search_query(query).map(|(query, before, limit)| {
-                Route::ConversationSearch {
-                    query,
-                    before,
-                    limit,
-                }
+                terms,
             })
+        }),
+        ["job-history", "events"] => get(&|| {
+            subscriptions::JobsQuery::parse(query)
+                .map(|query| Route::Subscription(subscriptions::Topic::Jobs(query)))
+        }),
+        ["catalog", "events"] => {
+            get(&|| no_query(query).map(|()| Route::Subscription(subscriptions::Topic::Catalog)))
         }
-        ["usage"] => dashboard::ObservationQuery::parse(query).map(Route::Usage),
-        ["usage", "summary"] => dashboard::UsageSummaryQuery::parse(query).map(Route::UsageSummary),
-        ["usage", "retries"] => dashboard::UsageRetriesQuery::parse(query).map(Route::UsageRetries),
-        ["tool-stats"] => no_query(query).map(|()| Route::ToolStats),
-        ["availability"] => dashboard::ObservationQuery::parse(query).map(Route::Availability),
-        ["logs"] => dashboard::LogQuery::parse(query).map(Route::Logs),
-        ["admissions"] => no_query(query).map(|()| Route::Admission),
-        ["session"] => no_query(query).map(|()| Route::SessionStatus),
-        ["settings", "system"] => no_query(query).map(|()| Route::ActiveSystemSettings),
-        ["settings", "compaction"] => no_query(query).map(|()| Route::GlobalCompactionSettings),
-        ["settings", "outbound-headers"] => no_query(query).map(|()| Route::GlobalOutboundHeaders),
-        ["profiles"] => catalog::agent_profile_query(query)
-            .map(|(before, limit)| Route::Profiles { before, limit }),
-        ["projects"] => {
-            projects::projects_query(query).map(|(before, limit)| Route::Projects { before, limit })
+        ["observation-changes", "events"] => get(&|| {
+            subscriptions::change_cursor(query)
+                .map(|cursor| Route::Subscription(subscriptions::Topic::ObservationChanges(cursor)))
+        }),
+        ["sidebar", "events"] => get(&|| {
+            subscriptions::SidebarQuery::parse(query)
+                .map(|query| Route::Subscription(subscriptions::Topic::Sidebar(query)))
+        }),
+        ["logs", "events"] => get(&|| {
+            dashboard::LogQuery::parse(query)
+                .map(|query| Route::Subscription(subscriptions::Topic::Logs(query)))
+        }),
+        ["usage", "events"] => get(&|| {
+            dashboard::ObservationQuery::parse(query)
+                .map(|query| Route::Subscription(subscriptions::Topic::Usage(query)))
+        }),
+        ["availability", "events"] => get(&|| {
+            dashboard::ObservationQuery::parse(query)
+                .map(|query| Route::Subscription(subscriptions::Topic::Availability(query)))
+        }),
+        ["usage"] => get(&|| dashboard::ObservationQuery::parse(query).map(Route::Usage)),
+        ["usage", "summary"] => {
+            get(&|| dashboard::UsageSummaryQuery::parse(query).map(Route::UsageSummary))
         }
-        ["pools"] => catalog::page_query(query, pools::pool_id)
-            .map(|(before, limit)| Route::Pools { before, limit }),
-        ["pools", pool, "allocations"] => {
+        ["usage", "retries"] => {
+            get(&|| dashboard::UsageRetriesQuery::parse(query).map(Route::UsageRetries))
+        }
+        ["tool-stats"] => get(&|| no_query(query).map(|()| Route::ToolStats)),
+        ["availability"] => {
+            get(&|| dashboard::ObservationQuery::parse(query).map(Route::Availability))
+        }
+        ["logs"] => get(&|| dashboard::LogQuery::parse(query).map(Route::Logs)),
+        ["admissions"] => get(&|| no_query(query).map(|()| Route::Admission)),
+        ["session"] => resolve(
+            Endpoint {
+                session: true,
+                ..endpoint
+            }
+            .get(&|| no_query(query).map(|()| Route::SessionStatus))
+            .delete(&|| Ok(Route::SessionRevoke)),
+        ),
+        ["settings", "system"] => get(&|| no_query(query).map(|()| Route::ActiveSystemSettings)),
+        ["settings", "compaction"] => resolve(
+            endpoint
+                .get(&|| no_query(query).map(|()| Route::GlobalCompactionSettings))
+                .post(MAX_SUBMISSION_BYTES, &|| {
+                    Ok(Route::SaveGlobalCompactionSettings)
+                }),
+        ),
+        ["settings", "outbound-headers"] => resolve(
+            endpoint
+                .get(&|| no_query(query).map(|()| Route::GlobalOutboundHeaders))
+                .post(MAX_SUBMISSION_BYTES, &|| {
+                    Ok(Route::SaveGlobalOutboundHeaders)
+                }),
+        ),
+        ["profiles"] => resolve(
+            endpoint
+                .get(&|| {
+                    catalog::agent_profile_query(query)
+                        .map(|(before, limit)| Route::Profiles { before, limit })
+                })
+                .post(MAX_SUBMISSION_BYTES, &|| Ok(Route::ProfileCreate)),
+        ),
+        ["projects"] => resolve(
+            endpoint
+                .get(&|| {
+                    projects::projects_query(query)
+                        .map(|(before, limit)| Route::Projects { before, limit })
+                })
+                .post(MAX_SUBMISSION_BYTES, &|| Ok(Route::ProjectCreate)),
+        ),
+        ["pools"] => resolve(
+            endpoint
+                .get(&|| {
+                    catalog::page_query(query, pools::pool_id)
+                        .map(|(before, limit)| Route::Pools { before, limit })
+                })
+                .post(MAX_SUBMISSION_BYTES, &|| Ok(Route::NativePoolCreate)),
+        ),
+        ["pools", pool, "allocations"] => get(&|| {
             let pool = pools::pool_id(pool)?;
             pools::allocations_query(query).map(|(after, limit)| Route::PoolAllocations {
                 pool,
                 after,
                 limit,
             })
-        }
-        ["executors"] => catalog::page_query(query, pools::executor_id)
-            .map(|(before, limit)| Route::NativeExecutors { before, limit }),
-        ["attachments", attachment] => {
+        }),
+        ["executors"] => resolve(
+            endpoint
+                .get(&|| {
+                    catalog::page_query(query, pools::executor_id)
+                        .map(|(before, limit)| Route::NativeExecutors { before, limit })
+                })
+                .post(MAX_SUBMISSION_BYTES, &|| Ok(Route::NativeExecutorCreate)),
+        ),
+        ["attachments", attachment] => get(&|| {
             let attachment = attachments::attachment_id(attachment)?;
             no_query(query).map(|()| Route::Attachment(attachment))
-        }
-        ["attachments", attachment, "content"] => {
+        }),
+        ["attachments", attachment, "content"] => get(&|| {
             let attachment = attachments::attachment_id(attachment)?;
             no_query(query).map(|()| Route::AttachmentContent(attachment))
-        }
+        }),
         ["jobs", job] => {
-            let job = job_id(job)?;
-            no_query(query).map(|()| Route::Job(job))
+            let discard = || {
+                Ok(Route::MutableJob(mutable_jobs::Action::Discard(job_id(
+                    job,
+                )?)))
+            };
+            let endpoint = Endpoint {
+                delete: (!job.is_empty()).then_some(&discard as ParseRoute<'_>),
+                ..endpoint
+            };
+            resolve(
+                endpoint
+                    .get(&|| {
+                        if *job == "current" {
+                            return no_query(query)
+                                .map(|()| Route::MutableJob(mutable_jobs::Action::Current));
+                        }
+                        let id = job_id(job)?;
+                        no_query(query).map(|()| Route::Job(id))
+                    })
+                    .post(MAX_SUBMISSION_BYTES, &|| {
+                        Ok(Route::MutableJob(mutable_jobs::Action::Edit(job_id(job)?)))
+                    }),
+            )
         }
-        ["jobs", job, "history"] => {
+        ["jobs", job, "history"] => get(&|| {
             let job = job_id(job)?;
             let (after, limit) = jobs::history_query(query)?;
             Ok(Route::JobHistory { job, after, limit })
-        }
-        ["jobs", job, "state"] => {
+        }),
+        ["jobs", job, "state"] => get(&|| {
             let job = job_id(job)?;
             jobs::state_query(query).map(|at_seq| Route::JobState { job, at_seq })
-        }
-        ["jobs", job, "requests", number] => {
+        }),
+        ["jobs", job, "requests", number] => get(&|| {
             let job = job_id(job)?;
             let request = decimal::<u32>(number)
                 .and_then(RequestNumber::new)
                 .ok_or(INVALID_REQUEST)?;
             no_query(query).map(|()| Route::ProviderRequest(job, request))
-        }
-        ["jobs", job, "responses"] => {
+        }),
+        ["jobs", job, "responses"] => get(&|| {
             let job = job_id(job)?;
             let (after, limit, text_offset) = responses::responses_query(query)?;
             Ok(Route::ProviderResponses {
@@ -459,15 +515,15 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 limit,
                 text_offset,
             })
-        }
-        ["jobs", job, "input"] => {
+        }),
+        ["jobs", job, "input"] => get(&|| {
             let job = job_id(job)?;
             no_query(query).map(|()| Route::JobInput(job))
-        }
-        ["conversations", conversation, "cards"] => {
+        }),
+        ["conversations", conversation, "cards"] => get(&|| {
             no_query(query).and_then(|()| job_id(conversation).map(Route::ConversationCards))
-        }
-        ["conversations", conversation, "children"] => {
+        }),
+        ["conversations", conversation, "children"] => get(&|| {
             let conversation = job_id(conversation)?;
             let (before, limit) = catalog::page_query(query, job_id)?;
             Ok(Route::ConversationChildren {
@@ -475,8 +531,8 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 before,
                 limit,
             })
-        }
-        ["conversations", conversation, "context"] => {
+        }),
+        ["conversations", conversation, "context"] => get(&|| {
             let conversation = job_id(conversation)?;
             let (before, limit) = catalog::page_query(query, job_id)?;
             Ok(Route::ConversationContext {
@@ -484,11 +540,11 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 before,
                 limit,
             })
-        }
+        }),
         ["conversations", conversation, "limits"] => {
-            no_query(query).and_then(|()| job_id(conversation).map(Route::JobLimits))
+            get(&|| no_query(query).and_then(|()| job_id(conversation).map(Route::JobLimits)))
         }
-        ["conversations", conversation, "turns"] => {
+        ["conversations", conversation, "turns"] => get(&|| {
             let conversation = job_id(conversation)?;
             let (before, limit) = catalog::page_query(query, job_id)?;
             Ok(Route::ConversationTurns {
@@ -496,13 +552,15 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 before,
                 limit,
             })
-        }
-        ["agent-profiles"] => catalog::agent_profile_query(query)
-            .map(|(before, limit)| Route::AgentProfiles { before, limit }),
+        }),
+        ["agent-profiles"] => get(&|| {
+            catalog::agent_profile_query(query)
+                .map(|(before, limit)| Route::AgentProfiles { before, limit })
+        }),
         ["jobs", job, "outputs", "latest"] if query.is_empty() => {
-            Ok(Route::LatestOutput(job_id(job)?))
+            get(&|| Ok(Route::LatestOutput(job_id(job)?)))
         }
-        ["jobs", job, "outputs"] => {
+        ["jobs", job, "outputs"] => get(&|| {
             let job = job_id(job)?;
             let (after_seq, limit) = output_query(query)?;
             Ok(Route::Outputs {
@@ -510,20 +568,22 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 after_seq,
                 limit,
             })
-        }
-        ["jobs", job, "tools"] => {
+        }),
+        ["jobs", job, "tools"] => get(&|| {
             let job = job_id(job)?;
             let (after, limit) = tools::tools_query(query)?;
             Ok(Route::Tools { job, after, limit })
-        }
-        ["jobs", job, "tools", request, index] if query.is_empty() => Ok(Route::Tool {
-            job: job_id(job)?,
-            request: decimal::<u32>(request)
-                .and_then(RequestNumber::new)
-                .ok_or(INVALID_REQUEST)?,
-            index: decimal::<u32>(index).ok_or(INVALID_REQUEST)?,
         }),
-        ["jobs", job, "tree"] => {
+        ["jobs", job, "tools", request, index] if query.is_empty() => get(&|| {
+            Ok(Route::Tool {
+                job: job_id(job)?,
+                request: decimal::<u32>(request)
+                    .and_then(RequestNumber::new)
+                    .ok_or(INVALID_REQUEST)?,
+                index: decimal::<u32>(index).ok_or(INVALID_REQUEST)?,
+            })
+        }),
+        ["jobs", job, "tree"] => get(&|| {
             let job = job_id(job)?;
             let (after, limit, depth) = catalog::tree_query(query)?;
             Ok(Route::JobTree {
@@ -532,13 +592,128 @@ pub(super) fn route(request: &HttpRequest) -> Result<Route, Refusal> {
                 limit,
                 depth,
             })
-        }
-        ["jobs", job, "events"] => {
+        }),
+        ["jobs", job, "events"] => get(&|| {
             let job = job_id(job)?;
             let after_seq = events::cursor(query, request.headers())?;
             Ok(Route::Events { job, after_seq })
+        }),
+        ["conversations"] => get(&|| conversations(false)),
+        ["conversations", job] if !job.is_empty() => {
+            resolve(
+                endpoint
+                    .get(&|| match *job {
+                        "archived" => conversations(true),
+                        "search" => catalog::conversation_search_query(query).map(
+                            |(query, before, limit)| Route::ConversationSearch {
+                                query,
+                                before,
+                                limit,
+                            },
+                        ),
+                        _ => Err(NOT_FOUND),
+                    })
+                    .post(MAX_SUBMISSION_BYTES, &|| Ok(Route::JobEdit(job_id(job)?))),
+            )
         }
-        _ => Err(NOT_FOUND),
+        ["jobs", job, "withdraw"] => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::MutableJob(mutable_jobs::Action::Withdraw(job_id(
+                job,
+            )?)))
+        }),
+        ["jobs", job, "cancel-unsupported"] => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::MutableJob(mutable_jobs::Action::CancelQueued(
+                job_id(job)?,
+            )))
+        }),
+        ["jobs", job, "release"] => {
+            post(MAX_SUBMISSION_BYTES, &|| Ok(Route::Release(job_id(job)?)))
+        }
+        ["jobs", job, "stop"] => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::MutableJob(mutable_jobs::Action::Stop(job_id(job)?)))
+        }),
+        ["jobs"] => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::MutableJob(mutable_jobs::Action::Create))
+        }),
+        ["jobs", job, "submit"] => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::MutableJob(mutable_jobs::Action::Submit(job_id(
+                job,
+            )?)))
+        }),
+        ["decisions"] => post(MAX_SUBMISSION_BYTES, &|| Ok(Route::DecisionSubmit)),
+        ["approvals", job, request, index]
+            if !job.is_empty() && !request.is_empty() && !index.is_empty() =>
+        {
+            post(MAX_SUBMISSION_BYTES, &|| {
+                Ok(Route::DecideApproval(crate::db::entities::ToolCallRef {
+                    job: job_id(job)?,
+                    request: decimal::<u32>(request)
+                        .and_then(RequestNumber::new)
+                        .ok_or(INVALID_REQUEST)?,
+                    index: decimal::<u32>(index).ok_or(INVALID_REQUEST)?,
+                }))
+            })
+        }
+        ["conversations", conversation, "compact"] if !conversation.is_empty() => {
+            post(MAX_SUBMISSION_BYTES, &|| {
+                Ok(Route::ConversationCompact(job_id(conversation)?))
+            })
+        }
+        ["profiles", profile, "availability"] if !profile.is_empty() => {
+            post(MAX_SUBMISSION_BYTES, &|| {
+                Ok(Route::ProfileAvailability(profiles::profile_id(profile)?))
+            })
+        }
+        ["provider-models"] => post(MAX_SUBMISSION_BYTES, &|| Ok(Route::ProviderModels)),
+        ["profiles", profile] if !profile.is_empty() => resolve(
+            endpoint
+                .post(MAX_SUBMISSION_BYTES, &|| {
+                    Ok(if *profile == "import" {
+                        Route::ProfileImport
+                    } else {
+                        Route::ProfileUpdate(profiles::profile_id(profile)?)
+                    })
+                })
+                .delete(&|| Ok(Route::ProfileDelete(profiles::profile_id(profile)?))),
+        ),
+        ["projects", project, "decision"] if !project.is_empty() => {
+            post(MAX_SUBMISSION_BYTES, &|| {
+                Ok(Route::ProjectDecision(projects::project_id(project)?))
+            })
+        }
+        ["projects", project] if !project.is_empty() => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::ProjectUpdate(projects::project_id(project)?))
+        }),
+        ["pools", pool, "archive"] if !pool.is_empty() => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::NativePoolArchive(pools::pool_id(pool)?))
+        }),
+        ["pools", pool] if !pool.is_empty() => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::PoolUpdate(pools::pool_id(pool)?))
+        }),
+        ["executors", executor] if !executor.is_empty() => post(MAX_SUBMISSION_BYTES, &|| {
+            Ok(Route::NativeExecutorUpdate(pools::executor_id(executor)?))
+        }),
+        ["executors", executor, "archive"] if !executor.is_empty() => {
+            post(MAX_SUBMISSION_BYTES, &|| {
+                Ok(Route::NativeExecutorArchive(pools::executor_id(executor)?))
+            })
+        }
+        ["attachments"] => post(MAX_ATTACHMENT_UPLOAD_BYTES, &|| Ok(Route::AttachmentUpload)),
+        ["conversations", conversation, action] if !conversation.is_empty() => {
+            match ["stop", "close", "hold", "unhold", "retry"]
+                .into_iter()
+                .find(|name| name == action)
+            {
+                Some(name) => post(MAX_SUBMISSION_BYTES, &|| {
+                    Ok(Route::JobAction(job_id(conversation)?, name))
+                }),
+                None => resolve(endpoint),
+            }
+        }
+        ["providers", id] if !id.is_empty() => {
+            resolve(endpoint.delete(&|| Ok(Route::ProviderDelete(profiles::profile_id(id)?))))
+        }
+        _ => resolve(endpoint),
     }
 }
 
@@ -590,7 +765,7 @@ pub(super) async fn respond(
     route: Route,
     caller: &Caller,
     request: &HttpRequest,
-    payload: web::types::Payload,
+    payload: LimitedBody,
     shared: &Arc<Shared>,
 ) -> Result<Reply, Refusal> {
     let database = &shared.database;
@@ -602,7 +777,7 @@ pub(super) async fn respond(
         }
         Route::Update(latest) => update::get(latest).await,
         Route::StartUpdate => {
-            let body = read_body(payload, update::UPDATE_BODY_LIMIT).await?;
+            let body = payload.read().await?;
             update::post(database, &body).await
         }
         Route::Jobs {
@@ -713,11 +888,11 @@ pub(super) async fn respond(
             profiles::list_profiles(database, before.map(Into::into), limit).await
         }
         Route::ProviderModels => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             profiles::provider_models(database, &body).await
         }
         Route::ProfileImport => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             profiles::import_models(database, &body).await
         }
         Route::ActiveSystemSettings => Ok(Reply::ok(envelope(serde_json::json!(
@@ -727,39 +902,39 @@ pub(super) async fn respond(
             profiles::global_compaction_settings(database, None).await
         }
         Route::SaveGlobalCompactionSettings => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             profiles::global_compaction_settings(database, Some(&body)).await
         }
         Route::GlobalOutboundHeaders => profiles::global_outbound_headers(database, None).await,
         Route::SaveGlobalOutboundHeaders => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             profiles::global_outbound_headers(database, Some(&body)).await
         }
         Route::ProfileDelete(id) => profiles::delete_model(database, id).await,
         Route::ProviderDelete(id) => profiles::remove_provider(database, id).await,
         Route::ProfileAvailability(id) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             profiles::set_model_availability(database, id, &body).await
         }
         Route::ProfileCreate => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             profiles::save_profile(database, None, &body).await
         }
         Route::ProfileUpdate(profile) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             profiles::save_profile(database, Some(profile), &body).await
         }
         Route::Projects { before, limit } => projects::list(database, before, limit).await,
         Route::ProjectCreate => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             projects::create(shared, &body).await
         }
         Route::ProjectDecision(project) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             projects::configure_decision(shared, project, &body).await
         }
         Route::ProjectUpdate(project) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             projects::update(database, project, &body).await
         }
         Route::Pools { before, limit } => pools::list(database, before, limit).await,
@@ -767,34 +942,34 @@ pub(super) async fn respond(
             pools::list_allocations(database, pool, after, limit).await
         }
         Route::NativePoolCreate => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             pools::create_pool(database, &body).await
         }
         Route::PoolUpdate(pool) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             pools::update(database, pool, &body).await
         }
         Route::NativePoolArchive(pool) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             pools::archive_pool(database, pool, &body).await
         }
         Route::NativeExecutors { before, limit } => {
             pools::list_executors(database, before, limit).await
         }
         Route::NativeExecutorCreate => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             pools::create_executor(database, &body).await
         }
         Route::NativeExecutorUpdate(executor) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             pools::update_executor(database, executor, &body).await
         }
         Route::NativeExecutorArchive(executor) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             pools::archive_executor(database, executor, &body).await
         }
         Route::JobEdit(job) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             catalog::edit_conversation(shared, job, &body).await
         }
         Route::Outputs {
@@ -819,7 +994,7 @@ pub(super) async fn respond(
         } => catalog::job_tree(shared, job, after, limit, depth).await,
         Route::DecisionSubmit => {
             let key = submissions::idempotency_key(request.headers())?;
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             let decision = submissions::DecisionJobRequest::parse(&body)?;
             submissions::submit_decision(shared, key, decision).await
         }
@@ -828,32 +1003,38 @@ pub(super) async fn respond(
             submissions::lookup(shared, key).await
         }
         Route::DecideApproval(approval) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             submissions::decide(shared, approval, &body).await
         }
         Route::ConversationCards(conversation) => submissions::cards(shared, conversation).await,
         Route::ConversationCompact(conversation) => {
             let key = submissions::idempotency_key(request.headers())?;
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             submissions::compact(shared, conversation, key, &body).await
         }
         Route::JobAction(conversation, action) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             submissions::action(shared, conversation, action, &body).await
         }
         Route::AttachmentUpload => {
-            let body = read_body(payload, MAX_ATTACHMENT_UPLOAD_BYTES).await?;
+            let body = payload.read().await?;
             attachments::upload(database, &body).await
         }
         Route::Attachment(attachment) => attachments::metadata(database, attachment).await,
         Route::SessionStatus => match caller {
             Caller::Operator(session) => Ok(Reply::ok(browser::described(session))),
-            Caller::Anonymous => shared.browser.begin_session(),
+            Caller::BeginSession => shared.browser.begin_session(),
+            Caller::Anonymous => Ok(browser::signed_out(!matches!(
+                browser::presented(request.headers()),
+                browser::Presented::None
+            ))),
             Caller::Programmatic => Err(NOT_FOUND),
         },
         Route::SessionRevoke => match caller {
-            Caller::Operator(session) => Ok(shared.browser.logout(session)),
-            Caller::Programmatic | Caller::Anonymous => Err(NOT_FOUND),
+            Caller::Operator(session) => {
+                Ok(shared.browser.logout(session, shared.token.ui_auth_mode))
+            }
+            Caller::Programmatic | Caller::Anonymous | Caller::BeginSession => Err(NOT_FOUND),
         },
         Route::Events { .. } | Route::Subscription(_) => Err(INTERNAL),
         Route::AttachmentContent(_) => Err(INTERNAL),

@@ -74,7 +74,7 @@ pub(crate) use pools::{PoolAnswerView, PoolsView};
 pub(crate) use profiles::{ImportedModelsView, ProfilesView, ProviderModelsView};
 pub(crate) use projects::{ProjectAnswerView, ProjectsView};
 pub(crate) use responses::ProviderResponsesView;
-use routing::{Route, authorize, decimal, respond, route};
+use routing::{ApiRequest, Route, authorize, decimal, respond, route};
 pub(crate) use submissions::{
     AdmissionResponseView, AppendView, ApprovalDecisionView, CardsView, CompactionView, StopView,
 };
@@ -83,13 +83,12 @@ pub(crate) use system::{ActiveSystemSettingsView, HealthView};
 pub(crate) use tools::ToolsView;
 pub(crate) use update::UpdateView;
 
-use security::{Caller, Destination, admit};
+use security::{Caller, admit};
 use wire::{
     BODY_NOT_ACCEPTED, DATABASE_BUSY, DATABASE_UNAVAILABLE, FORBIDDEN_HOST, FORBIDDEN_ORIGIN,
     HEADERS_TOO_LARGE, INCONSISTENT_RECORD, INTERNAL, INVALID_REQUEST, JOB_NOT_FOUND,
     METHOD_NOT_ALLOWED, NOT_FOUND, ONLY_POST, OUTPUT_TOO_LARGE, PROFILE_METHODS, Refusal, Reply,
-    SESSION_METHODS, SHUTTING_DOWN, UNAUTHENTICATED, URI_TOO_LONG, answer, read_body, single,
-    submission_body,
+    SESSION_METHODS, SHUTTING_DOWN, UNAUTHENTICATED, URI_TOO_LONG, answer, single, submission_body,
 };
 
 struct Shared {

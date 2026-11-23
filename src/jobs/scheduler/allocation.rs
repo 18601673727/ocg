@@ -28,6 +28,10 @@ const RESPONSES_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
     ExecutionOperation::LlmRequest,
     Some(LlmTransport::OpenAiResponses),
 );
+const ANTHROPIC_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) = (
+    ExecutionOperation::LlmRequest,
+    Some(LlmTransport::AnthropicMessages),
+);
 const DECISION_CAPABILITY: (ExecutionOperation, Option<LlmTransport>) =
     (ExecutionOperation::Decision, None);
 
@@ -212,9 +216,9 @@ pub(super) struct Allocator {
     shutdown: CancellationToken,
     stops: NativeStops,
     // Each supported executor capability set has its own ready cursor.
-    resume: Cell<[Option<DevelopmentReadyCursor>; 8]>,
+    resume: Cell<[Option<DevelopmentReadyCursor>; 16]>,
     // A changed queue may make a Job eligible in a previously scanned segment.
-    rescan: Cell<u8>,
+    rescan: Cell<u16>,
     discovery: Cell<Discovery>,
     workspace_tools: WorkspaceTools,
     running: RefCell<Vec<ntex::rt::JoinHandle<()>>>,
@@ -233,7 +237,7 @@ impl Allocator {
             database,
             shutdown,
             stops,
-            resume: Cell::new([None; 8]),
+            resume: Cell::new([None; 16]),
             rescan: Cell::new(0),
             discovery: Cell::new(Discovery::default()),
             running: RefCell::new(Vec::new()),
@@ -303,6 +307,7 @@ impl Allocator {
                     GENERATIVE_CAPABILITY,
                     DECISION_CAPABILITY,
                     RESPONSES_CAPABILITY,
+                    ANTHROPIC_CAPABILITY,
                 ]
                 .into_iter()
                 .enumerate()
@@ -324,7 +329,7 @@ impl Allocator {
         let mut capacity_reached = false;
         let mut dispatched = 0;
         let mut last_examined = None;
-        let mut exhausted = 0u8;
+        let mut exhausted = 0u16;
         for (pool, executor, scan) in executors {
             if self.halted.get() || self.shutdown.is_cancelled() {
                 break;

@@ -1,20 +1,23 @@
-import { RotateCw } from "@lucide/solid";
+import { Loading, lazy } from "solid-js";
 import type * as Api from "@/components/ocg/contracts/api";
 import { AppShell } from "@/components/ocg/layout/app-shell";
 import type { ApiClient } from "@/components/ocg/runtime/api-client";
-import { Button } from "@/components/ui/button";
 import { useI18n } from "../i18n";
 import { SessionActions } from "../login/access-boundary";
-import { AccessScreen } from "../login/access-screen";
 import { OcgRuntimeProvider } from "../runtime/runtime-context";
 
+const SessionAccess = lazy(() =>
+  import("../login/access-screen").then(({ SessionAccess }) => ({ default: SessionAccess })),
+);
+
 export type OperatorConsoleProps = {
-  phase: "out" | "in" | "unreachable";
+  phase: "out" | "in" | "token" | "unreachable";
   client: ApiClient;
   health: Api.Health | null;
   sessionExpiresAtUs: number | null;
   signingOut: boolean;
   signOutErrorCode: string | null;
+  signIn: (token: string) => Promise<void>;
   signOut: () => Promise<void>;
 };
 
@@ -24,20 +27,11 @@ export function OperatorConsole(props: OperatorConsoleProps) {
   return (
     <>
       {(() => {
-        if (props.phase === "unreachable" || props.phase === "out") {
-          const signedOut = props.phase === "out";
+        if (props.phase !== "in") {
           return (
-            <AccessScreen
-              title={i18n.t(signedOut ? "session.signedOutTitle" : "session.offlineTitle")}
-              description={i18n.t(
-                signedOut ? "session.signedOutDescription" : "session.unreachable",
-              )}
-            >
-              <Button class="self-start" onClick={() => window.location.reload()}>
-                <RotateCw aria-hidden="true" />
-                {i18n.t(signedOut ? "session.reopen" : "session.retry")}
-              </Button>
-            </AccessScreen>
+            <Loading fallback={<p role="status">{i18n.t("session.checking")}</p>}>
+              <SessionAccess phase={props.phase} signIn={props.signIn} />
+            </Loading>
           );
         }
 

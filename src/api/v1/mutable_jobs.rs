@@ -1,8 +1,8 @@
 use super::contracts::envelope;
 use super::{
-    DatabaseError, DatabaseHandle, HttpRequest, INTERNAL, JobId, MAX_SUBMISSION_BYTES, NOT_FOUND,
-    Refusal, Reply, StatusCode, Value, attachments, decimal, header, profiles, projects, read_body,
-    routing, single, submissions, web,
+    DatabaseError, DatabaseHandle, HttpRequest, INTERNAL, JobId, NOT_FOUND, Refusal, Reply,
+    StatusCode, Value, attachments, decimal, header, profiles, projects, routing, single,
+    submissions, wire::LimitedBody,
 };
 use crate::db::entities::{
     ComposerContextId, ExecutionConfiguration, JobQueuePriority, MutableJobContent,
@@ -296,7 +296,7 @@ pub(super) enum Action {
 
 pub(super) async fn release(
     id: JobId,
-    payload: web::types::Payload,
+    payload: LimitedBody,
     database: &DatabaseHandle,
 ) -> Result<Reply, Refusal> {
     #[derive(Deserialize)]
@@ -308,7 +308,7 @@ pub(super) async fn release(
         generation: std::num::NonZeroU32,
         job_revision: u64,
     }
-    let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+    let body = payload.read().await?;
     let release: Release = serde_json::from_slice(&body).map_err(|_| INVALID)?;
     let token = crate::db::entities::AllocationToken {
         job: id,
@@ -332,14 +332,14 @@ pub(super) async fn release(
 pub(super) async fn respond(
     action: Action,
     request: &HttpRequest,
-    payload: web::types::Payload,
+    payload: LimitedBody,
     database: &DatabaseHandle,
     stops: &crate::db::NativeStops,
 ) -> Result<Reply, Refusal> {
     let context = context(request)?;
     match action {
         Action::Create => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             let input: Input = serde_json::from_slice(&body).map_err(|_| INVALID)?;
             let conversation = input
                 .conversation
@@ -374,7 +374,7 @@ pub(super) async fn respond(
             Ok(Reply::ok(view(record)))
         }
         Action::Edit(id) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             let change: Change = serde_json::from_slice(&body).map_err(|_| INVALID)?;
             if change.input.conversation.is_some() || change.input.project.is_some() {
                 return Err(INVALID);
@@ -386,7 +386,7 @@ pub(super) async fn respond(
             Ok(Reply::ok(view(job)))
         }
         Action::Submit(id) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             let change: Submit = serde_json::from_slice(&body).map_err(|_| INVALID)?;
             if change
                 .input
@@ -423,7 +423,7 @@ pub(super) async fn respond(
             )))
         }
         Action::Withdraw(id) | Action::CancelQueued(id) => {
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             let input: CancelQueued = serde_json::from_slice(&body).map_err(|_| INVALID)?;
             let job = database
                 .cancel_queued_job(
@@ -438,7 +438,7 @@ pub(super) async fn respond(
         }
         Action::Stop(id) => {
             use crate::db::entities::NativeStopRequest;
-            let body = read_body(payload, MAX_SUBMISSION_BYTES).await?;
+            let body = payload.read().await?;
             let Stop {} = serde_json::from_slice(&body).map_err(|_| INVALID)?;
             let stop = database
                 .request_native_stop(context, id)

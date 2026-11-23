@@ -11,6 +11,7 @@ pub struct RequestRecorder {
     messages: Vec<ContentDigest>,
     stored: BTreeSet<ContentDigest>,
     sent: bool,
+    anthropic: bool,
 }
 
 pub struct SentRequestState {
@@ -19,6 +20,13 @@ pub struct SentRequestState {
 }
 
 impl RequestRecorder {
+    pub(crate) fn for_transport(transport: Option<crate::db::entities::LlmTransport>) -> Self {
+        Self {
+            anthropic: transport == Some(crate::db::entities::LlmTransport::AnthropicMessages),
+            ..Self::default()
+        }
+    }
+
     pub fn prepare(
         &self,
         job: JobId,
@@ -34,42 +42,20 @@ impl RequestRecorder {
             .get(if responses { "input" } else { "messages" })
             .and_then(Value::as_array)
             .ok_or_else(|| record_error("request has no messages"))?;
-        if conversation.messages.len() < self.messages.len() {
+        if !self.anthropic && conversation.messages.len() < self.messages.len() {
             return Err(record_error("recorded messages must only be appended"));
         }
         let mut digests = Vec::with_capacity(conversation.messages.len());
-        let mut wire = messages.as_slice();
-        for (index, message) in conversation.messages.iter().enumerate() {
-            let attachments = conversation
-                .image_attachments
-                .get(&index)
-                .map_or(&[][..], Vec::as_slice);
-            let group = message.response_items.as_deref().filter(|_| responses);
-            let count = group.map_or(1, <[Value]>::len);
-            let (items, remaining) = wire
-                .split_at_checked(count)
-                .ok_or_else(|| record_error("request input differs from its conversation"))?;
-            wire = remaining;
-            let value = if let Some(group) = group {
-                if group != items || !attachments.is_empty() {
-                    return Err(record_error(
-                        "request replay differs from its recorded output",
-                    ));
-                }
-                json!({"output": items})
-            } else {
-                let mut value = items[0].clone();
-                replace_images(&mut value, attachments)?;
-                value
-            };
-            let body =
-                MessageBody::new_exact(&value).map_err(|error| record_error(error.to_string()))?;
-            digests.push(body.digest());
-            if !self.stored.contains(&body.digest()) && pending.insert(body.digest()) {
-                bodies.push(body);
-            }
+        let mut keep_message = |value: &Value| -> Result<(), OutputSinkError> {
+            digests.push(self.keep(value, &mut bodies, &mut pending)?);
+            Ok(())
+        };
+        if self.anthropic {
+            record_anthropic_messages(messages, conversation, keep_message)?;
+        } else {
+            record_chat_messages(messages, conversation, responses, &mut keep_message)?;
         }
-        if !wire.is_empty() || (responses && !digests.starts_with(&self.messages)) {
+        if (responses || self.anthropic) && !digests.starts_with(&self.messages) {
             return Err(record_error(
                 "recorded request must preserve its input prefix",
             ));
@@ -140,6 +126,100 @@ impl RequestRecorder {
         self.messages.push(digest);
         self.stored.insert(digest);
     }
+}
+
+fn record_chat_messages(
+    messages: &[Value],
+    conversation: &ChatConversation,
+    responses: bool,
+    mut keep_message: impl FnMut(&Value) -> Result<(), OutputSinkError>,
+) -> Result<(), OutputSinkError> {
+    let mut wire = messages;
+    for (index, message) in conversation.messages.iter().enumerate() {
+        let attachments = conversation
+            .image_attachments
+            .get(&index)
+            .map_or(&[][..], Vec::as_slice);
+        let group = message.response_items.as_deref().filter(|_| responses);
+        let count = group.map_or(1, <[Value]>::len);
+        let (items, remaining) = wire
+            .split_at_checked(count)
+            .ok_or_else(|| record_error("request input differs from its conversation"))?;
+        wire = remaining;
+        let value = if let Some(group) = group {
+            if group != items || !attachments.is_empty() {
+                return Err(record_error(
+                    "request replay differs from its recorded output",
+                ));
+            }
+            json!({"output": items})
+        } else {
+            let mut value = items[0].clone();
+            replace_images(&mut value, attachments)?;
+            value
+        };
+        keep_message(&value)?;
+    }
+    if !wire.is_empty() {
+        return Err(record_error(
+            "recorded request must preserve its input prefix",
+        ));
+    }
+    Ok(())
+}
+
+fn record_anthropic_messages(
+    messages: &[Value],
+    conversation: &ChatConversation,
+    mut keep_message: impl FnMut(&Value) -> Result<(), OutputSinkError>,
+) -> Result<(), OutputSinkError> {
+    use super::openai_compatible::{ContentPartWire, MessageContentWire};
+    let mut attachments = conversation.image_attachments.values().flatten();
+    let mut images = conversation
+        .messages
+        .iter()
+        .filter_map(|message| match &message.content {
+            Some(MessageContentWire::Parts(parts)) => Some(parts.iter()),
+            Some(MessageContentWire::Text(_)) | None => None,
+        })
+        .flatten()
+        .filter_map(|part| match part {
+            ContentPartWire::ImageUrl { image_url } => Some(image_url.url.as_str()),
+            ContentPartWire::Text { .. } => None,
+        });
+    for message in messages {
+        let mut message = message.clone();
+        let parts = message["content"]
+            .as_array_mut()
+            .ok_or_else(|| record_error("Anthropic message has no content blocks"))?;
+        for part in parts.iter_mut().filter(|part| part["type"] == "image") {
+            let source = &mut part["source"];
+            let image = images
+                .next()
+                .and_then(|url| url.strip_prefix("data:"))
+                .and_then(|url| url.split_once(";base64,"));
+            let media_type = source["media_type"].as_str();
+            if source["type"] != "base64"
+                || image.is_none()
+                || media_type.zip(source["data"].as_str()) != image
+            {
+                return Err(record_error(
+                    "Anthropic image differs from its prepared Attachment",
+                ));
+            }
+            let attachment = attachments
+                .next()
+                .ok_or_else(|| record_error("request image has no stored Attachment"))?;
+            source["data"] = json!({"attachment": attachment.to_string()});
+        }
+        keep_message(&message)?;
+    }
+    if attachments.next().is_some() || images.next().is_some() {
+        return Err(record_error(
+            "request does not carry all its stored Attachments",
+        ));
+    }
+    Ok(())
 }
 
 fn record_error(message: impl Into<String>) -> OutputSinkError {

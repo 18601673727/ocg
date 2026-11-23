@@ -18,7 +18,7 @@ pub(crate) const MAX_PROVIDER_ERROR_BYTES: usize = 64 * 1024;
 const MAX_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
 
-mod anthropic;
+pub(crate) mod anthropic;
 mod credentials;
 pub(crate) mod headers;
 mod models;
@@ -94,16 +94,25 @@ pub(super) async fn send(
     config: &ProviderExecutionConfig,
     body: &Value,
     sink: Option<&mut dyn ProviderOutputSink>,
-    stream: bool,
+    transport: Option<crate::db::entities::LlmTransport>,
 ) -> Result<(ClientResponse, Instant, observe::Redactor), ProviderExecutionError> {
     use self::headers::{authorization, resolve_request_headers};
     use self::transport::provider_client_for;
 
+    let stream = transport.is_some();
+    let anthropic = transport == Some(crate::db::entities::LlmTransport::AnthropicMessages);
     let operation = if stream { "provider" } else { "decision" };
     let credential = resolver.resolve(credential_ref).await?;
     let headers = resolve_request_headers(frozen_headers, resolver).await?;
     let redactor = observe::Redactor::new(credential.as_deref()).with_secrets(headers.secrets());
-    let authorization = credential.as_deref().map(authorization).transpose()?;
+    let authorization = credential
+        .as_deref()
+        .map(if anthropic {
+            anthropic::api_key
+        } else {
+            authorization
+        })
+        .transpose()?;
     let cancelled = || ProviderExecutionError::NotDelivered {
         message: format!("{operation} execution was cancelled before sending"),
     };
@@ -140,8 +149,19 @@ pub(super) async fn send(
         .if_some(session, |session, request| {
             request.set_header("x-opencode-session", session)
         })
+        .if_some(
+            anthropic.then_some(anthropic::API_VERSION),
+            |version, request| request.set_header("anthropic-version", version),
+        )
         .if_some(authorization, |authorization, request| {
-            request.set_header("authorization", authorization)
+            request.set_header(
+                if anthropic {
+                    "x-api-key"
+                } else {
+                    "authorization"
+                },
+                authorization,
+            )
         });
     if config.cancellation.is_cancelled() {
         return Err(cancelled());

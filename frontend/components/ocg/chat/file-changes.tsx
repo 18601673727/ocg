@@ -12,7 +12,7 @@ import {
 import type { ToolCall } from "../contracts";
 import { useI18n } from "../i18n";
 import { useOcgRuntime } from "../runtime/runtime-context";
-import { artifactTitle, changedLines, fileArtifact } from "./artifact-model";
+import { artifactChangedLines, artifactTitle, fileArtifact } from "./artifact-model";
 import { ArtifactPreview } from "./artifact-preview";
 
 export type FileChangeCall = { job: string; call: ToolCall };
@@ -85,10 +85,7 @@ export function FileChanges(props: { changes: readonly FileChangeCall[] }) {
       if (path === call.name) continue;
       const file = grouped.get(path) ?? { path, calls: [], added: 0, removed: 0, known: true };
       const artifact = fileArtifact(call);
-      const counts =
-        artifact?.before !== undefined && artifact.after !== undefined
-          ? changedLines(artifact.before, artifact.after)
-          : null;
+      const counts = artifact ? artifactChangedLines(artifact) : null;
       file.calls.push({ job, call });
       if (counts) {
         file.added += counts.added;

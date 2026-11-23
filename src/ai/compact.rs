@@ -160,7 +160,11 @@ fn system_messages(
     }
 
     if let Some(project) = project {
-        if frozen.llm.provider.transport == LlmTransport::OpenAiResponses && grant.is_none() {
+        if matches!(
+            frozen.llm.provider.transport,
+            LlmTransport::OpenAiResponses | LlmTransport::AnthropicMessages
+        ) && grant.is_none()
+        {
             messages.push(ChatMessage::system(format!(
                 "You work in the Project {:?}. Its workspace root is {}. No workspace access or tools are available for this execution; do not claim to read or change project files.",
                 project.name, project.root

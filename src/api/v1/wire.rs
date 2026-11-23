@@ -1,8 +1,8 @@
 use super::contracts::envelope;
 use super::{
-    Arc, DatabaseError, Destination, HeaderMap, HeaderValue, HttpRequest, HttpResponse, Route,
+    ApiRequest, Arc, DatabaseError, HeaderMap, HeaderValue, HttpRequest, HttpResponse, Route,
     Shared, StatusCode, Value, admit, assets, attachments, authorize, decimal, events, header,
-    respond, route, submissions, subscriptions, web,
+    respond, submissions, subscriptions, web,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,6 +66,7 @@ pub(crate) struct Reply {
     pub(super) status: StatusCode,
     pub(super) body: Value,
     cookie: Option<String>,
+    bearer_challenge: bool,
 }
 
 impl Reply {
@@ -74,6 +75,7 @@ impl Reply {
             status,
             body,
             cookie: None,
+            bearer_challenge: false,
         }
     }
 
@@ -83,10 +85,36 @@ impl Reply {
 
     pub(super) fn with_cookie(status: StatusCode, body: Value, cookie: String) -> Self {
         Self {
-            status,
-            body,
             cookie: Some(cookie),
+            ..Self::new(status, body)
         }
+    }
+
+    pub(super) fn with_bearer_challenge(mut self) -> Self {
+        self.bearer_challenge = true;
+        self
+    }
+
+    pub(super) fn into_response(self, response_bytes: usize) -> HttpResponse {
+        let body = match bounded_json(&self.body, response_bytes) {
+            Ok(body) => body,
+            Err(refusal) => return refusal.response(),
+        };
+        let mut response = json_bytes_response(self.status, body);
+        if self.bearer_challenge {
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+        }
+        if let Some(cookie) = &self.cookie {
+            match HeaderValue::from_str(cookie) {
+                Ok(value) => {
+                    response.headers_mut().insert(header::SET_COOKIE, value);
+                }
+                Err(_) => return INTERNAL.response(),
+            }
+        }
+        response
     }
 }
 
@@ -246,9 +274,15 @@ pub(super) async fn answer(
     payload: web::types::Payload,
     shared: web::types::State<Arc<Shared>>,
 ) -> HttpResponse {
-    match admit(&request, &shared) {
+    match admit(
+        &request,
+        shared.port,
+        &shared.token,
+        &shared.browser,
+        shared.assets.is_some(),
+    ) {
         Err(refusal) => refusal.response(),
-        Ok(Destination::Asset) => {
+        Ok(None) => {
             let served = match shared.assets.as_ref() {
                 Some(assets) => assets.serve(request.path()).await,
                 None => Err(NOT_FOUND),
@@ -258,44 +292,39 @@ pub(super) async fn answer(
                 Err(refusal) => refusal.response(),
             }
         }
-        Ok(Destination::Api(caller)) => {
-            match route(&request).and_then(|route| authorize(&caller, route)) {
-                Ok(Route::Events { job, after_seq }) => {
-                    events::open(&shared, request.io().cloned(), job, after_seq)
-                        .await
-                        .unwrap_or_else(|refusal| refusal.response())
-                }
-                Ok(Route::Subscription(topic)) => {
-                    subscriptions::open(&shared, request.io().cloned(), topic)
-                        .unwrap_or_else(|refusal| refusal.response())
-                }
-                Ok(Route::AttachmentContent(attachment)) => {
-                    attachments::content(&shared.database, attachment)
-                        .await
-                        .unwrap_or_else(|refusal| refusal.response())
-                }
-                Ok(route) => match respond(route, &caller, &request, payload, &shared).await {
-                    Ok(reply) => {
-                        let body = match bounded_json(&reply.body, shared.response_bytes) {
-                            Ok(body) => body,
-                            Err(refusal) => return refusal.response(),
-                        };
-                        let mut response = json_bytes_response(reply.status, body);
-                        if let Some(cookie) = &reply.cookie {
-                            match HeaderValue::from_str(cookie) {
-                                Ok(value) => {
-                                    response.headers_mut().insert(header::SET_COOKIE, value);
-                                }
-                                Err(_) => return INTERNAL.response(),
-                            }
-                        }
-                        response
-                    }
-                    Err(refusal) => refusal.response(),
-                },
-                Err(refusal) => refusal.response(),
+        Ok(Some(ApiRequest {
+            caller,
+            route,
+            body_limit: limit,
+        })) => match authorize(&caller, route) {
+            Ok(Route::Events { job, after_seq }) => {
+                events::open(&shared, request.io().cloned(), job, after_seq)
+                    .await
+                    .unwrap_or_else(|refusal| refusal.response())
             }
-        }
+            Ok(Route::Subscription(topic)) => {
+                subscriptions::open(&shared, request.io().cloned(), topic)
+                    .unwrap_or_else(|refusal| refusal.response())
+            }
+            Ok(Route::AttachmentContent(attachment)) => {
+                attachments::content(&shared.database, attachment)
+                    .await
+                    .unwrap_or_else(|refusal| refusal.response())
+            }
+            Ok(route) => match respond(
+                route,
+                &caller,
+                &request,
+                LimitedBody { payload, limit },
+                &shared,
+            )
+            .await
+            {
+                Ok(reply) => reply.into_response(shared.response_bytes),
+                Err(refusal) => refusal.response(),
+            },
+            Err(refusal) => refusal.response(),
+        },
     }
 }
 
@@ -329,19 +358,23 @@ pub(super) fn submission_body(headers: &HeaderMap, limit: usize) -> Result<(), R
     }
 }
 
-pub(super) async fn read_body(
-    mut payload: web::types::Payload,
+pub(super) struct LimitedBody {
+    payload: web::types::Payload,
     limit: usize,
-) -> Result<Vec<u8>, Refusal> {
-    let mut body = Vec::new();
-    while let Some(chunk) = payload.recv().await {
-        let chunk = chunk.map_err(|_| submissions::INVALID_BODY)?;
-        if body.len() + chunk.len() > limit {
-            return Err(BODY_TOO_LARGE);
+}
+
+impl LimitedBody {
+    pub(super) async fn read(mut self) -> Result<Vec<u8>, Refusal> {
+        let mut body = Vec::new();
+        while let Some(chunk) = self.payload.recv().await {
+            let chunk = chunk.map_err(|_| submissions::INVALID_BODY)?;
+            if body.len() + chunk.len() > self.limit {
+                return Err(BODY_TOO_LARGE);
+            }
+            body.extend_from_slice(&chunk);
         }
-        body.extend_from_slice(&chunk);
+        Ok(body)
     }
-    Ok(body)
 }
 
 pub(super) fn single<'a>(

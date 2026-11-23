@@ -71,8 +71,8 @@ enum LanguageKind {
 fn detect_language(path: &str) -> Option<LanguageKind> {
     match path.rsplit('.').next()? {
         "rs" => Some(LanguageKind::Rust),
-        "ts" => Some(LanguageKind::TypeScript),
-        "tsx" => Some(LanguageKind::Tsx),
+        "js" | "mjs" | "cjs" | "ts" => Some(LanguageKind::TypeScript),
+        "jsx" | "tsx" => Some(LanguageKind::Tsx),
         "py" | "pyi" => Some(LanguageKind::Python),
         _ => None,
     }
