@@ -73,7 +73,8 @@ async function archiveAndRestore(page, fixture) {
     "archived conversation on disk",
   );
 
-  await page.getByRole("button", { name: "Archived", exact: true }).first().click();
+  await page.getByRole("button", { name: "Account", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Archived", exact: true }).click();
   const list = page.getByRole("dialog", { name: "Archived", exact: true });
   await list.getByRole("button", { name: "Unarchive", exact: true }).click();
   await eventually(
@@ -87,7 +88,8 @@ async function archiveAndRestore(page, fixture) {
     .getByRole("button", { name: /^Chat actions:/ })
     .first()
     .waitFor();
-  await page.getByRole("button", { name: "Archived", exact: true }).first().click();
+  await page.getByRole("button", { name: "Account", exact: true }).click();
+  await page.getByRole("menuitem", { name: "Archived", exact: true }).click();
   await page.getByText("No archived chats.", { exact: true }).waitFor();
   await page.keyboard.press("Escape");
   assert.ok(
