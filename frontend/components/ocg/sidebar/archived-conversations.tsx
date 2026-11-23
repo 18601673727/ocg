@@ -1,5 +1,4 @@
-import { Archive } from "@lucide/solid";
-import { createSignal, For, onCleanup, Show } from "solid-js";
+import { createEffect, createSignal, For, Show } from "solid-js";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -7,7 +6,6 @@ import {
   DialogDescription,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from "@/components/ui/dialog";
 import type * as Api from "../contracts/api";
 import { useI18n } from "../i18n";
@@ -15,25 +13,23 @@ import type { ApiClient } from "../runtime/api-client";
 
 export function ArchivedConversations(props: {
   api: ApiClient;
-  compact: boolean;
+  onClose: () => void;
   onOpenConversation: (conversation: Api.Conversation) => Promise<boolean>;
   onRestore: (conversation: Api.Conversation) => Promise<void>;
 }) {
   const i18n = useI18n();
-  const [open, setOpen] = createSignal(false);
   const [rows, setRows] = createSignal<Api.Conversation[]>([]);
   const [cursor, setCursor] = createSignal<string | null>();
   const [loading, setLoading] = createSignal(false);
   const [loadFailed, setLoadFailed] = createSignal(false);
   const [restoring, setRestoring] = createSignal<string>();
   const [restoreError, setRestoreError] = createSignal<string>();
-  let request: AbortController | undefined;
-  onCleanup(() => request?.abort());
+  const request = new AbortController();
 
   const load = async () => {
-    const signal = request?.signal;
+    const { signal } = request;
     const before = cursor();
-    if (!signal || loading() || restoring() || before === null) return;
+    if (signal.aborted || loading() || restoring() || before === null) return;
     setLoading(true);
     setLoadFailed(false);
     try {
@@ -48,18 +44,13 @@ export function ArchivedConversations(props: {
     }
   };
 
-  const changeOpen = (value: boolean) => {
-    if (restoring()) return;
-    setOpen(value);
-    request?.abort();
-    if (!value) return;
-    request = new AbortController();
-    setRows([]);
-    setCursor(undefined);
-    setLoading(false);
-    setRestoreError(undefined);
-    void load();
-  };
+  createEffect(
+    () => [],
+    () => {
+      void load();
+      return () => request.abort();
+    },
+  );
 
   const restore = async (item: Api.Conversation) => {
     if (loading() || restoring()) return;
@@ -80,26 +71,12 @@ export function ArchivedConversations(props: {
   };
 
   return (
-    <Dialog open={open()} onOpenChange={changeOpen}>
-      <DialogTrigger
-        render={
-          <Button
-            type="button"
-            variant="ghost"
-            size={props.compact ? "icon" : "sm"}
-            class={
-              props.compact
-                ? "size-9 rounded-lg text-muted-foreground"
-                : "h-9 w-full justify-start gap-2.5 rounded-lg px-3 text-sm font-normal tracking-normal text-muted-foreground normal-case"
-            }
-            aria-label={i18n.t("sidebar.archivedChats")}
-            title={props.compact ? i18n.t("sidebar.archivedChats") : undefined}
-          >
-            <Archive class="size-4" aria-hidden="true" />
-            {!props.compact && i18n.t("sidebar.archivedChats")}
-          </Button>
-        }
-      />
+    <Dialog
+      open
+      onOpenChange={(open) => {
+        if (!open && !restoring()) props.onClose();
+      }}
+    >
       <DialogContent class="flex max-h-[min(36rem,85dvh)] flex-col" showCloseButton={!restoring()}>
         <DialogHeader class="pr-8">
           <DialogTitle class="normal-case tracking-normal">
@@ -120,7 +97,7 @@ export function ArchivedConversations(props: {
                     title={item().title}
                     onClick={() => {
                       void props.onOpenConversation(item()).then((opened) => {
-                        if (opened) changeOpen(false);
+                        if (opened && !request.signal.aborted && !restoring()) props.onClose();
                       });
                     }}
                   >

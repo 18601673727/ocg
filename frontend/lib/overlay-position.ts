@@ -27,13 +27,16 @@ export function positionOverlay(
       element.style.maxHeight = `${Math.max(0, bottom - y - 4)}px`;
       element.style.overflowY = "auto";
     }
+    const anchor = trigger.getBoundingClientRect();
+    element.style.setProperty("--overlay-anchor-width", `${anchor.width}px`);
     const box = element.getBoundingClientRect();
-    const { left, top } = place(trigger.getBoundingClientRect(), box, bottom);
+    const { left, top } = place(anchor, box, bottom);
     element.style.left = `${Math.max(x, Math.min(left, right - box.width - 4)) - originX + (dialog?.scrollLeft ?? 0)}px`;
     element.style.top = `${Math.max(y, Math.min(top, bottom - box.height - 4)) - originY + (dialog?.scrollTop ?? 0)}px`;
   };
   const observer = new ResizeObserver(position);
   observer.observe(element);
+  observer.observe(trigger);
   if (dialog) observer.observe(dialog);
   const frame = requestAnimationFrame(position);
   window.addEventListener("resize", position);

@@ -1,4 +1,4 @@
-import { ChevronsUpDown, LogOut, SlidersHorizontal, User } from "@lucide/solid";
+import { Archive, ChevronsUpDown, LogOut, SlidersHorizontal, User } from "@lucide/solid";
 import { createMemo } from "solid-js";
 import {
   DropdownMenu,
@@ -12,6 +12,7 @@ import { useI18n } from "../i18n";
 
 export type AccountMenuProps = {
   email?: string | null;
+  onArchiveClick?: () => void;
   onLogout?: () => void;
   onSettingsClick?: () => void;
   variant?: "expanded" | "rail";
@@ -61,17 +62,21 @@ export function AccountMenu(props: AccountMenuProps) {
         )}
       </DropdownMenuTrigger>
       <DropdownMenuContent
-        align="start"
-        class={
-          rail()
-            ? "fixed top-auto right-auto bottom-3 left-18 mt-0 w-64"
-            : "top-auto right-0 bottom-full left-0 mb-1 mt-0"
-        }
+        side={rail() ? "right" : "top"}
+        align={rail() ? "end" : "start"}
+        sideOffset={rail() ? 8 : 4}
+        class={rail() ? "w-64" : "w-(--overlay-anchor-width)"}
       >
         {props.onLogout && (
           <DropdownMenuItem class="gap-2" onSelect={props.onLogout}>
             <LogOut class="size-3.5 shrink-0" aria-hidden="true" />
             {i18n.t("sidebar.logout")}
+          </DropdownMenuItem>
+        )}
+        {props.onArchiveClick && (
+          <DropdownMenuItem class="gap-2" aria-haspopup="dialog" onSelect={props.onArchiveClick}>
+            <Archive class="size-3.5 shrink-0" aria-hidden="true" />
+            {i18n.t("sidebar.archivedChats")}
           </DropdownMenuItem>
         )}
         {props.onSettingsClick && (

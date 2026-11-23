@@ -15,7 +15,7 @@ import {
   Workflow,
   X,
 } from "@lucide/solid";
-import { createEffect, createMemo, createSignal } from "solid-js";
+import { createEffect, createMemo, createSignal, Show } from "solid-js";
 import { WorkspaceLink } from "@/components/ocg/layout/workspace-link";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { Button } from "@/components/ui/button";
@@ -421,18 +421,17 @@ export function OcgSidebar(props: OcgSidebarProps) {
       setHiding(false);
     }
   };
-  const archive = (compact: boolean) => {
+  const [archiveOpen, setArchiveOpen] = createSignal(false);
+  const archive = createMemo(() => {
     const { api, onOpenArchivedConversation, onRestoreConversation } = props;
     if (!api || !onOpenArchivedConversation || !onRestoreConversation) return null;
-    return (
-      <ArchivedConversations
-        api={api}
-        compact={compact}
-        onOpenConversation={onOpenArchivedConversation}
-        onRestore={onRestoreConversation}
-      />
-    );
-  };
+    return {
+      api,
+      onOpenConversation: onOpenArchivedConversation,
+      onRestore: onRestoreConversation,
+    };
+  });
+  const openArchive = () => setArchiveOpen(true);
   const workbenchNav = WORKSPACE_NAV.filter((item) => item.target !== "chat");
   const hasNav = createMemo(() => Boolean(props.onNavigate));
   const navLabel = (item: (typeof WORKSPACE_NAV)[number]) =>
@@ -533,7 +532,6 @@ export function OcgSidebar(props: OcgSidebarProps) {
                     </button>
                   }
                 />
-                {archive(true)}
                 {hasNav() && (
                   <>
                     <div class="my-2 h-px w-8 bg-border" aria-hidden="true" />
@@ -615,6 +613,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
                     <AccountMenu
                       variant="rail"
                       email={email}
+                      onArchiveClick={archive() ? openArchive : undefined}
                       onLogout={
                         logout
                           ? () => {
@@ -719,7 +718,6 @@ export function OcgSidebar(props: OcgSidebarProps) {
                     </Button>
                   }
                 />
-                {archive(false)}
               </div>
 
               <ScrollArea
@@ -1075,6 +1073,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
               <div class="relative border-t border-border px-2 py-2">
                 <AccountMenu
                   email={email}
+                  onArchiveClick={archive() ? openArchive : undefined}
                   onLogout={
                     logout
                       ? () => {
@@ -1239,6 +1238,11 @@ export function OcgSidebar(props: OcgSidebarProps) {
           </TooltipProvider>
         );
       })()}
+      <Show when={archiveOpen() && archive()}>
+        {(options) => (
+          <ArchivedConversations {...options()} onClose={() => setArchiveOpen(false)} />
+        )}
+      </Show>
     </>
   );
 }
