@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use ntex::client::Client;
 use ntex::http::{Uri, header};
 
+use crate::api::v1::{PORT_VARIABLE, TOKEN_VARIABLE};
 use crate::network::http;
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
@@ -33,10 +34,39 @@ fn setting<'a>(text: &'a str, key: &str) -> Option<&'a str> {
 }
 
 pub(crate) fn install() -> Result<Install> {
-    fn find() -> Option<Install> {
-        let exe = fs::canonicalize(std::env::current_exe().ok()?).ok()?;
-        let settings = exe.parent()?.parent()?.parent()?.join("ocg.env");
-        let text = fs::read_to_string(settings).ok()?;
+    let exe = std::env::current_exe()
+        .ok()
+        .and_then(|exe| fs::canonicalize(exe).ok())
+        .ok_or(REINSTALL)?;
+    let settings = exe
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or(REINSTALL)?
+        .join("ocg.env");
+    let text = fs::read_to_string(&settings).map_err(|_| REINSTALL)?;
+    let renames = [
+        ("OCG_CONTROL_PORT", PORT_VARIABLE),
+        ("OCG_CONTROL_TOKEN", TOKEN_VARIABLE),
+    ]
+    .into_iter()
+    .filter(|(old, _)| {
+        text.lines().any(|line| {
+            line.strip_prefix(old)
+                .is_some_and(|rest| rest.starts_with('='))
+        })
+    })
+    .map(|(old, new)| format!("{old} to {new}"))
+    .collect::<Vec<_>>();
+    if !renames.is_empty() {
+        return Err(format!(
+            "{} uses obsolete settings: rename {}, then run ocg update again",
+            settings.display(),
+            renames.join(" and ")
+        )
+        .into());
+    }
+    let find = || -> Option<Install> {
         let ui = setting(&text, "OCG_UI_DIR")?;
         let prefix = PathBuf::from(ui.strip_suffix("/current/ui")?);
         if !prefix.is_absolute()
@@ -46,10 +76,10 @@ pub(crate) fn install() -> Result<Install> {
         }
         Some(Install {
             prefix,
-            port: setting(&text, "OCG_API_PORT")?.to_owned(),
-            token: setting(&text, "OCG_API_TOKEN")?.to_owned(),
+            port: setting(&text, PORT_VARIABLE)?.to_owned(),
+            token: setting(&text, TOKEN_VARIABLE)?.to_owned(),
         })
-    }
+    };
     find().ok_or_else(|| REINSTALL.into())
 }
 

@@ -37,6 +37,22 @@ systemd_path() {
     fi
 }
 
+check_obsolete_settings() {
+    renames=$(awk '
+        /^OCG_CONTROL_PORT=/ { port=1 }
+        /^OCG_CONTROL_TOKEN=/ { token=1 }
+        END {
+            if (port) printf "OCG_CONTROL_PORT to OCG_API_PORT"
+            if (port && token) printf " and "
+            if (token) printf "OCG_CONTROL_TOKEN to OCG_API_TOKEN"
+        }
+    ' "$settings" </dev/null)
+    if [ -n "$renames" ]; then
+        printf '%s uses obsolete settings: rename %s, then run install.sh again\n' "$settings" "$renames" >&2
+        exit 1
+    fi
+}
+
 replace_link() {
     link_target=$1
     link_path=$2
@@ -428,6 +444,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
     if [ -n "$stage_dir" ]; then exit 0; fi
 
     if [ -f "$settings" ]; then
+        check_obsolete_settings
         data=$(sed -n "s/^OCG_DATA_DIR='\(.*\)'$/\1/p" "$settings" </dev/null)
         port=$(sed -n "s/^OCG_API_PORT='\(.*\)'$/\1/p" "$settings" </dev/null)
         [ -n "$data" ] && [ -n "$port" ] || { printf 'Cannot read settings from %s\n' "$settings" >&2; exit 1; }
@@ -491,6 +508,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         cp -p "$service_file" "$tmp/service" </dev/null
     fi
     if [ -f "$settings" ]; then
+        check_obsolete_settings
         token=$(sed -n "s/^OCG_API_TOKEN='\(.*\)'$/\1/p" "$settings" </dev/null)
         [ -n "$token" ] || { printf 'Cannot read API token from %s\n' "$settings" >&2; exit 1; }
         escaped_token=$(printf '%s\n' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
@@ -616,6 +634,7 @@ Install a specific version: curl -fsSL https://github.com/18601673727/ocg/releas
         fi
         stop="launchctl bootout $domain/$uid '$plist'"
     fi
+    check_obsolete_settings
     token=$(sed -n "s/^OCG_API_TOKEN='\(.*\)'$/\1/p" "$settings" </dev/null)
     [ -n "$token" ] || { printf 'Cannot read API token from %s\n' "$settings" >&2; exit 1; }
     escaped_token=$(printf '%s\n' "$token" | sed 's/\\/\\\\/g; s/"/\\"/g')
