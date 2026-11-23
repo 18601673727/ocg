@@ -1,10 +1,11 @@
+use super::providers::anthropic;
 use super::providers::openai_compatible::{
     ChatConversation, ChatMessage, ChatRole, ContentPartWire, ImageInput, MessageContentWire,
     ToolWire,
 };
 use crate::db::entities::{
-    DevelopmentContextRequirements, FrozenExecutionConfig, LlmConfig, LlmTransport, ProjectRecord,
-    VerifiedNativeSummary,
+    DevelopmentContextRequirements, FrozenExecutionConfig, FrozenLlmConfig, LlmParameters,
+    LlmTransport, ProjectRecord, VerifiedNativeSummary,
 };
 
 pub(super) const ADOPTED_SUMMARY_NOTICE: &str = "Generated context summary (advisory, not an original user instruction). Originals remain available:\n";
@@ -92,10 +93,7 @@ fn tool_bytes(tool: &ToolWire) -> usize {
     crate::db::serialized_len(tool).unwrap_or(0)
 }
 
-pub(crate) fn estimate_request_tokens(
-    conversation: &ChatConversation,
-    max_tokens: Option<u32>,
-) -> u64 {
+pub(crate) fn estimate_request_tokens(conversation: &ChatConversation, max_tokens: u32) -> u64 {
     let mut bytes: usize = 0;
     let mut images: usize = 0;
 
@@ -111,7 +109,7 @@ pub(crate) fn estimate_request_tokens(
 
     let text_tokens = bytes.div_ceil(3) as u64;
     let image_tokens = (images as u64).saturating_mul(1600);
-    let output_tokens = max_tokens.map_or(4096, u64::from);
+    let output_tokens = u64::from(max_tokens);
     text_tokens
         .saturating_add(image_tokens)
         .saturating_add(output_tokens)
@@ -119,23 +117,27 @@ pub(crate) fn estimate_request_tokens(
 
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
 
-#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+pub(crate) fn reserved_output_tokens(transport: LlmTransport, parameters: &LlmParameters) -> u32 {
+    match transport {
+        LlmTransport::AnthropicMessages => anthropic::max_tokens(parameters),
+        LlmTransport::OpenAiChatCompletions | LlmTransport::OpenAiResponses => parameters
+            .max_completion_tokens
+            .or(parameters.max_tokens)
+            .unwrap_or(4096),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContextLimits {
     pub(crate) context_window: Option<u32>,
-    pub(crate) max_tokens: Option<u32>,
+    pub(crate) max_tokens: u32,
 }
 
 impl ContextLimits {
-    pub(crate) fn for_profile(config: &crate::db::entities::LlmConfig) -> Self {
+    pub(crate) fn for_profile(model: &FrozenLlmConfig) -> Self {
         Self {
-            context_window: config.context_window,
-            max_tokens: Some(
-                config
-                    .parameters
-                    .max_completion_tokens
-                    .or(config.parameters.max_tokens)
-                    .unwrap_or(4096),
-            ),
+            context_window: model.config.context_window,
+            max_tokens: reserved_output_tokens(model.provider.transport, &model.config.parameters),
         }
     }
 }
@@ -369,7 +371,7 @@ pub(crate) fn fit_with_notices(
     let total_prior_bytes: usize = prior_weights.iter().map(|(b, _)| *b).sum();
     let total_prior_images: usize = prior_weights.iter().map(|(_, img)| *img).sum();
 
-    let output_tokens = context_limits.max_tokens.map_or(4096, u64::from);
+    let output_tokens = u64::from(context_limits.max_tokens);
 
     let full_bytes = rest_without_notice_bytes.saturating_add(total_prior_bytes);
     let full_images = current_images_count.saturating_add(total_prior_images);
@@ -478,16 +480,17 @@ impl DevelopmentContextRequirements for DevelopmentContextBudget {
         Ok(bytes)
     }
 
-    fn admits_tokens(&self, model: &LlmConfig, selected_bytes: usize, image_count: usize) -> bool {
-        let output_reserve = model
-            .parameters
-            .max_completion_tokens
-            .or(model.parameters.max_tokens)
-            .unwrap_or(4096);
+    fn admits_tokens(
+        &self,
+        model: &FrozenLlmConfig,
+        selected_bytes: usize,
+        image_count: usize,
+    ) -> bool {
+        let limits = ContextLimits::for_profile(model);
         let estimated_tokens = (selected_bytes.div_ceil(3) as u64)
             .saturating_add((image_count as u64).saturating_mul(1600))
-            .saturating_add(u64::from(output_reserve));
-        let window = model.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+            .saturating_add(u64::from(limits.max_tokens));
+        let window = limits.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
         estimated_tokens <= u64::from(window)
     }
 }

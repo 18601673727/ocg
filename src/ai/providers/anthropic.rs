@@ -10,12 +10,42 @@ use super::{
     incomplete_tool_calls,
 };
 use crate::db::entities::{
-    ChatFinishReason, FrozenLlmConfig, IntermediateOutputKind, NormalizedUsage, ProviderFailure,
-    UsageFinality,
+    ChatFinishReason, FrozenLlmConfig, IntermediateOutputKind, LlmParameters, NormalizedUsage,
+    ProviderFailure, UsageFinality,
 };
 
 pub(crate) const API_VERSION: &str = "2023-06-01";
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1";
+pub(crate) const DEFAULT_MAX_TOKENS: u32 = 16_384;
+
+pub(crate) fn max_tokens(parameters: &LlmParameters) -> u32 {
+    parameters
+        .max_tokens
+        .or(parameters.max_completion_tokens)
+        .unwrap_or(DEFAULT_MAX_TOKENS)
+}
+
+pub(crate) fn parameter_refusal(
+    parameters: &LlmParameters,
+) -> Option<(&'static str, &'static str)> {
+    const UNSUPPORTED: &str = "Anthropic Messages does not support this setting";
+    if parameters.reasoning_effort.is_some() {
+        return Some(("reasoning_effort", UNSUPPORTED));
+    }
+    if parameters.presence_penalty.is_some() {
+        return Some(("presence_penalty", UNSUPPORTED));
+    }
+    if parameters.frequency_penalty.is_some() {
+        return Some(("frequency_penalty", UNSUPPORTED));
+    }
+    if parameters.temperature.is_some() && parameters.top_p.is_some() {
+        return Some((
+            "temperature",
+            "Anthropic Messages does not allow temperature and top_p together",
+        ));
+    }
+    None
+}
 
 fn build(message: &str) -> ProviderExecutionError {
     ProviderExecutionError::Build {
@@ -34,6 +64,11 @@ pub(crate) fn request_body(
     frozen: &FrozenLlmConfig,
     conversation: &ChatConversation,
 ) -> Result<Value, ProviderExecutionError> {
+    let parameters = &frozen.config.parameters;
+    if let Some((setting, reason)) = parameter_refusal(parameters) {
+        return Err(build(&format!("{setting}: {reason}")));
+    }
+
     let mut system = Vec::new();
     let mut turns: Vec<(&str, Vec<Value>)> = Vec::new();
     for message in &conversation.messages {
@@ -70,7 +105,6 @@ pub(crate) fn request_body(
         return Err(build("Anthropic Messages requires an initial user message"));
     }
 
-    let parameters = &frozen.config.parameters;
     let messages: Vec<_> = turns
         .into_iter()
         .map(|(role, content)| json!({ "role": role, "content": content }))
@@ -79,7 +113,7 @@ pub(crate) fn request_body(
         "model": frozen.config.model,
         "messages": messages,
         "stream": true,
-        "max_tokens": parameters.max_tokens.or(parameters.max_completion_tokens).unwrap_or(4096),
+        "max_tokens": max_tokens(parameters),
     });
     if !system.is_empty() {
         body["system"] = Value::String(system.join("\n\n"));
@@ -735,7 +769,7 @@ mod tests {
         let text = |value: &str| json!({"type":"text","text":value});
         assert_eq!(body["model"], "test-model");
         assert_eq!(body["stream"], true);
-        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["max_tokens"], DEFAULT_MAX_TOKENS);
         assert_eq!(body["system"], "system rules\n\ndeveloper rules");
         assert_eq!(
             body["messages"],

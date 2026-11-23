@@ -145,6 +145,7 @@ export function SettingsSurface(props: {
   const [llmName, setLlmName] = createSignal("");
   const [llmModel, setLlmModel] = createSignal("");
   const [llmProtocol, setLlmProtocol] = createSignal<LlmProtocol>("openai_chat_completions");
+  const isAnthropic = () => llmProtocol() === "anthropic_messages";
   const [llmEndpoint, setLlmEndpoint] = createSignal("");
   const [llmCredentialRef, setLlmCredentialRef] = createSignal("");
   const [llmSecret, setLlmSecret] = createSignal("");
@@ -419,7 +420,8 @@ export function SettingsSurface(props: {
           temperature: parsedTemp,
           top_p: parsedTopP,
           max_tokens: parsedMaxTokens,
-          reasoning_effort: llmReasoningEffort() || null,
+          reasoning_effort: isAnthropic() ? null : llmReasoningEffort() || null,
+          ...(isAnthropic() ? { presence_penalty: null, frequency_penalty: null } : {}),
         },
       };
     }
@@ -1030,11 +1032,17 @@ export function SettingsSurface(props: {
                                 <Input
                                   value={llmMaxTokens()}
                                   onInput={(e) => setLlmMaxTokens(e.target.value)}
-                                  placeholder="4096"
+                                  placeholder={isAnthropic() ? undefined : "4096"}
                                   spellcheck="false"
                                 />
                               </label>
-                              <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                              <label
+                                hidden={isAnthropic()}
+                                class={cn(
+                                  "flex-col gap-1 text-xs font-medium text-muted-foreground",
+                                  !isAnthropic() && "flex",
+                                )}
+                              >
                                 {i18n.t("settings.llm.reasoningEffort")}
                                 <Select
                                   value={llmReasoningEffort()}
@@ -1106,6 +1114,12 @@ export function SettingsSurface(props: {
                                 </Select>
                               </label>
                             </div>
+                            {isAnthropic() ? (
+                              <div class="text-xs text-muted-foreground">
+                                <p>{i18n.t("settings.llm.anthropicSamplingHelp")}</p>
+                                <p>{i18n.t("settings.llm.anthropicTokenLimitHelp")}</p>
+                              </div>
+                            ) : null}
                           </>
                         ) : (
                           <>

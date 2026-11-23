@@ -220,6 +220,12 @@ pub(crate) fn map_mutation_error(error: DatabaseError) -> Refusal {
         DatabaseError::Rejected(Violation::InvalidValue("executor", reason)) => {
             Refusal::new(StatusCode::CONFLICT, "executor_unavailable", reason)
         }
+        DatabaseError::Rejected(
+            reason @ Violation::InvalidValue(
+                "reasoning_effort" | "presence_penalty" | "frequency_penalty" | "temperature",
+                _,
+            ),
+        ) => INVALID_PARAMETERS.with_reason(reason.to_string()),
         DatabaseError::Rejected(Violation::NotFound(RecordRef::Profile(_))) => PROFILE_NOT_FOUND,
         DatabaseError::Rejected(Violation::WrongConfigKind { .. }) => WRONG_PROFILE_KIND,
         DatabaseError::Rejected(reason @ Violation::ConnectionHeaders { .. }) => {

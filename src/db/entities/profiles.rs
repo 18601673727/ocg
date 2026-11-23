@@ -716,6 +716,7 @@ pub(crate) enum ProfilePageRecord {
 
 pub(crate) struct AgentModelConfig {
     pub config: Option<ConfigRecord>,
+    pub protocol: Option<LlmTransport>,
     pub executors: Vec<ExecutorId>,
 }
 

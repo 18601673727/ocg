@@ -1151,6 +1151,10 @@ export const zh: Dictionary = {
   "settings.llm.temperature": "温度（0..2，可选）",
   "settings.llm.topP": "Top-P（0..1，可选）",
   "settings.llm.maxTokens": "最大 Token 数（可选）",
+  "settings.llm.anthropicSamplingHelp":
+    "Anthropic Messages 的 temperature 和 top_p 最多只能设置一项。",
+  "settings.llm.anthropicTokenLimitHelp":
+    "如果旧版 Claude 模型的最大输出少于 16,384 个 Token，请明确设置 Token 上限。",
   "settings.llm.reasoningEffort": "推理强度（Effort，可选）",
   "settings.llm.saveCreate": "添加模型",
   "settings.llm.saveUpdate": "更新模型",

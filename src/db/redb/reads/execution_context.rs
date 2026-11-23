@@ -1114,7 +1114,7 @@ fn development_candidate_in(
             "selected Model does not support images",
         ));
     }
-    if !requirements.admits_tokens(model, selected_bytes, image_count) {
+    if !requirements.admits_tokens(&configuration.llm, selected_bytes, image_count) {
         return Err(context_unavailable(
             "selected execution context exceeds estimated model token budget",
         ));

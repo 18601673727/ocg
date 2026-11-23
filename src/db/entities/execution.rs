@@ -134,7 +134,7 @@ pub(crate) trait DevelopmentContextRequirements: Send + Sync {
     ) -> Result<usize, serde_json::Error>;
     fn admits_tokens(
         &self,
-        model: &crate::db::entities::LlmConfig,
+        model: &crate::db::entities::FrozenLlmConfig,
         selected_bytes: usize,
         image_count: usize,
     ) -> bool;

@@ -1224,6 +1224,10 @@ export const en = {
   "settings.llm.temperature": "Temperature (0..2, optional)",
   "settings.llm.topP": "Top-P (0..1, optional)",
   "settings.llm.maxTokens": "Max Tokens (optional)",
+  "settings.llm.anthropicSamplingHelp":
+    "Use at most one of temperature and top_p with Anthropic Messages.",
+  "settings.llm.anthropicTokenLimitHelp":
+    "Set an explicit token limit for older Claude models that support fewer than 16,384 output tokens.",
   "settings.llm.reasoningEffort": "Reasoning Effort (optional)",
   "settings.llm.saveCreate": "Add Model",
   "settings.llm.saveUpdate": "Update Model",

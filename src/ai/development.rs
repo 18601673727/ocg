@@ -394,7 +394,7 @@ pub(crate) fn prepare_development_handoff(
             if image_cursor.next().is_some() {
                 return Err(unavailable());
             }
-            let limits = ContextLimits::for_profile(&frozen.llm.config);
+            let limits = ContextLimits::for_profile(&frozen.llm);
             let mut conversation = fit_with_notices(
                 frozen,
                 prior,

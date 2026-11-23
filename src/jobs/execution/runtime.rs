@@ -100,7 +100,7 @@ pub(crate) async fn supervise_development_generative(
         )
         .await;
     }
-    let limits = ContextLimits::for_profile(&frozen.llm.config);
+    let limits = ContextLimits::for_profile(&frozen.llm);
     let max_requests = tools
         .as_ref()
         .map_or(1, |tools| tools.limits.max_provider_requests);

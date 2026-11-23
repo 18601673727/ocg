@@ -396,7 +396,7 @@ fn replace(
     }
     let len = current.len() - edits.iter().map(|edit| edit.old.len()).sum::<usize>()
         + edits.iter().map(|edit| edit.new.len()).sum::<usize>();
-    if matches!(replacements, Replacements::Multi(_)) && len > MAX_REPLACE_FILE_BYTES {
+    if len > MAX_REPLACE_FILE_BYTES {
         return Err(Refusal::ResultTooLarge.into());
     }
     let mut new_content = String::with_capacity(len);

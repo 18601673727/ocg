@@ -1,3 +1,4 @@
+use crate::ai::providers::anthropic;
 use crate::db::entities::{
     AgentConfig, CompactionPolicy, ConfigBody, ConfigId, ConfigKind, ConfigRecord, ConfigRef,
     ConnectionConfig, DecisionCapability, DecisionModelConfig, ExecutionConfiguration,
@@ -270,6 +271,12 @@ impl Batch {
                 .unwrap_or(LlmTransport::OpenAiChatCompletions),
             ModelProfileDefinition::Decision { .. } => LlmTransport::OpenAiChatCompletions,
         };
+        if protocol == LlmTransport::AnthropicMessages
+            && let ModelProfileDefinition::Llm { parameters, .. } = &save.definition
+            && let Some((setting, reason)) = anthropic::parameter_refusal(parameters)
+        {
+            return self.reject(Violation::InvalidValue(setting, reason));
+        }
         let prior_credential_ref = previous_connection
             .as_ref()
             .and_then(|(_, connection)| connection.credential_ref.clone());
@@ -1379,6 +1386,11 @@ impl<'a, Tx: TxRead> ConfigurationResolver<'a, Tx> {
         let ConfigBody::Connection(connection_body) = connection.body else {
             return self.corrupted(format!("{} has a mismatched body", connection.id));
         };
+        if connection_body.protocol == LlmTransport::AnthropicMessages
+            && let Some((setting, reason)) = anthropic::parameter_refusal(&model_body.parameters)
+        {
+            return self.reject(Violation::InvalidValue(setting, reason));
+        }
         let headers = self.frozen_headers(&connection.name, &connection_body)?;
         let decision_profile = if let Some(id) = configuration.agent_profile {
             let row = self.require_config(id.into())?;

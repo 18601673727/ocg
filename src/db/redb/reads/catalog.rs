@@ -372,7 +372,7 @@ pub(crate) fn read_agent_model_configs(
     ids.iter()
         .map(|id| {
             let record = config(&rx, *id)?;
-            let executors = if let Some(ConfigRecord {
+            let (protocol, executors) = if let Some(ConfigRecord {
                 body: ConfigBody::Model(model),
                 model_enabled: true,
                 archived_at: None,
@@ -388,7 +388,7 @@ pub(crate) fn read_agent_model_configs(
                     ));
                 };
                 use std::collections::btree_map::Entry;
-                match executors_by_protocol.entry(connection.protocol) {
+                let executors = match executors_by_protocol.entry(connection.protocol) {
                     Entry::Occupied(entry) => entry.get().clone(),
                     Entry::Vacant(entry) => entry
                         .insert(allocations::pools_offering_capability(
@@ -397,12 +397,14 @@ pub(crate) fn read_agent_model_configs(
                             Some(connection.protocol),
                         )?)
                         .clone(),
-                }
+                };
+                (Some(connection.protocol), executors)
             } else {
-                Vec::new()
+                (None, Vec::new())
             };
             Ok(AgentModelConfig {
                 config: record,
+                protocol,
                 executors,
             })
         })

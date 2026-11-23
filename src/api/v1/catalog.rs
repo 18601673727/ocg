@@ -6,9 +6,10 @@ use super::{
     INCONSISTENT_RECORD, INVALID_REQUEST, JOB_NOT_FOUND, NOT_FOUND, Refusal, Reply, Shared,
     dashboard, decimal, profiles, routing, submissions,
 };
+use crate::ai::compact::reserved_output_tokens;
 use crate::db::entities::{
     ConfigBody, ConfigKind, DependencyCondition, DependencyState, JobEdit, JobId, JobTree,
-    ProfileId, RecordRef, Recurrence, TreeFacts, TreeNode, Violation,
+    LlmTransport, ProfileId, RecordRef, Recurrence, TreeFacts, TreeNode, Violation,
 };
 use crate::db::{DatabaseError, DatabaseHandle};
 
@@ -798,7 +799,12 @@ pub(super) async fn agent_profiles(
                 name: llm.name,
                 model: model.model,
                 context_window: model.context_window,
-                reasoning_efforts: model.reasoning_efforts,
+                reasoning_efforts: if model_config.protocol == Some(LlmTransport::AnthropicMessages)
+                {
+                    Some(Vec::new())
+                } else {
+                    model.reasoning_efforts
+                },
                 parameters: model.parameters,
                 declared_capabilities: model
                     .declared_capabilities
@@ -1059,12 +1065,10 @@ pub(super) async fn conversation_context(
                 "unknown"
             }
             .to_owned(),
-            reserved_output_tokens: model
-                .config
-                .parameters
-                .max_completion_tokens
-                .or(model.config.parameters.max_tokens)
-                .unwrap_or(4096),
+            reserved_output_tokens: reserved_output_tokens(
+                model.provider.transport,
+                &model.config.parameters,
+            ),
         }),
         estimated_tokens: state.estimated_tokens,
         estimate_method: "utf8_bytes_per_three_plus_framing_and_image_allowance".to_owned(),
