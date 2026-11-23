@@ -49,7 +49,7 @@ pub(crate) fn next_check_interval(configured: Duration, locked: bool) -> Duratio
         configured
     }
 }
-pub const READ_WORKERS: usize = 2;
+pub const READ_WORKERS: usize = 4;
 pub const READ_QUEUE_CAPACITY: usize = 64;
 pub const MAX_OBSERVATION_SCAN: usize = redb::MAX_OBSERVATION_SCAN;
 const MAINTENANCE_QUEUE_CAPACITY: usize = 2;

@@ -11,10 +11,11 @@ use crate::db::redb::QueueCounts;
 use crate::db::redb::StorageError;
 use crate::db::scheduler_wake::SchedulerWakeSubscription;
 use crate::db::shared::{Admission, Opened, ReadJob, ReadMessage, Shared, admitted};
-use crate::db::worker::{DatabaseHandle, run};
+use crate::db::worker::{DatabaseHandle, run, settle};
 use crate::db::{errors, redb};
 use crate::host::data_directory::DataDirectory;
 use ::redb::Database;
+use std::ops::ControlFlow;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError};
 
@@ -170,10 +171,7 @@ impl DatabaseHandle {
             .admission
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        admitted(&admission)?;
-        if self.shared.update_paused.load(Ordering::SeqCst) {
-            return Err(DatabaseError::ShuttingDown);
-        }
+        self.check_write_admission(&admission)?;
         let opened = database.as_ref().ok_or(DatabaseError::ReadsClosed)?;
         let counts = redb::queue_counts(&opened.database, true).map_err(|error| {
             self.shared.note_read_error(&error);
@@ -196,6 +194,22 @@ impl DatabaseHandle {
         Ok(Some(UpdatePause(self.shared.clone())))
     }
 
+    fn check_write_admission(&self, admission: &Admission) -> Result<(), DatabaseError> {
+        admitted(admission)?;
+        if self.shared.update_paused.load(Ordering::SeqCst) {
+            return Err(DatabaseError::ShuttingDown);
+        }
+        Ok(())
+    }
+
+    async fn preflight_write<T: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Database) -> Result<T, StorageError> + Send + 'static,
+    ) -> Result<T, DatabaseError> {
+        self.check_write_admission(&self.shared.admission())?;
+        self.read(read).await
+    }
+
     async fn submit<T>(
         &self,
         command: impl FnOnce(Reply<T>) -> Command,
@@ -208,10 +222,7 @@ impl DatabaseHandle {
                 .admission
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            admitted(&admission)?;
-            if self.shared.update_paused.load(Ordering::SeqCst) {
-                return Err(DatabaseError::ShuttingDown);
-            }
+            self.check_write_admission(&admission)?;
             let epoch = self.shared.epoch.load(Ordering::SeqCst);
             let operation = OperationId::new(
                 epoch,
@@ -265,6 +276,29 @@ impl DatabaseHandle {
             Command::new(args, reply, size, kind, move |args, batch| {
                 batch.native_stops = Some(stops);
                 f(batch, args)
+            })
+        })
+        .await
+    }
+
+    async fn write_declinable<A: Send + 'static, T: Send + 'static>(
+        &self,
+        args: A,
+        size: impl FnOnce(&A) -> u64,
+        kind: OperationKind,
+        f: impl FnOnce(&mut redb::Batch, A) -> Result<ControlFlow<T, T>, redb::BatchError>
+        + Send
+        + 'static,
+    ) -> Result<T, DatabaseError> {
+        let stops = self.native_stops();
+        self.submit(|reply| {
+            Command::custom(args, reply, size, move |args, reply, db, op, commit| {
+                let (outcome, declined) =
+                    redb::run_batch_declinable(db, op.epoch, commit, |batch| {
+                        batch.native_stops = Some(stops);
+                        f(batch, args)
+                    });
+                settle(op, commit, kind, reply, outcome, declined)
             })
         })
         .await

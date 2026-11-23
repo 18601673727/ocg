@@ -115,7 +115,7 @@ pub(super) async fn send(
     } else {
         config.timeout
     };
-    let client = provider_client_for(timeout, &config.destination, &endpoint).await?;
+    let client = provider_client_for(&config.destination, &endpoint).await?;
     let session = stream
         .then(|| endpoint.parse::<ntex::http::Uri>().ok())
         .flatten()
@@ -131,7 +131,7 @@ pub(super) async fn send(
         "application/json"
     };
     let request = headers
-        .apply(client.post(endpoint))
+        .apply(client.post(endpoint).timeout(timeout))
         .set_header(CONTENT_TYPE, "application/json")
         .set_header(ACCEPT, accept)
         .if_some(stream.then_some("no-cache"), |value, request| {

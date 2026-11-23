@@ -216,6 +216,7 @@ pub(crate) async fn answer_calls(
         .flatten()
         .map(|call| call.id.as_str())
         .collect::<std::collections::HashSet<_>>();
+    let mut prepared = Vec::with_capacity(calls.len());
     for call in calls {
         if earlier.contains(call.id.as_str()) {
             return Err(ToolLoopStop::Refused(InvalidToolCall::at(
@@ -224,15 +225,17 @@ pub(crate) async fn answer_calls(
                 format!("tool call {} repeats the id of an earlier call", call.index),
             )));
         }
-        if refused
+        if let Some(refusal) = refused
             .iter()
-            .any(|refusal| refusal.index == Some(call.index))
+            .find(|refusal| refusal.index == Some(call.index))
         {
+            prepared.push(Err(refusal));
             continue;
         }
-        if let Err(refusal) = tools.offer.resolve(call) {
-            return Err(refuse(site, call, refusal).await);
-        }
+        let dispatch = match tools.offer.resolve(call) {
+            Ok(dispatch) => dispatch,
+            Err(refusal) => return Err(refuse(site, call, refusal).await),
+        };
         if call.arguments.len() > MAX_STORED_TOOL_ARGUMENTS_BYTES {
             let refusal = InvalidToolCall::at(
                 ToolCallRefusal::LimitExceeded,
@@ -244,46 +247,44 @@ pub(crate) async fn answer_calls(
             );
             return Err(refuse(site, call, refusal).await);
         }
+        prepared.push(Ok(dispatch));
     }
 
     // Keep read-only results when a user decision may pause the Turn before the next request.
     let retain_results = tools.decider
-        && calls.iter().any(|call| {
-            needs_decision(&call.name).is_some()
-                && !refused
-                    .iter()
-                    .any(|refusal| refusal.index == Some(call.index))
-        });
+        && calls
+            .iter()
+            .zip(&prepared)
+            .any(|(call, dispatch)| dispatch.is_ok() && needs_decision(&call.name).is_some());
     let limits = &tools.limits;
     let mut answers = Vec::with_capacity(calls.len());
     let mut awaiting = Vec::new();
-    for call in calls {
+    for (call, dispatch) in calls.iter().zip(prepared) {
         if let Some(reason) = cancellation.reason() {
             return Err(ToolLoopStop::Interrupted {
                 reason,
                 effect_unknown: false,
             });
         }
-        if let Some(refusal) = refused
-            .iter()
-            .find(|refusal| refusal.index == Some(call.index))
-        {
-            record_refusal(site, call, refusal).await?;
-            answers.push(refusal_answer(refusal));
-            continue;
-        }
-        let dispatch = match tools.offer.resolve(call) {
+        let dispatch = match dispatch {
             Ok(dispatch) => dispatch,
-            Err(refusal) => return Err(refuse(site, call, refusal).await),
+            Err(refusal) => {
+                record_refusal(site, call, refusal).await?;
+                answers.push(refusal_answer(refusal));
+                continue;
+            }
         };
+        if let Err(refusal) = tools.offer.recheck(call) {
+            return Err(refuse(site, call, refusal).await);
+        }
         let index = call.index;
         let reference = site.call(call);
         let effect = dispatch.effect;
         let stoppable = dispatch.spawns;
         let decided = ToolAdmission {
-            handler_version: dispatch.version.clone(),
+            handler_version: dispatch.version,
             effect,
-            parameters: dispatch.schema.clone(),
+            parameters: dispatch.schema,
             arguments: ToolPayload::new(call.arguments.clone()),
             authorization: AuthorizationBasis::RegistryGrant,
         };
@@ -339,17 +340,12 @@ pub(crate) async fn answer_calls(
         if let Some(reason) = cancellation.reason() {
             return Err(cancelled_before_invocation(site, reference, reason).await);
         }
-        let dispatch = match tools.offer.resolve(call) {
-            Ok(dispatch) => dispatch,
-            Err(refusal) => {
-                let outcome = ToolOutcome::NotInvoked {
-                    reason: NotInvokedReason::Refused(refusal.kind),
-                };
-                return Err(
-                    conclude(site, reference, outcome, ToolLoopStop::Refused(refusal)).await,
-                );
-            }
-        };
+        if let Err(refusal) = tools.offer.recheck(call) {
+            let outcome = ToolOutcome::NotInvoked {
+                reason: NotInvokedReason::Refused(refusal.kind),
+            };
+            return Err(conclude(site, reference, outcome, ToolLoopStop::Refused(refusal)).await);
+        }
         if JobToolCall::is_job_tool(&call.name) {
             let Some(job_call) = JobToolCall::parse(&call.name, &call.arguments) else {
                 let message = "the arguments do not fit the job tool".to_owned();

@@ -277,6 +277,7 @@ function UserMessage() {
     <div
       data-slot="aui_user-message-root"
       data-role="user"
+      style={{ contain: message().queued ? undefined : "layout style" }}
       class="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 [contain-intrinsic-size:auto_80px] [&>*]:col-start-2"
     >
       <ImageGallery images={message().images} compact />
@@ -326,6 +327,7 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
           <div
             data-slot="aui_assistant-message-root"
             data-role="assistant"
+            style={{ contain: running() ? undefined : "layout style" }}
             data-intermediate={message().intermediate || undefined}
             class="relative -mb-7.5 pb-7.5"
           >

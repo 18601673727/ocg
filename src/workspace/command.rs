@@ -6,7 +6,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -202,13 +202,16 @@ fn parse(arguments: &Value, commands: &[ProjectCommand]) -> Result<Selected, Ref
 
 #[derive(Clone, Debug)]
 pub(crate) struct CommandEnvironment {
-    search: Vec<PathBuf>,
-    variables: Vec<(OsString, OsString)>,
+    search: Arc<[PathBuf]>,
+    variables: Arc<[(OsString, OsString)]>,
 }
 
 impl CommandEnvironment {
     pub(crate) fn of_process() -> Self {
-        Self::from_source(|name| std::env::var_os(name))
+        static ENVIRONMENT: OnceLock<CommandEnvironment> = OnceLock::new();
+        ENVIRONMENT
+            .get_or_init(|| Self::from_source(|name| std::env::var_os(name)))
+            .clone()
     }
 
     pub(crate) fn from_source(source: impl Fn(&str) -> Option<OsString>) -> Self {
@@ -233,7 +236,10 @@ impl CommandEnvironment {
         for (name, value) in SET_VARIABLES {
             variables.push((OsString::from(name), OsString::from(value)));
         }
-        Self { search, variables }
+        Self {
+            search: search.into(),
+            variables: variables.into(),
+        }
     }
 
     fn find(&self, program: &str) -> Option<PathBuf> {
@@ -262,7 +268,7 @@ struct Invocation {
     program: PathBuf,
     arguments: Vec<String>,
     directory: PathBuf,
-    variables: Vec<(OsString, OsString)>,
+    variables: Arc<[(OsString, OsString)]>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

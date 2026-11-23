@@ -7,7 +7,9 @@ use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::registry::{ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError};
+use super::registry::{
+    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, register_static,
+};
 use crate::db::entities::ToolEffect;
 
 pub(crate) const NAMES: [&str; 2] = ["web_fetch", "web_search"];
@@ -391,22 +393,38 @@ impl ToolHandler for Search {
 }
 
 pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
-    registry.register("web_fetch", Some("Access the internet: GET an HTTP or HTTPS webpage or API using OCG's configured proxy. Private and local addresses are refused. Returns the final URL, HTTP status, content type and UTF-8 content. HTML becomes readable text by default; format=html returns source. Follow next_start with start_char to read more (the URL is fetched again). body_truncated means the downloaded body exceeded 2 MiB; use a smaller resource or the site's pagination. No JavaScript execution. Use URLs without credentials."), json!({
-        "type":"object", "additionalProperties":false,
-        "properties":{
-            "url":{"type":"string", "minLength":1, "maxLength":2048},
-            "start_char":{"type":"integer", "minimum":0, "maximum":MAX_BODY_BYTES},
-            "max_chars":{"type":"integer", "minimum":1, "maximum":16000},
-            "format":{"type":"string", "enum":["text", "html"]}
-        }, "required":["url"]
-    }), Arc::new(Fetch))?;
-    registry.register("web_search", Some("Search the public web with Bing's RSS search through OCG's configured proxy; no API key is needed. Returns titles, source URLs and snippets. Use web_fetch on result URLs to read and verify sources. Public search may be unavailable or rate limited; it does not execute JavaScript."), json!({
-        "type":"object", "additionalProperties":false,
-        "properties":{
-            "query":{"type":"string", "minLength":1, "maxLength":512},
-            "limit":{"type":"integer", "minimum":1, "maximum":10}
-        }, "required":["query"]
-    }), Arc::new(Search))?;
+    register_static!(
+        registry,
+        "web_fetch",
+        Some(
+            "Access the internet: GET an HTTP or HTTPS webpage or API using OCG's configured proxy. Private and local addresses are refused. Returns the final URL, HTTP status, content type and UTF-8 content. HTML becomes readable text by default; format=html returns source. Follow next_start with start_char to read more (the URL is fetched again). body_truncated means the downloaded body exceeded 2 MiB; use a smaller resource or the site's pagination. No JavaScript execution. Use URLs without credentials."
+        ),
+        json!({
+            "type":"object", "additionalProperties":false,
+            "properties":{
+                "url":{"type":"string", "minLength":1, "maxLength":2048},
+                "start_char":{"type":"integer", "minimum":0, "maximum":MAX_BODY_BYTES},
+                "max_chars":{"type":"integer", "minimum":1, "maximum":16000},
+                "format":{"type":"string", "enum":["text", "html"]}
+            }, "required":["url"]
+        }),
+        Arc::new(Fetch)
+    )?;
+    register_static!(
+        registry,
+        "web_search",
+        Some(
+            "Search the public web with Bing's RSS search through OCG's configured proxy; no API key is needed. Returns titles, source URLs and snippets. Use web_fetch on result URLs to read and verify sources. Public search may be unavailable or rate limited; it does not execute JavaScript."
+        ),
+        json!({
+            "type":"object", "additionalProperties":false,
+            "properties":{
+                "query":{"type":"string", "minLength":1, "maxLength":512},
+                "limit":{"type":"integer", "minimum":1, "maximum":10}
+            }, "required":["query"]
+        }),
+        Arc::new(Search)
+    )?;
     for name in NAMES {
         registry.authorize(name)?;
     }

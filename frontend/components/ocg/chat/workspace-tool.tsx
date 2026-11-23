@@ -1,20 +1,22 @@
 import { Check, Copy, FileCode2 } from "@lucide/solid";
-import { createEffect, createMemo, createSignal } from "solid-js";
+import { createEffect, createMemo, createSignal, Loading, lazy } from "solid-js";
 import { ToolFallback, toolArgumentSummary } from "@/components/ocg/chat/ui/tool-fallback";
 import { Button } from "@/components/ui/button";
-import { DiffViewer } from "@/components/ui/diff-viewer";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { type View } from "@/lib/ui-state";
 import type { ToolCall } from "../contracts";
 import { useI18n } from "../i18n";
 import { highlightCode } from "../markdown/markdown-pipeline";
-import { sourceLanguage } from "../markdown/source-snapshot";
 import type { ApiClient } from "../runtime/api-client";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { artifactTitle, fileArtifact, toolObject } from "./artifact-model";
 import { CommandTool } from "./command-tool";
 import { SearchTool } from "./search-tool";
 import type { ToolCallMessagePartComponent } from "./tool-part";
+
+const DiffViewer = lazy(() =>
+  import("@/components/ui/diff-viewer").then((module) => ({ default: module.DiffViewer })),
+);
 
 const SUPPORTED_TOOLS = new Set([
   "workspace_read_file",
@@ -33,7 +35,8 @@ function FileCode(props: {
 }) {
   const i18n = useI18n();
   const { isCopied, copyToClipboard } = useCopyToClipboard();
-  const highlighted = createMemo(() => highlightCode(props.content, sourceLanguage(props.path)));
+  const language = createMemo(() => props.path.match(/[^./\\]+$/)?.[0] ?? "");
+  const highlighted = createMemo(() => highlightCode(props.content, language()));
   const lines = createMemo(() => (props.content ? props.content.split("\n") : []));
   if (lines().at(-1) === "") lines().pop();
   const endLine = createMemo(
@@ -233,15 +236,17 @@ export function WorkspaceTool(props: {
                 role="region"
                 aria-label={path() ?? undefined}
               >
-                <DiffViewer
-                  oldFile={{ name: path()!, content: file()!.before! }}
-                  newFile={{ name: path()!, content: file()!.after! }}
-                  viewMode="unified"
-                  size="sm"
-                  showLineNumbers={!file()!.excerpt}
-                  maxCollapsedLines={80}
-                  class="max-w-full rounded-lg"
-                />
+                <Loading fallback={null}>
+                  <DiffViewer
+                    oldFile={{ name: path()!, content: file()!.before! }}
+                    newFile={{ name: path()!, content: file()!.after! }}
+                    viewMode="unified"
+                    size="sm"
+                    showLineNumbers={!file()!.excerpt}
+                    maxCollapsedLines={80}
+                    class="max-w-full rounded-lg"
+                  />
+                </Loading>
               </div>
             </div>
           );

@@ -20,7 +20,24 @@ use crate::db::redb::schema::{
     MUTABLE_READY, RECURRENCE_DUE, RECURRENCES,
 };
 use crate::db::redb::{reads, state};
-use ::redb::ReadableTable;
+use ::redb::{Database, ReadableTable};
+use std::ops::ControlFlow;
+use std::time::Duration;
+
+fn recurrence_delay(tx: &impl TxRead, now: i64) -> Result<Option<Duration>, StorageError> {
+    let due = tx
+        .table(RECURRENCE_DUE)?
+        .first()?
+        .map(|(key, _)| key.value().0);
+    Ok(due.map(|due| Duration::from_micros(due.saturating_sub(now).max(0) as u64)))
+}
+
+pub(crate) fn read_recurrence_delay(database: &Database) -> Result<Option<Duration>, StorageError> {
+    recurrence_delay(
+        &reads::read(database)?,
+        crate::db::entities::Timestamp::now().as_unix_micros(),
+    )
+}
 
 pub(super) fn recurrence_submission(
     conv_u128: u128,
@@ -809,7 +826,7 @@ impl Batch {
     pub(crate) fn claim_due_recurrences(
         &mut self,
         limit: usize,
-    ) -> Result<Option<std::time::Duration>, BatchError> {
+    ) -> Result<ControlFlow<Option<Duration>, Option<Duration>>, BatchError> {
         use crate::db::entities::{Recurrence, RecurrenceHalt, RecurrencePhase};
         let now_micros = self.now.as_unix_micros();
         let due_entries = self.step(|tx| {
@@ -824,6 +841,7 @@ impl Batch {
             }
             Ok(due)
         })?;
+        let changed = !due_entries.is_empty();
         for (due_micros, conv_u128) in due_entries {
             self.step(|tx| {
                 tx.open_table(RECURRENCE_DUE)?
@@ -896,14 +914,12 @@ impl Batch {
                 }
             }
         }
-        let next = self.step(|tx| {
-            let table = tx.open_table(RECURRENCE_DUE)?;
-            Ok(table.first()?.map(|(k, _)| k.value().0))
-        })?;
-        Ok(next.map(|due| {
-            let delta = due.saturating_sub(self.now.as_unix_micros()).max(0);
-            std::time::Duration::from_micros(u64::try_from(delta).unwrap_or(0))
-        }))
+        let next = self.step(|tx| recurrence_delay(tx, now_micros))?;
+        Ok(if changed {
+            ControlFlow::Continue(next)
+        } else {
+            ControlFlow::Break(next)
+        })
     }
 
     pub(crate) fn resume_recurrence(&mut self, conversation: JobId) -> Result<(), BatchError> {

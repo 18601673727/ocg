@@ -1,6 +1,9 @@
+use std::cell::{OnceCell, RefCell};
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -46,42 +49,91 @@ pub(crate) fn authorization(credential: &str) -> Result<HeaderValue, HttpError> 
     Ok(value)
 }
 
-pub(crate) async fn standard_client(timeout: Duration, uri: &Uri) -> Result<Client, HttpError> {
-    let connector = if uri.scheme_str() == Some("http") {
+#[derive(PartialEq, Eq)]
+struct ApprovedDestination {
+    host: String,
+    port: u16,
+    proxy: SocketAddr,
+}
+
+#[derive(Default)]
+struct ProviderClients {
+    http: OnceCell<Client>,
+    https: OnceCell<Client>,
+    approved: RefCell<VecDeque<(ApprovedDestination, Client)>>,
+}
+
+fn worker_clients() -> Rc<ProviderClients> {
+    ntex::rt::Arbiter::get_value(Rc::<ProviderClients>::default)
+}
+
+pub(crate) async fn standard_client(uri: &Uri) -> Result<Client, HttpError> {
+    let plain = uri.scheme_str() == Some("http");
+    let clients = worker_clients();
+    let cache = if plain { &clients.http } else { &clients.https };
+    if let Some(client) = cache.get() {
+        return Ok(client.clone());
+    }
+    let connector = if plain {
         Connector::default()
     } else {
         connector()?
     };
-    Client::builder()
-        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-        .connector::<()>(connector)
-        .disable_redirects()
-        .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
-        .response_payload_timeout(Millis::ZERO)
-        .build(
-            ntex::SharedCfg::new("provider")
-                .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
-        )
-        .await
-        .map_err(|_| HttpError {
-            message: "provider HTTP client could not be initialized".to_owned(),
-        })
+    let client = provider_client(connector, "provider").await?;
+    Ok(cache.get_or_init(|| client).clone())
 }
 
 pub(crate) async fn approved_client(
-    timeout: Duration,
     host: &str,
     port: u16,
     proxy: SocketAddr,
 ) -> Result<Client, HttpError> {
+    const LIMIT: usize = 16;
+    let key = ApprovedDestination {
+        host: bare_host(host),
+        port,
+        proxy,
+    };
+    let clients = worker_clients();
+    let cached = || {
+        clients
+            .approved
+            .borrow()
+            .iter()
+            .find(|(destination, _)| destination == &key)
+            .map(|(_, client)| client.clone())
+    };
+    if let Some(client) = cached() {
+        return Ok(client);
+    }
+    let client = provider_client(
+        approved_connector(&key.host, port, proxy)?,
+        "provider-approved",
+    )
+    .await?;
+    if let Some(existing) = cached() {
+        return Ok(existing);
+    }
+    let mut cache = clients.approved.borrow_mut();
+    if cache.len() == LIMIT {
+        cache.pop_front();
+    }
+    cache.push_back((key, client.clone()));
+    Ok(client)
+}
+
+async fn provider_client(connector: Connector, name: &'static str) -> Result<Client, HttpError> {
     Client::builder()
         .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-        .connector::<()>(approved_connector(host, port, proxy)?)
+        // Job admission controls concurrency. A shared connector must not impose
+        // ntex's default eight-request ceiling across independent Providers.
+        // A positive limit also lets ntex wake waiters for a connecting authority.
+        .connector::<()>(connector.limit(usize::MAX))
         .disable_redirects()
-        .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
+        .disable_timeout()
         .response_payload_timeout(Millis::ZERO)
         .build(
-            ntex::SharedCfg::new("provider-approved")
+            ntex::SharedCfg::new(name)
                 .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
         )
         .await
@@ -128,7 +180,6 @@ struct Proxy {
     uri: Uri,
     authorization: Option<HeaderValue>,
     exclusions: Vec<Exclusion>,
-    tls: Arc<rustls::ClientConfig>,
 }
 
 struct Exclusion {
@@ -180,12 +231,7 @@ impl Proxy {
             uri,
             authorization,
             exclusions: exclusions.split(',').filter_map(parse_exclusion).collect(),
-            tls: tunnel_tls(),
         })
-    }
-
-    fn tls(&self) -> Arc<rustls::ClientConfig> {
-        self.tls.clone()
     }
 
     fn bypasses(&self, host: &str, port: u16) -> bool {
@@ -239,12 +285,17 @@ pub(crate) fn bare_host(host: &str) -> String {
 }
 
 fn tunnel_tls() -> Arc<rustls::ClientConfig> {
-    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let mut tls = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-    Arc::new(tls)
+    static TLS: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+    TLS.get_or_init(|| {
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let mut tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        Arc::new(tls)
+    })
+    .clone()
 }
 
 fn decode_credentials(value: &str) -> Option<String> {
@@ -392,9 +443,10 @@ fn connector() -> Result<Connector, HttpError> {
             message: message.clone(),
         })?;
     let Some(proxy) = proxy else {
-        return Ok(Connector::default());
+        return Ok(Connector::default()
+            .secure_connector(ntex::connect::rustls::TlsConnector::from(tunnel_tls())));
     };
-    let tls = proxy.tls();
+    let tls = tunnel_tls();
     Ok(Connector::default()
         .connector(apply_fn_factory(
             TcpConnector::<Uri>::new(),
@@ -483,7 +535,7 @@ fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, HttpError> {
         .map_err(|message| HttpError {
             message: message.clone(),
         })?;
-    let tls = proxy.as_ref().map_or_else(tunnel_tls, Proxy::tls);
+    let tls = tunnel_tls();
     let http_non_public = non_public.clone();
     Ok(Connector::default()
         .connector(apply_fn_factory(

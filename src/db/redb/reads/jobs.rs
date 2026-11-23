@@ -3,28 +3,35 @@ use crate::db::entities::{ConfigBody, ConfigId, DependencyState, OutcomeKind, To
 use crate::db::entities::{
     DependencyCondition, ExecutionEventKind, JobId, JobLifecycle, JobOutputId, JobOutputRecord,
     JobSearchPage, JobSpec, JobState, JobTree, JobUsage, MutableConfiguration, MutableJob,
-    MutableJobContent, MutableJobDetails, MutableJobPhase, NativeJobItem, Origin, OutputKind,
-    Recurrence, RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
+    MutableJobContent, MutableJobDetails, MutableJobPhase, MutableJobRecord, NativeJobItem, Origin,
+    OutputKind, ProjectId, Recurrence, RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
 };
 use crate::db::redb::batch::Batch;
 use crate::db::redb::reads::conversations::{conversation_summary, conversation_tip};
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::{ConfigRow, decode_output, decode_tool_evidence, tool_call_ref};
 use crate::db::redb::schema::{
-    ACTIVE_ALLOCATIONS, APPROVALS, CHILDREN, CONFIGS, CONVERSATIONS, JOB_EVENTS, JOB_OBSERVATIONS,
-    JOB_OUTPUTS, JOB_RUNTIME, JOBS, MAX_OBSERVATION_SCAN, MAX_PAGE, OPEN_APPROVALS,
-    POOL_ALLOCATIONS, RECURRENCES, REQUEST_EVENTS, TOOL_CALLS, TURNS,
+    ACTIVE_ALLOCATIONS, APPROVALS, CHILDREN, CONFIGS, CONVERSATIONS, EXECUTION_COMMITS, JOB_EVENTS,
+    JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MAX_OBSERVATION_SCAN, MAX_PAGE,
+    OPEN_APPROVALS, POOL_ALLOCATIONS, RECURRENCES, REQUEST_EVENTS, TOOL_CALLS, TURNS,
 };
 use crate::db::redb::{StorageError, TxRead, allocations, rows, state};
 use crate::db::redb::{execution, observations};
 use ::redb::{Database, ReadTransaction, ReadableTable};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, btree_map::Entry};
 
 pub(crate) fn read_conversation_row(
     rx: &impl TxRead,
     id: JobId,
 ) -> Result<Option<JobSpec>, StorageError> {
-    rx.table(CONVERSATIONS)?
+    conversation_row_in(&rx.table(CONVERSATIONS)?, id)
+}
+
+fn conversation_row_in(
+    conversations: &impl ReadableTable<u128, &'static [u8]>,
+    id: JobId,
+) -> Result<Option<JobSpec>, StorageError> {
+    conversations
         .get(id.get())?
         .map(|bytes| JobSpec::decode_at(id.get(), bytes.value()))
         .transpose()
@@ -148,35 +155,58 @@ pub(crate) fn turn_first(
 pub(crate) fn mutable_job_record_in(
     rx: &ReadTransaction,
     id: JobId,
-) -> Result<Option<crate::db::entities::MutableJobRecord>, StorageError> {
+) -> Result<Option<MutableJobRecord>, StorageError> {
     let jobs = rx.open_table(JOBS)?;
     let Some(bytes) = jobs.get(id.get())? else {
         return Ok(None);
     };
     let job = crate::db::redb::jobs::decode_mutable_job(id.get(), bytes.value())?;
-    let states = rx.open_table(JOB_RUNTIME)?;
+    mutable_job_record(
+        job,
+        &rx.open_table(JOB_RUNTIME)?,
+        &rx.open_table(JOB_EVENTS)?,
+        &rx.open_table(EXECUTION_COMMITS)?,
+        |parent| conversation_project(&rx.open_table(CONVERSATIONS)?, parent),
+    )
+    .map(Some)
+}
+
+fn conversation_project(
+    conversations: &impl ReadableTable<u128, &'static [u8]>,
+    id: JobId,
+) -> Result<Option<ProjectId>, StorageError> {
+    Ok(conversation_row_in(conversations, id)?
+        .ok_or_else(|| StorageError::corrupted("mutable Job conversation missing"))?
+        .project)
+}
+
+fn mutable_job_record(
+    job: MutableJob,
+    states: &impl ReadableTable<u128, &'static [u8]>,
+    events: &impl ReadableTable<(u128, u64), &'static [u8]>,
+    commits: &impl ReadableTable<u64, u64>,
+    project: impl FnOnce(JobId) -> Result<Option<ProjectId>, StorageError>,
+) -> Result<MutableJobRecord, StorageError> {
+    let id = job.id;
     let state = states
         .get(id.get())?
         .ok_or_else(|| StorageError::corrupted("mutable Job state is missing"))?;
     let state = state::decode_state(id.get(), state.value())?;
-    let parent = read_conversation_row(rx, job.parent_id)?
-        .ok_or_else(|| StorageError::corrupted("mutable Job conversation missing"))?;
-    let record = crate::db::entities::MutableJobRecord {
+    let project = project(job.parent_id)?;
+    Ok(MutableJobRecord {
         job,
         outcome: state.outcome,
-        project: parent.project,
-        event_seq: execution::latest_seq(rx, id)?,
-    };
-    Ok(Some(record))
+        project,
+        event_seq: execution::latest_seq_in(events, commits, id)?,
+    })
 }
 
 fn native_job_item(
-    rx: &ReadTransaction,
-    record: crate::db::entities::MutableJobRecord,
+    allocations: &impl ReadableTable<u128, &'static [u8]>,
+    record: MutableJobRecord,
 ) -> Result<NativeJobItem, StorageError> {
     let id = record.job.id;
-    let allocation = rx
-        .open_table(POOL_ALLOCATIONS)?
+    let allocation = allocations
         .get(id.get())?
         .map(|bytes| allocations::decode_pool_allocation(id.get(), bytes.value()))
         .transpose()?;
@@ -215,7 +245,7 @@ pub(crate) fn read_native_job(
     if record.job.phase == crate::db::entities::MutableJobPhase::Unsubmitted {
         return Ok(None);
     }
-    native_job_item(&rx, record).map(Some)
+    native_job_item(&rx.open_table(POOL_ALLOCATIONS)?, record).map(Some)
 }
 
 const JOB_LIST_SCAN: usize = 5_000;
@@ -229,6 +259,12 @@ pub(crate) fn read_job_search(
     use crate::db::entities::MutableJobPhase;
     let rx = read(database)?;
     let jobs = rx.open_table(JOBS)?;
+    let states = rx.open_table(JOB_RUNTIME)?;
+    let conversations = rx.open_table(CONVERSATIONS)?;
+    let events = rx.open_table(JOB_EVENTS)?;
+    let commits = rx.open_table(EXECUTION_COMMITS)?;
+    let allocations = rx.open_table(POOL_ALLOCATIONS)?;
+    let mut projects = BTreeMap::new();
     let end = before.map_or(u128::MAX, JobId::get);
     let limit = limit.clamp(1, 100);
     let mut items: Vec<NativeJobItem> = Vec::new();
@@ -241,12 +277,18 @@ pub(crate) fn read_job_search(
             next_before = last_examined;
             break;
         }
-        let (key, _) = entry?;
+        let (key, bytes) = entry?;
         let id = JobId::new(key.value());
         last_examined = Some(id);
-        let Some(record) = mutable_job_record_in(&rx, id)? else {
-            continue;
-        };
+        let job = crate::db::redb::jobs::decode_mutable_job(id.get(), bytes.value())?;
+        let record = mutable_job_record(job, &states, &events, &commits, |parent| {
+            Ok(match projects.entry(parent) {
+                Entry::Occupied(entry) => *entry.get(),
+                Entry::Vacant(entry) => {
+                    *entry.insert(conversation_project(&conversations, parent)?)
+                }
+            })
+        })?;
         if record.job.phase == MutableJobPhase::Unsubmitted {
             continue;
         }
@@ -265,7 +307,7 @@ pub(crate) fn read_job_search(
             next_before = items.last().map(|item| item.record.job.id);
             break;
         }
-        items.push(native_job_item(&rx, record)?);
+        items.push(native_job_item(&allocations, record)?);
     }
     Ok(JobSearchPage {
         items,

@@ -1,7 +1,7 @@
 use super::{StorageError, TxRead, jobs, reads};
 use crate::db::entities::{
     Actor, Appended, ConfigId, ContentDigest, DependencyCondition, JobId, JobLimits, JobSpec,
-    JobState, Origin, OutcomeKind, OutputKind, ProjectId, Recurrence, SubmissionKey,
+    JobState, Origin, OutcomeKind, OutputKind, ProjectId, RecordRef, Recurrence, SubmissionKey,
 };
 use crate::db::entities::{
     AllocationPhase, AllocationToken, ComposerContextId, DependencyState, ExecutionConfiguration,
@@ -17,6 +17,46 @@ use crate::db::redb::schema::{
 use crate::db::redb::{rows, state};
 use ::redb::ReadableTable;
 use reads::jobs::{read_conversation_row, turn_head};
+use std::ops::ControlFlow;
+
+#[derive(Default)]
+pub(super) struct ChildTurnSettlement {
+    head: bool,
+    changed: bool,
+}
+
+fn settled_turn(tx: &impl TxRead, id: JobId) -> Result<Option<(JobSpec, OutcomeKind)>, BatchError> {
+    let Some(turn) = jobs::mutable_job_in(tx, id)? else {
+        return Ok(None);
+    };
+    let spec = read_conversation_row(tx, turn.parent_id)?
+        .ok_or(Violation::NotFound(RecordRef::Job(turn.parent_id)))?;
+    if spec.is_chunk_group() || turn.summary_source.is_some() {
+        return Ok(None);
+    }
+    let runtime = state::read(tx, id)?.ok_or(Violation::NotFound(RecordRef::Job(id)))?;
+    Ok(runtime.state.outcome.map(|outcome| (spec, outcome.kind)))
+}
+
+pub(crate) fn read_child_turns_need_settlement(
+    database: &::redb::Database,
+    turns: &[JobId],
+) -> Result<bool, StorageError> {
+    let tx = reads::read(database)?;
+    for &id in turns {
+        let spec = match settled_turn(&tx, id) {
+            Ok(None) => continue,
+            Ok(Some((spec, _))) => spec,
+            Err(BatchError(Failure::Storage(error))) => return Err(error),
+            // Let the writer return the violation against its authoritative snapshot.
+            Err(BatchError(Failure::Rejected(_))) => return Ok(true),
+        };
+        if spec.parent_id.is_some() || state::require(&tx, spec.id)?.lifecycle.closing.is_some() {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 pub(super) const MAX_LIVE_CHILDREN: usize = 16;
 const MAX_LIVE_SUBTREE: usize = 64;
@@ -531,10 +571,10 @@ impl Batch {
         })
     }
 
-    fn settle_closing(&mut self, conversation: JobId) -> Result<(), BatchError> {
+    fn settle_closing(&mut self, conversation: JobId) -> Result<bool, BatchError> {
         let lifecycle = self.job_lifecycle(conversation)?;
         let Some(closing) = lifecycle.closing else {
-            return Ok(());
+            return Ok(false);
         };
         let spec = self.require_mutable_conversation(conversation)?;
         if spec.is_chunk_group() {
@@ -546,7 +586,7 @@ impl Batch {
             || !self.unsettled_non_turn_jobs(conversation)?.is_empty()
             || self.step(|tx| super::recovery::group_holds_capacity(tx, conversation))?
         {
-            return Ok(());
+            return Ok(false);
         }
         let head = self.head_turn(conversation)?;
         let answered = match head {
@@ -569,7 +609,7 @@ impl Batch {
         if let Some(parent) = spec.parent_id {
             self.settle_closing(parent)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn record_conversation_outcome(
@@ -706,18 +746,18 @@ impl Batch {
         Ok(())
     }
 
-    fn settle_chunk_group(&mut self, spec: &JobSpec) -> Result<(), BatchError> {
+    fn settle_chunk_group(&mut self, spec: &JobSpec) -> Result<bool, BatchError> {
         let group = spec.id;
         if self.require_job_state(group)?.outcome.is_some() {
-            return Ok(());
+            return Ok(false);
         }
         // Chunk Jobs are parallel members in CHILDREN. They have no sequential head in TURNS.
         let counts = self.step(|tx| state::pending(tx, group))?;
         if counts != Some((0, 0)) {
-            return Ok(());
+            return Ok(false);
         }
         let Some(outcome) = self.chunk_group_outcome(group)? else {
-            return Ok(());
+            return Ok(false);
         };
         let mut lifecycle = self.job_lifecycle(group)?;
         if lifecycle.closing.is_none() {
@@ -734,7 +774,7 @@ impl Batch {
             self.settle_closing(parent)?;
         }
         self.wake_scheduler();
-        Ok(())
+        Ok(true)
     }
 
     fn chunk_group_outcome(&mut self, group: JobId) -> Result<Option<OutcomeRecord>, BatchError> {
@@ -790,7 +830,8 @@ impl Batch {
             // Startup has already refused Held Allocations. Only queued work can be ended here.
             self.stop_unsettled_turns(group, &OutcomeCause::Closed)?;
         }
-        self.settle_chunk_group(spec)
+        self.settle_chunk_group(spec)?;
+        Ok(())
     }
 
     pub(crate) fn hold(
@@ -1021,43 +1062,40 @@ impl Batch {
         })
     }
 
-    pub(crate) fn child_turn_settled(&mut self, job: JobId) -> Result<bool, BatchError> {
-        let Some(turn) = self.mutable_job(job)? else {
-            return Ok(false);
+    pub(super) fn child_turn_settled(
+        &mut self,
+        job: JobId,
+    ) -> Result<ChildTurnSettlement, BatchError> {
+        let mut settlement = ChildTurnSettlement::default();
+        let Some((spec, outcome)) = self.inspect(|tx| settled_turn(tx, job))? else {
+            return Ok(settlement);
         };
-        let conversation = turn.parent_id;
-        let spec = self.require_mutable_conversation(conversation)?;
-        if spec.is_chunk_group() || turn.summary_source.is_some() {
-            return Ok(false);
-        }
-        let Some(outcome) = self.require_job_state(job)?.outcome else {
-            return Ok(false);
-        };
-        self.settle_closing(conversation)?;
+        let conversation = spec.id;
+        settlement.changed = self.settle_closing(conversation)?;
         let Some(parent) = spec.parent_id else {
-            return Ok(false);
+            return Ok(settlement);
         };
-        if outcome.kind == OutcomeKind::Unknown {
-            self.report_settled_child(parent, conversation)?;
-            return Ok(false);
+        if outcome == OutcomeKind::Unknown {
+            settlement.changed |= self.report_settled_child(parent, conversation)? > 0;
+            return Ok(settlement);
         }
-        let is_head = self.group_head(conversation)? == Some(job);
-        if is_head {
+        settlement.head = self.group_head(conversation)? == Some(job);
+        if settlement.head {
             let lifecycle = self.job_lifecycle(conversation)?;
             if lifecycle.closing.is_none() {
-                self.auto_close_if_done(conversation)?;
+                settlement.changed |= self.auto_close_if_done(conversation)?;
             }
-            self.end_impossible_dependents(parent, conversation)?;
+            settlement.changed |= self.end_impossible_dependents(parent, conversation)?;
         }
         if self.step(|tx| {
             Ok(report_segment(tx, parent, conversation, None)?.is_some_and(|s| s.head == job))
         })? {
-            self.report_settled_child(parent, conversation)?;
+            settlement.changed |= self.report_settled_child(parent, conversation)? > 0;
         }
-        Ok(is_head)
+        Ok(settlement)
     }
 
-    fn auto_close_if_done(&mut self, conversation: JobId) -> Result<(), BatchError> {
+    fn auto_close_if_done(&mut self, conversation: JobId) -> Result<bool, BatchError> {
         let spec = self.require_mutable_conversation(conversation)?;
         let mut lifecycle = self.job_lifecycle(conversation)?;
         if spec.parent_id.is_none()
@@ -1066,10 +1104,10 @@ impl Batch {
             || lifecycle.closing.is_some()
             || self.step(|tx| has_user_turn(tx, conversation, false))?
         {
-            return Ok(());
+            return Ok(false);
         }
         let Some(head) = self.group_head(conversation)? else {
-            return Ok(());
+            return Ok(false);
         };
         if !self
             .require_job_state(head)?
@@ -1079,7 +1117,7 @@ impl Batch {
             || !self.unsettled_non_turn_jobs(conversation)?.is_empty()
             || self.step(|tx| has_open_approvals(tx, conversation))?
         {
-            return Ok(());
+            return Ok(false);
         }
         lifecycle.closing = Some(JobClosing {
             at: self.now,
@@ -1087,14 +1125,15 @@ impl Batch {
             running: false,
         });
         self.put_job_lifecycle(conversation, &lifecycle)?;
-        self.settle_closing(conversation)
+        self.settle_closing(conversation)?;
+        Ok(true)
     }
 
     fn end_impossible_dependents(
         &mut self,
         parent: JobId,
         settled: JobId,
-    ) -> Result<(), BatchError> {
+    ) -> Result<bool, BatchError> {
         let mut ended = Vec::new();
         loop {
             let mut progressed = false;
@@ -1134,13 +1173,14 @@ impl Batch {
                 break;
             }
         }
-        if !ended.is_empty() {
-            self.wake_scheduler();
+        if ended.is_empty() {
+            return Ok(false);
         }
+        self.wake_scheduler();
         for sibling in ended {
             self.report_settled_child(parent, sibling)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     fn return_child_results(&mut self, report: ChildReport) -> Result<usize, BatchError> {
@@ -1222,14 +1262,22 @@ impl Batch {
         }
     }
 
-    pub(crate) fn settle_child_turns(&mut self, turns: &[JobId]) -> Result<usize, BatchError> {
+    pub(crate) fn settle_child_turns(
+        &mut self,
+        turns: &[JobId],
+    ) -> Result<ControlFlow<usize, usize>, BatchError> {
         let mut settled = 0;
+        let mut changed = false;
         for turn in turns {
-            if self.child_turn_settled(*turn)? {
-                settled += 1;
-            }
+            let settlement = self.child_turn_settled(*turn)?;
+            settled += usize::from(settlement.head);
+            changed |= settlement.changed;
         }
-        Ok(settled)
+        Ok(if changed {
+            ControlFlow::Continue(settled)
+        } else {
+            ControlFlow::Break(settled)
+        })
     }
 
     pub(crate) fn idle_worker(&mut self, caller: JobId, worker: JobId) -> Result<bool, BatchError> {

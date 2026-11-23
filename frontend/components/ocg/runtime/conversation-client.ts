@@ -239,6 +239,11 @@ function* turnAttachments(turn: Turn): Iterable<string> {
 
 type WatchPages = Map<string, Promise<Conversation>>;
 
+type PublicationWindow = {
+  dirty: boolean;
+  frame?: number;
+};
+
 type StreamEntry = {
   subscription: JobStreamSubscription | null;
   catalogChanged: (pages: WatchPages) => void;
@@ -251,6 +256,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   private disposed = false;
   private readonly lifetime = new AbortController();
   private readonly toolTimeGate = new ToolTimeGate();
+  private readonly publicationWindows = new Map<string, PublicationWindow>();
   private readonly turns = new Map<string, Turn>();
   private readonly projections = new WeakMap<
     Turn,
@@ -349,7 +355,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         this.listedRoots.has(session.conversationId) &&
         !visible.has(session.conversationId)
       ) {
-        this.emit({ type: "conversation.session-deleted", sessionId: session.id });
+        this.removeSession(session.id);
         this.roots.delete(session.conversationId);
       }
     }
@@ -434,6 +440,11 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     }
     if (this.tips.has(sessionId) || this.sending.has(sessionId)) return;
     this.selections.delete(sessionId);
+    this.removeSession(sessionId);
+  }
+
+  private removeSession(sessionId: string) {
+    this.cancelPublication(sessionId);
     this.emit({ type: "conversation.session-deleted", sessionId });
   }
 
@@ -471,7 +482,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     for (const turn of this.turns.values()) {
       if (turn.sessionId === stray.id) turn.sessionId = sessionId;
     }
-    this.emit({ type: "conversation.session-deleted", sessionId: stray.id });
+    this.removeSession(stray.id);
     this.publish(sessionId);
   }
 
@@ -536,7 +547,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       this.selections.delete(sessionId);
       this.earlier.delete(sessionId);
       this.loadingEarlier.delete(sessionId);
-      this.emit({ type: "conversation.session-deleted", sessionId });
+      this.removeSession(sessionId);
       this.evictTurns((_, turn) => turn.sessionId === sessionId);
       this.tips.delete(sessionId);
       this.roots.delete(root);
@@ -1166,18 +1177,56 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     return messages;
   }
 
-  private publish(sessionId: string) {
-    if (this.disposed || !this.getSnapshot().sessions.some((session) => session.id === sessionId))
+  private schedulePublication(sessionId: string) {
+    if (this.disposed) return;
+    const active = this.publicationWindows.get(sessionId);
+    if (active) {
+      active.dirty = true;
       return;
+    }
+    const window: PublicationWindow = { dirty: false };
+    this.publicationWindows.set(sessionId, window);
+    const nextFrame = () => {
+      if (this.publicationWindows.get(sessionId) !== window) return;
+      this.publicationWindows.delete(sessionId);
+      if (window.dirty) this.schedulePublication(sessionId);
+    };
+    // Arm this session's next frame before publishing to synchronous listeners.
+    if (typeof requestAnimationFrame === "function") {
+      window.frame = requestAnimationFrame(nextFrame);
+    } else {
+      queueMicrotask(nextFrame);
+    }
+    this.publishSnapshot(sessionId);
+  }
+
+  private cancelPublication(sessionId: string): boolean {
+    const active = this.publicationWindows.get(sessionId);
+    if (!active) return false;
+    this.publicationWindows.delete(sessionId);
+    if (active.frame !== undefined) cancelAnimationFrame(active.frame);
+    return active.dirty;
+  }
+
+  private publish(sessionId: string) {
+    this.cancelPublication(sessionId);
+    if (!this.disposed) this.publishSnapshot(sessionId);
+  }
+
+  private publishSnapshot(sessionId: string) {
+    if (!this.getSnapshot().sessions.some((session) => session.id === sessionId)) return;
     const turns = [...this.turns.values()]
       .filter((turn) => turn.sessionId === sessionId)
       .sort(
         (a, b) =>
           (a.input.submitted_at_us ?? a.job.created_at_us) -
-            (b.input.submitted_at_us ?? b.job.created_at_us) || a.job.id.localeCompare(b.job.id),
+            (b.input.submitted_at_us ?? b.job.created_at_us) ||
+          (a.job.id < b.job.id ? -1 : a.job.id > b.job.id ? 1 : 0),
       );
     const messages = turns.flatMap((turn) => this.messagesForTurn(turn));
     this.emit({ type: "conversation.history-loaded", sessionId, messages });
+    // A listener may have disposed the client, removed this session, or published newer history.
+    if (this.disposed || this.getSnapshot().messagesBySession[sessionId] !== messages) return;
     const queue = turns
       .filter(
         (turn) => turn.job.started_at_us === null && turn.job.settlement.state === "unsettled",
@@ -1192,6 +1241,33 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           },
         })),
       );
+    const previous = this.getSnapshot().chatQueues?.[sessionId];
+    if (
+      previous &&
+      !previous.paused &&
+      previous.queue.length === queue.length &&
+      queue.every((entry, index) => {
+        const stored = previous.queue[index];
+        const images = stored.input.images;
+        return (
+          entry.id === stored.id &&
+          entry.input.content === stored.input.content &&
+          stored.input.mode === "queue" &&
+          images?.length === entry.input.images.length &&
+          images.every((image, i) => {
+            const next = entry.input.images[i];
+            return (
+              image === next ||
+              (image.id === next.id &&
+                image.name === next.name &&
+                image.media_type === next.media_type &&
+                image.url === next.url)
+            );
+          })
+        );
+      })
+    )
+      return;
     this.emit({ type: "conversation.queue-updated", sessionId, queue, paused: false });
   }
 
@@ -1288,6 +1364,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       if (inFlight || entry.stopped || this.disposed) return;
       inFlight = true;
       try {
+        if (this.cancelPublication(turn.sessionId)) {
+          this.publishSnapshot(turn.sessionId);
+          if (entry.stopped || this.disposed) return;
+        }
         const pages = pendingPages;
         pendingPages = undefined;
         const conversation = turn.job.conversation;
@@ -1442,13 +1522,16 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           if (this.disposed || entry.stopped) return;
           if (event.type === "heartbeat") return;
           if (event.type === "job") turn.job = reconcileJob(turn.job, event.job);
-          if (event.type === "output" && event.output.seq > turn.outputs.lastSeq) {
+          if (event.type === "output") {
+            if (event.output.seq <= turn.outputs.lastSeq) return;
             if (event.output.seq !== turn.outputs.lastSeq + 1) {
               replayThrough = Math.max(replayThrough, event.output.seq);
               throw new ContractError("output.seq", "the next stored sequence without a gap");
             }
             turn.outputs.append(event.output);
             turn.outputRevision = (turn.outputRevision ?? 0) + 1;
+            this.schedulePublication(turn.sessionId);
+            return;
           }
           if (event.type === "settlement") {
             turn.job = reconcileJob(turn.job, {
@@ -1461,12 +1544,13 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
           if (event.type === "stream_error")
             turn.error = `${event.error.code}: ${event.error.message}`;
           this.publish(turn.sessionId);
-          if (event.type !== "output") requestTick();
+          requestTick();
         },
         {
           signal: this.lifetime.signal,
           afterSeq: turn.outputs.lastSeq,
           onReconnect: (error) => {
+            if (this.disposed || entry.stopped) return;
             turn.error = `Reconnecting: ${error.code}`;
             this.publish(turn.sessionId);
             requestTick();
@@ -1664,7 +1748,9 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   }
 
   override dispose() {
+    if (this.disposed) return;
     this.disposed = true;
+    for (const id of this.publicationWindows.keys()) this.cancelPublication(id);
     this.lifetime.abort();
     this.api.close();
     if (this.unsubscribeConversations) {

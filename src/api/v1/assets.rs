@@ -1,7 +1,10 @@
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use ntex::http::StatusCode;
 use ntex::http::header;
+use ntex::util::Bytes;
 use ntex::web::HttpResponse;
 
 use super::{NOT_FOUND, Refusal};
@@ -10,12 +13,45 @@ const MAX_ASSET_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) struct UiAssets {
     root: PathBuf,
+    cache: Mutex<AssetCache>,
 }
 
+#[derive(Clone)]
 pub(super) struct Asset {
-    pub(super) body: Vec<u8>,
+    pub(super) body: Bytes,
     pub(super) content_type: &'static str,
     pub(super) immutable: bool,
+}
+
+#[derive(Default)]
+struct AssetCache {
+    entries: VecDeque<(String, Asset)>,
+    bytes: usize,
+}
+
+impl AssetCache {
+    fn get(&self, path: &str) -> Option<&Asset> {
+        self.entries
+            .iter()
+            .find(|(key, _)| key == path)
+            .map(|(_, asset)| asset)
+    }
+
+    fn insert(&mut self, path: String, asset: Asset) {
+        const MAX_ENTRIES: usize = 64;
+        const MAX_BYTES: usize = 16 * 1024 * 1024;
+        if self.get(&path).is_some() {
+            return;
+        }
+        while self.entries.len() >= MAX_ENTRIES || self.bytes + asset.body.len() > MAX_BYTES {
+            let Some((_, oldest)) = self.entries.pop_front() else {
+                return;
+            };
+            self.bytes -= oldest.body.len();
+        }
+        self.bytes += asset.body.len();
+        self.entries.push_back((path, asset));
+    }
 }
 
 impl UiAssets {
@@ -27,27 +63,44 @@ impl UiAssets {
                 "the frontend directory is not a directory",
             ));
         }
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            cache: Mutex::default(),
+        })
     }
 
     pub(super) async fn serve(&self, path: &str) -> Result<Asset, Refusal> {
+        let relative = resolved(path).ok_or(NOT_FOUND)?;
+        let cacheable = relative.starts_with("_assets/");
+        if cacheable
+            && let Ok(cache) = self.cache.try_lock()
+            && let Some(asset) = cache.get(&relative)
+        {
+            return Ok(asset.clone());
+        }
         let root = self.root.clone();
-        let path = path.to_owned();
-        ntex::rt::spawn_blocking(move || serve_file(&root, &path))
-            .await
-            .unwrap_or(Err(NOT_FOUND))
+        let (relative, asset) = ntex::rt::spawn_blocking(move || {
+            let asset = serve_file(&root, &relative)?;
+            Ok::<_, Refusal>((relative, asset))
+        })
+        .await
+        .map_err(|_| NOT_FOUND)??;
+        if asset.immutable
+            && asset.body.len() <= 2 * 1024 * 1024
+            && let Ok(mut cache) = self.cache.try_lock()
+        {
+            cache.insert(relative, asset.clone());
+        }
+        Ok(asset)
     }
 }
 
-fn serve_file(root: &std::path::Path, path: &str) -> Result<Asset, Refusal> {
-    let Some(relative) = resolved(path) else {
-        return Err(NOT_FOUND);
-    };
-    let (file, immutable) = file_under(root, &relative)?;
+fn serve_file(root: &Path, relative: &str) -> Result<Asset, Refusal> {
+    let (file, immutable) = file_under(root, relative)?;
     let bytes = std::fs::read(&file).map_err(|_| NOT_FOUND)?;
     let content_type = content_type(&file).ok_or(NOT_FOUND)?;
     Ok(Asset {
-        body: bytes,
+        body: bytes.into(),
         content_type,
         immutable,
     })

@@ -28,13 +28,24 @@ export function ConversationView(props: { sessionId: string; children: JSX.Eleme
       history().filter((message) => !message.planningTarget || !planningConclusion(message)),
     ),
   );
-  const byJob = createMemo(() => {
+  const byJob = createMemo<Map<string, ChatMessage[]>>((previous) => {
     const groups = new Map<string, ChatMessage[]>();
-    for (const message of history()) {
-      if (!message.jobId) continue;
-      const list = groups.get(message.jobId);
-      if (list) list.push(message);
-      else groups.set(message.jobId, [message]);
+    const items = history();
+    // The runtime publishes each turn's projected messages together.
+    for (let start = 0; start < items.length; ) {
+      const id = items[start].jobId;
+      let end = start + 1;
+      while (end < items.length && items[end].jobId === id) end++;
+      if (id) {
+        const prior = previous?.get(id);
+        groups.set(
+          id,
+          prior?.length === end - start && prior.every((message, i) => message === items[start + i])
+            ? prior
+            : items.slice(start, end),
+        );
+      }
+      start = end;
     }
     return groups;
   });

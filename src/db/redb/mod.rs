@@ -16,7 +16,7 @@ mod batch;
 mod configs;
 mod execution_writes;
 mod job_tree;
-pub(crate) use job_tree::read_child_report_page;
+pub(crate) use job_tree::{read_child_report_page, read_child_turns_need_settlement};
 mod jobs;
 mod observations;
 pub(crate) mod reads;
@@ -27,6 +27,7 @@ mod rows;
 mod scheduled_external;
 mod schema;
 mod settlement;
+pub(crate) use settlement::read_recurrence_delay;
 mod state;
 
 pub(crate) use allocations::{

@@ -426,11 +426,15 @@ impl DatabaseHandle {
         &self,
         limit: usize,
     ) -> Result<Option<std::time::Duration>, DatabaseError> {
-        self.write(
-            4096,
-            OperationKind::ClaimExecution,
+        let next = self.preflight_write(redb::read_recurrence_delay).await?;
+        if next != Some(std::time::Duration::ZERO) || limit == 0 {
+            return Ok(next);
+        }
+        self.write_declinable(
             limit,
-            |batch, limit| batch.claim_due_recurrences(limit),
+            |_| 4096,
+            OperationKind::ClaimExecution,
+            redb::Batch::claim_due_recurrences,
         )
         .await
     }

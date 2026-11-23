@@ -314,7 +314,7 @@ impl DatabaseHandle {
                 batch.require_mutable_job_context(context, id)?;
                 batch.cancel_queued_job(id, revision, unsupported_only)?;
                 if !unsupported_only {
-                    batch.settle_child_turns(&[id])?;
+                    let _ = batch.settle_child_turns(&[id])?;
                 }
                 batch.read_mutable_job(id)?.ok_or_else(|| {
                     redb::BatchError(redb::Failure::Storage(redb::StorageError::corrupted(
@@ -421,7 +421,15 @@ impl DatabaseHandle {
         if turns.is_empty() {
             return Ok(0);
         }
-        self.write_sized(
+        let Some(turns) = self
+            .preflight_write(move |db| {
+                Ok(redb::read_child_turns_need_settlement(db, &turns)?.then_some(turns))
+            })
+            .await?
+        else {
+            return Ok(0);
+        };
+        self.write_declinable(
             turns,
             |turns| byte_count(turns.len()).saturating_mul(64 * 1024),
             OperationKind::SettleChildTurns,

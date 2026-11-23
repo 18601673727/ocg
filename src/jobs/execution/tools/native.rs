@@ -1,4 +1,6 @@
-use super::registry::{ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError};
+use super::registry::{
+    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, register_static,
+};
 use super::tool_loop::{
     ASK_USER_TOOL_NAME, REQUEST_COMMAND_TOOL_NAME, ToolExecution, ToolLoopLimits,
 };
@@ -96,9 +98,12 @@ impl ToolHandler for AwaitsUser {
 }
 
 fn register_request_command(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
-    registry.register(
+    register_static!(
+        registry,
         REQUEST_COMMAND_TOOL_NAME,
-        Some("Request a new named command before running it. Supply the exact literal argv and a task-specific reason. The user approves or declines; an approved command joins the Project's commands but does not run. Then call workspace_run_command by name."),
+        Some(
+            "Request a new named command before running it. Supply the exact literal argv and a task-specific reason. The user approves or declines; an approved command joins the Project's commands but does not run. Then call workspace_run_command by name."
+        ),
         serde_json::json!({"type":"object","additionalProperties":false,"properties":{"name":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[a-z][a-z0-9_]{0,63}$"},"argv":{"type":"array","minItems":1,"maxItems":64,"items":{"type":"string","minLength":1,"maxLength":4096}},"reason":{"type":"string","minLength":1,"maxLength":4096}},"required":["name","argv","reason"]}),
         std::sync::Arc::new(AwaitsUser("workspace_request_command-1")),
     )?;
@@ -106,7 +111,8 @@ fn register_request_command(registry: &ToolRegistry) -> Result<(), ToolRegistryE
 }
 
 fn register_ask_user(registry: &ToolRegistry) -> Result<(), ToolRegistryError> {
-    registry.register(
+    register_static!(
+        registry,
         ASK_USER_TOOL_NAME,
         Some("Ask the deciding user a question and wait for their answer."),
         serde_json::json!({"type":"object","additionalProperties":false,"properties":{"question":{"type":"string","minLength":1}},"required":["question"]}),

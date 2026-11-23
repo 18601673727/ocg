@@ -1,10 +1,11 @@
-import hljs from "highlight.js/lib/common";
+import type { HLJSApi, LanguageFn } from "highlight.js";
 import MarkdownIt, {
   type MarkdownIt as MarkdownItType,
   type StateBlock,
   type StateInline,
 } from "markdown-it";
 import taskLists from "markdown-it-task-lists";
+import { createSignal } from "solid-js";
 
 const DOLLAR = "$";
 
@@ -140,11 +141,105 @@ export interface HighlightedCode {
   html: string;
 }
 
+type Grammar = { name: string; read: () => HLJSApi | undefined };
+const grammars = new Map<string, Grammar>();
+const inFlight = new Map<string, Promise<boolean>>();
+let core: Promise<HLJSApi> | undefined;
+
+function loadCore(): Promise<HLJSApi> {
+  core ??= import("highlight.js/lib/core")
+    .then(({ default: hljs }) => {
+      const engine = hljs.newInstance();
+      // The first embedded match requests its grammar. registerLanguage replaces
+      // this rule when the module arrives (e.g. XML for JSX, CSS for <style>).
+      for (const name of ["xml", "css", "javascript", "graphql", "php", "python", "bash", "ruby"]) {
+        engine.registerLanguage(name, () => ({
+          contains: [{ match: /[\s\S]+/, "on:begin": () => grammars.get(name)?.read() }],
+        }));
+      }
+      return engine;
+    })
+    .catch((error) => {
+      core = undefined;
+      throw error;
+    });
+  return core;
+}
+
+function defineGrammar(names: string, load: () => Promise<{ default: LanguageFn }>) {
+  const aliases = names.split(" ");
+  const name = aliases[0];
+  const [ready, setReady] = createSignal<HLJSApi>();
+  function read() {
+    const loaded = ready();
+    if (!loaded && !inFlight.has(name)) {
+      const request = Promise.all([loadCore(), load()])
+        .then(([engine, module]) => {
+          engine.registerLanguage(name, module.default);
+          setReady(engine);
+          return true;
+        })
+        .catch(() => false)
+        .finally(() => {
+          inFlight.delete(name);
+        });
+      inFlight.set(name, request);
+    }
+    return loaded;
+  }
+  const grammar = { name, read };
+  for (const alias of aliases) grammars.set(alias, grammar);
+}
+
+defineGrammar("bash sh zsh shell", () => import("highlight.js/lib/languages/bash"));
+defineGrammar("c h", () => import("highlight.js/lib/languages/c"));
+defineGrammar("cpp cc c++ h++ hpp hh hxx cxx", () => import("highlight.js/lib/languages/cpp"));
+defineGrammar("csharp cs c#", () => import("highlight.js/lib/languages/csharp"));
+defineGrammar("css", () => import("highlight.js/lib/languages/css"));
+defineGrammar("diff patch", () => import("highlight.js/lib/languages/diff"));
+defineGrammar("go golang", () => import("highlight.js/lib/languages/go"));
+defineGrammar("graphql gql", () => import("highlight.js/lib/languages/graphql"));
+defineGrammar("ini toml", () => import("highlight.js/lib/languages/ini"));
+defineGrammar("java jsp", () => import("highlight.js/lib/languages/java"));
+defineGrammar("javascript js jsx mjs cjs", () => import("highlight.js/lib/languages/javascript"));
+defineGrammar("json jsonc json5", () => import("highlight.js/lib/languages/json"));
+defineGrammar("kotlin kt kts ktm ktx", () => import("highlight.js/lib/languages/kotlin"));
+defineGrammar("less", () => import("highlight.js/lib/languages/less"));
+defineGrammar("lua pluto", () => import("highlight.js/lib/languages/lua"));
+defineGrammar("makefile mk mak make", () => import("highlight.js/lib/languages/makefile"));
+defineGrammar("markdown md mkdown mkd", () => import("highlight.js/lib/languages/markdown"));
+defineGrammar(
+  "objectivec mm objc obj-c obj-c++ objective-c++",
+  () => import("highlight.js/lib/languages/objectivec"),
+);
+defineGrammar("perl pl pm", () => import("highlight.js/lib/languages/perl"));
+defineGrammar("php", () => import("highlight.js/lib/languages/php"));
+defineGrammar("php-template", () => import("highlight.js/lib/languages/php-template"));
+defineGrammar("python py gyp ipython", () => import("highlight.js/lib/languages/python"));
+defineGrammar("python-repl pycon", () => import("highlight.js/lib/languages/python-repl"));
+defineGrammar("r", () => import("highlight.js/lib/languages/r"));
+defineGrammar("ruby rb gemspec podspec thor irb", () => import("highlight.js/lib/languages/ruby"));
+defineGrammar("rust rs", () => import("highlight.js/lib/languages/rust"));
+defineGrammar("scss", () => import("highlight.js/lib/languages/scss"));
+defineGrammar("console shellsession", () => import("highlight.js/lib/languages/shell"));
+defineGrammar("sql", () => import("highlight.js/lib/languages/sql"));
+defineGrammar("swift", () => import("highlight.js/lib/languages/swift"));
+defineGrammar("typescript ts tsx mts cts", () => import("highlight.js/lib/languages/typescript"));
+defineGrammar("vbnet vb", () => import("highlight.js/lib/languages/vbnet"));
+defineGrammar("wasm", () => import("highlight.js/lib/languages/wasm"));
+defineGrammar(
+  "xml html xhtml rss atom xjb xsd xsl plist wsf svg",
+  () => import("highlight.js/lib/languages/xml"),
+);
+defineGrammar("yaml yml", () => import("highlight.js/lib/languages/yaml"));
+
 export function highlightCode(code: string, info: string): HighlightedCode | null {
-  const language = info.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
-  if (!language || language === "text" || !hljs.getLanguage(language)) return null;
+  const language = info.trim().split(/\s+/, 1)[0].toLowerCase();
+  const grammar = grammars.get(language);
+  const hljs = grammar?.read();
+  if (!grammar || !hljs) return null;
   try {
-    const { value } = hljs.highlight(code, { language, ignoreIllegals: true });
+    const { value } = hljs.highlight(code, { language: grammar.name, ignoreIllegals: true });
     return { language, html: value };
   } catch {
     return null;

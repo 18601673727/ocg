@@ -101,14 +101,62 @@ pub enum ToolRegistryError {
     Disabled(String, String),
 }
 
+pub(crate) struct ToolSpec {
+    wire: ToolWire,
+    schema: String,
+    validator: Arc<Validator>,
+}
+
+impl ToolSpec {
+    pub(crate) fn compile(
+        name: &str,
+        description: Option<&str>,
+        parameters: Value,
+    ) -> Result<Arc<Self>, ToolRegistryError> {
+        if !is_function_name(name) {
+            return Err(ToolRegistryError::InvalidName(name.to_owned()));
+        }
+        let schema = parameters.to_string();
+        if schema.len() > MAX_TOOL_DEFINITION_BYTES {
+            return Err(ToolRegistryError::UnsupportedSchema(
+                name.to_owned(),
+                format!("is larger than {MAX_TOOL_DEFINITION_BYTES} bytes"),
+            ));
+        }
+        let validator = admission::compile_parameters(&parameters)
+            .map_err(|problem| ToolRegistryError::UnsupportedSchema(name.to_owned(), problem))?;
+        Ok(Arc::new(Self {
+            wire: ToolWire {
+                tool_type: "function".to_owned(),
+                function: FunctionDefinitionWire {
+                    name: name.to_owned(),
+                    description: description.map(str::to_owned),
+                    parameters: Some(parameters),
+                    strict: None,
+                },
+            },
+            schema,
+            validator,
+        }))
+    }
+}
+
+// Each declaration owns one specification. Its handler and authorization remain per registry.
+macro_rules! register_static {
+    ($registry:expr, $name:expr, $description:expr, $parameters:expr, $handler:expr $(,)?) => {{
+        use $crate::jobs::execution::tools::registry::{ToolRegistryError, ToolSpec};
+        static SPEC: std::sync::LazyLock<Result<std::sync::Arc<ToolSpec>, ToolRegistryError>> =
+            std::sync::LazyLock::new(|| ToolSpec::compile($name, $description, $parameters));
+        $registry.register_spec(SPEC.clone()?, $handler)
+    }};
+}
+pub(crate) use register_static;
+
 struct Registration {
     generation: u64,
-    description: Option<String>,
-    parameters: Value,
-    schema: String,
+    spec: Arc<ToolSpec>,
     version: String,
     effect: ToolEffect,
-    validator: Arc<Validator>,
     handler: Arc<dyn ToolHandler>,
     authorized: bool,
 }
@@ -146,23 +194,21 @@ impl ToolRegistry {
         parameters: Value,
         handler: Arc<dyn ToolHandler>,
     ) -> Result<(), ToolRegistryError> {
-        if !is_function_name(name) {
-            return Err(ToolRegistryError::InvalidName(name.to_owned()));
-        }
+        let spec = ToolSpec::compile(name, description, parameters)?;
+        self.register_spec(spec, handler)
+    }
+
+    pub(crate) fn register_spec(
+        &self,
+        spec: Arc<ToolSpec>,
+        handler: Arc<dyn ToolHandler>,
+    ) -> Result<(), ToolRegistryError> {
+        let name = spec.wire.function.name.as_str();
         let version = handler.version().to_owned();
         if !is_handler_version(&version) {
             return Err(ToolRegistryError::InvalidVersion(name.to_owned()));
         }
         let effect = handler.effect();
-        let schema = parameters.to_string();
-        if schema.len() > MAX_TOOL_DEFINITION_BYTES {
-            return Err(ToolRegistryError::UnsupportedSchema(
-                name.to_owned(),
-                format!("is larger than {MAX_TOOL_DEFINITION_BYTES} bytes"),
-            ));
-        }
-        let validator = admission::compile_parameters(&parameters)
-            .map_err(|problem| ToolRegistryError::UnsupportedSchema(name.to_owned(), problem))?;
         let mut registry = self.lock();
         if registry.tools.contains_key(name) {
             return Err(ToolRegistryError::Duplicate(name.to_owned()));
@@ -173,12 +219,9 @@ impl ToolRegistry {
             name.to_owned(),
             Registration {
                 generation,
-                description: description.map(str::to_owned),
-                parameters,
-                schema,
+                spec,
                 version,
                 effect,
-                validator,
                 handler,
                 authorized: false,
             },
@@ -241,20 +284,28 @@ impl ToolOffer {
             .iter()
             .map(|(name, generation)| {
                 let tool = current(&registry, name, *generation)?;
-                Ok(ToolWire {
-                    tool_type: "function".to_owned(),
-                    function: FunctionDefinitionWire {
-                        name: name.clone(),
-                        description: tool.description.clone(),
-                        parameters: Some(tool.parameters.clone()),
-                        strict: None,
-                    },
-                })
+                Ok(tool.spec.wire.clone())
             })
             .collect()
     }
 
-    pub(crate) fn resolve(&self, call: &CompletedToolCall) -> Result<Dispatch, InvalidToolCall> {
+    pub(crate) fn matches_wires(&self, wires: &[ToolWire]) -> bool {
+        let registry = self.registry.lock();
+        self.tools.len() == wires.len()
+            && self
+                .tools
+                .iter()
+                .zip(wires)
+                .all(|((name, generation), wire)| {
+                    current(&registry, name, *generation).is_ok_and(|tool| tool.spec.wire == *wire)
+                })
+    }
+
+    fn registration<'a>(
+        &self,
+        registry: &'a Registry,
+        call: &CompletedToolCall,
+    ) -> Result<&'a Registration, InvalidToolCall> {
         let index = call.index;
         let refused =
             |message: String| InvalidToolCall::at(ToolCallRefusal::Unauthorized, index, message);
@@ -265,27 +316,35 @@ impl ToolOffer {
                 call.name
             )));
         };
-        let (validator, handler, version, effect, spawns, schema) = {
+        current(registry, name, *generation)
+            .map_err(|error| refused(format!("tool call {index} cannot run: {error}")))
+    }
+
+    pub(crate) fn recheck(&self, call: &CompletedToolCall) -> Result<(), InvalidToolCall> {
+        self.registration(&self.registry.lock(), call).map(|_| ())
+    }
+
+    pub(crate) fn resolve(&self, call: &CompletedToolCall) -> Result<Dispatch, InvalidToolCall> {
+        let (spec, handler, version, effect, spawns) = {
             let registry = self.registry.lock();
-            let tool = current(&registry, name, *generation)
-                .map_err(|error| refused(format!("tool call {index} cannot run: {error}")))?;
+            let tool = self.registration(&registry, call)?;
             (
-                tool.validator.clone(),
+                tool.spec.clone(),
                 tool.handler.clone(),
                 tool.version.clone(),
                 tool.effect,
                 tool.handler.spawns(),
-                tool.schema.clone(),
             )
         };
-        let arguments = admission::admit_arguments(index, name, &call.arguments, &validator)?;
+        let arguments =
+            admission::admit_arguments(call.index, &call.name, &call.arguments, &spec.validator)?;
         Ok(Dispatch {
             handler,
             arguments,
             version,
             effect,
             spawns,
-            schema,
+            schema: spec.schema.clone(),
         })
     }
 }

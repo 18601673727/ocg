@@ -1,6 +1,5 @@
 import { render } from "@solidjs/web";
 import { createEffect, createSignal, onCleanup, Show } from "solid-js";
-import { dictionaries } from "@/components/ocg/i18n/dictionaries";
 import { DEFAULT_LOCALE, isLocale } from "@/components/ocg/i18n/locale";
 import { type ApiClient, ApiError, createApiClient } from "@/components/ocg/runtime/api-client";
 import type { OperatorConsoleProps } from "@/components/ocg/session/operator-console";
@@ -25,7 +24,7 @@ function SessionLoading() {
           aria-hidden="true"
           class="size-4 rounded-full border-2 border-primary border-t-transparent motion-safe:animate-spin"
         />
-        {dictionaries[locale]["session.checking"]}
+        {locale === "zh-CN" ? "正在检查此会话…" : "Checking this session…"}
       </p>
     </main>
   );
@@ -148,7 +147,7 @@ function App() {
     <Show when={phase()} fallback={<SessionLoading />}>
       {(currentPhase) => (
         <ThemeProvider>
-          <I18nProvider>
+          <I18nProvider fallback={<SessionLoading />}>
             <OperatorConsole
               phase={currentPhase()}
               client={client}

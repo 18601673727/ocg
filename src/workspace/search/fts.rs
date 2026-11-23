@@ -200,7 +200,7 @@ struct Document {
     path: String,
     text: String,
     line_starts: Vec<u32>,
-    token_count: u32,
+    byte_starts: Vec<u32>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -232,7 +232,8 @@ impl Index {
                 document.path.len() as u64
                     + document.text.len() as u64
                     + document.line_starts.len() as u64 * 4
-                    + 64
+                    + document.byte_starts.len() as u64 * 4
+                    + std::mem::size_of::<Document>() as u64
             })
             .sum::<u64>();
         let terms = self
@@ -284,18 +285,6 @@ struct Clause {
 struct ParsedQuery {
     clauses: Vec<Clause>,
     subtokens: Vec<String>,
-}
-
-#[derive(Debug)]
-struct ScannedToken<'query> {
-    lower: &'query str,
-    start: u32,
-    line: u32,
-    position: u32,
-}
-
-struct Scanned<'query> {
-    tokens: Vec<ScannedToken<'query>>,
 }
 
 fn tokenize(text: &str, sink: &mut impl FnMut(&str, u32, u32)) {
@@ -758,15 +747,16 @@ impl Build<'_> {
         }
 
         let mut positions: BTreeMap<String, Vec<u32>> = BTreeMap::new();
-        let mut token_count = 0u32;
+        let mut byte_starts = Vec::new();
         let mut interrupted = false;
         tokenize_while(
             &text,
-            &mut |lower, _, _| {
+            &mut |lower, start, _| {
                 if interrupted {
                     return;
                 }
-                if token_count.is_multiple_of(256)
+                let position = byte_starts.len() as u32;
+                if position.is_multiple_of(256)
                     && (self.stop.load(Ordering::Relaxed)
                         || self.obsolete.load(Ordering::Relaxed)
                         || Instant::now() >= self.deadline)
@@ -775,12 +765,12 @@ impl Build<'_> {
                     return;
                 }
                 match positions.get_mut(lower) {
-                    Some(term_positions) => term_positions.push(token_count),
+                    Some(term_positions) => term_positions.push(position),
                     None => {
-                        positions.insert(lower.to_owned(), vec![token_count]);
+                        positions.insert(lower.to_owned(), vec![position]);
                     }
                 }
-                token_count += 1;
+                byte_starts.push(start);
             },
             &mut || {
                 !self.stop.load(Ordering::Relaxed)
@@ -803,7 +793,7 @@ impl Build<'_> {
         if self
             .coverage
             .tokens_indexed
-            .saturating_add(u64::from(token_count))
+            .saturating_add(byte_starts.len() as u64)
             > self.limits.tokens
         {
             self.limit = Some(BuildLimit::Tokens);
@@ -827,12 +817,12 @@ impl Build<'_> {
         }
         self.coverage.files_indexed += 1;
         self.coverage.content_bytes_indexed += text.len() as u64;
-        self.coverage.tokens_indexed += u64::from(token_count);
+        self.coverage.tokens_indexed += byte_starts.len() as u64;
         self.documents.push(Document {
             path: path.to_owned(),
             text,
             line_starts,
-            token_count,
+            byte_starts,
         });
         Ok(())
     }
@@ -954,6 +944,11 @@ struct Answer {
     limit: Option<QueryLimit>,
 }
 
+struct IndexedClause<'a> {
+    terms: &'a [String],
+    postings: Vec<&'a [Posting]>,
+}
+
 fn search_index(
     index: &Index,
     query: &ParsedQuery,
@@ -969,44 +964,55 @@ fn search_index(
     };
     let total = index.documents.len();
     let average = index.average_length();
-    let mut candidates: Vec<(u32, f64)> = Vec::new();
-    let mut seeded = false;
+    let mut terms = Vec::with_capacity(query.subtokens.len());
     for subtoken in &query.subtokens {
         query_checkpoint(stop, deadline)?;
         let Some(postings) = index.postings.get(subtoken) else {
             return Ok(answer);
         };
-        let document_frequency = postings.len() as f64;
-        let inverse =
-            (1.0 + (total as f64 - document_frequency + 0.5) / (document_frequency + 0.5)).ln();
-        let scored = |posting: &Posting| {
-            let length = index.documents[posting.document as usize].token_count as f64;
-            let frequency = f64::from(posting.frequency);
-            inverse * (frequency * (BM25_K1 + 1.0))
-                / (frequency + BM25_K1 * (1.0 - BM25_B + BM25_B * length / average.max(1.0)))
-        };
-        if !seeded {
-            candidates = postings
+        let frequency = postings.len() as f64;
+        let inverse = (1.0 + (total as f64 - frequency + 0.5) / (frequency + 0.5)).ln();
+        terms.push((postings.as_slice(), inverse));
+    }
+    let Some(&(rarest, _)) = terms.iter().min_by_key(|(postings, _)| postings.len()) else {
+        return Ok(answer);
+    };
+    // Each cursor advances in document order. Keep scores in the original term order.
+    let mut cursors = terms;
+    let mut candidates = Vec::with_capacity(rarest.len());
+    let mut matched = Vec::with_capacity(cursors.len());
+    for (number, seed) in rarest.iter().enumerate() {
+        if number.is_multiple_of(256) {
+            query_checkpoint(stop, deadline)?;
+        }
+        matched.clear();
+        for (postings, inverse) in &mut cursors {
+            if postings
+                .first()
+                .is_some_and(|posting| posting.document < seed.document)
+            {
+                let skip = postings.partition_point(|posting| posting.document < seed.document);
+                *postings = &postings[skip..];
+            }
+            let Some((first, rest)) = postings.split_first() else {
+                break;
+            };
+            if first.document != seed.document {
+                break;
+            }
+            matched.push((f64::from(first.frequency), *inverse));
+            *postings = rest;
+        }
+        if matched.len() == cursors.len() {
+            let length = index.documents[seed.document as usize].byte_starts.len() as f64;
+            let norm = BM25_K1 * (1.0 - BM25_B + BM25_B * length / average.max(1.0));
+            let score: f64 = matched
                 .iter()
-                .map(|posting| (posting.document, scored(posting)))
-                .collect();
-            seeded = true;
-            continue;
-        }
-        let mut intersected = Vec::new();
-        let mut at = 0;
-        for (document, score) in &mut candidates {
-            while at < postings.len() && postings[at].document < *document {
-                at += 1;
-            }
-            if at < postings.len() && postings[at].document == *document {
-                *score += scored(&postings[at]);
-                intersected.push((*document, *score));
-            }
-        }
-        candidates = intersected;
-        if candidates.is_empty() {
-            return Ok(answer);
+                .map(|(frequency, inverse)| {
+                    inverse * (frequency * (BM25_K1 + 1.0)) / (frequency + norm)
+                })
+                .sum();
+            candidates.push((seed.document, score));
         }
     }
     candidates.sort_by(
@@ -1018,6 +1024,20 @@ fn search_index(
             })
         },
     );
+    let mut clauses = Vec::with_capacity(query.clauses.len());
+    for clause in &query.clauses {
+        let mut postings = Vec::with_capacity(clause.subtokens.len());
+        for term in &clause.subtokens {
+            let Some(list) = index.postings.get(term) else {
+                return Ok(answer);
+            };
+            postings.push(list.as_slice());
+        }
+        clauses.push(IndexedClause {
+            terms: &clause.subtokens,
+            postings,
+        });
+    }
     let mut size = 0;
     let mut suppressed_lines = false;
     for (rank, (document, score)) in candidates.iter().enumerate() {
@@ -1029,7 +1049,7 @@ fn search_index(
             if answer.hits.is_empty() && !suppressed_lines {
                 for (remaining, _) in &candidates[rank..] {
                     query_checkpoint(stop, deadline)?;
-                    if phrases_match(index, *remaining, query, stop, deadline)? {
+                    if phrases_match(index, *remaining, &clauses, stop, deadline)? {
                         answer.limit = Some(QueryLimit::Candidates);
                         break;
                     }
@@ -1040,12 +1060,8 @@ fn search_index(
             break;
         }
         query_checkpoint(stop, deadline)?;
-        if !phrases_match(index, *document, query, stop, deadline)? {
-            continue;
-        }
+        let mut lines = matching_lines(index, *document, &clauses, stop, deadline)?;
         let document = &index.documents[*document as usize];
-        let scanned = scan_document(document, query, stop, deadline)?;
-        let mut lines = matching_lines(document, &scanned, query, stop, deadline)?;
         if lines.is_empty() {
             continue;
         }
@@ -1064,7 +1080,9 @@ fn search_index(
                 offset,
                 score: *score,
             };
-            let cost = hit.to_json().to_string().len() + 1;
+            let cost = crate::db::serialized_len(&hit.to_json())
+                .map_err(|_| SearchRefusal::ResultBytes)?
+                + 1;
             if answer.hits.len() == limits.results {
                 answer.limit = Some(QueryLimit::Results);
                 break;
@@ -1089,92 +1107,68 @@ fn search_index(
 fn phrases_match(
     index: &Index,
     document: u32,
-    query: &ParsedQuery,
+    clauses: &[IndexedClause<'_>],
     stop: &AtomicBool,
     deadline: Instant,
 ) -> Result<bool, SearchRefusal> {
-    let positions = |subtoken: &str| -> Option<&[u32]> {
-        let postings = index.postings.get(subtoken)?;
-        let at = postings
-            .binary_search_by_key(&document, |posting| posting.document)
-            .ok()?;
-        let posting = postings.get(at)?;
-        let start = posting.position_start as usize;
-        let end = start.checked_add(posting.frequency as usize)?;
-        index.positions.get(start..end)
-    };
-    for clause in &query.clauses {
-        if clause.subtokens.len() < 2 {
-            continue;
-        }
-        let Some(first) = clause.subtokens.first() else {
-            continue;
-        };
-        let Some(first_positions) = positions(first) else {
-            return Ok(false);
-        };
-        let mut clause_matched = false;
-        for (number, start) in first_positions.iter().enumerate() {
-            if number.is_multiple_of(1024) {
-                query_checkpoint(stop, deadline)?;
-            }
-            let matched = clause
-                .subtokens
-                .iter()
-                .enumerate()
-                .skip(1)
-                .all(|(offset, subtoken)| {
-                    positions(subtoken).is_some_and(|positions| {
-                        positions.binary_search(&(*start + offset as u32)).is_ok()
-                    })
-                });
-            if matched {
-                clause_matched = true;
-                break;
-            }
-        }
-        if !clause_matched {
+    for clause in clauses {
+        if clause.terms.len() > 1
+            && !visit_clause(index, document, clause, stop, deadline, |_| false)?
+        {
             return Ok(false);
         }
     }
     Ok(true)
 }
 
-fn scan_document<'query>(
-    document: &Document,
-    query: &'query ParsedQuery,
+// Return whether a clause occurs. The visitor can stop after the first match.
+fn visit_clause(
+    index: &Index,
+    document: u32,
+    clause: &IndexedClause<'_>,
     stop: &AtomicBool,
     deadline: Instant,
-) -> Result<Scanned<'query>, SearchRefusal> {
-    let mut tokens = Vec::new();
-    let mut position = 0u32;
-    let mut interrupted = false;
-    tokenize_while(
-        &document.text,
-        &mut |lower, start, _end| {
-            if interrupted {
-                return;
+    mut visit: impl FnMut(u32) -> bool,
+) -> Result<bool, SearchRefusal> {
+    // Parsing bounds each clause to MAX_CLAUSE_TOKENS. Reuse stack storage
+    // while visiting candidates, including documents that yield no matches.
+    let mut slices = [&[][..]; MAX_CLAUSE_TOKENS];
+    let positions = &mut slices[..clause.postings.len()];
+    for (positions, postings) in positions.iter_mut().zip(&clause.postings) {
+        let at = if postings.len() == index.documents.len() {
+            // A term present in every document has one posting per document ID.
+            document as usize
+        } else if let Ok(at) = postings.binary_search_by_key(&document, |p| p.document) {
+            at
+        } else {
+            return Ok(false);
+        };
+        let posting = postings[at];
+        let start = posting.position_start as usize;
+        *positions = &index.positions[start..start + posting.frequency as usize];
+    }
+    let Some((anchor, &occurrences)) = positions.iter().enumerate().min_by_key(|(_, p)| p.len())
+    else {
+        return Ok(false);
+    };
+    let mut found = false;
+    for (number, position) in occurrences.iter().enumerate() {
+        if number.is_multiple_of(1024) {
+            query_checkpoint(stop, deadline)?;
+        }
+        let Some(first) = position.checked_sub(anchor as u32) else {
+            continue;
+        };
+        if positions.iter().enumerate().all(|(offset, slice)| {
+            offset == anchor || slice.binary_search(&(first + offset as u32)).is_ok()
+        }) {
+            found = true;
+            if !visit(first) {
+                break;
             }
-            if position.is_multiple_of(1024)
-                && (stop.load(Ordering::Relaxed) || Instant::now() >= deadline)
-            {
-                interrupted = true;
-                return;
-            }
-            if let Some(term) = query.subtokens.iter().find(|term| *term == lower) {
-                tokens.push(ScannedToken {
-                    lower: term,
-                    start,
-                    line: line_of(&document.line_starts, start),
-                    position,
-                });
-            }
-            position += 1; // Unmatched tokens still separate phrase terms.
-        },
-        &mut || !stop.load(Ordering::Relaxed) && Instant::now() < deadline,
-    );
-    query_checkpoint(stop, deadline)?;
-    Ok(Scanned { tokens })
+        }
+    }
+    Ok(found)
 }
 
 fn line_of(line_starts: &[u32], offset: u32) -> u32 {
@@ -1185,43 +1179,31 @@ fn line_of(line_starts: &[u32], offset: u32) -> u32 {
 type MatchingLine = (usize, u32, u32, Vec<String>);
 
 fn matching_lines(
-    document: &Document,
-    scanned: &Scanned<'_>,
-    query: &ParsedQuery,
+    index: &Index,
+    id: u32,
+    clauses: &[IndexedClause<'_>],
     stop: &AtomicBool,
     deadline: Instant,
 ) -> Result<Vec<MatchingLine>, SearchRefusal> {
+    let document = &index.documents[id as usize];
     let mut by_line: BTreeMap<u32, (Vec<String>, u32, usize)> = BTreeMap::new();
-    for clause in &query.clauses {
-        let mut clause_matched = false;
-        let width = clause.subtokens.len();
-        for (number, window) in scanned.tokens.windows(width).enumerate() {
-            if number.is_multiple_of(1024) {
-                query_checkpoint(stop, deadline)?;
-            }
-            let matched = window.iter().zip(&clause.subtokens).enumerate().all(
-                |(position, (token, subtoken))| {
-                    token.lower == *subtoken
-                        && token.position == window[0].position + position as u32
-                },
-            );
-            if !matched {
-                continue;
-            }
-            clause_matched = true;
-            let line = window[0].line;
+    for clause in clauses {
+        let matched = visit_clause(index, id, clause, stop, deadline, |position| {
+            let start = document.byte_starts[position as usize];
+            let line = line_of(&document.line_starts, start);
             let entry = by_line
                 .entry(line)
-                .or_insert((Vec::new(), window[0].start, 0));
-            entry.1 = entry.1.min(window[0].start);
+                .or_insert_with(|| (Vec::new(), start, 0));
+            entry.1 = entry.1.min(start);
             entry.2 += 1;
-            for subtoken in &clause.subtokens {
+            for subtoken in clause.terms {
                 if !entry.0.contains(subtoken) {
                     entry.0.push(subtoken.clone());
                 }
             }
-        }
-        if !clause_matched {
+            true
+        })?;
+        if !matched {
             return Ok(Vec::new());
         }
     }
@@ -1403,7 +1385,9 @@ impl WorkspaceFts {
             "available"
         });
         drop(slot);
-        while value.to_string().len() > limits.result_bytes {
+        while crate::db::serialized_len(&value).map_err(|_| SearchRefusal::ResultBytes)?
+            > limits.result_bytes
+        {
             if value["results"].as_array_mut().and_then(Vec::pop).is_none() {
                 return Err(SearchRefusal::ResultBytes);
             }

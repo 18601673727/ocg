@@ -525,7 +525,7 @@ impl WriteWorker {
         }
     }
 
-    pub(super) fn admit(&mut self, envelope: Envelope) -> Option<Envelope> {
+    fn admit(&mut self, envelope: Envelope, space_checked: bool) -> Option<Envelope> {
         let operation = envelope.operation;
         if self.shared.update_paused.load(Ordering::SeqCst) {
             let Envelope {
@@ -545,6 +545,9 @@ impl WriteWorker {
                 lock: lock.clone(),
             });
             return None;
+        }
+        if space_checked {
+            return Some(envelope);
         }
         match self.check_database_space(envelope.command.expected_write_bytes()) {
             Ok(()) => Some(envelope),
@@ -614,6 +617,21 @@ impl WriteWorker {
         // Keep staged writes hidden until they are durable or the database is released.
         let staging = (commit == Commit::Staged).then(|| StagingBarrier::raise(&shared));
 
+        // A failed aggregate estimate must leave protection and individual refusals
+        // to the original per-command admission path.
+        let space_checked = group.len() > 1
+            && !shared.update_paused.load(Ordering::SeqCst)
+            && shared.protection.status().lock.is_none()
+            && disk::check_space(
+                ProtectedArea::Database,
+                &self.directory,
+                group.iter().fold(0u64, |total, envelope| {
+                    total.saturating_add(envelope.command.expected_write_bytes())
+                }),
+                self.config.disk_lock_threshold_bytes,
+            )
+            .is_ok();
+
         let mut executed = Vec::with_capacity(group.len());
         let mut unrun = Vec::new();
         let mut failure: Option<StorageFailure> = None;
@@ -628,7 +646,7 @@ impl WriteWorker {
                     unrun.push(envelope);
                     continue;
                 }
-                let Some(envelope) = self.admit(envelope) else {
+                let Some(envelope) = self.admit(envelope, space_checked) else {
                     continue;
                 };
                 let Envelope {

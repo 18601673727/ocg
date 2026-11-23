@@ -363,7 +363,10 @@ pub(crate) fn latest_event_seq(
 }
 
 pub(crate) fn commit_end(tx: &impl TxRead, transaction: u64) -> DecodeResult<u64> {
-    let commits = tx.table(EXECUTION_COMMITS)?;
+    commit_end_in(&tx.table(EXECUTION_COMMITS)?, transaction)
+}
+
+fn commit_end_in(commits: &impl ReadableTable<u64, u64>, transaction: u64) -> DecodeResult<u64> {
     let end = commits
         .get(transaction)?
         .ok_or_else(|| StorageError::corrupted("execution event has no committed transaction"))?
@@ -377,7 +380,14 @@ pub(crate) fn commit_end(tx: &impl TxRead, transaction: u64) -> DecodeResult<u64
 }
 
 pub(crate) fn latest_seq(tx: &impl TxRead, job: JobId) -> DecodeResult<u64> {
-    let events = tx.table(JOB_EVENTS)?;
+    latest_seq_in(&tx.table(JOB_EVENTS)?, &tx.table(EXECUTION_COMMITS)?, job)
+}
+
+pub(super) fn latest_seq_in(
+    events: &impl ReadableTable<(u128, u64), &'static [u8]>,
+    commits: &impl ReadableTable<u64, u64>,
+    job: JobId,
+) -> DecodeResult<u64> {
     let last = events
         .range((job.get(), 0)..=(job.get(), u64::MAX))?
         .next_back()
@@ -385,7 +395,7 @@ pub(crate) fn latest_seq(tx: &impl TxRead, job: JobId) -> DecodeResult<u64> {
     match last {
         Some((key, value)) => {
             let event = decode_event(key.value(), value.value())?;
-            let end = commit_end(tx, event.transaction)?;
+            let end = commit_end_in(commits, event.transaction)?;
             if event.seq > end {
                 return Err(StorageError::corrupted(
                     "execution event exceeds its transaction",

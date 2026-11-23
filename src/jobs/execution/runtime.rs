@@ -265,8 +265,7 @@ pub(crate) async fn supervise_development_generative(
         if matches!(policy, EndpointPolicy::ScheduledExternal(_)) {
             let recheck = match ScheduledExternalGrant::load(database, token).await {
                 Ok(Some(live_grant)) => {
-                    let body_bytes =
-                        serde_json::to_vec(&body).map_or(usize::MAX, |bytes| bytes.len());
+                    let body_bytes = crate::db::serialized_len(&body).unwrap_or(usize::MAX);
                     let ep_ok = frozen
                         .llm
                         .provider
@@ -501,15 +500,8 @@ fn offer_mismatch(
     match tools {
         None if conversation.tools.is_empty() => None,
         None => Some("the prepared request offers tools this execution does not hold"),
-        Some(tools) => match tools.offer.wires() {
-            Ok(wires)
-                if serde_json::to_value(&wires).ok()
-                    == serde_json::to_value(&conversation.tools).ok() =>
-            {
-                None
-            }
-            Ok(_) | Err(_) => Some("the tools changed since the request was prepared"),
-        },
+        Some(tools) if tools.offer.matches_wires(&conversation.tools) => None,
+        Some(_) => Some("the tools changed since the request was prepared"),
     }
 }
 
@@ -1014,26 +1006,33 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                     message: "prepared request mismatch".into(),
                 });
             }
-            // A bound Allocation must use its approved route for every request.
-            use ntex::util::{Either, select};
-            let grant = match select(
-                self.cancellation.cancelled(),
-                ScheduledExternalGrant::load(self.database, self.execution.handoff.token()),
-            )
-            .await
-            {
-                Either::Left(()) => {
-                    return Err(OutputSinkError {
-                        message: "provider execution was cancelled during authorization".into(),
-                    });
+            // The reservation fixes the binding for this allocation generation. Both
+            // supervisors checked the destination against that binding before starting.
+            let destination_permitted = match self.destination {
+                DestinationPolicy::Standard => true,
+                DestinationPolicy::ApprovedHttps { .. } => {
+                    use ntex::util::{Either, select};
+                    match select(
+                        self.cancellation.cancelled(),
+                        ScheduledExternalGrant::load(self.database, self.execution.handoff.token()),
+                    )
+                    .await
+                    {
+                        Either::Left(()) => {
+                            return Err(OutputSinkError {
+                                message: "provider execution was cancelled during authorization"
+                                    .into(),
+                            });
+                        }
+                        Either::Right(result) => result
+                            .map_err(|_| OutputSinkError {
+                                message:
+                                    "scheduled external authorization is unavailable or changed"
+                                        .into(),
+                            })?
+                            .is_some_and(|grant| grant.permits_destination(self.destination)),
+                    }
                 }
-                Either::Right(result) => result.map_err(|_| OutputSinkError {
-                    message: "scheduled external authorization is unavailable or changed".into(),
-                })?,
-            };
-            let destination_permitted = match grant {
-                Some(grant) => grant.permits_destination(self.destination),
-                None => *self.destination == DestinationPolicy::Standard,
             };
             if !destination_permitted {
                 return Err(OutputSinkError {

@@ -1,6 +1,6 @@
 import { Check, Copy, Maximize2, Minus, Plus } from "@lucide/solid";
 import { Dynamic } from "@solidjs/web";
-import { createEffect, createMemo, createSignal } from "solid-js";
+import { createEffect, createMemo, createSignal, For } from "solid-js";
 import { Dialog, DialogContent, DialogTitle, DialogTrigger } from "@/components/ui/dialog";
 import { bindElementRef, elementRef, Group, type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
@@ -337,7 +337,7 @@ function CodeBlock(props: { code: string; language: string; inMuted: boolean; co
               {highlight() ? (
                 <code class="hljs bg-transparent p-0" innerHTML={highlight()!.html} />
               ) : (
-                <code class={highlight() ? "" : "hljs"}>{props.code}</code>
+                <code class="hljs">{props.code}</code>
               )}
             </pre>
           </div>
@@ -397,7 +397,7 @@ function inline(parent: WalkContext, tokens: Token[], from = 0, to = tokens.leng
         const close = findClose(tokens, i, to, "link_close");
         const body = inline(ctx, tokens, i + 1, close);
         i = close;
-        if (ctx.sourceSnapshots && sourceReference(rawHref)) {
+        if (sourceReference(rawHref) && ctx.sourceSnapshots) {
           out.push(
             <SourceLink href={rawHref} snapshots={ctx.sourceSnapshots}>
               {body}
@@ -694,12 +694,11 @@ function tableEnd(tokens: Token[], start: number): number {
 }
 
 function jsonDocument(content: string): string | null {
-  const code = content.trim();
-  if (
-    !(code.startsWith("{") && code.endsWith("}")) &&
-    !(code.startsWith("[") && code.endsWith("]"))
-  )
-    return null;
+  const first = content.search(/\S/);
+  if (first < 0 || (content[first] !== "{" && content[first] !== "[")) return null;
+  const end = content.trimEnd();
+  if (!end.endsWith(content[first] === "{" ? "}" : "]")) return null;
+  const code = end.slice(first);
   try {
     const value: unknown = JSON.parse(code);
     if (typeof value !== "object" || value === null) return null;
@@ -709,17 +708,92 @@ function jsonDocument(content: string): string | null {
   }
 }
 
+type MarkdownBlock = { start: number; source: string; tokens: Token[] };
+type MarkdownDocument = { content: string; blocks: MarkdownBlock[]; resume: number };
+
+function sameRenderedTokens(left: Token[], right: Token[]) {
+  const fields = ["type", "tag", "content", "attrs", "info", "hidden", "children"];
+  return JSON.stringify(left, fields) === JSON.stringify(right, fields);
+}
+
+function markdownBlocks(content: string, previous?: MarkdownDocument): MarkdownDocument {
+  // A reference definition at the end can change links anywhere in the document.
+  const references = content.includes("]:");
+  const appended = previous && content.startsWith(previous.content);
+  const resume = appended && !references ? previous.resume : 0;
+  const base = resume > 0 ? previous!.blocks[resume].start : 0;
+  const suffix = content.slice(base);
+  const tokens = markdownParser().parse(suffix, {});
+  const blocks = previous?.blocks.slice(0, resume) ?? [];
+  let nextResume = resume;
+
+  const starts = [0];
+  for (const match of suffix.matchAll(/\r\n?|\n/g)) starts.push(match.index + match[0].length);
+  for (let i = 0; i < tokens.length; ) {
+    const first = tokens[i];
+    let j = i + 1;
+    if (first.nesting === 1) {
+      while (j < tokens.length && tokens[j].level !== 0) j++;
+      if (j < tokens.length) j++;
+    }
+    const lines = first.map;
+    if (!lines)
+      return {
+        content,
+        resume: 0,
+        blocks: [{ start: 0, source: content, tokens: markdownParser().parse(content, {}) }],
+      };
+    const start = starts[lines[0]];
+    const source = suffix.slice(start, starts[lines[1]] ?? suffix.length);
+    const chunk = tokens.slice(i, j);
+    const prior = previous?.blocks[blocks.length];
+
+    // Resume only at a confirmed top-level block after a blank line. A partial
+    // last line can still change the preceding paragraph, list or table.
+    if (
+      lines[0] > 0 &&
+      lines[0] + 1 < starts.length &&
+      /^[ \t]*(?:\r\n?|\n)$/.test(suffix.slice(starts[lines[0] - 1], start))
+    ) {
+      nextResume = blocks.length;
+    }
+    const sameSource = prior?.start === base + start && prior.source === source;
+    const local = appended && (!references || !source.includes("["));
+    blocks.push(
+      sameSource && (local || sameRenderedTokens(prior.tokens, chunk))
+        ? prior
+        : { start: base + start, source, tokens: chunk },
+    );
+    i = j;
+  }
+  return { content, blocks, resume: nextResume };
+}
+
 export function MarkdownBody(props: MarkdownBodyProps) {
   const i18n = useI18n();
   const json = createMemo(() => jsonDocument(props.content));
-  const tokens = createMemo(() =>
-    json() === null ? markdownParser().parse(props.content, {}) : [],
+  const document = createMemo<MarkdownDocument>((previous) =>
+    markdownBlocks(json() === null ? props.content : "", previous),
   );
-  const ctx = createMemo<WalkContext>(() => ({
-    inMuted: props.inMuted === undefined ? false : props.inMuted,
-    sourceSnapshots: props.sourceSnapshots,
-    copyLabel: i18n.t("chat.copyCode"),
-  }));
+  const snapshots = createMemo(() => props.sourceSnapshots, {
+    equals: (previous, next) =>
+      previous === next ||
+      (previous !== undefined &&
+        next !== undefined &&
+        previous.length === next.length &&
+        previous.every((snapshot, i) => snapshot === next[i])),
+  });
+  const ctx: WalkContext = {
+    get inMuted() {
+      return props.inMuted ?? false;
+    },
+    get sourceSnapshots() {
+      return snapshots();
+    },
+    get copyLabel() {
+      return i18n.t("chat.copyCode");
+    },
+  };
 
   return (
     <div
@@ -731,13 +805,13 @@ export function MarkdownBody(props: MarkdownBodyProps) {
       )}
     >
       {json() === null ? (
-        walk(ctx(), tokens())
+        <For each={document().blocks}>{(block) => <>{walk(ctx, block.tokens)}</>}</For>
       ) : (
         <CodeBlock
           code={json()!}
           language="json"
           inMuted={props.inMuted === undefined ? false : props.inMuted}
-          copyLabel={ctx().copyLabel}
+          copyLabel={ctx.copyLabel}
         />
       )}
     </div>

@@ -288,7 +288,7 @@ impl std::fmt::Debug for ImageUrlWire {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolWire {
     #[serde(rename = "type")]
@@ -300,7 +300,7 @@ pub const MAX_TOOLS: usize = 128;
 pub const MAX_TOOL_CALLS: usize = 128;
 pub const MAX_TOOL_ARGUMENTS_BYTES: usize = 1024 * 1024;
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct FunctionDefinitionWire {
     pub name: String,

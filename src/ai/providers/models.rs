@@ -30,10 +30,9 @@ pub(crate) async fn list_models(
         .transpose()
         .map_err(|_| ModelListError::Unreachable)?;
     ntex::time::timeout(Duration::from_secs(30), async {
-        let client =
-            provider_client_for(Duration::from_secs(30), &DestinationPolicy::Standard, &base)
-                .await
-                .map_err(|_| ModelListError::Unreachable)?;
+        let client = provider_client_for(&DestinationPolicy::Standard, &base)
+            .await
+            .map_err(|_| ModelListError::Unreachable)?;
         let mut endpoint = if anthropic {
             format!("{base}?limit=1000")
         } else {

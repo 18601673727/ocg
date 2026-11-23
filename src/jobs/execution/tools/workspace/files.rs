@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde_json::{Value, json};
 
 use super::super::registry::{
-    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError,
+    ToolFailure, ToolFuture, ToolHandler, ToolRegistry, ToolRegistryError, register_static,
 };
 use crate::db::entities::{JobId, ToolCallRef, ToolEffect};
 use crate::workspace::blocking::{self, Kind};
@@ -62,7 +62,8 @@ pub(crate) fn register_read(
     registry: &ToolRegistry,
     workspace: Workspace,
 ) -> Result<(), ToolRegistryError> {
-    registry.register(
+    register_static!(
+        registry,
         read::TOOL_NAME,
         Some(
             "Read one UTF-8 text file from the authorized Workspace. With only `path`, return its complete contents; a file over 32 KiB fails the call, so read larger files in ranges. With `start_line` or `line_count`, return whole lines from `start_line` (from 1) of a file of up to 16 MiB, at most `line_count` (up to 2000) and about 32 KiB of them, exactly as the file holds them, with `end_line` (null when the file ends before `start_line`), `total_lines`, and `next_start_line` to continue from (null at the end of the file); `line_truncated` says the one line returned is cut because it alone is longer than the limit.",
@@ -152,7 +153,8 @@ pub(crate) fn register_discovery(
     workspace: Workspace,
 ) -> Result<(), ToolRegistryError> {
     let limits = discovery::DiscoveryLimits::default();
-    registry.register(
+    register_static!(
+        registry,
         discovery::LIST_TOOL_NAME,
         Some(
             "List one directory of the authorized Workspace: its entries sorted by name, each with its type (file, directory, symlink, other, inaccessible) and a file's size in bytes. Hidden and secret-bearing names are not shown, and symlinks are never followed. At most 200 entries; `truncated` says some were left out and `total_entries` counts them all.",
@@ -163,7 +165,8 @@ pub(crate) fn register_discovery(
             limits,
         }),
     )?;
-    registry.register(
+    register_static!(
+        registry,
         discovery::SEARCH_TOOL_NAME,
         Some(
             "Find files below a directory of the authorized Workspace by name, by content, or both: give `name`, `text`, or both. Returns matching file paths with their sizes and, for `text`, the matching line numbers and lines (each cut to 200 bytes, at most 10 per file). Hidden, secret-bearing, symlinked, binary and over 1 MiB files are not searched, nor `target` or `node_modules` directories unless `path` names them. `complete` is false when a bound (results, entries, content_bytes, time) named by `limit` ended the search early; `skipped` counts entries that could not be searched.",
@@ -213,7 +216,8 @@ pub(crate) fn register_write(
     registry: &ToolRegistry,
     workspace: Workspace,
 ) -> Result<(), ToolRegistryError> {
-    registry.register(
+    register_static!(
+        registry,
         write::TOOL_NAME,
         Some(
             "Create a new UTF-8 text file, replace the whole content of an existing one, replace exact text in a file, or delete a file in the authorized Workspace. Operations: `create` {path, content} fails if the file exists. `update` {path, content, expected_content} requires the whole file to match `expected_content`. `replace` {path, old, new} replaces `old` (must occur exactly once) with `new` (up to 8 KiB each, in files up to 1 MiB). `delete` {path, expected_content} deletes a file matching `expected_content` (up to 64 KiB). Directories are never created or deleted.",

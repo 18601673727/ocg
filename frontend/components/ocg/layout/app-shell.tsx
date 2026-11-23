@@ -19,7 +19,6 @@ import {
 } from "../chat/mutable-composer";
 import { useI18n } from "../i18n";
 import { JobDetailsContext } from "../job/job-details-context";
-import { JobDetailsDialog } from "../job/job-details-dialog";
 import type { ApiClient } from "../runtime/api-client";
 import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context";
 import {
@@ -54,6 +53,9 @@ const ChatInspector = lazy(() =>
 );
 const ChatScreen = lazy(() =>
   import("../chat/chat-screen").then((module) => ({ default: module.ChatScreen })),
+);
+const JobDetailsDialog = lazy(() =>
+  import("../job/job-details-dialog").then((module) => ({ default: module.JobDetailsDialog })),
 );
 const JobsSurface = lazy(() =>
   import("../job/jobs-surface").then((module) => ({ default: module.JobsSurface })),
@@ -733,22 +735,26 @@ function AppShellContent(props: AppShellProps) {
               </Loading>
             )}
           </div>
-          <JobDetailsDialog
-            client={props.client}
-            job={detailJob()}
-            onJob={(job) => {
-              if (job === null) closeJobDetails();
-              else setDetailJob(job);
-            }}
-            onOpenChat={(job) => {
-              void confirmMutableComposerNavigation().then((allowed) => {
-                if (!allowed) return;
-                setDetailJob(null);
-                setSessionId("");
-                goDirect("chat", job);
-              });
-            }}
-          />
+          <Show when={detailJob() !== null}>
+            <Loading fallback={null}>
+              <JobDetailsDialog
+                client={props.client}
+                job={detailJob()}
+                onJob={(job) => {
+                  if (job === null) closeJobDetails();
+                  else setDetailJob(job);
+                }}
+                onOpenChat={(job) => {
+                  void confirmMutableComposerNavigation().then((allowed) => {
+                    if (!allowed) return;
+                    setDetailJob(null);
+                    setSessionId("");
+                    goDirect("chat", job);
+                  });
+                }}
+              />
+            </Loading>
+          </Show>
         </ConversationErrorScope>
       </JobDetailsContext>
     </WorkspaceNavigation>
