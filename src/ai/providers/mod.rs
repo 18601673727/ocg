@@ -87,6 +87,50 @@ pub(crate) fn provider_uri(url: &str) -> Option<ntex::http::Uri> {
     .then_some(uri)
 }
 
+pub(crate) fn effective_provider_endpoint(
+    endpoint: Option<&str>,
+    transport: crate::db::entities::LlmTransport,
+) -> &str {
+    endpoint.unwrap_or(match transport {
+        crate::db::entities::LlmTransport::OpenAiChatCompletions
+        | crate::db::entities::LlmTransport::OpenAiResponses => openai_compatible::DEFAULT_ENDPOINT,
+        crate::db::entities::LlmTransport::AnthropicMessages => anthropic::DEFAULT_ENDPOINT,
+    })
+}
+
+pub(crate) fn provider_origins_match(
+    left_endpoint: Option<&str>,
+    left_transport: crate::db::entities::LlmTransport,
+    right_endpoint: Option<&str>,
+    right_transport: crate::db::entities::LlmTransport,
+) -> bool {
+    let left = effective_provider_endpoint(left_endpoint, left_transport);
+    let right = effective_provider_endpoint(right_endpoint, right_transport);
+    let Some(left) = provider_uri(left) else {
+        return false;
+    };
+    let Some(right) = provider_uri(right) else {
+        return false;
+    };
+    left.scheme_str() == right.scheme_str()
+        && left.host().zip(right.host()).is_some_and(|(left, right)| {
+            crate::network::http::bare_host(left) == crate::network::http::bare_host(right)
+        })
+        && left.port_u16().unwrap_or_else(|| {
+            if left.scheme_str() == Some("http") {
+                80
+            } else {
+                443
+            }
+        }) == right.port_u16().unwrap_or_else(|| {
+            if right.scheme_str() == Some("http") {
+                80
+            } else {
+                443
+            }
+        })
+}
+
 pub(super) async fn send(
     endpoint: String,
     (credential_ref, frozen_headers): (Option<&str>, &FrozenHeaders),

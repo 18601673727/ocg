@@ -143,11 +143,68 @@ pub(crate) fn live_credential_refs(
         .collect())
 }
 
-pub(crate) fn read_credential_ref_in_use(
+pub(crate) fn read_credential_ref_origin_matches(
     database: &Database,
     reference: &str,
-) -> Result<bool, StorageError> {
-    Ok(live_credential_refs(&read(database)?)?.contains(reference))
+    endpoint: &str,
+    live_only: bool,
+) -> Result<Option<bool>, StorageError> {
+    let tx = read(database)?;
+    let mut connections = BTreeMap::new();
+    let mut known_connections = BTreeMap::new();
+    let mut live_connections = BTreeMap::new();
+    for entry in tx.open_table(CONFIGS)?.iter()? {
+        let (key, bytes) = entry?;
+        let row = ConfigRow::decode_at(key.value(), bytes.value())?;
+        match row.body {
+            ConfigBody::Connection(connection) => {
+                connections.insert(row.id, connection);
+            }
+            ConfigBody::Model(model) => {
+                known_connections.insert(model.connection_id, true);
+                if row.archived_at.is_none() {
+                    live_connections.insert(model.connection_id, true);
+                }
+            }
+            ConfigBody::DecisionModel(model) => {
+                known_connections
+                    .entry(model.connection_id)
+                    .or_insert(false);
+                if row.archived_at.is_none() {
+                    live_connections.entry(model.connection_id).or_insert(false);
+                }
+            }
+            ConfigBody::Agent(_) | ConfigBody::DecisionAgent(_) => {}
+        }
+    }
+    let relevant_connections = if live_only {
+        &live_connections
+    } else {
+        &known_connections
+    };
+    let mut in_use = false;
+    for (connection, use_default_endpoint) in relevant_connections
+        .iter()
+        .filter_map(|(id, use_default_endpoint)| {
+            connections
+                .get(id)
+                .map(|connection| (connection, *use_default_endpoint))
+        })
+        .filter(|(connection, _)| connection.credential_refs().any(|value| value == reference))
+    {
+        in_use = true;
+        if (connection.endpoint.is_some() || use_default_endpoint)
+            && crate::ai::providers::provider_origins_match(
+                connection.endpoint.as_deref(),
+                connection.protocol,
+                Some(endpoint),
+                connection.protocol,
+            )
+        {
+            return Ok(Some(true));
+        }
+    }
+    Ok(in_use.then_some(false))
 }
 
 pub(crate) fn read_configs(
