@@ -658,7 +658,7 @@ function table(ctx: WalkContext, tokens: Token[], start: number): View {
       row.push(
         token.type === "th_open" ? (
           <th
-            class="px-4 py-3 text-left align-top font-semibold leading-6"
+            class="px-4 py-3 text-left align-top font-semibold leading-6 whitespace-nowrap"
             style={align ? { "text-align": align } : undefined}
           >
             {cells}

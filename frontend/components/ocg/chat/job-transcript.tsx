@@ -348,19 +348,21 @@ function TurnToolCalls(props: {
                           {tool.arguments === null ? "—" : formatToolJson(tool.arguments)}
                         </pre>
                       </div>
-                      <div>
-                        <div class="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
-                          <span>{i18n.t("transcript.result")}</span>
-                          {tool.result_cut ? (
-                            <span class="text-[10px] font-semibold text-amber-500">
-                              {i18n.t("transcript.cut")}
-                            </span>
-                          ) : null}
+                      {tool.outcome_kind !== "completed_elided" && (
+                        <div>
+                          <div class="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
+                            <span>{i18n.t("transcript.result")}</span>
+                            {tool.result_cut ? (
+                              <span class="text-[10px] font-semibold text-amber-500">
+                                {i18n.t("transcript.cut")}
+                              </span>
+                            ) : null}
+                          </div>
+                          <pre class="ocg-subtle-scrollbar max-h-48 overflow-auto overscroll-contain whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
+                            {tool.result === null ? "—" : formatToolJson(tool.result)}
+                          </pre>
                         </div>
-                        <pre class="ocg-subtle-scrollbar max-h-48 overflow-auto overscroll-contain whitespace-pre-wrap break-all rounded bg-muted p-2 text-[11px]">
-                          {tool.result === null ? "—" : formatToolJson(tool.result)}
-                        </pre>
-                      </div>
+                      )}
                     </WorkspaceTool>
                   </div>
                 )}

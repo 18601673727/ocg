@@ -36,7 +36,7 @@ export function presentToolCall(
     call.outcome_kind === "uncertain";
   const result = refused
     ? `${t("transcript.outcome.refused")}: ${call.decision}`
-    : call.outcome_kind
+    : call.outcome_kind && call.outcome_kind !== "completed_elided"
       ? (call.result ?? call.outcome_kind)
       : undefined;
   return {

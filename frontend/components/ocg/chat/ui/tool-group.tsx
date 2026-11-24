@@ -119,16 +119,18 @@ function ToolGroupTrigger(
       >
         {viewProps.summary ?? label()}
       </span>
-      <ChevronDownIcon
-        data-slot="tool-group-trigger-chevron"
-        class={cn(
-          "aui-tool-group-trigger-chevron size-3 shrink-0",
-          "transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none",
-          "-rotate-90",
-          "group-data-open/trigger:rotate-0",
-          "group-data-panel-open/trigger:rotate-0",
-        )}
-      />
+      <span class="flex size-5 shrink-0 items-center justify-center" aria-hidden="true">
+        <ChevronDownIcon
+          data-slot="tool-group-trigger-chevron"
+          class={cn(
+            "aui-tool-group-trigger-chevron size-3 shrink-0",
+            "transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none",
+            "-rotate-90",
+            "group-data-open/trigger:rotate-0",
+            "group-data-panel-open/trigger:rotate-0",
+          )}
+        />
+      </span>
     </CollapsibleTrigger>
   );
 }
@@ -142,10 +144,7 @@ function ToolGroupContent(
   return (
     <CollapsibleContent
       data-slot="tool-group-content"
-      class={cn(
-        "aui-tool-group-content relative overflow-hidden text-sm outline-none",
-        viewProps.class,
-      )}
+      class={cn("aui-tool-group-content relative text-sm outline-none", viewProps.class)}
       {...props}
     >
       <BoundedMessage

@@ -233,16 +233,18 @@ function ToolFallbackTrigger(
         <span class="flex-1" />
       )}
       <ToolFallbackDuration durationMs={viewProps.durationMs} />
-      <ChevronDownIcon
-        data-slot="tool-fallback-trigger-chevron"
-        class={cn(
-          "aui-tool-fallback-trigger-chevron size-3.5 shrink-0",
-          "transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none",
-          "-rotate-90",
-          "group-data-open/trigger:rotate-0",
-          "group-data-panel-open/trigger:rotate-0",
-        )}
-      />
+      <span class="flex size-5 shrink-0 items-center justify-center" aria-hidden="true">
+        <ChevronDownIcon
+          data-slot="tool-fallback-trigger-chevron"
+          class={cn(
+            "aui-tool-fallback-trigger-chevron size-3.5 shrink-0",
+            "transition-transform duration-(--animation-duration) ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:transition-none",
+            "-rotate-90",
+            "group-data-open/trigger:rotate-0",
+            "group-data-panel-open/trigger:rotate-0",
+          )}
+        />
+      </span>
     </CollapsibleTrigger>
   );
 }
@@ -254,7 +256,7 @@ function ToolFallbackContent(viewProps: ElementProps<typeof CollapsibleContent>)
     <CollapsibleContent
       data-slot="tool-fallback-content"
       class={cn(
-        "aui-tool-fallback-content relative min-w-0 overflow-hidden text-xs leading-5 outline-none",
+        "aui-tool-fallback-content relative min-w-0 text-xs leading-5 outline-none",
         "group/collapsible-content ease-[cubic-bezier(0.32,0.72,0,1)] motion-reduce:animate-none",
         "data-closed:animate-collapsible-up",
         "data-open:animate-collapsible-down",
@@ -297,7 +299,7 @@ function ToolFallbackArgs(
             class={cn("aui-tool-fallback-args", viewProps.class)}
             {...props}
           >
-            <pre class="aui-tool-fallback-args-value bg-muted/50 text-foreground/90 rounded-md p-2.5 whitespace-pre-wrap wrap-anywhere">
+            <pre class="aui-tool-fallback-args-value bg-muted/50 text-foreground/90 overflow-x-visible rounded-md p-2.5 whitespace-pre-wrap wrap-anywhere">
               {formatToolJson(viewProps.argsText)}
             </pre>
           </div>
@@ -345,7 +347,7 @@ function ToolFallbackResult(
             <p class="aui-tool-fallback-result-header text-muted-foreground text-xs font-medium">
               Result:
             </p>
-            <pre class="aui-tool-fallback-result-content bg-muted/50 text-foreground/90 mt-1 rounded-md p-2.5 whitespace-pre-wrap wrap-anywhere">
+            <pre class="aui-tool-fallback-result-content bg-muted/50 text-foreground/90 mt-1 overflow-x-visible rounded-md p-2.5 whitespace-pre-wrap wrap-anywhere">
               {formatToolJson(formatUnknownValue(viewProps.result, 2))}
             </pre>
           </div>
