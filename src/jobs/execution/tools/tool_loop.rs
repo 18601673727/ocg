@@ -328,6 +328,24 @@ pub(crate) async fn answer_calls(
                 if let Some(starting) = &mut starting {
                     starting.admission_refused();
                 }
+                if matches!(
+                    &violation,
+                    Violation::InvalidValue(
+                        "job_plan",
+                        "project decision policy requires job_plan before side-effecting tools"
+                    )
+                ) {
+                    let refusal = InvalidToolCall::at(
+                        ToolCallRefusal::Unauthorized,
+                        index,
+                        format!(
+                            "{violation}. This tool was not invoked. Submit job_plan before retrying side-effecting tools, including workspace_run_command. You may instead finish using the results already available."
+                        ),
+                    );
+                    record_refusal(site, call, &refusal).await?;
+                    answers.push(refusal_answer(&refusal));
+                    continue;
+                }
                 return Err(ToolLoopStop::AdmissionRefused { index, violation });
             }
             Err(_) => {

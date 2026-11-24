@@ -49,7 +49,7 @@ fn job_tools() -> Result<Vec<JobTool>, ToolRegistryError> {
             "job_plan",
             json!({"steps":{"type":"array","minItems":1,"maxItems":6,"items":{"type":"object","additionalProperties":false,"properties":{"title":{"type":"string","minLength":1,"maxLength":120},"objective":{"type":"string","minLength":1,"maxLength":2000},"depends_on":{"type":"array","maxItems":5,"uniqueItems":true,"items":{"type":"integer","minimum":0,"maximum":5}}},"required":["title","objective","depends_on"]}}}),
             vec!["steps"],
-            "Submit a bounded execution plan. Each step names its prerequisites in depends_on as zero-based indices of earlier steps. Use [] for independent work, which may run concurrently when capacity permits. A dependent step waits for its prerequisites to settle. One local step continues directly in the current Job without creating a child conversation. For several steps, the host opens one child conversation per step with this Agent's own permissions and, once every step has settled, adds their results to this conversation as a message. Use one precise scope per step; a plan must come before any other work and cannot be made by one of its own steps.",
+            "Submit a bounded execution plan. Each step names its prerequisites in depends_on as zero-based indices of earlier steps. Use [] for independent work, which may run concurrently when capacity permits. A dependent step waits for its prerequisites to settle. One local step continues directly in the current Job without creating a child conversation. For several steps, the host opens one child conversation per step with this Agent's own permissions and, once every step has settled, adds their results to this conversation as a message. Use one precise scope per step. Read-only discovery may precede a plan, but side-effecting work must not. A Project policy may require a plan before workspace_run_command even for a read-only shell command. A plan cannot be made by one of its own steps.",
         ),
         (
             "job_limits",
@@ -131,7 +131,7 @@ fn job_tools() -> Result<Vec<JobTool>, ToolRegistryError> {
         let version = if USER_DECIDED.contains(&name) {
             2
         } else if name == "job_plan" {
-            6
+            7
         } else {
             1
         };

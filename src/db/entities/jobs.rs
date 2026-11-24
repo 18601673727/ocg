@@ -782,7 +782,7 @@ impl JobToolCall {
 
     pub(crate) fn handler_version(&self) -> String {
         let version = match self {
-            Self::JobPlan { .. } => 6,
+            Self::JobPlan { .. } => 7,
             Self::JobDispatch { .. } | Self::JobAssign { .. } => 2,
             Self::JobLimits { .. }
             | Self::JobAgents { .. }

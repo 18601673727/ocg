@@ -860,7 +860,9 @@ pub(crate) fn unknown_execution_note(
     {
         let (key, bytes) = entry?;
         let call = decode_tool_evidence(tool_call_ref(key.value())?, bytes.value())?;
-        if let Some(admission) = call.admission() {
+        if let Some(admission) = call.admission()
+            && admission.effect != crate::db::entities::ToolEffect::ReadOnly
+        {
             let _ = write!(note, "\n{}: {}", call.name, admission.arguments.as_str());
         }
     }

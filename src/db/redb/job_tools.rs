@@ -307,7 +307,14 @@ impl Batch {
                         ToolOutcome::NotApplied { .. } | ToolOutcome::NotInvoked { .. }
                     )
                 });
-            !matches!(previous.decision.fact, ToolDecision::Refused(_)) && !refused_plan
+            let work = match &previous.decision.fact {
+                ToolDecision::Admitted(admission) => {
+                    admission.effect != crate::db::entities::ToolEffect::ReadOnly
+                }
+                ToolDecision::Refused(_) => false,
+                ToolDecision::AwaitingApproval(_) | ToolDecision::AwaitingAnswer(_) => true,
+            };
+            work && !refused_plan
         });
         if work_started {
             return self.reject(Violation::InvalidValue(

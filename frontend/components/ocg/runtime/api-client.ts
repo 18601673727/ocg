@@ -100,7 +100,7 @@ export async function readOutputWindow(
   job: string,
   {
     beforeSeq,
-    limit = 200,
+    limit = 260,
     signal,
   }: { beforeSeq?: number; limit?: number; signal?: AbortSignal } = {},
 ) {

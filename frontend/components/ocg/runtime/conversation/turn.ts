@@ -9,7 +9,7 @@ import type {
 import { taskPlanActive } from "../job-status";
 import type { OutputHistory } from "../output-history";
 
-export const TURN_PAGE_SIZE = 20;
+export const TURN_PAGE_SIZE = 26;
 
 export type Turn = {
   content_kind?: ConversationTurn["content_kind"];
