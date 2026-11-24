@@ -11,9 +11,11 @@ import {
 import { Button } from "@/components/ui/button";
 import { bindElementRef, elementRef } from "@/lib/ui-state";
 import { useI18n } from "../i18n";
+import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context";
 import { IMAGE_TYPES, imageFiles } from "./composer/attachments";
 import { ComposerSelectors } from "./composer/composer-selectors";
 import { type ComposerProps, createComposerDraft } from "./composer/draft-state";
+import { useConversationView } from "./conversation-view";
 
 export { bindComposerContext, contextForSession, MUTABLE_CONTEXT_KEY } from "./composer/context";
 export { confirmMutableComposerNavigation } from "./composer/draft-state";
@@ -26,7 +28,7 @@ export function MutableComposer(props: ComposerProps) {
   const {
     input,
     confirmed,
-    statusInfo,
+    saving,
     error,
     busy,
     uncertain,
@@ -51,6 +53,58 @@ export function MutableComposer(props: ComposerProps) {
   } = draft;
   const { pendingImages, uploading, selectImages, retryUploads, paste } = attachments;
   const i18n = useI18n();
+  const { t } = i18n;
+  const { api } = useOcgRuntime();
+  const { reportSubmissionNotice } = useConversationView();
+  const [stopping, setStopping] = createSignal(false);
+  const conversation = useOcgRuntimeSnapshot(
+    (snapshot) =>
+      snapshot.sessions.find((session) => session.id === props.sessionId)?.conversationId,
+  );
+  const active = useOcgRuntimeSnapshot((snapshot) =>
+    snapshot.messagesBySession[props.sessionId]?.findLast(({ execution }) =>
+      execution
+        ? execution.holdsCapacity ||
+          execution.phase === "queued" ||
+          execution.phase === "reserved" ||
+          execution.phase === "running" ||
+          execution.phase === "stop_requested"
+        : false,
+    ),
+  );
+  const actionMode = createMemo(() => {
+    if (!ready() || busy() || stopping() || active()?.execution?.phase === "stop_requested")
+      return "loading";
+    if (active() && !editingQueue()) return "stop";
+    if (saving() || uploading() > 0) return "loading";
+    return "send";
+  });
+  const actionLabel = createMemo(() =>
+    actionMode() === "stop"
+      ? i18n.t("aui.stopGenerating")
+      : actionMode() === "loading"
+        ? i18n.t("common.loading")
+        : editingQueue()
+          ? t("chat.draft.saveQueued")
+          : i18n.t("aui.sendMessage"),
+  );
+  async function stop() {
+    const root = conversation();
+    const message = active();
+    if (!root || !message || stopping()) return;
+    setStopping(true);
+    try {
+      await api.stopConversation(root);
+    } catch (cause) {
+      reportSubmissionNotice(
+        props.sessionId,
+        cause instanceof Error ? cause.message : String(cause),
+        { content: message.content, jobId: message.jobId },
+      );
+    } finally {
+      setStopping(false);
+    }
+  }
   const [dragActive, setDragActive] = createSignal(false);
   const inputRef = elementRef<HTMLInputElement>(null);
   const modelTriggerRef = elementRef<HTMLButtonElement>(null);
@@ -131,7 +185,7 @@ export function MutableComposer(props: ComposerProps) {
           </ComposerAttachments>
           {uncertain() && (
             <div role="alert" class="text-xs text-destructive">
-              Submission outcome is uncertain.{" "}
+              {t("chat.draft.uncertain")}{" "}
               <Button
                 type="button"
                 size="xs"
@@ -139,7 +193,7 @@ export function MutableComposer(props: ComposerProps) {
                 disabled={busy()}
                 onClick={() => void reconcileSubmission()}
               >
-                Reconcile submission
+                {t("chat.draft.reconcile")}
               </Button>
             </div>
           )}
@@ -147,7 +201,7 @@ export function MutableComposer(props: ComposerProps) {
             <div role="alert" class="text-xs text-destructive">
               {queueError()}
               <Button type="button" size="xs" variant="ghost" onClick={() => void refreshQueue()}>
-                Retry
+                {t("common.retry")}
               </Button>
             </div>
           )}
@@ -170,7 +224,11 @@ export function MutableComposer(props: ComposerProps) {
                           void refreshUnfinished())
                   }
                 >
-                  {!ready() ? "Reload" : conflict() ? "Load saved version" : "Retry"}
+                  {!ready()
+                    ? t("common.reload")
+                    : conflict()
+                      ? t("chat.draft.loadSaved")
+                      : t("common.retry")}
                 </Button>
               )}
             </div>
@@ -189,22 +247,29 @@ export function MutableComposer(props: ComposerProps) {
               changeText(event.currentTarget.value);
             }}
             onKeyDown={(event) => {
-              if (event.isComposing || !shortcuts().length) return;
-              if (event.key === "Escape") {
-                event.preventDefault();
-                setShortcutDismissed(input().text);
-              } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-                event.preventDefault();
-                const count = shortcuts().length;
-                setShortcutIndex(
-                  (index) => (index + (event.key === "ArrowDown" ? 1 : count - 1)) % count,
-                );
-              } else if (event.key === "Enter" && !event.shiftKey) {
-                const shortcut = shortcuts()[shortcutIndex()];
-                if (shortcut) {
+              if (event.isComposing || event.keyCode === 229) return;
+              if (shortcuts().length && !event.ctrlKey && !event.metaKey && !event.altKey) {
+                if (event.key === "Escape") {
                   event.preventDefault();
-                  runShortcut(shortcut);
+                  setShortcutDismissed(input().text);
+                } else if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                  event.preventDefault();
+                  const count = shortcuts().length;
+                  setShortcutIndex(
+                    (index) => (index + (event.key === "ArrowDown" ? 1 : count - 1)) % count,
+                  );
+                } else if (event.key === "Enter" && !event.shiftKey) {
+                  const shortcut = shortcuts()[shortcutIndex()];
+                  if (shortcut) {
+                    event.preventDefault();
+                    runShortcut(shortcut);
+                    return;
+                  }
                 }
+              }
+              if (event.key === "Enter" && !event.shiftKey && !event.altKey) {
+                event.preventDefault();
+                if (!event.repeat && !sendDisabled()) event.currentTarget.form?.requestSubmit();
               }
             }}
             onPaste={paste}
@@ -222,7 +287,7 @@ export function MutableComposer(props: ComposerProps) {
           />
           {pendingImages().some((item) => item.failed) && (
             <div role="alert" class="text-xs text-destructive">
-              Image upload failed.{" "}
+              {t("chat.draft.uploadFailed")}{" "}
               <Button
                 type="button"
                 size="xs"
@@ -230,7 +295,7 @@ export function MutableComposer(props: ComposerProps) {
                 disabled={busy() || uploading() > 0}
                 onClick={retryUploads}
               >
-                Retry upload
+                {t("chat.draft.retryUpload")}
               </Button>
             </div>
           )}
@@ -243,39 +308,18 @@ export function MutableComposer(props: ComposerProps) {
               onClick={() => inputRef.current?.click()}
             />
             <ComposerSelectors composer={props} draft={draft} trigger={modelTriggerRef} />
-            <ComposerActions class="min-w-0 shrink-0">
-              <Show when={statusInfo().label || statusInfo().job}>
-                <p
-                  data-slot="composer-status"
-                  role="status"
-                  class="flex min-w-0 max-w-56 items-center gap-1.5 text-xs text-muted-foreground"
-                  title={[
-                    statusInfo().label,
-                    statusInfo().job,
-                    statusInfo().revision ? `revision ${statusInfo().revision}` : undefined,
-                  ]
-                    .filter(Boolean)
-                    .join(" · ")}
-                >
-                  <span class="truncate">{statusInfo().label}</span>
-                  <Show when={statusInfo().job}>
-                    {(job) => <span class="shrink-0 font-mono">#{job().slice(-8)}</span>}
-                  </Show>
-                </p>
-              </Show>
-              {editingQueue() ? (
-                <Button type="submit" size="sm" disabled={sendDisabled()}>
-                  Save queued Job
-                </Button>
-              ) : (
-                <ComposerSend
-                  type="submit"
-                  idle={sendDisabled()}
-                  disabled={sendDisabled()}
-                  aria-label={i18n.t("aui.sendMessage")}
-                  title={i18n.t("aui.sendMessage")}
-                />
-              )}
+            <ComposerActions class="ms-auto min-w-0 shrink-0">
+              <ComposerSend
+                mode={actionMode()}
+                type={actionMode() === "send" ? "submit" : "button"}
+                idle={actionMode() === "send" && sendDisabled()}
+                disabled={actionMode() === "loading" || (actionMode() === "send" && sendDisabled())}
+                onClick={() => {
+                  if (actionMode() === "stop") void stop();
+                }}
+                aria-label={actionLabel()}
+                title={actionLabel()}
+              />
             </ComposerActions>
           </ComposerToolbar>
         </ComposerBar>

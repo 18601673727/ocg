@@ -18,8 +18,16 @@ function messageContext(messages: readonly ChatMessage[]): MessageContext {
       (item) => item.role === "assistant" && !item.intermediate && item.status === "pending",
     );
   const lastAssistant = transcript.findLast((item) => item.role === "assistant");
+  const reasoningActive =
+    activity &&
+    transcript.some(
+      (item) =>
+        item.jobId === activity.jobId &&
+        Boolean(item.reasoning?.trim()) &&
+        (item.status === "streaming" || item.status === "pending"),
+    );
   return {
-    activityId: activity?.id,
+    activityId: reasoningActive ? undefined : activity?.id,
     retryId:
       lastAssistant && retryInput(transcript, lastAssistant.id) !== null
         ? lastAssistant.id

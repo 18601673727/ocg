@@ -163,14 +163,16 @@ export class TurnProjection {
                 : (turn.error ??
                   turn.toolError ??
                   message.detail ??
-                  (message.status === "unknown"
-                    ? (turn.details?.allocation?.holds_capacity
-                        ? "Execution outcome uncertain; ownership is held and capacity is not released."
-                        : turn.job.stop_confirmed_at_us === null
-                          ? "Outcome unknown; stop is not yet confirmed."
-                          : "Execution stopped; final outcome unknown.") +
-                      (turn.unknownReason ? ` ${turn.unknownReason}` : "")
-                    : undefined)),
+                  turn.unknownReason ??
+                  undefined),
+              failureCode:
+                !message.intermediate && message.status === "unknown"
+                  ? turn.details?.allocation?.holds_capacity
+                    ? ("outcome-held" as const)
+                    : turn.job.stop_confirmed_at_us === null
+                      ? ("outcome-unconfirmed" as const)
+                      : ("outcome-stopped" as const)
+                  : undefined,
               failureAt:
                 !message.intermediate &&
                 !turn.error &&

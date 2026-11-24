@@ -281,11 +281,11 @@ function UserMessage() {
       class="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 [contain-intrinsic-size:auto_80px] [&>*]:col-start-2"
     >
       <ImageGallery images={message().images} compact />
-      <div class="relative col-start-2 min-w-0 justify-self-end">
+      <div class="group/user-message relative col-start-2 min-w-0 justify-self-end">
         <div class="peer bg-muted text-foreground rounded-(--composer-radius) px-4 py-2 whitespace-pre-wrap wrap-break-word empty:hidden">
           {message().content}
         </div>
-        <div class="absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 peer-empty:hidden rtl:translate-x-full">
+        <div class="pointer-events-none absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 opacity-0 transition-opacity group-hover/user-message:pointer-events-auto group-hover/user-message:opacity-100 group-focus-within/user-message:pointer-events-auto group-focus-within/user-message:opacity-100 peer-empty:hidden motion-reduce:transition-none rtl:translate-x-full">
           <MessageActions />
         </div>
       </div>
@@ -316,6 +316,20 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
       message().content.trim() || message().reasoning || parts().length || message().images?.length,
     ),
   );
+  const failure = createMemo(() => {
+    const code = message().failureCode;
+    const key =
+      code === "outcome-held"
+        ? "chat.outcome.held"
+        : code === "outcome-unconfirmed"
+          ? "chat.outcome.unconfirmed"
+          : code === "outcome-stopped"
+            ? "chat.outcome.stopped"
+            : undefined;
+    return key
+      ? [t(key), message().failureReason].filter(Boolean).join(" ")
+      : message().failureReason;
+  });
 
   return (
     <Show
@@ -353,7 +367,7 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
                   {t("chat.thinking")}
                 </p>
               </Show>
-              <Show when={message().reasoning}>
+              <Show when={Boolean(message().reasoning)}>
                 <ReasoningRoot streaming={running()}>
                   <ReasoningTrigger
                     active={running()}
@@ -374,13 +388,13 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
                   </ReasoningContent>
                 </ReasoningRoot>
               </Show>
-              <Show when={message().content}>
+              <Show when={Boolean(message().content)}>
                 <MarkdownBody
                   content={message().content}
                   sourceSnapshots={message().sourceSnapshots}
                 />
               </Show>
-              <Show when={parts().length}>
+              <Show when={parts().length > 0}>
                 <ToolGroupRoot variant="ghost">
                   <ToolGroupTrigger
                     count={parts().length}
@@ -398,7 +412,10 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
                     }
                   />
                   <ToolGroupContent streaming={running()}>
-                    <For each={parts()} keyed={(part) => part.toolCallId}>
+                    <For
+                      each={parts()}
+                      keyed={(part) => `${part.jobId}:${part.call?.request}:${part.call?.index}`}
+                    >
                       {(part) => <WorkspaceToolFallback {...part()} />}
                     </For>
                   </ToolGroupContent>
@@ -406,9 +423,9 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
               </Show>
               <ImageGallery images={message().images} />
               {props.footer}
-              <Show when={message().failureReason || message().status === "failed"}>
+              <Show when={failure() || message().status === "failed"}>
                 <p role="alert" class="text-destructive mt-2 text-sm whitespace-pre-wrap">
-                  {message().failureReason ?? t("chat.failed")}
+                  {failure() ?? t("chat.failed")}
                 </p>
               </Show>
             </div>

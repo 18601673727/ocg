@@ -45,7 +45,13 @@ export type ChatMessage = {
   intermediate?: boolean;
   failureReason?: string;
   failureAt?: number;
-  failureCode?: "project-missing" | "configuration-required" | "stream-closed";
+  failureCode?:
+    | "project-missing"
+    | "configuration-required"
+    | "stream-closed"
+    | "outcome-held"
+    | "outcome-unconfirmed"
+    | "outcome-stopped";
   createdAt: string;
   status: MessageStatus;
 };

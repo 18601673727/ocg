@@ -3,7 +3,6 @@ import { elementRef } from "@/lib/ui-state";
 import type { ChatImage, ChatModelSelection } from "../../contracts";
 import { useI18n } from "../../i18n";
 import { ApiError, type MutableJob, type MutableJobInput } from "../../runtime/api-client";
-import { executionLabel } from "../../runtime/job-status";
 import { useOcgRuntime } from "../../runtime/runtime-context";
 import { useConversationView } from "../conversation-view";
 import type { ModelSupport } from "../model-selector";
@@ -88,9 +87,6 @@ type Work = {
   conflict: boolean;
   promise: Promise<void> | null;
 };
-function errorMessage(cause: unknown) {
-  return cause instanceof Error ? cause.message : String(cause);
-}
 
 function isEmptyDraft(
   job: MutableJob | null,
@@ -111,7 +107,13 @@ function hasDraftContent(input: MutableJobInput) {
 
 export function createComposerDraft(props: ComposerProps) {
   const { api, client } = useOcgRuntime();
-  const i18n = useI18n();
+  const { t } = useI18n();
+  const errorMessage = (cause: unknown) =>
+    cause instanceof ApiError && cause.code === "mutable_job_conflict"
+      ? `${t("chat.draft.apiConflict")} (${cause.code}, ${cause.status})`
+      : cause instanceof Error
+        ? cause.message
+        : String(cause);
   const work = elementRef<Work>({
     context: props.context,
     job: null,
@@ -145,25 +147,8 @@ export function createComposerDraft(props: ComposerProps) {
   const [input, setInput] = createSignal<MutableJobInput>(empty);
   const [confirmed, setConfirmed] = createSignal<MutableJob | null>(null);
   const [ready, setReady] = createSignal(false);
-  const [status, setStatus] = createSignal<string | { submittedJob: string }>("Loading saved Job…");
-  const { byJob, reportSubmissionNotice } = useConversationView();
-  const statusInfo = createMemo(() => {
-    const current = status();
-    if (typeof current === "string")
-      return {
-        label: current === "New Job" ? "" : current,
-        job: confirmed()?.id,
-        revision: confirmed()?.revision,
-      };
-    const execution = byJob()
-      .get(current.submittedJob)
-      ?.find((message) => message.execution)?.execution;
-    return {
-      label: execution ? executionLabel(i18n.t, execution) : "",
-      job: current.submittedJob,
-      revision: undefined,
-    };
-  });
+  const { reportSubmissionNotice } = useConversationView();
+  const [saving, setSaving] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
   const busyRef = elementRef(false);
@@ -267,9 +252,7 @@ export function createComposerDraft(props: ComposerProps) {
       }
     }
     setQueued(rows);
-    setQueueError(
-      failed ? "Some queued Jobs could not be loaded. Retry to see their latest state." : undefined,
-    );
+    setQueueError(failed ? t("chat.draft.queueLoadFailed") : undefined);
   };
   const hasQueued = createMemo(() => queued().length > 0);
   createEffect(hasQueued, (hasQueued) => {
@@ -321,11 +304,11 @@ export function createComposerDraft(props: ComposerProps) {
       ),
     );
     if (results.some((result) => result.status === "rejected"))
-      setError("Some unfinished Jobs could not be loaded. Retry to see their latest state.");
+      setError(t("chat.draft.unfinishedLoadFailed"));
   };
   async function startDraftAfterJob(job: MutableJob, text = "") {
     if (scope.current.conversation && job.conversation !== scope.current.conversation)
-      throw new Error("The saved Job belongs to another conversation.");
+      throw new Error(t("chat.draft.wrongConversation"));
 
     const state = work.current;
     const sessionId = props.sessionId;
@@ -333,7 +316,7 @@ export function createComposerDraft(props: ComposerProps) {
     try {
       await client.presentMutableJob?.(sessionId, job);
     } catch (cause) {
-      historyError = `Could not load Job ${job.id} in history. ${errorMessage(cause)}`;
+      historyError = t("chat.draft.historyLoadFailed", { job: job.id, error: errorMessage(cause) });
     }
     if (!alive.current || work.current !== state || props.sessionId !== sessionId) return;
 
@@ -373,7 +356,6 @@ export function createComposerDraft(props: ComposerProps) {
     setQueued((jobs) => jobs.filter((item) => item.id !== job.id));
     setUnfinished((jobs) => jobs.filter((item) => item.id !== job.id));
     if (work.current.dirty) scheduleAutosave();
-    setStatus(`Job ${job.id} is ${job.phase}. A new draft is ready.`);
   }
 
   createEffect(
@@ -412,8 +394,7 @@ export function createComposerDraft(props: ComposerProps) {
                 job: submitted.id,
               });
               bindComposerContext(props.sessionId, props.context, submitted.conversation);
-              if (!client.presentMutableJob)
-                throw new Error("The submitted Job cannot yet be opened in history.");
+              if (!client.presentMutableJob) throw new Error(t("chat.draft.historyUnavailable"));
               await client.presentMutableJob(props.sessionId, submitted);
               forgetUnfinished(props.context);
               localStorage.removeItem(pendingKey(props.context));
@@ -431,19 +412,15 @@ export function createComposerDraft(props: ComposerProps) {
               job = submitted;
               work.current.conflict = true;
               setConflict(true);
-              setError(
-                "The pending submission no longer matches the saved revision. Reconcile it before editing.",
-              );
+              setError(t("chat.draft.pendingChanged"));
             }
           }
           if (cancelled) return;
           if (job) {
             if (scope.current.conversation && job.conversation !== scope.current.conversation)
-              throw new Error(
-                "The saved Job belongs to another conversation. Open that conversation to continue editing it.",
-              );
+              throw new Error(t("chat.draft.openOtherConversation"));
             if (job.phase === "unsubmitted") rememberUnfinished(props.context);
-            const restored = await loadImages(api, job.input.attachments);
+            const restored = await loadImages(api, job.input.attachments, t);
             if (cancelled) return;
             work.current.job = job;
             work.current.desired = job.input;
@@ -453,7 +430,6 @@ export function createComposerDraft(props: ComposerProps) {
             restoreSelection(job);
           }
           setReady(true);
-          setStatus(job ? "Saved" : "New Job");
           await refreshQueue();
           await refreshUnfinished();
         } catch (cause) {
@@ -488,9 +464,9 @@ export function createComposerDraft(props: ComposerProps) {
     }
     if (!state.dirty || state.conflict) return;
     const run = async () => {
+      if (alive.current) setSaving(true);
       while (state.dirty && !state.conflict) {
         if (alive.current) {
-          setStatus("Saving…");
           setError(null);
         }
         try {
@@ -547,29 +523,35 @@ export function createComposerDraft(props: ComposerProps) {
             state.association = null;
             if (alive.current) setUnfinished((jobs) => jobs.filter((job) => job.id !== id));
           } else if (!same(state.job.input, state.desired)) {
-            state.job = await api.updateMutableJob(
-              state.context,
-              state.job.id,
-              state.job.revision,
-              structuredClone(state.desired),
-            );
+            const saved = state.job;
+            const desired = structuredClone(state.desired);
+            try {
+              state.job = await api.updateMutableJob(
+                state.context,
+                saved.id,
+                saved.revision,
+                desired,
+              );
+            } catch (cause) {
+              const observed = await api.readMutableJob(state.context, saved.id).catch(() => null);
+              if (
+                !observed ||
+                observed.revision <= saved.revision ||
+                observed.phase !== saved.phase ||
+                observed.conversation !== saved.conversation ||
+                observed.previous !== saved.previous ||
+                observed.project !== saved.project ||
+                !same(observed.input, desired)
+              )
+                throw cause;
+              state.job = observed;
+            }
           }
           state.dirty = state.job
             ? !same(state.job.input, state.desired) ||
               isEmptyDraft(state.job, state.desired, pendingImagesRef.current)
             : hasDraftContent(state.desired);
-          if (alive.current) {
-            setConfirmed(state.job);
-            setStatus(
-              state.dirty
-                ? autosave
-                  ? "Waiting to save…"
-                  : "Saving…"
-                : state.job
-                  ? "Saved"
-                  : "New Job",
-            );
-          }
+          if (alive.current) setConfirmed(state.job);
           if (autosave) break;
         } catch (cause) {
           if (
@@ -585,18 +567,15 @@ export function createComposerDraft(props: ComposerProps) {
                 .catch(() => null);
               if (latest && alive.current) setConfirmed(latest);
             }
-            if (alive.current)
-              setError(
-                "The saved Job changed elsewhere. Your local edits are not saved. Load the saved version before continuing.",
-              );
+            if (alive.current) setError(t("chat.draft.conflict"));
           } else if (alive.current) setError(errorMessage(cause));
-          if (alive.current) setStatus("Local changes not saved");
           throw cause;
         }
       }
     };
     state.promise = run().finally(() => {
       state.promise = null;
+      if (alive.current) setSaving(false);
     });
     await state.promise;
   };
@@ -606,11 +585,7 @@ export function createComposerDraft(props: ComposerProps) {
     const state = work.current;
     if (state.conflict || uncertainRef.current) return;
     if (isEmptyDraft(state.job, state.desired, pendingImagesRef.current)) state.dirty = true;
-    if (!state.dirty) {
-      setStatus(state.job ? "Saved" : "New Job");
-      return;
-    }
-    setStatus("Waiting to save…");
+    if (!state.dirty) return;
     autosaveTimer.current = setTimeout(() => {
       autosaveTimer.current = null;
       void flush(true).catch(() => {});
@@ -645,9 +620,7 @@ export function createComposerDraft(props: ComposerProps) {
           !busyRef.current
         )
           return true;
-        return window.confirm(
-          "Some input or images are not confirmed saved, or submission is still unresolved. Leave anyway? Your unsaved changes may be lost.",
-        );
+        return window.confirm(t("chat.draft.confirmLeave"));
       };
       navigationGuard = guard;
       return () => {
@@ -700,13 +673,11 @@ export function createComposerDraft(props: ComposerProps) {
       await flush();
       const state = work.current;
       submission.jobId = state.job?.id;
-      if (!state.job || state.dirty || state.conflict)
-        throw new Error("Save the Job before sending.");
+      if (!state.job || state.dirty || state.conflict) throw new Error(t("chat.draft.saveFirst"));
       if (editingQueue()) {
         const draft = draftBeforeQueueEdit.current;
-        if (!client.presentMutableJob)
-          throw new Error("The saved Job cannot yet be opened in history.");
-        if (!draft) throw new Error("The original draft could not be restored.");
+        if (!client.presentMutableJob) throw new Error(t("chat.draft.savedHistoryUnavailable"));
+        if (!draft) throw new Error(t("chat.draft.restoreFailed"));
         await client.presentMutableJob(props.sessionId, state.job);
         work.current = draft.work;
         draftBeforeQueueEdit.current = null;
@@ -716,7 +687,6 @@ export function createComposerDraft(props: ComposerProps) {
         setImages(draft.images);
         props.onSelectionChange(draft.selection);
         await refreshQueue();
-        setStatus("Saved queued Job");
         return;
       }
       const submittedInput = structuredClone(state.desired);
@@ -748,9 +718,7 @@ export function createComposerDraft(props: ComposerProps) {
             setConflict(true);
             if (observed) setConfirmed(observed);
             localStorage.removeItem(pendingKey(state.context));
-            throw new Error(
-              "The Job revision or conversation head changed. Your local input is preserved. Review the saved version; the Job will not be moved or rebased automatically.",
-            );
+            throw new Error(t("chat.draft.headChanged"));
           }
           if (cause instanceof ApiError && cause.status >= 400 && cause.status < 500)
             localStorage.removeItem(pendingKey(state.context));
@@ -761,24 +729,20 @@ export function createComposerDraft(props: ComposerProps) {
           state.conflict = true;
           setConflict(true);
           setConfirmed(observed);
-          throw new Error(
-            "The submitted Job differs from your local input. Your input has not been cleared.",
-          );
+          throw new Error(t("chat.draft.inputMismatch"));
         }
         result = observed;
       }
       if (result.phase !== "queued" && result.phase !== "executing" && result.phase !== "completed")
-        throw new Error(`Job is ${result.phase}; input has not been cleared.`);
+        throw new Error(t("chat.draft.unexpectedPhase", { phase: result.phase }));
       reportSubmissionNotice(submissionSessionId, notice, submission);
       bindComposerContext(props.sessionId, state.context, result.conversation);
       try {
-        if (!client.presentMutableJob) throw new Error("History is unavailable.");
+        if (!client.presentMutableJob) throw new Error(t("chat.draft.noHistory"));
         await client.presentMutableJob(props.sessionId, result);
       } catch (cause) {
         setUncertain(true);
-        throw new Error(
-          `The Job was submitted, but history could not be opened. Reconcile the same Job. ${errorMessage(cause)}`,
-        );
+        throw new Error(t("chat.draft.submittedHistoryFailed", { error: errorMessage(cause) }));
       }
       savePointer({ context: state.context, job: result.id });
       forgetUnfinished(state.context);
@@ -796,7 +760,6 @@ export function createComposerDraft(props: ComposerProps) {
       setInput(empty());
       setConfirmed(null);
       setImages([]);
-      setStatus({ submittedJob: result.id });
       await refreshQueue();
       await refreshUnfinished();
     } catch (cause) {
@@ -819,7 +782,7 @@ export function createComposerDraft(props: ComposerProps) {
     setError(null);
     try {
       const text = localStorage.getItem(pendingKey(work.current.context));
-      if (!text) throw new Error("The pending submission metadata is unavailable.");
+      if (!text) throw new Error(t("chat.draft.pendingUnavailable"));
       const pending = JSON.parse(text) as {
         context: string;
         job: string;
@@ -833,15 +796,11 @@ export function createComposerDraft(props: ComposerProps) {
         return;
       }
       if ((await inputFingerprint(saved.input)) !== pending.fingerprint)
-        throw new Error(
-          "The saved input changed; the pending submission cannot be reconciled automatically.",
-        );
+        throw new Error(t("chat.draft.savedInputChanged"));
       let result = saved;
       if (saved.phase === "unsubmitted") {
         if (saved.revision !== pending.revision)
-          throw new Error(
-            "The saved revision changed; the pending submission cannot be retried safely.",
-          );
+          throw new Error(t("chat.draft.savedRevisionChanged"));
         result = await api.submitMutableJob(
           pending.context,
           pending.job,
@@ -851,16 +810,12 @@ export function createComposerDraft(props: ComposerProps) {
         );
       }
       if (result.phase !== "queued" && result.phase !== "executing" && result.phase !== "completed")
-        throw new Error(`Job is ${result.phase}; input has not been cleared.`);
-      if (!client.presentMutableJob)
-        throw new Error("The Job was submitted, but history is unavailable. Retry reconciliation.");
+        throw new Error(t("chat.draft.unexpectedPhase", { phase: result.phase }));
+      if (!client.presentMutableJob) throw new Error(t("chat.draft.reconcileHistory"));
       await client.presentMutableJob(props.sessionId, result);
       savePointer({ context: pending.context, job: result.id });
       forgetUnfinished(pending.context);
-      if (!same(result.input, work.current.desired))
-        throw new Error(
-          "The submitted Job differs from your local input. Your input has not been cleared.",
-        );
+      if (!same(result.input, work.current.desired)) throw new Error(t("chat.draft.inputMismatch"));
       localStorage.removeItem(pendingKey(pending.context));
       clearGlobalContext(pending.context);
       const state = work.current;
@@ -874,7 +829,6 @@ export function createComposerDraft(props: ComposerProps) {
       setImages([]);
       setConfirmed(null);
       setUncertain(false);
-      setStatus({ submittedJob: result.id });
       await refreshQueue();
       await refreshUnfinished();
     } catch (cause) {
@@ -914,10 +868,10 @@ export function createComposerDraft(props: ComposerProps) {
       await flush();
       const latest = await api.readMutableJob(job.context, job.id);
       if (props.conversation && latest.conversation !== props.conversation)
-        throw new Error("This Job belongs to another conversation.");
+        throw new Error(t("chat.draft.otherJob"));
       if (latest.phase !== "queued")
-        throw new Error(`This Job is ${latest.phase} and can no longer be edited.`);
-      const restored = await loadImages(api, latest.input.attachments);
+        throw new Error(t("chat.draft.notEditable", { phase: latest.phase }));
+      const restored = await loadImages(api, latest.input.attachments, t);
       draftBeforeQueueEdit.current = {
         work: work.current,
         images: images(),
@@ -937,7 +891,6 @@ export function createComposerDraft(props: ComposerProps) {
       setConfirmed(latest);
       setImages(restored);
       setEditingQueue(true);
-      setStatus("Editing queued Job");
       setError(null);
       restoreSelection(latest);
     } catch (cause) {
@@ -954,9 +907,8 @@ export function createComposerDraft(props: ComposerProps) {
     setBusy(true);
     try {
       const result = await api.withdrawQueuedJob(job.context, job.id, job.revision);
-      if (result.phase !== "cancelled") throw new Error("Withdrawal was not confirmed.");
+      if (result.phase !== "cancelled") throw new Error(t("chat.draft.withdrawUnconfirmed"));
       forgetQueued(job.id);
-      setStatus("Queued message withdrawn.");
     } catch (cause) {
       setError(errorMessage(cause));
     } finally {
@@ -976,21 +928,15 @@ export function createComposerDraft(props: ComposerProps) {
       editingQueue()
     )
       return;
-    if (
-      !window.confirm(
-        "Cancel this queued Job if it cannot run because its history contains a Decision? Its input and history will be preserved.",
-      )
-    )
-      return;
+    if (!window.confirm(t("chat.draft.confirmCancelBlocked"))) return;
     busyRef.current = true;
     setBusy(true);
     try {
       const result = await api.cancelUnsupportedQueuedJob(job.context, job.id, job.revision);
-      if (result.phase !== "cancelled") throw new Error("The Job cancellation was not confirmed.");
+      if (result.phase !== "cancelled") throw new Error(t("chat.draft.cancelUnconfirmed"));
       forgetQueued(job.id);
       await refreshQueue();
       if (client.presentMutableJob) await client.presentMutableJob(props.sessionId, result);
-      setStatus("Unsupported queued Job cancelled; its history is preserved.");
       setError(null);
     } catch (cause) {
       setError(errorMessage(cause));
@@ -1000,22 +946,45 @@ export function createComposerDraft(props: ComposerProps) {
     }
   }
   async function loadSaved() {
-    if (!api || !work.current.job || busyRef.current || uploadTask.current) return;
-    if (
-      work.current.dirty &&
-      !window.confirm("Loading the saved version replaces your unsaved text. Continue?")
-    )
-      return;
+    if (!api || busyRef.current || uploadTask.current) return;
     cancelAutosave();
     busyRef.current = true;
     setBusy(true);
     try {
-      const job = await api.readMutableJob(work.current.context, work.current.job.id);
+      const state = work.current;
+      const job = state.job
+        ? await api.readMutableJob(state.context, state.job.id).catch((cause) => {
+            if (cause instanceof ApiError && cause.status === 404)
+              return api.currentMutableJob(state.context);
+            throw cause;
+          })
+        : await api.currentMutableJob(state.context);
+      if (!job) {
+        forgetUnfinished(state.context);
+        clearGlobalContext(state.context);
+        state.context = rotateContext(props.sessionId, scope.current.conversation);
+        state.job = null;
+        state.initial = null;
+        state.association = null;
+        state.conflict = false;
+        state.dirty = hasDraftContent(state.desired);
+        setConflict(false);
+        setConfirmed(null);
+        setError(null);
+        scheduleAutosave();
+        return;
+      }
+      if (
+        state.dirty &&
+        !same(job.input, state.desired) &&
+        !window.confirm(t("chat.draft.confirmLoadSaved"))
+      )
+        return;
       if (job.phase !== "unsubmitted" && job.phase !== "queued") {
         await startDraftAfterJob(job);
         return;
       }
-      const restored = await loadImages(api, job.input.attachments);
+      const restored = await loadImages(api, job.input.attachments, t);
       const unsavedImages = images().filter(
         (image) =>
           work.current.desired.attachments.includes(image.id) &&
@@ -1033,12 +1002,7 @@ export function createComposerDraft(props: ComposerProps) {
       setInput(desired);
       setImages([...restored, ...unsavedImages]);
       setConfirmed(job);
-      setError(
-        desired.attachments.length > 8
-          ? "Remove images to meet the eight-image limit before saving."
-          : null,
-      );
-      setStatus(work.current.dirty ? "Local image changes not saved" : "Saved");
+      setError(desired.attachments.length > 8 ? t("chat.draft.tooManyImages") : null);
       if (isEmptyDraft(job, desired, pendingImagesRef.current)) scheduleAutosave();
     } catch (cause) {
       setError(errorMessage(cause));
@@ -1063,10 +1027,10 @@ export function createComposerDraft(props: ComposerProps) {
       await flush();
       const latest = await api.readMutableJob(job.context, job.id);
       if (props.conversation && latest.conversation !== props.conversation)
-        throw new Error("This Job belongs to another conversation.");
+        throw new Error(t("chat.draft.otherJob"));
       if (latest.phase !== "unsubmitted")
-        throw new Error(`This Job is ${latest.phase} and is no longer unsubmitted.`);
-      const restored = await loadImages(api, latest.input.attachments);
+        throw new Error(t("chat.draft.notUnsubmitted", { phase: latest.phase }));
+      const restored = await loadImages(api, latest.input.attachments, t);
       const state = work.current;
       state.context = latest.context;
       state.job = latest;
@@ -1077,7 +1041,6 @@ export function createComposerDraft(props: ComposerProps) {
       setInput(latest.input);
       setConfirmed(latest);
       setImages(restored);
-      setStatus("Saved");
       if (isEmptyDraft(latest, latest.input, pendingImagesRef.current)) scheduleAutosave();
       setError(null);
       restoreSelection(latest);
@@ -1102,7 +1065,7 @@ export function createComposerDraft(props: ComposerProps) {
   return {
     input,
     confirmed,
-    statusInfo,
+    saving,
     error,
     busy,
     uncertain,

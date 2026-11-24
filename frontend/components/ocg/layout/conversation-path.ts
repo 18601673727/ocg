@@ -1,3 +1,4 @@
+import type { ApiClient } from "../runtime/api-client";
 import { isJobIdentity } from "./view-domain";
 
 export function parseConversationPath(pathname: string): string[] | null {
@@ -24,8 +25,14 @@ export function conversationPath(ids: readonly string[]) {
 }
 
 export async function conversationAncestors(
-  resolve: (id: string) => Promise<string>,
+  client: Pick<ApiClient, "resolveConversation" | "readJobTree">,
   id: string,
 ): Promise<string[]> {
-  return [await resolve(id)];
+  const conversation = await client.resolveConversation(id);
+  const tree = await client.readJobTree(conversation, { depth: 1, limit: 1 });
+  if (tree.root.id !== conversation || tree.root.kind !== "conversation")
+    throw new Error("Invalid conversation ancestry.");
+  const chain = [...tree.ancestors, conversation];
+  conversationPath(chain);
+  return chain;
 }

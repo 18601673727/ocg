@@ -53,6 +53,7 @@ const HistoryComposer: Component = () => {
 };
 
 const ChatComposerSlot: Component = () => {
+  const { t } = useI18n();
   const value = useContext(ChatComposerContext);
   const { api } = useOcgRuntime();
   const [model, setModel] = createSignal<"checking" | "mutable" | "error">("checking");
@@ -95,8 +96,9 @@ const ChatComposerSlot: Component = () => {
     <>
       {(() => {
         if (model() === "checking" || probedSession() !== sessionId)
-          return <p role="status">Checking Composer availability…</p>;
-        if (model() === "error") return <p role="alert">Composer unavailable: {probeError()}</p>;
+          return <p role="status">{t("chat.composerChecking")}</p>;
+        if (model() === "error")
+          return <p role="alert">{t("chat.composerUnavailable", { error: probeError() })}</p>;
         return (
           <MutableComposer
             sessionId={value.session.id}
@@ -123,6 +125,7 @@ const Welcome: Component = () => {
 };
 
 function MessageFileChanges() {
+  const { t } = useI18n();
   const record = useThreadMessage();
   const { byJob } = useConversationView();
   const job = createMemo(() => record().jobId);
@@ -161,7 +164,10 @@ function MessageFileChanges() {
       }
     >
       {(decision) => (
-        <section class="my-3 rounded-lg border p-3" aria-label="Decision">
+        <section
+          class="my-3 rounded-lg border p-3"
+          aria-label={t("settings.agent.capability.decision")}
+        >
           <DecisionDetails decision={decision()} message={record()} />
         </section>
       )}

@@ -53,12 +53,12 @@ export function ModelSelector(props: {
           agents.push(...page.agent_profiles);
           if (!page.has_more) break;
           if (!page.next_before || page.next_before === before)
-            throw new Error("Agent Profile cursor did not advance.");
+            throw new Error(i18n.t("chat.agentCursorInvalid"));
           before = page.next_before;
         }
         const listed = new Set(profiles.agent_profiles.map((profile) => profile.id));
         if (agents.some((agent) => !listed.has(agent.id)))
-          throw new Error("Profile catalog changed while loading. Refresh the selection.");
+          throw new Error(i18n.t("chat.catalogChanged"));
         if (!controller.signal.aborted) {
           setCatalog({ agents, projects });
           setError(undefined);
@@ -225,7 +225,7 @@ export function ModelSelector(props: {
   }
 
   return (
-    <div class="min-w-0 flex-1">
+    <div class="min-w-0 max-w-full">
       <ModelSelectorView
         triggerRef={props.triggerRef}
         status={

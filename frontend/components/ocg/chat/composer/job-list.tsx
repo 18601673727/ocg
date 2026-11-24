@@ -1,8 +1,13 @@
 import { createMemo, For, Show } from "solid-js";
 import { Button } from "@/components/ui/button";
+import { useI18n } from "../../i18n";
+import type { MutableJob } from "../../runtime/api-client";
 import type { ComposerDraft } from "./draft-state";
 
 export default function ComposerJobList(props: { draft: ComposerDraft }) {
+  const { t } = useI18n();
+  const phaseLabel = (phase: MutableJob["phase"]) =>
+    t(phase === "executing" ? "job.phase.running" : `job.phase.${phase}`);
   const {
     confirmed,
     unfinished,
@@ -25,11 +30,11 @@ export default function ComposerJobList(props: { draft: ComposerDraft }) {
   return (
     <>
       {others().length > 0 && (
-        <div role="group" aria-label="Unsubmitted Jobs" class="space-y-1 text-sm">
+        <div role="group" aria-label={t("chat.draft.unsubmittedJobs")} class="space-y-1 text-sm">
           {others().map((job) => (
             <div class="flex items-center gap-2">
               <span class="min-w-0 flex-1 truncate">
-                Unsubmitted: {job.input.text || "Image Job"}
+                {t("chat.draft.unsubmitted", { text: job.input.text || t("chat.draft.imageJob") })}
               </span>
               <Button
                 type="button"
@@ -38,14 +43,14 @@ export default function ComposerJobList(props: { draft: ComposerDraft }) {
                 disabled={busy() || uncertain() || conflict() || uploading() > 0 || editingQueue()}
                 onClick={() => void openUnfinished(job)}
               >
-                Open
+                {t("chat.draft.open")}
               </Button>
             </div>
           ))}
         </div>
       )}
       <Show when={hasQueued()}>
-        <div role="group" aria-label="Queued Jobs" class="space-y-1 text-sm">
+        <div role="group" aria-label={t("chat.draft.queuedJobs")} class="space-y-1 text-sm">
           <For each={queued()} keyed={(item) => item.id}>
             {(row) => (
               <div class="flex items-center gap-2">
@@ -54,16 +59,23 @@ export default function ComposerJobList(props: { draft: ComposerDraft }) {
                   title={
                     row().autonomous_loopback_eligibility &&
                     !row().autonomous_loopback_eligibility!.eligible
-                      ? `Not eligible for automatic dispatch (${row().autonomous_loopback_eligibility!.code}): ${row().autonomous_loopback_eligibility!.detail}`
+                      ? t("chat.draft.ineligible", {
+                          code: row().autonomous_loopback_eligibility!.code,
+                          detail: row().autonomous_loopback_eligibility!.detail,
+                        })
                       : undefined
                   }
                 >
-                  {row().unsupported_decision_history ? "Blocked by Decision history" : row().phase}
+                  {row().unsupported_decision_history
+                    ? t("chat.draft.blockedDecision")
+                    : phaseLabel(row().phase)}
                   {row().autonomous_loopback_eligibility &&
                   !row().autonomous_loopback_eligibility!.eligible
-                    ? ` (not schedulable: ${row().autonomous_loopback_eligibility!.code})`
+                    ? t("chat.draft.notSchedulable", {
+                        code: row().autonomous_loopback_eligibility!.code,
+                      })
                     : ""}
-                  : {row().input.text || "Image Job"}
+                  : {row().input.text || t("chat.draft.imageJob")}
                 </span>
                 <Button
                   type="button"
@@ -78,7 +90,7 @@ export default function ComposerJobList(props: { draft: ComposerDraft }) {
                   }
                   onClick={() => void editQueued(row())}
                 >
-                  Edit
+                  {t("common.edit")}
                 </Button>
                 <Button
                   type="button"
@@ -87,7 +99,7 @@ export default function ComposerJobList(props: { draft: ComposerDraft }) {
                   disabled={busy() || queuedLoading() || uncertain() || editingQueue()}
                   onClick={() => void withdraw(row())}
                 >
-                  Withdraw
+                  {t("chat.draft.withdraw")}
                 </Button>
                 {row().unsupported_decision_history && (
                   <Button
@@ -103,7 +115,7 @@ export default function ComposerJobList(props: { draft: ComposerDraft }) {
                     }
                     onClick={() => void cancelUnsupported(row())}
                   >
-                    Cancel blocked Job
+                    {t("chat.draft.cancelBlocked")}
                   </Button>
                 )}
               </div>

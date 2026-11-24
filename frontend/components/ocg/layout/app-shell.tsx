@@ -35,7 +35,7 @@ import {
   parseConversationPath,
 } from "./conversation-path";
 import { PageTitleVisibilityContext } from "./page-title";
-import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
+import { isReachableView, type WorkspaceView } from "./view-domain";
 import { WorkspaceHome } from "./workspace-home";
 import { WorkspaceNavigation } from "./workspace-link";
 
@@ -79,7 +79,6 @@ function currentLocation() {
   const requested =
     url.searchParams.get("view") ??
     (settingsSection ? "settings" : url.pathname.replace(/^\/|\/$/g, "").replace(/\.html$/, ""));
-  const job = url.searchParams.get("job");
   const chain = parseConversationPath(url.pathname);
   return {
     view: chain
@@ -87,7 +86,7 @@ function currentLocation() {
       : isReachableView(requested)
         ? requested
         : ("chat" as WorkspaceView),
-    job: chain?.at(-1) ?? (isJobIdentity(job) ? job : null),
+    job: chain?.at(-1) ?? null,
     chain,
     settingsSection: settingsSection ?? "models",
   };
@@ -169,18 +168,10 @@ function AppShellContent(props: AppShellProps) {
   const observedStatus = elementRef<RuntimeStatus | null>(null);
   const activeConversation = elementRef(conversationKey());
   const currentLocationRef = elementRef({ location: location(), sessionId: sessionId() });
-  const listedConversations = elementRef(new Set<string>()); // Listed IDs already identify conversations.
   createEffect(
     () => [location(), sessionId()],
     () => {
       currentLocationRef.current = { location: location(), sessionId: sessionId() };
-    },
-  );
-  createEffect(
-    () => [sessions()],
-    () => {
-      for (const listed of sessions())
-        if (listed.conversationId) listedConversations.current.add(listed.conversationId);
     },
   );
   createEffect(
@@ -332,14 +323,12 @@ function AppShellContent(props: AppShellProps) {
       if (!location().job || location().view !== "chat" || !runtime.client.openConversation) return;
       let alive = true;
       void (async () => {
-        const chain = await conversationAncestors(
-          (id) =>
-            listedConversations.current.has(id)
-              ? Promise.resolve(id)
-              : props.client.resolveConversation(id),
-          location().job!,
-        );
-        if (location().chain && conversationPath(chain) !== conversationPath(location().chain!))
+        const chain = await conversationAncestors(props.client, location().job!);
+        if (
+          location().chain &&
+          location().chain!.length > 1 &&
+          conversationPath(chain) !== conversationPath(location().chain!)
+        )
           throw new Error(i18n.t("chat.child.invalidPath"));
         if (!alive) return;
         const id = await runtime.client.openConversation!(location().job!);
@@ -347,8 +336,8 @@ function AppShellContent(props: AppShellProps) {
           transfer?.(location().job!, id);
           setSessionId(id);
           setAncestors(chain);
-          if (location().chain || chain.length > 1)
-            window.history.replaceState(null, "", conversationPath(chain));
+          window.history.replaceState(null, "", conversationPath(chain));
+          lastLocationUrl.current = window.location.href;
         }
       })()
         .catch((cause) => {
@@ -378,7 +367,10 @@ function AppShellContent(props: AppShellProps) {
         !opening() &&
         session()?.sessionId
       ) {
-        window.history.replaceState(null, "", `/?job=${session()!.sessionId}`);
+        const chain = ancestors().length ? ancestors() : [session()!.conversationId!];
+        if (!chain[0]) return;
+        window.history.replaceState(null, "", conversationPath(chain));
+        lastLocationUrl.current = window.location.href;
       }
     },
   );
@@ -397,10 +389,7 @@ function AppShellContent(props: AppShellProps) {
   ) => {
     if (!isReachableView(view)) return;
     discardEmptyDraft(keepDraft);
-    const query = new URLSearchParams();
-    if (job) query.set("job", job);
-    const path = view === "chat" ? "/" : `/${view}`;
-    const href = `${path}${query.size ? `?${query}` : ""}`;
+    const href = view === "chat" ? (job ? conversationPath([job]) : "/") : `/${view}`;
     window.history.pushState(null, "", href);
     lastLocationUrl.current = window.location.href;
     setLocation({ view, job, chain: null, settingsSection: "models" });

@@ -1,6 +1,6 @@
 import { createMemo } from "solid-js";
 import type { NativeDecisionTurn } from "../contracts/conversations";
-import { useI18n } from "../i18n";
+import { runtimeStateLabel, useI18n } from "../i18n";
 import { executionDetail, executionLabel } from "../runtime/job-status";
 import type { ChatMessage } from "../types";
 
@@ -21,7 +21,10 @@ export function DecisionDetails(props: {
   );
   return (
     <>
-      <strong>Decision · {request.question.kind.replaceAll("_", " ")}</strong>
+      <strong>
+        {i18n.t("settings.agent.capability.decision")} ·{" "}
+        {request.question.kind.replaceAll("_", " ")}
+      </strong>
       <p class="mt-2 whitespace-pre-wrap">{request.question.prompt}</p>
       {request.question.options?.map((option) => (
         <p>
@@ -40,15 +43,13 @@ export function DecisionDetails(props: {
         </div>
       ) : (
         <details class="mt-2">
-          <summary>Caller state</summary>
+          <summary>{i18n.t("planning.callerState")}</summary>
           {callerState}
         </details>
       )}
       {result ? (
         <>
-          <strong>
-            {(props.full === undefined ? false : props.full) ? i18n.t("planning.result") : "Result"}
-          </strong>
+          <strong>{i18n.t("planning.result")}</strong>
           <pre class="overflow-x-auto whitespace-pre-wrap">
             {JSON.stringify(
               (props.full === undefined ? false : props.full) ? result : result.outcome,
@@ -63,9 +64,7 @@ export function DecisionDetails(props: {
             <strong>
               {props.message.execution
                 ? executionLabel(i18n.t, props.message.execution)
-                : props.message.status === "pending"
-                  ? "Pending"
-                  : `Job ${props.message.status}`}
+                : runtimeStateLabel(i18n.t, props.message.status)}
             </strong>
             {failure() ? ` · ${failure()}` : ""}
           </p>
@@ -75,9 +74,7 @@ export function DecisionDetails(props: {
           {props.message.status === "unknown" &&
             props.message.failureReason === undefined &&
             !(props.message.execution && executionDetail(i18n.t, props.message.execution)) && (
-              <p class="text-muted-foreground">
-                The outcome could not be established; it is not reported as stopped.
-              </p>
+              <p class="text-muted-foreground">{i18n.t("job.phase.unknownDetail")}</p>
             )}
         </div>
       )}

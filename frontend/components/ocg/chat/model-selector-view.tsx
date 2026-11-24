@@ -49,18 +49,19 @@ export function ModelSelectorView(props: ModelSelectorViewProps) {
     "h-11 w-full min-w-0 rounded-md border border-border bg-background px-2 text-base text-foreground outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-60 sm:h-9 sm:text-sm";
 
   return (
-    <div class="w-full min-w-0">
+    <div class="w-fit min-w-0 max-w-full">
       <p id={id + "-status"} class="sr-only">
         {props.status}
       </p>
       <fieldset
         aria-describedby={id + "-status"}
         aria-busy={ariaState(props.loading)}
-        class="flex min-w-0 items-center gap-1.5"
+        class="flex w-fit min-w-0 max-w-full items-center gap-1.5"
       >
         <legend class="sr-only">{i18n.t("chat.executionSettings")}</legend>
-        <div class="max-w-[45%] min-w-0 shrink">
+        <div class="min-w-0 shrink">
           <Select
+            fitSelected
             value={props.project.value}
             items={[{ value: "", label: props.project.placeholder }, ...props.project.options]}
             disabled={props.project.disabled}
@@ -76,7 +77,7 @@ export function ModelSelectorView(props: ModelSelectorViewProps) {
             ))}
           </Select>
         </div>
-        <div class="min-w-0 flex-1">
+        <div class="min-w-0 shrink">
           <button
             type="button"
             popovertarget={id + "-settings"}

@@ -1,4 +1,5 @@
 import { type Ref } from "@/lib/ui-state";
+import { useI18n } from "../../i18n";
 import { ModelSelector } from "../model-selector";
 import type { ComposerDraft, ComposerProps } from "./draft-state";
 
@@ -7,11 +8,12 @@ export function ComposerSelectors(props: {
   draft: ComposerDraft;
   trigger: Ref<HTMLButtonElement>;
 }) {
+  const { t } = useI18n();
   const { draft, composer } = props;
   let explicit = false;
   return (
     <div
-      class="min-w-0 flex-1"
+      class="min-w-0 max-w-full shrink"
       onPointerDown={() => {
         explicit = true;
       }}
@@ -36,11 +38,11 @@ export function ComposerSelectors(props: {
         busy={draft.busy() || !draft.ready() || draft.uncertain() || draft.conflict()}
         statusText={
           draft.conflict()
-            ? "Review the Job conflict before continuing."
+            ? t("chat.draft.reviewConflict")
             : draft.uncertain()
-              ? "Waiting to reconcile submission."
+              ? t("chat.draft.waitReconcile")
               : draft.busy()
-                ? "Saving Job…"
+                ? t("chat.draft.saving")
                 : undefined
         }
         projectLocked={Boolean(composer.conversation || draft.confirmed() || draft.association())}

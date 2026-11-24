@@ -703,26 +703,32 @@ pub(crate) fn parameters() -> Value {
         "required": ["operation", "path"],
         "oneOf": [
             {
-                "properties": {"operation": {"const": "create"}, "edits": false},
+                "properties": {"operation": {"const": "create"}, "edits": {"not": {}}},
                 "required": ["content"],
                 "not": {"anyOf": [{"required": ["expected_content"]}, {"required": ["old"]}, {"required": ["new"]}]}
             },
             {
-                "properties": {"operation": {"const": "update"}, "edits": false},
+                "properties": {"operation": {"const": "update"}, "edits": {"not": {}}},
                 "required": ["content", "expected_content"],
                 "not": {"anyOf": [{"required": ["old"]}, {"required": ["new"]}]}
             },
             {
-                "properties": {"operation": {"const": "replace"}, "edits": false},
+                "properties": {"operation": {"const": "replace"}, "edits": {"not": {}}},
                 "required": ["old", "new"],
                 "not": {"anyOf": [{"required": ["content"]}, {"required": ["expected_content"]}]}
             },
             {
-                "properties": {"operation": {"const": "multi_replace"}, "content": false, "expected_content": false, "old": false, "new": false},
+                "properties": {
+                    "operation": {"const": "multi_replace"},
+                    "content": {"not": {}},
+                    "expected_content": {"not": {}},
+                    "old": {"not": {}},
+                    "new": {"not": {}}
+                },
                 "required": ["edits"]
             },
             {
-                "properties": {"operation": {"const": "delete"}, "edits": false},
+                "properties": {"operation": {"const": "delete"}, "edits": {"not": {}}},
                 "required": ["expected_content"],
                 "not": {"anyOf": [{"required": ["content"]}, {"required": ["old"]}, {"required": ["new"]}]}
             }

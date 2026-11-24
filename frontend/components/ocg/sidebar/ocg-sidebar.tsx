@@ -998,12 +998,18 @@ export function OcgSidebar(props: OcgSidebarProps) {
                                       <SidebarConversationChildren
                                         conversation={session.conversationId}
                                         api={props.api}
-                                        activeChild={props.activeAncestors?.[1]}
+                                        activeChild={props.activeAncestors?.at(-1)}
                                         project={preview.project}
                                         expanded
                                         sessionId={session.id}
                                         onAvailabilityChange={handleChildAvailability}
-                                        onOpen={props.onOpenConversation}
+                                        onOpen={(conversation) => {
+                                          setExpandedSessions((current) => ({
+                                            ...current,
+                                            [session.id]: true,
+                                          }));
+                                          props.onOpenConversation?.(conversation);
+                                        }}
                                         onRename={
                                           props.onRenameChild
                                             ? (child) =>

@@ -69,7 +69,7 @@ export function TaskStatus(props: { plan?: TaskPlan | null }) {
                   <div class="min-w-0">
                     <WorkspaceLink
                       class={`${step.state === "completed" ? "text-muted-foreground" : "text-foreground"} rounded-sm hover:underline focus-visible:outline-2 focus-visible:outline-offset-2`}
-                      href={`/jobs?job=${step.turn}`}
+                      href={`/jobs/${step.turn}`}
                       onClick={(event) => {
                         if (
                           !openJobDetails ||

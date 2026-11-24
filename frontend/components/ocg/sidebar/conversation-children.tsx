@@ -3,6 +3,7 @@ import { cn } from "@/lib/utils";
 import type { ChildConversation } from "../contracts";
 import { runtimeStateLabel, useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
+import { SELECTED_ROW } from "../primitives/selection";
 import type { ApiClient } from "../runtime/api-client";
 import { ConversationPreview } from "./conversation-preview";
 import { ConversationStatus } from "./conversation-status";
@@ -86,7 +87,7 @@ export function SidebarConversationChildren(props: {
                             class={cn(
                               "grid w-full min-w-0 max-w-full grid-cols-[minmax(0,1fr)_auto] items-center overflow-hidden rounded-md px-2 py-1.5 text-left text-sm leading-5",
                               props.activeChild === child.id
-                                ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
+                                ? cn(SELECTED_ROW, "font-medium")
                                 : "text-sidebar-foreground/80 hover:bg-sidebar-accent hover:text-sidebar-foreground",
                             )}
                           />

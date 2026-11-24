@@ -1,30 +1,31 @@
 import { createEffect, createSignal } from "solid-js";
 import { elementRef } from "@/lib/ui-state";
 import type { ChatImage } from "../../contracts";
+import { type TranslateFn, useI18n } from "../../i18n";
 import type { ApiClient } from "../../runtime/api-client";
 import type { ConversationRuntimeClient } from "../../runtime/conversation-client";
 export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 export type PendingImage = { file: File; url: string; failed: boolean; progress: number };
-function fileData(file: File): Promise<string> {
+function fileData(file: File, t: TranslateFn): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = () =>
       typeof reader.result === "string"
         ? resolve(reader.result)
-        : reject(new Error("Unable to read image."));
-    reader.onerror = () => reject(reader.error ?? new Error("Unable to read image."));
+        : reject(new Error(t("chat.imageReadFailed")));
+    reader.onerror = () => reject(reader.error ?? new Error(t("chat.imageReadFailed")));
     reader.readAsDataURL(file);
   });
 }
 
-export async function loadImages(api: ApiClient, ids: string[]) {
+export async function loadImages(api: ApiClient, ids: string[], t: TranslateFn) {
   return Promise.all(
     ids.map(async (id) => {
       const item = await api.readAttachment(id);
-      if (!item.available) throw new Error(`Attachment ${id} is unavailable.`);
+      if (!item.available) throw new Error(t("chat.attachmentUnavailable", { id }));
       return {
         id,
-        name: item.display_name ?? "Image",
+        name: item.display_name ?? t("chat.imageName"),
         media_type: item.mime,
         url: api.attachmentContentUrl(id),
       };
@@ -40,6 +41,7 @@ export function createAttachmentQueue(
   onUpload: (image: ChatImage) => void,
   setError: (message: string) => void,
 ) {
+  const { t } = useI18n();
   const [uploading, setUploading] = createSignal(0);
   const [pendingImages, setPendingImages] = createSignal<PendingImage[]>([]);
   const pendingImagesRef = elementRef<PendingImage[]>([]);
@@ -63,7 +65,7 @@ export function createAttachmentQueue(
           pending.some((entry) => entry.url === item.url) ? { ...item, failed: true } : item,
         ),
       );
-      setError("Image upload is unavailable.");
+      setError(t("chat.uploadUnavailable"));
       return;
     }
     setUploading((n) => n + pending.length);
@@ -73,7 +75,7 @@ export function createAttachmentQueue(
           {
             project_id: "",
             name: item.file.name,
-            data_url: await fileData(item.file),
+            data_url: await fileData(item.file, t),
           },
           undefined,
           (progress) => {
@@ -110,7 +112,7 @@ export function createAttachmentQueue(
   function selectImages(files: readonly File[]) {
     if (!files.length || !canAttach() || uploadTask.current) return;
     if (savedCount() + pendingImagesRef.current.length + files.length > 8) {
-      setError("At most eight images are supported.");
+      setError(t("chat.imageLimitReached"));
       return;
     }
     const selected = files.map((file) => ({

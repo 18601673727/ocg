@@ -1,5 +1,5 @@
 import type { JSX } from "@solidjs/web";
-import { createContext, createSignal, useContext } from "solid-js";
+import { createContext, createSignal, Show, useContext } from "solid-js";
 import { ariaState, handleEvent, splitProps } from "@/lib/ui-state";
 
 type Disclosure = {
@@ -59,13 +59,15 @@ export function CollapsibleContent(
   props: JSX.IntrinsicElements["div"] & { keepMounted?: boolean },
 ) {
   const disclosure = useContext(DisclosureContext);
-  const [, rest] = splitProps(props, ["keepMounted"]);
+  const [local, rest] = splitProps(props, ["keepMounted", "children"]);
   return (
     <div
       data-slot="collapsible-content"
       data-open={disclosure?.open() || undefined}
       hidden={!disclosure?.open()}
       {...rest}
-    />
+    >
+      <Show when={local.keepMounted === true || Boolean(disclosure?.open())}>{local.children}</Show>
+    </div>
   );
 }

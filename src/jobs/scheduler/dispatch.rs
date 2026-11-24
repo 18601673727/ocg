@@ -15,7 +15,7 @@ use crate::jobs::execution::runtime::{
 use crate::jobs::execution::tools::native::NativeTooling;
 use crate::support::cancellation::CancellationReason;
 
-const DISPATCH_TIMEOUT: Duration = Duration::from_secs(600);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 const MAX_RESPONSE_BYTES: usize = 1 << 20;
 
 #[derive(Debug)]
@@ -210,16 +210,19 @@ pub(super) async fn dispatch(
         .await;
     }
     let started = Instant::now();
-    // Authorization and execution share a deadline that the bound policy can only shorten.
+    let preparation = cancellation.child();
     let grant = within_deadline(
-        cancellation,
-        started + DISPATCH_TIMEOUT,
+        &preparation,
+        started + REQUEST_TIMEOUT,
         prepare_or_cancel(
-            cancellation,
+            &preparation,
             ScheduledExternalGrant::load(database, allocation.token),
         ),
     )
     .await;
+    if let Some(reason) = preparation.reason() {
+        cancellation.cancel_for(reason);
+    }
     if let Some(cause) = cancellation_before_start(cancellation) {
         return end_dispatch(
             database,
@@ -252,23 +255,20 @@ pub(super) async fn dispatch(
             .await;
         }
     };
-    let deadline = started
-        + grant
-            .as_ref()
-            .map_or(DISPATCH_TIMEOUT, |grant| grant.limits().timeout);
-    within_deadline(
+    let exchange = dispatch_admitted(
+        database,
+        allocation,
         cancellation,
-        deadline,
-        dispatch_admitted(
-            database,
-            allocation,
-            cancellation,
-            workspace_tools,
-            stops,
-            grant.as_ref(),
-        ),
-    )
-    .await
+        workspace_tools,
+        stops,
+        grant.as_ref(),
+    );
+    match grant.as_ref() {
+        Some(grant) => {
+            within_deadline(cancellation, started + grant.limits().timeout, exchange).await
+        }
+        None => exchange.await,
+    }
 }
 
 async fn end_dispatch(
@@ -330,8 +330,8 @@ async fn dispatch_admitted(
     }
     let config = grant.map_or_else(
         || ProviderExecutionConfig {
-            timeout: DISPATCH_TIMEOUT,
-            first_delta_timeout: Some(DISPATCH_TIMEOUT),
+            timeout: REQUEST_TIMEOUT,
+            first_delta_timeout: Some(REQUEST_TIMEOUT),
             max_output_bytes: MAX_RESPONSE_BYTES,
             cancellation: cancellation.clone(),
             ..ProviderExecutionConfig::default()

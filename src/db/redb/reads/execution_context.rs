@@ -915,7 +915,6 @@ fn development_candidate_in(
     let mut history = Vec::new();
     let mut previous = record.job.previous;
     let outputs = rx.open_table(JOB_OUTPUTS)?;
-    let mut output_count = 0usize;
     let mut output_bytes = 0usize;
     let mut selected_bytes = record.job.input.text().len().saturating_add(
         requirements
@@ -1003,11 +1002,6 @@ fn development_candidate_in(
         for (expected_sequence, entry) in
             (1u32..).zip(outputs.range((id.get(), 0)..=(id.get(), u32::MAX))?)
         {
-            if output_count == 1000 {
-                return Err(context_unavailable(
-                    "conversation output exceeds context limit",
-                ));
-            }
             let (key, value) = entry?;
             if key.value().1 != expected_sequence {
                 return Err(StorageError::corrupted(
@@ -1034,7 +1028,6 @@ fn development_candidate_in(
                 ));
             }
             prior_outputs.push(row);
-            output_count += 1;
         }
         if !ended_unstarted
             && !unknown

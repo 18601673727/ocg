@@ -1,4 +1,81 @@
 export const en = {
+  "chat.imageReadFailed": "Unable to read image.",
+  "chat.attachmentUnavailable": "Attachment {id} is unavailable.",
+  "chat.imageName": "Image",
+  "chat.uploadUnavailable": "Image upload is unavailable.",
+  "chat.imageLimitReached": "At most eight images are supported.",
+  "chat.agentCursorInvalid": "Agent Profile cursor did not advance.",
+  "chat.catalogChanged": "Profile catalog changed while loading. Refresh the selection.",
+
+  "chat.draft.queueLoadFailed":
+    "Some queued Jobs could not be loaded. Retry to see their latest state.",
+  "chat.draft.unfinishedLoadFailed":
+    "Some unfinished Jobs could not be loaded. Retry to see their latest state.",
+  "chat.draft.wrongConversation": "The saved Job belongs to another conversation.",
+  "chat.draft.historyUnavailable": "The submitted Job cannot yet be opened in history.",
+  "chat.draft.pendingChanged":
+    "The pending submission no longer matches the saved revision. Reconcile it before editing.",
+  "chat.draft.openOtherConversation":
+    "The saved Job belongs to another conversation. Open that conversation to continue editing it.",
+  "chat.draft.conflict":
+    "The saved Job changed elsewhere. Your local edits are not saved. Load the saved version before continuing.",
+  "chat.draft.confirmLeave":
+    "Some input or images are not confirmed saved, or submission is still unresolved. Leave anyway? Your unsaved changes may be lost.",
+  "chat.draft.saveFirst": "Save the Job before sending.",
+  "chat.draft.savedHistoryUnavailable": "The saved Job cannot yet be opened in history.",
+  "chat.draft.restoreFailed": "The original draft could not be restored.",
+  "chat.draft.headChanged":
+    "The Job revision or conversation head changed. Your local input is preserved. Review the saved version; the Job will not be moved or rebased automatically.",
+  "chat.draft.inputMismatch":
+    "The submitted Job differs from your local input. Your input has not been cleared.",
+  "chat.draft.noHistory": "History is unavailable.",
+  "chat.draft.pendingUnavailable": "The pending submission metadata is unavailable.",
+  "chat.draft.savedInputChanged":
+    "The saved input changed; the pending submission cannot be reconciled automatically.",
+  "chat.draft.savedRevisionChanged":
+    "The saved revision changed; the pending submission cannot be retried safely.",
+  "chat.draft.reconcileHistory":
+    "The Job was submitted, but history is unavailable. Retry reconciliation.",
+  "chat.draft.otherJob": "This Job belongs to another conversation.",
+  "chat.draft.withdrawUnconfirmed": "Withdrawal was not confirmed.",
+  "chat.draft.confirmCancelBlocked":
+    "Cancel this queued Job if it cannot run because its history contains a Decision? Its input and history will be preserved.",
+  "chat.draft.cancelUnconfirmed": "The Job cancellation was not confirmed.",
+  "chat.draft.confirmLoadSaved": "Loading the saved version replaces your unsaved text. Continue?",
+  "chat.draft.tooManyImages": "Remove images to meet the eight-image limit before saving.",
+  "chat.draft.reviewConflict": "Review the Job conflict before continuing.",
+  "chat.draft.waitReconcile": "Waiting to reconcile submission.",
+  "chat.draft.saving": "Saving Job…",
+  "chat.draft.saveQueued": "Save queued Job",
+  "chat.draft.uncertain": "Submission outcome is uncertain.",
+  "chat.draft.reconcile": "Reconcile submission",
+  "chat.draft.loadSaved": "Load saved version",
+  "chat.draft.uploadFailed": "Image upload failed.",
+  "chat.draft.retryUpload": "Retry upload",
+  "chat.draft.unsubmittedJobs": "Unsubmitted Jobs",
+  "chat.draft.queuedJobs": "Queued Jobs",
+  "chat.draft.imageJob": "Image Job",
+  "chat.draft.open": "Open",
+  "chat.draft.withdraw": "Withdraw",
+  "chat.draft.blockedDecision": "Blocked by Decision history",
+  "chat.draft.cancelBlocked": "Cancel blocked Job",
+  "chat.outcome.held":
+    "Execution outcome uncertain; ownership is held and capacity is not released.",
+  "chat.outcome.unconfirmed": "Outcome unknown; stop is not yet confirmed.",
+  "chat.outcome.stopped": "Execution stopped; final outcome unknown.",
+  "chat.draft.historyLoadFailed": "Could not load Job {job} in history. {error}",
+  "chat.draft.unexpectedPhase": "Job is {phase}; input has not been cleared.",
+  "chat.draft.submittedHistoryFailed":
+    "The Job was submitted, but history could not be opened. Reconcile the same Job. {error}",
+  "chat.draft.notEditable": "This Job is {phase} and can no longer be edited.",
+  "chat.draft.notUnsubmitted": "This Job is {phase} and is no longer unsubmitted.",
+  "chat.draft.unsubmitted": "Unsubmitted: {text}",
+  "chat.draft.ineligible": "Not eligible for automatic dispatch ({code}): {detail}",
+  "chat.draft.notSchedulable": " (not schedulable: {code})",
+  "chat.composerChecking": "Checking Composer availability…",
+  "chat.composerUnavailable": "Composer unavailable: {error}",
+  "chat.draft.apiConflict": "The Job revision or lifecycle does not permit this change.",
+
   "job.activity.queued": "Queued",
   "job.activity.unsubmitted": "Draft, not submitted",
   "job.activity.starting": "Starting",

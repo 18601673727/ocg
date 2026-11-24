@@ -1,7 +1,9 @@
+import { useI18n } from "../../i18n";
 import { AttachmentTile, AttachmentTileRemove } from "../ui/attachment";
 import type { ComposerDraft } from "./draft-state";
 
 export default function AttachmentTiles(props: { draft: ComposerDraft }) {
+  const { t } = useI18n();
   const {
     images,
     busy,
@@ -34,7 +36,7 @@ export default function AttachmentTiles(props: { draft: ComposerDraft }) {
           isUploading={!item.failed}
           uploadProgress={item.progress}
           isError={item.failed}
-          errorMessage={item.failed ? "Upload failed" : undefined}
+          errorMessage={item.failed ? t("chat.imageUploadFailed") : undefined}
           remove={
             item.failed && (
               <AttachmentTileRemove name={item.file.name} onClick={() => removePending(item)} />

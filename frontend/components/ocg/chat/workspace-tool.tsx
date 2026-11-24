@@ -1,9 +1,9 @@
 import { Check, Copy, FileCode2 } from "@lucide/solid";
-import { createEffect, createMemo, createSignal, Loading, lazy } from "solid-js";
+import { createEffect, createMemo, createSignal, Loading, lazy, Show } from "solid-js";
 import { ToolFallback, toolArgumentSummary } from "@/components/ocg/chat/ui/tool-fallback";
 import { Button } from "@/components/ui/button";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
-import { type View } from "@/lib/ui-state";
+import { shallowSelector, type View } from "@/lib/ui-state";
 import type { ToolCall } from "../contracts";
 import { useI18n } from "../i18n";
 import { highlightCode } from "../markdown/markdown-pipeline";
@@ -130,6 +130,11 @@ export function WorkspaceTool(props: {
     () =>
       supportedTool() && recordedResult() && (props.call.arguments_cut || props.call.result_cut),
   );
+  const current = createMemo(
+    shallowSelector((_previous: ToolCall | undefined) =>
+      loaded()?.key === key() ? loaded()!.call : props.call,
+    ),
+  );
   createEffect(
     () => [
       props.client,
@@ -185,7 +190,6 @@ export function WorkspaceTool(props: {
             </div>
           );
         }
-        const current = createMemo(() => (loaded()?.key === key() ? loaded()!.call : props.call));
         if (!supportedTool() || current().arguments_cut || current().result_cut)
           return props.children;
         if (current().name === "workspace_run_command") {
@@ -283,36 +287,31 @@ export function WorkspaceTool(props: {
 
 export const WorkspaceToolFallback: ToolCallMessagePartComponent = (props) => {
   const { api } = useOcgRuntime();
+  const supported = createMemo(() => Boolean(props.call && SUPPORTED_TOOLS.has(props.call.name)));
+  const search = createMemo(
+    () => props.call?.name === "workspace_search" || props.call?.name === "workspace_fts_search",
+  );
   return (
-    <>
-      {(() => {
-        const call = props.call;
-        if (!call || !SUPPORTED_TOOLS.has(call.name)) return <ToolFallback {...props} />;
-        const search = createMemo(
-          () => call.name === "workspace_search" || call.name === "workspace_fts_search",
-        );
-        return (
-          <ToolFallback.Root>
-            <ToolFallback.Trigger
-              toolName={props.toolName}
-              durationMs={props.durationMs}
-              summary={
-                search()
-                  ? toolArgumentSummary(call.name, call.arguments ?? "")
-                  : artifactTitle(call)
-              }
-              status={props.status}
-            />
-            <ToolFallback.Content>
-              <ToolFallback.Error status={props.status} />
-              <WorkspaceTool call={call} jobId={props.jobId} client={api ?? undefined}>
-                <ToolFallback.Args argsText={props.argsText} />
-                <ToolFallback.Result result={props.result} />
-              </WorkspaceTool>
-            </ToolFallback.Content>
-          </ToolFallback.Root>
-        );
-      })()}
-    </>
+    <Show when={supported()} fallback={<ToolFallback {...props} />}>
+      <ToolFallback.Root>
+        <ToolFallback.Trigger
+          toolName={props.toolName}
+          durationMs={props.durationMs}
+          summary={
+            search()
+              ? toolArgumentSummary(props.call!.name, props.argsText)
+              : artifactTitle(props.call!)
+          }
+          status={props.status}
+        />
+        <ToolFallback.Content>
+          <ToolFallback.Error status={props.status} />
+          <WorkspaceTool call={props.call!} jobId={props.jobId} client={api ?? undefined}>
+            <ToolFallback.Args argsText={props.argsText} />
+            <ToolFallback.Result result={props.result} />
+          </WorkspaceTool>
+        </ToolFallback.Content>
+      </ToolFallback.Root>
+    </Show>
   );
 };
