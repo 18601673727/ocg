@@ -121,211 +121,44 @@ Keep the OCG data directory separate from project workspaces. The [data layout](
 
 ## Performance
 
-### Backend reference (2026-11-25)
+Current: 2026-11-25, commit [`0c4bdd5`](https://github.com/18601673727/ocg/commit/0c4bdd585a9320ca5700e00fe6eea7c6151ee503). Last: 2026-11-20, commit [`1c20348`](https://github.com/18601673727/ocg/commit/1c20348b660027990d7be59ab2aa1e1e80721023). Both ran on the same 2-core ARM64 Linux machine (11.66 GiB RAM, ext4, optimized build). Each job makes 3 mock model requests and 2 real tool calls. 8 concurrent clients, 1,000 jobs, 1,000 workspace files. Values are medians of 3 trials; latency is p50 / p95.
 
-Measured on **2026-11-25** (Singapore time) from commit [`0c4bdd5`](https://github.com/18601673727/ocg/commit/0c4bdd585a9320ca5700e00fe6eea7c6151ee503) on `chuncheon`, using Rust 1.99.1 and Cargo's optimized `bench` profile. The host ran Debian Linux 6.12.113 on ARM64 with two logical CPUs and 11.66 GiB RAM. Benchmark data was isolated on ext4 on `/dev/sda2`. The existing OCG service remained running.
-
-The reference profile used concurrency eight, 1,000 jobs or completed-job fixtures, and 1,000 workspace files, as applicable. Startup measured ten launches after two warm-up launches. Memory, admission, throughput, and streaming used 32 warm-up jobs per trial. History used 625 first-page and cursor-page pairs per reader, and search used 200 iterations per reader. Streaming used three markers per job at 20 ms intervals. Except for startup, values are medians of three corresponding trial statistics.
-
-| Metric | Result |
-| --- | --- |
-| Startup readiness | 36.087 ms median, 35.760–36.878 ms range |
-| Memory | 17.82 MiB idle, 70.27 MiB sampled loaded peak |
-| Job admission | 25.600 ms p50, 31.669 ms p95 |
-| Job throughput | 33.025 jobs/s, 243.031 ms completion p50, 275.538 ms p95 |
-| Streaming delivery | 17.207 ms p50, 27.585 ms p95 |
-| History read | 3.714 ms p50, 9.466 ms p95 |
-| Workspace search | 0.026 ms p50, 0.282 ms p95 |
-| Database footprint | 46.13 MiB, 47.136 KiB apparent growth per completed job |
-
-All eight sections recorded 73 successful measurements in total. The records contain zero failed, rejected, timed-out, or unfinished benchmark operations. The memory peak is sampled. Database growth uses an equivalent empty baseline and apparent file lengths, which can differ from allocated disk space.
-
-The source archive, optimized build log, runner, per-section JSONL and stderr, combined results, and summary are preserved at `/srv/ocg-backend-bench-0c4bdd5/` on `chuncheon`. All 410 tracked files in the extracted source matched the archive and the archive matched commit `0c4bdd5`. The combined `results/reference.jsonl` SHA-256 is `55a48ae42e73c5ae9ad69139704f01adfde3bab4a9e0f87591d933183d532176`. The benchmark binary SHA-256 is `3a897b15dd89bc06040c5d4c4945f6c92aa356fcb7e3f7cb5bd9167d1820d23d`. Use the eight-section recipe under the earlier ext4 reference with this source revision to reproduce the run.
-
-### Previous backend reference (2026-11-20)
-
-Measured [`1c20348`](https://github.com/18601673727/ocg/commit/1c20348b660027990d7be59ab2aa1e1e80721023) with the benchmark executor fix in this working tree on `chuncheon`, using the optimized Cargo benchmark profile and Rust 1.99.1. The host ran Debian Linux 6.12.113 on ARM64 with 2 vCPUs and 11.66 GiB RAM. Benchmark data used a separate ext4 directory on `/dev/sda2`. The existing OCG service remained running.
-
-The reference workload used eight clients, a benchmark Pool with capacity eight and eight compatible Executors, 1,000 jobs, 1,000 workspace files, three trials and 32 warm-up jobs. An independent preflight observed eight running allocations simultaneously. Startup used ten measured launches and two warm-up launches. History used 625 page pairs per reader and search used 200 iterations per reader. Each reference job made three mock model requests and two real workspace tool calls. Except for startup, values are medians of the three corresponding trial statistics.
-
-| Metric | Result |
-| --- | --- |
-| Startup readiness | 35.93 ms median, 35.54–36.15 ms range |
-| Memory | 17.60 MiB idle, 118.33 MiB sampled loaded peak |
-| Job admission | 25.34 ms p50, 31.88 ms p95 |
-| Job throughput | 31.17 jobs/s, 257.42 ms completion p50, 294.02 ms p95 |
-| Streaming delivery | 16.62 ms p50, 27.31 ms p95 |
-| History read | 4.28 ms p50, 10.48 ms p95 |
-| Workspace search | 0.036 ms p50, 0.590 ms p95 |
-| Database footprint | 45.57 MiB, 46.57 KiB apparent growth per completed job |
-
-All eight sections completed successfully, with 73 successful measurements and no failed, rejected, timed-out or unfinished operations. The memory peak is sampled. Database growth uses an equivalent empty baseline and apparent file lengths, which can differ from allocated disk space.
-
-The previous `d421854` run reported 11.67 jobs/s and 714.79 ms completion p95. It used eight clients but created only one benchmark Executor. Together with the one default Executor, that limited execution to two simultaneous allocations. Its results are preserved at `/srv/ocg-backend-bench-d421854/`.
-
-The earlier ext4 reference below reported 38.10 jobs/s and 236.15 ms completion p95 with eight execution slots. The November 20 reference offered 22 tools per model request, including 12 Job-management tools, while the earlier workload offered 10. In a separate three-trial experiment on the November 20 snapshot, an agent with coding capability only retained the two file reads and increased throughput to 32.60 jobs/s median. A separate experimental cache for compiled parameter validators retained all offered tools and raised throughput to 32.10 jobs/s median while reducing backend CPU time from 27 to 24 seconds per 1,000 jobs. Combining the coding-only agent with the cache yielded 33.09 jobs/s median and 19 seconds of backend CPU time. These experiments change different aspects of the workload or implementation and do not fully explain the remaining difference. CPU sampling also identified schema compilation and redb activity; traced write-call counts increased in the newer version. The precise contribution of the remaining changes is unquantified.
-
-The measured source snapshot, build log, preflight, per-section JSONL and stderr, combined results and summary are preserved at `/srv/ocg-backend-bench-1c20348/`. All 382 tracked source files were checked against the measured snapshot, including the uncommitted benchmark patch. The combined JSONL SHA-256 is `23e1d33ed526af3f26ad52e22f19b56de92db99faee37386ca949456b0d9da26`. The extracted source has no Git metadata, so the benchmark's reported clean-tree status does not independently identify the commit. The diagnostic cache is isolated at `/srv/ocg-bench-schema-cache-probe/`. Use the eight-section commands in the earlier ext4 reference to reproduce this run.
-
-### Long-conversation frontend benchmark
-
-The benchmark starts an isolated Rust backend and a local mock model provider, seeds 56 conversation turns, and opens the production frontend in headless Chrome. It measures initial JavaScript size, latency from provider updates to the browser DOM, and scroll frame intervals. [Benchmark source](benchmark/frontend/)
-
-Install Google Chrome in addition to the build requirements. Run these commands from the repository root.
-
-```sh
-cargo build --locked --bin ocg
-cargo run --locked --bin ocg-rs-ts
-pnpm --dir frontend install --frozen-lockfile
-pnpm --dir frontend build
-pnpm --dir benchmark/frontend install --frozen-lockfile
-pnpm --dir benchmark/frontend bench
-```
-
-The default schedule runs once at 1× CPU and three times at 4×. To run only the throttled rounds, use `pnpm --dir benchmark/frontend bench 4,4,4`. The runner prints the path to `benchmark.json` in its temporary output directory. Set `OCG_BENCH_BROWSER` to use a custom Chrome or Chromium executable or `OCG_BENCH_BACKEND` to use a custom OCG binary.
-
-### Backend comparison (2026-11-17)
-
-Compared the backend before and after the recent five-commit change: baseline [`3386cac`](https://github.com/18601673727/ocg/commit/3386cacc1f37dc4e674c74df2c1a5563f1963805) and current [`77dff6f`](https://github.com/18601673727/ocg/commit/77dff6ff166b924e214914cc1ad13d991cd84294). Both used the matching benchmark harness for their revision.
-
-**Machine:** Linux ARM64 Neoverse-N1, 2 vCPUs, 11 GiB RAM. Rust 1.99.1, optimized Cargo bench profile, and **tmpfs** benchmark storage. The production service was not used. Runtime workloads exercised the authenticated backend HTTP surface, real workspace tools, persistence, and a deterministic mock provider.
-
-The `all` run used reference mode, 3 trials, 1 warm-up, 1,000 jobs, 1,000 workspace files, 50 iterations, and client concurrency 1 and 8. Values below are medians of per-trial statistics.
-
-| Metric | Baseline → current | Change |
-| --- | --- | ---: |
-| Startup readiness p50 | 84.18 → 32.67 ms | **−61.2%** |
-| Admission p95 | C1: 2.72 → 2.86 ms; C8: 9.42 → 9.41 ms | C1 **+5.2%**; C8 −0.1% |
-| Throughput | C1: 11.57 → 11.62; C8: 23.06 → 23.01 jobs/s | C1 +0.5%; C8 −0.2% |
-| Streaming delivery p50 | C1: 11.94 → 11.32 ms; C8: 11.43 → 10.70 ms | −5.2%; −6.4% |
-| History read p95 | C1: 1.32 → 1.47 ms; C8: 6.63 → 6.23 ms | +11.6%; −6.0% |
-| Database after 1,000 completed jobs | C1: 40.7 → 36.2 MiB; C8: 72.3 → 54.2 MiB | **−11%; −25%** |
-| Database growth per completed job | C1: 40.64 → 36.03 KiB; C8: 72.99 → 54.48 KiB | **−11%; −25%** |
-| Loaded peak RSS (separate 100-job run) | C1: 32.96 → 32.43 MiB; C8: 34.81 → 34.17 MiB | −1.6%; −1.8% |
-| FTS build, 64 MiB corpus | 506.29 → 464.60 ms | −8.2% |
-| FTS full rebuild, 64 MiB corpus | 503.50 → 465.36 ms | −7.6% |
-| Mixed search latency, C8 p50 / p95 / p99 | 0.039 / 2.576 / 12.649 → 0.036 / 0.624 / 16.345 ms | −8.8% / −75.8% / **+29.2%** |
-
-The mixed-query p99 increase is a tail-latency regression to watch; its p99 varied between 12.6 and 16.6 ms across trials. Database file size also varied between trials. This was one baseline-then-current run on the same VM, so treat those tail and footprint changes as directional.
-
-The main `all` run produced 159 successful measurements per revision, with every section complete and no diagnostics. The `all` command omits the memory section; memory was run separately with 100 jobs and 3 trials for each concurrency. This backend benchmark does not measure browser rendering or interaction latency.
-
-To repeat the main profile on a comparable machine:
-
-```sh
-cargo bench --features benchmarks --bench backend -- \
-  all --mode reference --trials 3 --warmup 1 --iterations 50 \
-  --jobs 1000 --files 1000 --clients 1,8 --dir /tmp/ocg-benchmark
-```
-
-### Earlier ext4 reference (2026-11-07)
-
-Measured on **2026-11-07** (Singapore time) from the source in this commit, based on [`728aab5`](https://github.com/18601673727/ocg/commit/728aab570cbcc0a7096e652bd4a6badd0eb7a00f), using a native optimized Cargo benchmark build with Rust 1.99.1. All eight sections below used the same binary and source snapshot, including the 5 ms output flush and the `ntex-loopback-tcp-nodelay-v1` benchmark client.
-
-**Machine:** Debian Linux 6.12.113, ARM64 Neoverse-N1 (2 logical CPUs at 2.0 GHz), 11.66 GiB RAM, and **ext4** storage on `/dev/sda2`. The existing OCG service remained running and was not modified. The benchmark database was isolated on ext4, not tmpfs.
-
-Runtime workloads use a deterministic local mock provider with the real backend, workspace tools, and persistence. Each reference job makes **3 model requests**, executes **2 real tool calls**, and produces **1 validated completion**. C8 means configured concurrency 8.
-
-| Metric | Result | Workload |
-| --- | --- | --- |
-| Startup | **85.04 ms** median; 83.13–146.83 ms range | 10 launches; 1,000 completed-job database; warm OS cache; authenticated readiness |
-| Memory | **18.14 MiB** idle; **105.49 MiB** sampled loaded peak | Isolated backend; C8; 1,000 jobs/trial; nominal 20 ms RSS polling |
-| Job admission | **20.91 ms** p50; **37.09 ms** p95 | C8; 1,000 confirmed admissions/trial; completion drain excluded |
-| Job throughput | **38.10 jobs/s**; **209.43 ms** completion p50; **236.15 ms** p95 | Closed-loop C8; 1,000 validated reference jobs/trial |
-| Streaming delivery | **16.37 ms** p50; **26.49 ms** p95 | C8; 1,000 jobs / 3,000 markers per trial at 20 ms pacing; 5 ms output-flush interval; upstream emission to downstream SSE observation |
-| History read | **2.93 ms** p50; **8.52 ms** p95 | C8; 20-row first/cursor pages; 1,000-job fixture; 10,000 reads and 88–96 completed background jobs/trial |
-| Workspace search | **0.040 ms** p50; **0.608 ms** p95 | C8; warm index; 1,000 files / 3,968,000 indexed bytes; 11,200 queries/trial across seven classes |
-| Database footprint | **44.91 MiB** median; **45.90 KiB** apparent growth per completed job | 1,000 completed jobs/trial; cleanly closed `ocg.redb` |
-
-Except for startup, displayed results are medians of three trial statistics. Latency p50 and p95 are each the median of the corresponding per-trial percentile. The memory value is the median of the three sampled loaded peaks, which ranged from **105.03 to 106.30 MiB**.
-
-Database growth is relative to an equivalent empty baseline of **86,016 bytes** and excludes logs and attachments. Each fixture contained **1,000 validated completed jobs**, with execution configured at **C8**. These are apparent file lengths, not allocated disk bytes: sparse regions can make the two differ. Apparent growth ranged from **38.34 to 61.36 KiB per workload** across the three trials. Storage figures describe this workload and are not a fixed per-job cost.
-
-<details>
-<summary>Measurement details and search breakdown</summary>
-
-The [benchmark harness](benchmark/) exercises the existing runtime and validates completed work.
-
-- Runtime warm-up uses 32 separate jobs before each measured memory, admission, throughput, and streaming trial. Warm-up work is excluded from the results.
-- Startup prepares and cleanly closes its 1,000-job fixture outside the timer, performs two warm-up reopens, then measures ten launches. Readiness includes authenticated health and basic history reads.
-- Admission ends at confirmed admission. Completion drain and validation follow outside its timing window.
-- Throughput and completion timing end at observed settlement. The subsequent evidence audit must pass for a trial to be valid.
-- Memory samples cover the loaded measurement window. The 20 ms interval is the configured polling interval, and the peak is the highest RSS observed by sampling.
-- Streaming delivery measures propagation of paced markers through the runtime, durable persistence, and downstream SSE observation. The 5 ms setting controls the pending-output buffer timer, not the end-to-end delivery time.
-- History uses `/api/v1/job-history` with eight readers, 625 first-page/cursor-page pairs per reader, and background reference jobs in batches of eight.
-- Search calls the production `WorkspaceFts` API directly, using a warm index and the fixed seven-class query mix. Each class has 1,600 successful samples per trial.
-- Database measurements use three separately prepared baseline/loaded pairs and no warm-up jobs.
-
-All required measured work completed successfully, with zero rejected, failed, timed-out, or unfinished operations. These are bounded 1,000-job measurements with a local mock provider; provider inference latency and maximum sustainable load are outside their scope.
-
-The memory trials reported a median of **0.70 core** of backend CPU utilization. The workspace index held **1,000 files**, **528,499 tokens**, and **3,968,000 content bytes**. Its estimated memory footprint was **9,185,237 bytes** (8.76 MiB). Median initial build and rebuild times were **104.20 ms** and **108.56 ms**, respectively.
-
-Search latency varies substantially by query class. The table below reports medians of the three corresponding per-trial statistics; the aggregate row above comes from the same mixed workload.
-
-| Query class | p50 | p95 |
-| --- | ---: | ---: |
-| `rare` | 0.037 ms | 0.047 ms |
-| `common` | 0.320 ms | 12.343 ms |
-| `and` | 0.036 ms | 0.047 ms |
-| `phrase` | 0.029 ms | 0.031 ms |
-| `missing` | 0.016 ms | 0.018 ms |
-| `broad_phrase` | 0.337 ms | 12.376 ms |
-| `broad_phrase_zero` | 0.545 ms | 12.565 ms |
-
-The positional phrase index avoids most candidate file scans for nonmatching phrases. Individual broad-query p95 values can still exceed the mixed-query p95 because each class contributes only part of the query mix. Phrase candidate, time, and index-coverage limits still apply.
-
-</details>
-
-<details>
-<summary>Previous ext4 reference and observed changes</summary>
-
-The previous reference was measured on **2026-11-07** from clean [`728aab5`](https://github.com/18601673727/ocg/commit/728aab570cbcc0a7096e652bd4a6badd0eb7a00f) on the same two-core ARM64/ext4 machine. It used a **50 ms** output-flush interval and the default benchmark HTTP client; this run uses **5 ms** and `ntex-loopback-tcp-nodelay-v1`. The current source also contains the Executor admission consistency correction.
-
-| Metric | Previous clean `728aab5` | Current snapshot | Observed change |
+| Metric | Last | Current | Delta |
 | --- | ---: | ---: | ---: |
-| Startup median | 85.00 ms | 85.04 ms | +0.0% |
-| Idle RSS | 18.02 MiB | 18.14 MiB | +0.7% |
-| Loaded peak RSS | 105.41 MiB | 105.49 MiB | +0.1% |
-| Admission p50 / p95 | 58.67 / 78.71 ms | 20.91 / 37.09 ms | −64.4% / −52.9% |
-| Throughput | 37.56 jobs/s | 38.10 jobs/s | +1.4% |
-| Completion p95 | 239.38 ms | 236.15 ms | −1.4% |
-| Streaming delivery p50 / p95 | 42.69 / 72.49 ms | 16.37 / 26.49 ms | −61.7% / −63.5% |
-| History read p50 / p95 | 2.95 / 8.23 ms | 2.93 / 8.52 ms | −0.5% / +3.5% |
-| Workspace search p50 / p95 | 0.040 / 0.608 ms | 0.040 / 0.608 ms | +0.2% / −0.0% |
-| Apparent database file size | 50.07 MiB | 44.91 MiB | −10.3% |
-| Apparent database growth/workload | 51.18 KiB | 45.90 KiB | −10.3% |
+| Startup | 35.9 ms | 36.1 ms | +0.4% |
+| Memory, idle | 17.6 MiB | 17.8 MiB | +1.2% |
+| Memory, under load | 118.3 MiB | 70.3 MiB | −40.6% |
+| Job admission | 25.3 / 31.9 ms | 25.6 / 31.7 ms | +1.0% / −0.7% |
+| Job throughput | 31.2 jobs/s | 33.0 jobs/s | +6.0% |
+| Job completion | 257 / 294 ms | 243 / 276 ms | −5.6% / −6.3% |
+| Streaming delivery | 16.6 / 27.3 ms | 17.2 / 27.6 ms | +3.5% / +1.0% |
+| History read | 4.3 / 10.5 ms | 3.7 / 9.5 ms | −13.2% / −9.7% |
+| Workspace search | 0.036 / 0.590 ms | 0.026 / 0.282 ms | −27.8% / −52.2% |
+| Database per job | 46.6 KiB | 47.1 KiB | +1.2% |
 
-These are separate runs with different source snapshots, client behavior, run times, and OS cache states. The table reports observations and does not isolate a particular change or establish steady-state performance. Database file lengths may include sparse regions and do not establish allocated disk usage. Previous raw evidence remains on the benchmark host in `/srv/ocg-bench-20261107-728aab5.7UgXe3/`.
-
-</details>
+All runs finished with no failed, rejected or timed-out operations. The provider is a local mock, so model latency is not included.
 
 <details>
-<summary>Reproduce the reference profile</summary>
+<summary>Run the backend benchmark</summary>
 
-Run from the repository root in Bash with the source snapshot for the reference run you want to reproduce. The script creates a fresh result directory and runs all eight sections sequentially. To compare against the published numbers, run on a matching two-core ARM64 machine and set `OCG_BENCH_PARENT` to a directory on **ext4**. The November 7 run used `/srv/ocg-bench-current.zewYsE`; do not reuse its data directory or the production OCG database.
+Run from the repository root. Set `OCG_BENCH_PARENT` to an ext4 directory. Never point it at your real OCG database.
 
 ```bash
 set -euo pipefail
-
 OCG_BENCH_PARENT="${OCG_BENCH_PARENT:-$HOME}"
-OCG_BENCH_RESULTS="$(mktemp -d "$OCG_BENCH_PARENT/ocg-benchmark.XXXXXX")"
-
-unset OCG_BENCHMARK_ADMISSION_DELAY_MS
-unset OCG_BENCHMARK_SPLIT_OUTPUT_RECORDS
-unset OCG_BENCHMARK_INJECT_WORKER_ERROR
+OUT="$(mktemp -d "$OCG_BENCH_PARENT/ocg-benchmark.XXXXXX")"
+unset OCG_BENCHMARK_ADMISSION_DELAY_MS OCG_BENCHMARK_SPLIT_OUTPUT_RECORDS OCG_BENCHMARK_INJECT_WORKER_ERROR
 
 run_bench() {
-  local section="$1"
-  shift
+  local section="$1"; shift
   cargo bench --locked --features benchmarks --bench backend -- \
     "$section" --mode reference \
     --clients 8 --jobs 1000 --files 1000 \
     --iterations 1 --trials 3 --warmup 32 \
     --deadline-ms 120000 --stream-chunks 3 --stream-pace-ms 20 \
     --page-size 20 --writer-jobs 8 \
-    --dir "$OCG_BENCH_RESULTS/data" "$@" \
-    > "$OCG_BENCH_RESULTS/$section.jsonl" \
-    2> "$OCG_BENCH_RESULTS/$section.stderr"
+    --dir "$OUT/data" "$@" \
+    > "$OUT/$section.jsonl" 2> "$OUT/$section.stderr"
 }
 
 run_bench startup --trials 10 --warmup 2
@@ -337,21 +170,31 @@ run_bench history --iterations 625 --warmup 10
 run_bench search --iterations 200 --warmup 10
 run_bench database --warmup 0
 
-for section in startup memory admission throughput streaming history search database; do
-  cat "$OCG_BENCH_RESULTS/$section.jsonl"
-done > "$OCG_BENCH_RESULTS/reference.jsonl"
-
+cat "$OUT"/{startup,memory,admission,throughput,streaming,history,search,database}.jsonl \
+  > "$OUT/reference.jsonl"
 cargo bench --locked --features benchmarks --bench backend -- \
   summary --concurrency 8 --mode reference \
-  < "$OCG_BENCH_RESULTS/reference.jsonl" \
-  > "$OCG_BENCH_RESULTS/summary.md"
-
-printf 'Results: %s\n' "$OCG_BENCH_RESULTS"
+  < "$OUT/reference.jsonl" > "$OUT/summary.md"
+echo "Results: $OUT"
 ```
 
-The measured benchmark binary SHA-256 was `aaf91651c70cc64e04f19fe78788cc20556ad08ca0b4250c97eb026a206b193c`. Raw JSONL, stderr, the source snapshot, source manifest, patch, build records, and checksums are preserved on the benchmark host in `/srv/ocg-bench-current.zewYsE/`. Before the run, all **324 tracked non-README files** in that snapshot were verified byte for byte against the working tree. The manifest SHA-256 is `dee8390539e65b24354480af8748a3724fbc115ec6c8e35f2713a5951f58a142`; the source and benchmark patch against `728aab5` has SHA-256 `d0b3a38941db70734ddd066cb06191bf05ae2dbd7a2c24191bea9707af15befe`. The extracted snapshot has no Git metadata: its reported `dirty_tree: false` does not independently verify cleanliness. These paths identify artifacts on that host, not files included in the repository.
+</details>
 
-The harness records environment, workload, trial statistics, and outcomes in JSONL, with Git metadata when available. Keep the exact source commit, binary identity, raw records, stderr, and filesystem details together. Keep results from different revisions and filesystems separate. The [summary implementation](benchmark/summary.rs) reports medians of per-trial statistics.
+<details>
+<summary>Run the frontend benchmark</summary>
+
+It starts a local backend and mock provider, seeds a 56-turn conversation, and opens the built frontend in headless Chrome. It measures JavaScript size, update-to-screen latency and scroll smoothness. Needs Google Chrome. [Source](benchmark/frontend/)
+
+```sh
+cargo build --locked --bin ocg
+cargo run --locked --bin ocg-rs-ts
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend build
+pnpm --dir benchmark/frontend install --frozen-lockfile
+pnpm --dir benchmark/frontend bench
+```
+
+`OCG_BENCH_BROWSER` and `OCG_BENCH_BACKEND` select a custom Chrome or OCG binary.
 
 </details>
 
