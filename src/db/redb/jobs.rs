@@ -277,14 +277,26 @@ fn decode_mutable_input(d: &mut Dec<'_>) -> DecodeResult<crate::db::entities::Mu
     Ok(MutableJobInput { priority, content })
 }
 
+fn mutable_job_header(key: u128, bytes: &[u8]) -> DecodeResult<(JobId, JobId, Dec<'_>)> {
+    let mut d = Dec::new(bytes, TAG_JOB)?;
+    let id = JobId::new(d.u128()?);
+    let parent_id = JobId::new(d.u128()?);
+    if id.get() != key || parent_id.get() == 0 || parent_id >= id {
+        return Err(StorageError::corrupted("invalid mutable Job"));
+    }
+    Ok((id, parent_id, d))
+}
+
+pub(super) fn mutable_job_parent(key: u128, bytes: &[u8]) -> DecodeResult<JobId> {
+    mutable_job_header(key, bytes).map(|(_, parent_id, _)| parent_id)
+}
+
 pub(super) fn decode_mutable_job(
     key: u128,
     bytes: &[u8],
 ) -> DecodeResult<crate::db::entities::MutableJob> {
     use crate::db::entities::{MutableContextSelection, MutableJob, MutableJobPhase};
-    let mut d = Dec::new(bytes, TAG_JOB)?;
-    let id = JobId::new(d.u128()?);
-    let parent_id = JobId::new(d.u128()?);
+    let (id, parent_id, mut d) = mutable_job_header(key, bytes)?;
     let previous = d.ou128()?.map(JobId::new);
     let retry = d.opt(|d| {
         Ok(crate::db::entities::JobRetry {
@@ -341,10 +353,7 @@ pub(super) fn decode_mutable_job(
         ))
     })?;
     d.end()?;
-    if id.get() != key
-        || parent_id.get() == 0
-        || parent_id >= id
-        || previous.is_some_and(|previous| previous >= id)
+    if previous.is_some_and(|previous| previous >= id)
         || retry
             .as_ref()
             .is_some_and(|retry| retry.original >= id || retry.original.get() == 0)

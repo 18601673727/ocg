@@ -50,9 +50,38 @@ fn append_omitted_notice(conversation: &mut ChatConversation) {
     }
 }
 
+const IMAGE_TOKEN_WEIGHT: u64 = 1600;
+
+fn is_response_image(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(serde_json::Value::as_str),
+        Some("image" | "input_image" | "image_url")
+    )
+}
+
+fn response_item_images(items: &[serde_json::Value]) -> usize {
+    let mut images: usize = 0;
+    for item in items {
+        if is_response_image(item) {
+            images = images.saturating_add(1);
+        }
+        if let Some(content) = item["content"].as_array() {
+            for part in content {
+                if is_response_image(part) {
+                    images = images.saturating_add(1);
+                }
+            }
+        }
+    }
+    images
+}
+
 fn message_weights(message: &ChatMessage) -> (usize, usize) {
     if let Some(items) = &message.response_items {
-        return (crate::db::serialized_len(items).unwrap_or(usize::MAX), 0);
+        return (
+            crate::db::serialized_len(items).unwrap_or(usize::MAX),
+            response_item_images(items),
+        );
     }
     let mut bytes: usize = 0;
     let mut images: usize = 0;
@@ -94,25 +123,49 @@ fn tool_bytes(tool: &ToolWire) -> usize {
 }
 
 pub(crate) fn estimate_request_tokens(conversation: &ChatConversation, max_tokens: u32) -> u64 {
-    let mut bytes: usize = 0;
-    let mut images: usize = 0;
+    ContextEstimate::new(conversation, max_tokens).tokens()
+}
 
-    for message in &conversation.messages {
-        let (m_bytes, m_images) = message_weights(message);
-        bytes = bytes.saturating_add(m_bytes);
-        images = images.saturating_add(m_images);
+/// Incremental form of `estimate_request_tokens` for a conversation that only
+/// grows by appended messages: weigh each new message once instead of
+/// re-serializing the whole history on every provider round.
+pub(crate) struct ContextEstimate {
+    bytes: usize,
+    images: usize,
+    weighed: usize,
+    max_tokens: u32,
+}
+
+impl ContextEstimate {
+    pub(crate) fn new(conversation: &ChatConversation, max_tokens: u32) -> Self {
+        let mut estimate = Self {
+            bytes: conversation
+                .tools
+                .iter()
+                .map(tool_bytes)
+                .fold(0, usize::saturating_add),
+            images: 0,
+            weighed: 0,
+            max_tokens,
+        };
+        estimate.extend(conversation);
+        estimate
     }
 
-    for tool in &conversation.tools {
-        bytes = bytes.saturating_add(tool_bytes(tool));
+    pub(crate) fn extend(&mut self, conversation: &ChatConversation) {
+        for message in conversation.messages.iter().skip(self.weighed) {
+            let (bytes, images) = message_weights(message);
+            self.bytes = self.bytes.saturating_add(bytes);
+            self.images = self.images.saturating_add(images);
+        }
+        self.weighed = conversation.messages.len();
     }
 
-    let text_tokens = bytes.div_ceil(3) as u64;
-    let image_tokens = (images as u64).saturating_mul(1600);
-    let output_tokens = u64::from(max_tokens);
-    text_tokens
-        .saturating_add(image_tokens)
-        .saturating_add(output_tokens)
+    pub(crate) fn tokens(&self) -> u64 {
+        (self.bytes.div_ceil(3) as u64)
+            .saturating_add((self.images as u64).saturating_mul(IMAGE_TOKEN_WEIGHT))
+            .saturating_add(u64::from(self.max_tokens))
+    }
 }
 
 pub(crate) const DEFAULT_CONTEXT_WINDOW: u32 = 128_000;
@@ -376,7 +429,7 @@ pub(crate) fn fit_with_notices(
     let full_bytes = rest_without_notice_bytes.saturating_add(total_prior_bytes);
     let full_images = current_images_count.saturating_add(total_prior_images);
     let full_tokens = (full_bytes.div_ceil(3) as u64)
-        .saturating_add((full_images as u64).saturating_mul(1600))
+        .saturating_add((full_images as u64).saturating_mul(IMAGE_TOKEN_WEIGHT))
         .saturating_add(output_tokens);
 
     if full_tokens <= window as u64 {
@@ -401,7 +454,7 @@ pub(crate) fn fit_with_notices(
         let candidate_bytes = rest_with_notice_bytes.saturating_add(remaining_prior_bytes);
         let candidate_images = current_images_count.saturating_add(remaining_prior_images);
         let candidate_tokens = (candidate_bytes.div_ceil(3) as u64)
-            .saturating_add((candidate_images as u64).saturating_mul(1600))
+            .saturating_add((candidate_images as u64).saturating_mul(IMAGE_TOKEN_WEIGHT))
             .saturating_add(output_tokens);
 
         if candidate_tokens <= window as u64 {
@@ -488,7 +541,7 @@ impl DevelopmentContextRequirements for DevelopmentContextBudget {
     ) -> bool {
         let limits = ContextLimits::for_profile(model);
         let estimated_tokens = (selected_bytes.div_ceil(3) as u64)
-            .saturating_add((image_count as u64).saturating_mul(1600))
+            .saturating_add((image_count as u64).saturating_mul(IMAGE_TOKEN_WEIGHT))
             .saturating_add(u64::from(limits.max_tokens));
         let window = limits.context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
         estimated_tokens <= u64::from(window)

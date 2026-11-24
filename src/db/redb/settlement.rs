@@ -799,21 +799,12 @@ impl Batch {
         if let Some(conf) = confidence
             && (conf.value * 1000.0) < f64::from(policy.minimum_confidence_millis)
         {
-            return self.reject(Violation::InvalidValue(
-                "job_plan",
-                "planning decision confidence below policy minimum; call job_plan first",
-            ));
+            return self.reject(Violation::PlanRequiredLowConfidence);
         }
         if selected == "direct" {
             return Ok(());
         }
-        if !has_plan {
-            return self.reject(Violation::InvalidValue(
-                "job_plan",
-                "project decision policy requires job_plan before side-effecting tools",
-            ));
-        }
-        Ok(())
+        self.reject(Violation::PlanRequired)
     }
 
     fn advance_recurrence_on_settlement(

@@ -703,11 +703,11 @@ pub(super) fn bound_conversation_turns(shared: &Shared, mut body: Value) -> Resu
     );
     body["has_more"] = Value::Bool(false);
     body["next_before"] = body["conversation"].clone();
-    let mut size = body.to_string().len();
+    let mut size = dashboard::serialized_len(&body)?;
     let mut turns = Vec::new();
     let mut next_before = Value::Null;
     for mut turn in records {
-        let mut cost = turn.to_string().len() + 1;
+        let mut cost = dashboard::serialized_len(&turn)? + 1;
         if size + cost > shared.response_bytes {
             if !turns.is_empty() {
                 has_more = true;
@@ -719,7 +719,7 @@ pub(super) fn bound_conversation_turns(shared: &Shared, mut body: Value) -> Resu
                     .ok_or(INCONSISTENT_RECORD)?,
             );
             turn["outputs_truncated"] = Value::Bool(true);
-            cost = turn.to_string().len() + 1;
+            cost = dashboard::serialized_len(&turn)? + 1;
             if size + cost > shared.response_bytes {
                 return Err(super::OUTPUT_TOO_LARGE);
             }
@@ -728,7 +728,7 @@ pub(super) fn bound_conversation_turns(shared: &Shared, mut body: Value) -> Resu
                 .and_then(Value::as_array_mut)
                 .ok_or(INCONSISTENT_RECORD)?;
             for output in outputs {
-                let output_cost = output.to_string().len() + 1;
+                let output_cost = dashboard::serialized_len(&output)? + 1;
                 if size + cost + output_cost > shared.response_bytes {
                     break;
                 }

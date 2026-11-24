@@ -5,7 +5,7 @@ use std::sync::Arc;
 use super::tools::tool_loop::{
     CallAnswers, CallSite, REQUEST_COMMAND_TOOL_NAME, ToolExecution, ToolLoopStop, answer_calls,
 };
-use crate::ai::compact::{ContextLimits, estimate_request_tokens};
+use crate::ai::compact::{ContextEstimate, ContextLimits};
 use crate::ai::development::DevelopmentExecution;
 use crate::ai::providers::openai_compatible::{ChatConversation, ChatMessage, ChatToolCallWire};
 use crate::ai::providers::{
@@ -105,6 +105,7 @@ pub(crate) async fn supervise_development_generative(
         .as_ref()
         .map_or(1, |tools| tools.limits.max_provider_requests);
     let mut conversation = first_conversation.clone();
+    let mut estimate = None;
     let mut body = prepared.clone();
     let mut request = RequestNumber::FIRST;
     let mut output_seq = 1u32;
@@ -251,17 +252,20 @@ pub(crate) async fn supervise_development_generative(
                 return settle_tool_stop(database, handoff, output_seq, Some(&result), stop).await;
             }
         };
-        if let Some(window) = limits.context_window
-            && estimate_request_tokens(&conversation, limits.max_tokens) > u64::from(window)
-        {
-            return settle_tool_stop(
-                database,
-                handoff,
-                output_seq,
-                Some(&result),
-                ToolLoopStop::ContextWindow,
-            )
-            .await;
+        if let Some(window) = limits.context_window {
+            let estimate = estimate
+                .get_or_insert_with(|| ContextEstimate::new(&conversation, limits.max_tokens));
+            estimate.extend(&conversation);
+            if estimate.tokens() > u64::from(window) {
+                return settle_tool_stop(
+                    database,
+                    handoff,
+                    output_seq,
+                    Some(&result),
+                    ToolLoopStop::ContextWindow,
+                )
+                .await;
+            }
         }
         body = match crate::ai::generative_model::request_body(&frozen.llm, &conversation) {
             Ok(body) => body,

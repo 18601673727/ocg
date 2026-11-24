@@ -100,7 +100,8 @@ impl Batch {
                 serde_json::from_slice(bytes.value())
                     .map_err(|_| StorageError::corrupted("malformed summary manifest"))
             })?;
-            let subsequent = self.active_job(conversation)?.is_some();
+            let subsequent =
+                self.step(|tx| Ok(reads::jobs::active_job_in(tx, conversation)?.is_some()))?;
             return Ok(crate::db::entities::CompactionRequest::Prepared {
                 job: record.job,
                 conversation,
@@ -165,15 +166,15 @@ impl Batch {
         if self.job_lifecycle(conversation)?.closing.is_some()
             || self.require_job_state(conversation)?.outcome.is_some()
             || depth.saturating_add(1) > limits.max_depth
-            || self.live_children(conversation)?.len() >= 16
-            || self.live_subtree(root)?.len() >= 64
+            || self.live_children(conversation)?.len() >= super::job_tree::MAX_LIVE_CHILDREN
+            || self.live_subtree(root)?.len() >= super::job_tree::MAX_LIVE_SUBTREE
         {
             refuse!(
                 "compaction_unavailable",
                 "conversation cannot admit a compaction child now"
             );
         }
-        let active = self.active_job(conversation)?;
+        let active = self.step(|tx| Ok(reads::jobs::active_job_in(tx, conversation)?.is_some()))?;
         let tip = self.read_summary_source(|tx| summary_turn_head(tx, conversation))?;
         let Some(mut through) = tip else {
             return Ok(crate::db::entities::CompactionRequest::Noop {
@@ -372,7 +373,7 @@ impl Batch {
                 job: existing_job,
                 conversation,
                 through,
-                subsequent: active.is_some(),
+                subsequent: active,
                 already: true,
             });
         }
@@ -404,8 +405,9 @@ impl Batch {
             .live_children(conversation)?
             .len()
             .saturating_add(work_count)
-            > 16
-            || self.live_subtree(root)?.len().saturating_add(work_count) > 64
+            > super::job_tree::MAX_LIVE_CHILDREN
+            || self.live_subtree(root)?.len().saturating_add(work_count)
+                > super::job_tree::MAX_LIVE_SUBTREE
             || self
                 .step(|tx| Ok(tx.open_table(PENDING)?.len()?))?
                 .saturating_add(work_count as u64)
@@ -587,7 +589,7 @@ impl Batch {
                 job: producer_id,
                 conversation,
                 through,
-                subsequent: active.is_some(),
+                subsequent: active,
                 already: false,
             })
         })
@@ -629,9 +631,6 @@ impl Batch {
 
     pub(crate) fn group_head(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
         self.step(|tx| reads::jobs::turn_head(tx, conversation))
-    }
-    pub(crate) fn active_job(&mut self, conversation: JobId) -> Result<Option<JobId>, BatchError> {
-        self.step(|tx| Ok(reads::jobs::active_job_in(tx, conversation)?.map(|job| job.id)))
     }
 
     pub(crate) fn live_children(&mut self, conversation: JobId) -> Result<Vec<JobId>, BatchError> {

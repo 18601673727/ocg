@@ -15,7 +15,7 @@ use crate::db::redb::schema::{
     JOB_OBSERVATIONS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, MAX_OBSERVATION_SCAN, MAX_PAGE,
     OPEN_APPROVALS, POOL_ALLOCATIONS, RECURRENCES, REQUEST_EVENTS, TOOL_CALLS, TURNS,
 };
-use crate::db::redb::{StorageError, TxRead, allocations, rows, state};
+use crate::db::redb::{StorageError, TxRead, allocations, jobs, rows, state};
 use crate::db::redb::{execution, observations};
 use ::redb::{Database, ReadTransaction, ReadableTable};
 use std::collections::{BTreeMap, btree_map::Entry};
@@ -424,8 +424,11 @@ pub(crate) fn active_job_in(
         let row = jobs
             .get(id)?
             .ok_or_else(|| StorageError::corrupted("active Allocation references a missing Job"))?;
-        let job = crate::db::redb::jobs::decode_mutable_job(id, row.value())?;
-        if job.parent_id == conversation && job.summary_source.is_none() {
+        if jobs::mutable_job_parent(id, row.value())? != conversation {
+            continue;
+        }
+        let job = jobs::decode_mutable_job(id, row.value())?;
+        if job.summary_source.is_none() {
             return Ok(Some(job));
         }
     }

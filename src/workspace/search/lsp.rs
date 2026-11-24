@@ -1589,7 +1589,7 @@ impl WorkspaceCode {
                 let result = loop {
                     let (text, counts) = render(&sections, &report, text_budget);
                     let result = json!({"text": text, "counts": counts, "index": {"files": index.files.len(), "reparsed": reparsed, "skipped": scan.skipped + failures.len(), "unsupported": scan.unsupported, "bounds": scan.limits}});
-                    let bytes = result.to_string().len();
+                    let bytes = crate::db::serialized_len(&result).unwrap_or(usize::MAX);
                     if bytes <= max_result_bytes { break result; }
                     if text_budget == 0 { return Err(refused("result limit too small for counts")); }
                     text_budget = text_budget.saturating_sub(bytes - max_result_bytes);

@@ -2,7 +2,7 @@ use super::contracts::envelope;
 use super::{
     INVALID_REQUEST, JobId, NOT_FOUND, NotInvokedReason, OUTPUT_TOO_LARGE, Refusal, Reply,
     RequestNumber, Shared, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind,
-    UncertainCause, Value, WithheldReason, dashboard, json, routing,
+    UncertainCause, Value, WithheldReason, dashboard, routing,
 };
 
 pub(super) const MAX_EXPOSED_TOOL_STRING_BYTES: usize = 2 * 1024;
@@ -208,13 +208,14 @@ pub(super) async fn tools(
             has_more: more,
         }))
     };
-    let mut size = envelope(Vec::new(), None, true).to_string().len();
+    let largest_cursor = RequestNumber::new(u32::MAX).map(|request| (request, u32::MAX));
+    let mut size = dashboard::serialized_len(&envelope(Vec::new(), largest_cursor, true))?;
     let mut page = Vec::new();
     let mut next = None;
     let mut more = records.len() > limit;
     for record in records.iter().take(limit) {
         let tool = tool_view(record);
-        let cost = json!(tool).to_string().len() + 1;
+        let cost = dashboard::serialized_len(&tool)? + 1;
         if size + cost > shared.response_bytes {
             if page.is_empty() {
                 return Err(OUTPUT_TOO_LARGE);

@@ -54,8 +54,12 @@ pub(super) fn jobs_query(query: &str) -> Result<(Option<JobId>, usize, Vec<Strin
     Ok((before, limit, terms))
 }
 
+pub(super) fn serialized_len(value: &impl serde::Serialize) -> Result<usize, Refusal> {
+    crate::db::serialized_len(value).map_err(|_| super::INCONSISTENT_RECORD)
+}
+
 pub(super) fn bounded(shared: &Shared, value: Value) -> Result<Reply, Refusal> {
-    if value.to_string().len() > shared.response_bytes {
+    if serialized_len(&value)? > shared.response_bytes {
         return Err(OUTPUT_TOO_LARGE);
     }
     Ok(Reply::ok(value))

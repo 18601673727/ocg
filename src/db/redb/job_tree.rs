@@ -59,7 +59,7 @@ pub(crate) fn read_child_turns_need_settlement(
 }
 
 pub(super) const MAX_LIVE_CHILDREN: usize = 16;
-const MAX_LIVE_SUBTREE: usize = 64;
+pub(super) const MAX_LIVE_SUBTREE: usize = 64;
 pub(super) const MAX_AGENT_RETRIES: usize = 2;
 pub(super) const REPORT_HEADER: &str = "The conversations you opened have finished. Their answers follow; use them, and do not claim a failed or cancelled one completed.";
 const REPORT_TITLE_BYTES: usize = 128;

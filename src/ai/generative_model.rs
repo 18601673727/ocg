@@ -477,7 +477,7 @@ impl<'a> StreamOutput<'a> {
                 self.started = Some(Instant::now());
             }
             let available = STREAM_OUTPUT_BUFFER_BYTES - self.text.len();
-            let split = floor_char_boundary(delta, available);
+            let split = delta.floor_char_boundary(available);
             if split == 0 {
                 self.flush().await?;
                 continue;
@@ -530,14 +530,6 @@ impl ProviderOutputSink for StreamOutput<'_> {
             }
         })
     }
-}
-
-fn floor_char_boundary(text: &str, maximum: usize) -> usize {
-    let mut split = text.len().min(maximum);
-    while split > 0 && !text.is_char_boundary(split) {
-        split -= 1;
-    }
-    split
 }
 
 enum StreamWait {

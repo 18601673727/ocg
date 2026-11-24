@@ -143,7 +143,8 @@ pub(crate) fn list(
             "truncated": truncated,
         })
     };
-    let mut size = result(Vec::new(), true).to_string().len();
+    let mut size =
+        crate::db::serialized_len(&result(Vec::new(), true)).map_err(|_| Refusal::Unreadable)?;
     let mut entries = Vec::new();
     let mut truncated = partial;
     for name in &names {
@@ -151,7 +152,7 @@ pub(crate) fn list(
             continue;
         };
         let entry = kind.entry(name);
-        let cost = entry.to_string().len() + 1;
+        let cost = crate::db::serialized_len(&entry).map_err(|_| Refusal::Unreadable)? + 1;
         if entries.len() == limits.listed_entries || size + cost > limits.result_bytes {
             truncated = true;
             break;
@@ -163,48 +164,53 @@ pub(crate) fn list(
 }
 
 #[derive(Debug)]
-struct NamePattern {
-    pattern: Vec<char>,
-    wildcard: bool,
+enum NamePattern {
+    Literal(String),
+    Wildcard(Vec<char>),
 }
 
 impl NamePattern {
     fn new(pattern: &str) -> Self {
-        Self {
-            pattern: pattern.to_ascii_lowercase().chars().collect(),
-            wildcard: pattern.contains(['*', '?']),
+        if pattern.contains(['*', '?']) {
+            Self::Wildcard(pattern.chars().collect())
+        } else {
+            Self::Literal(pattern.to_owned())
         }
     }
 
     fn matches(&self, name: &str) -> bool {
-        let name = name.to_ascii_lowercase().chars().collect::<Vec<_>>();
-        if self.wildcard {
-            wildcard_match(&self.pattern, &name)
-        } else {
-            name.windows(self.pattern.len())
-                .any(|window| window == self.pattern.as_slice())
+        match self {
+            Self::Literal(pattern) => {
+                pattern.is_empty()
+                    || name
+                        .as_bytes()
+                        .windows(pattern.len())
+                        .any(|window| window.eq_ignore_ascii_case(pattern.as_bytes()))
+            }
+            Self::Wildcard(pattern) => wildcard_match(pattern, name),
         }
     }
 }
 
-fn wildcard_match(pattern: &[char], name: &[char]) -> bool {
-    let (mut at, mut position) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while position < name.len() {
+fn wildcard_match(pattern: &[char], name: &str) -> bool {
+    let mut at = 0;
+    let mut name = name.chars();
+    let mut star = None;
+    while let Some(character) = name.clone().next() {
         match pattern.get(at) {
             Some('*') => {
-                star = Some((at, position));
+                star = Some((at, name.clone()));
                 at += 1;
             }
-            Some(&character) if character == '?' || character == name[position] => {
+            Some(&expected) if expected == '?' || expected.eq_ignore_ascii_case(&character) => {
                 at += 1;
-                position += 1;
+                name.next();
             }
-            _ => match star {
-                Some((star_at, star_position)) => {
-                    at = star_at + 1;
-                    position = star_position + 1;
-                    star = Some((star_at, star_position + 1));
+            Some(_) | None => match &mut star {
+                Some((star_at, retry)) => {
+                    retry.next();
+                    name = retry.clone();
+                    at = *star_at + 1;
                 }
                 None => return false,
             },
@@ -461,7 +467,11 @@ impl Walk<'_> {
     }
 
     fn push(&mut self, file: Value) {
-        let cost = file.to_string().len() + 1;
+        let Ok(bytes) = crate::db::serialized_len(&file) else {
+            self.limit = Some(Limit::Results);
+            return;
+        };
+        let cost = bytes + 1;
         if self.size + cost > self.limits.result_bytes {
             self.limit = Some(Limit::Results);
             return;
