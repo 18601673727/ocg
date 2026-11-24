@@ -1274,12 +1274,18 @@ fn reconcile(directory: &Path, operation: Operation) -> Result<Value, Refused> {
                 }),
             )
         }
-        Operation::MigrateStorage { expected_digest } => (
-            applied["plan"].clone(),
-            expected_digest.clone(),
-            vec![json!({"database_format": 2})],
-            json!({"format": [1, 2], "kept_text_jobs": applied["plan"]["kept_text_jobs"]}),
-        ),
+        Operation::MigrateStorage { expected_digest } => {
+            let plan = &applied["plan"];
+            let current_format = storage_format_versions().0;
+            let source_format = plan["source_format"].as_u64().unwrap_or(current_format);
+            let target_format = plan["target_format"].as_u64().unwrap_or(current_format);
+            (
+                applied["plan"].clone(),
+                expected_digest.clone(),
+                vec![json!({"database_format": target_format})],
+                json!({"format": [source_format, target_format], "kept_text_jobs": plan["kept_text_jobs"]}),
+            )
+        }
         Operation::CompactionRefs { expected_digest } => (
             applied["plan"].clone(),
             expected_digest.clone(),

@@ -1,7 +1,7 @@
 import type { JSX } from "@solidjs/web";
 import { createContext, createSignal, Show, useContext } from "solid-js";
 import { type Dictionary, en, formatTemplate, type TranslateFn } from "./dictionaries";
-import { detectLocale, isLocale, LOCALE_STORAGE_KEY, type Locale } from "./locale";
+import { DEFAULT_LOCALE, detectLocale, isLocale, LOCALE_STORAGE_KEY, type Locale } from "./locale";
 
 export type { TranslateFn } from "./dictionaries";
 
@@ -23,7 +23,11 @@ export function I18nProvider(props: { children: JSX.Element; fallback?: JSX.Elem
   function loadChinese() {
     void import("./zh")
       .then(({ zh }) => setChinese(zh))
-      .catch(() => {})
+      .catch((error) => {
+        console.warn("Could not load the Chinese dictionary.", error);
+        setLocale(DEFAULT_LOCALE);
+        document.documentElement.lang = "en";
+      })
       .finally(() => setReady(true));
   }
   if (locale() === "zh-CN") loadChinese();

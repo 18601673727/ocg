@@ -19,11 +19,25 @@ export function GlobalHeadersSection(props: { client: ApiClient }) {
   const [drafts, setDrafts] = createSignal<HeaderDraft[]>([]);
   const [invalid, setInvalid] = createSignal<HeaderDraftError>();
   const [error, setError] = createSignal<string>();
+  const [conflict, setConflict] = createSignal(false);
   const [saved, setSaved] = createSignal(false);
   const [busy, setBusy] = createSignal(false);
   const load = (value: GlobalOutboundHeaders) => {
+    setConflict(false);
+    setError(undefined);
+    setInvalid(undefined);
     setSettings(value);
     setDrafts(globalHeaderDrafts(value));
+  };
+  const reload = async () => {
+    setBusy(true);
+    try {
+      load(await props.client.readGlobalOutboundHeaders());
+    } catch (cause) {
+      setError(describeError(cause, i18n.t));
+    } finally {
+      setBusy(false);
+    }
   };
   createEffect(
     () => [props.client, load, i18n.t],
@@ -68,12 +82,12 @@ export function GlobalHeadersSection(props: { client: ApiClient }) {
                   load(value);
                   setSaved(true);
                 },
-                (cause) =>
-                  setError(
-                    cause instanceof ApiError && cause.code === "headers_revision_changed"
-                      ? i18n.t("headers.conflict")
-                      : describeError(cause, i18n.t),
-                  ),
+                (cause) => {
+                  const changed =
+                    cause instanceof ApiError && cause.code === "headers_revision_changed";
+                  if (changed) setConflict(true);
+                  setError(changed ? i18n.t("headers.conflict") : describeError(cause, i18n.t));
+                },
               )
               .finally(() => setBusy(false));
           }}
@@ -95,7 +109,12 @@ export function GlobalHeadersSection(props: { client: ApiClient }) {
               {i18n.t("headers.saved")}
             </p>
           )}
-          <Button type="submit" disabled={busy()}>
+          {conflict() && (
+            <Button type="button" variant="outline" size="sm" disabled={busy()} onClick={reload}>
+              {i18n.t("common.reload")}
+            </Button>
+          )}
+          <Button type="submit" disabled={busy() || conflict()}>
             {busy() ? i18n.t("context.saving") : i18n.t("common.save")}
           </Button>
         </form>

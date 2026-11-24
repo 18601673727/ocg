@@ -92,6 +92,7 @@ pub(super) struct Shared {
     pub(super) reclamation_omitted_at_open: u64,
     pub(super) probes: std::sync::Mutex<std::collections::HashMap<OperationId, Option<Probe>>>,
     pub(super) in_flight_commands: AtomicUsize,
+    pub(super) in_flight_maintenance: AtomicUsize,
     pub(super) credential_key: std::sync::OnceLock<Arc<redb::CredentialKey>>,
     pub(super) credential_key_writer: std::sync::Mutex<()>,
     pub(super) undecryptable_credentials_at_open: u64,
@@ -195,10 +196,33 @@ impl Drop for StagingBarrier<'_> {
     }
 }
 
+pub(super) struct MaintenanceRequest {
+    pub(super) message: Maintenance,
+    _in_flight: InFlightMaintenance,
+}
+
+impl MaintenanceRequest {
+    pub(super) fn new(message: Maintenance, shared: Arc<Shared>) -> Self {
+        shared.in_flight_maintenance.fetch_add(1, Ordering::SeqCst);
+        Self {
+            message,
+            _in_flight: InFlightMaintenance(shared),
+        }
+    }
+}
+
+struct InFlightMaintenance(Arc<Shared>);
+
+impl Drop for InFlightMaintenance {
+    fn drop(&mut self) {
+        self.0.in_flight_maintenance.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub(super) struct ReleaseOnPanic {
     pub(super) shared: Arc<Shared>,
     pub(super) receiver: flume::Receiver<Message>,
-    pub(super) maintenance: flume::Receiver<Maintenance>,
+    pub(super) maintenance: flume::Receiver<MaintenanceRequest>,
 }
 
 impl Drop for ReleaseOnPanic {
@@ -222,7 +246,7 @@ impl Drop for ReleaseOnPanic {
                 }
             }
             for maintenance in self.maintenance.drain() {
-                maintenance.refuse_policy(true);
+                maintenance.message.refuse_policy(true);
             }
             self.shared.release_database();
             self.shared.protection.close();

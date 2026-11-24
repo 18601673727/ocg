@@ -65,7 +65,7 @@ pub(super) const INVALID_CAPABILITIES: Refusal = Refusal::new(
 pub(super) const INVALID_PARAMETERS: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "invalid_parameters",
-    "LLM parameters must be finite numbers within valid bounds (temperature 0..=2, top_p 0..=1, one token limit >= 1, reasoning_effort supported by the wire, penalties -2..=2)",
+    "LLM parameters must be finite numbers within valid bounds (temperature 0..=1 for Anthropic Messages or 0..=2 for OpenAI protocols, top_p 0..=1, one token limit >= 1, reasoning_effort supported by the wire, penalties -2..=2)",
 );
 const INVALID_INSTRUCTIONS: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,

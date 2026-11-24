@@ -19,7 +19,7 @@ use crate::db::redb::allocations::{
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
 use crate::db::redb::codec::{Code, encode_scheduled_external_binding};
-use crate::db::redb::jobs::{decode_mutable_job, mutable_priority};
+use crate::db::redb::jobs::{decode_mutable_job, encode_mutable_job, mutable_priority};
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::{decode_attachment, decode_output};
 use crate::db::redb::schema::{
@@ -234,7 +234,12 @@ impl Batch {
             if !self.mutable_predecessor_ready(&job)? || self.mutable_job_blocked(&job)? {
                 continue;
             }
+            let stored_selection = job.context_selection;
             if previous.is_none()
+                && matches!(
+                    &job.input.content,
+                    crate::db::entities::MutableJobContent::Generative { .. }
+                )
                 && job.context_selection
                     == crate::db::entities::MutableContextSelection::FullHistory
                 && job.previous.is_some()
@@ -322,6 +327,7 @@ impl Batch {
                     &pool,
                     &executor,
                     &job,
+                    job.context_selection != stored_selection,
                     *key,
                     request,
                     operation,
@@ -347,6 +353,7 @@ impl Batch {
         pool: &crate::db::entities::AllocationPool,
         executor: &crate::db::entities::AllocationExecutor,
         row: &crate::db::entities::MutableJob,
+        persist_job: bool,
         ready_key: (u8, i64, u128, u16),
         request: crate::db::entities::DevelopmentReservationRequest,
         operation: ExecutionOperation,
@@ -398,6 +405,10 @@ impl Batch {
         };
         self.put_pool_allocation(&allocation, previous)?;
         self.step(|tx| {
+            if persist_job {
+                tx.open_table(JOBS)?
+                    .insert(row.id.get(), encode_mutable_job(row).as_slice())?;
+            }
             tx.open_table(MUTABLE_READY)?.remove(ready_key)?;
             tx.open_table(PENDING)?.remove(row.id.get())?;
             let mut bindings = tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;

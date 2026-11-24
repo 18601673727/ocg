@@ -1,7 +1,7 @@
 use super::contracts::envelope;
 use super::{DatabaseHandle, Duration, INTERNAL, INVALID_REQUEST, Refusal, Reply, StatusCode};
 
-pub(super) const UPDATE_BODY_LIMIT: usize = 64;
+pub(super) const UPDATE_BODY_LIMIT: usize = 256;
 
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Update")]
@@ -148,15 +148,16 @@ pub(super) async fn post(database: &DatabaseHandle, body: &[u8]) -> Result<Reply
             started_at: update::now_ms(),
         };
         let result_state = state.clone();
-        let child = ntex::rt::spawn_blocking(move || launch(state))
+        let mut child = ntex::rt::spawn_blocking(move || launch(state))
             .await
             .map_err(|_| INTERNAL)??;
         ntex::rt::spawn(async move {
-            let _ = ntex::rt::spawn_blocking(move || {
-                let mut child = child;
-                child.wait()
-            })
-            .await;
+            match ntex::rt::spawn_blocking(move || child.wait()).await {
+                Ok(Ok(status)) if status.success() => {}
+                Ok(Ok(status)) => log::warn!("updater process exited with {status}"),
+                Ok(Err(error)) => log::warn!("failed to wait for updater process: {error}"),
+                Err(error) => log::warn!("updater wait task failed: {error:?}"),
+            }
         });
         Ok(Reply::new(
             StatusCode::ACCEPTED,

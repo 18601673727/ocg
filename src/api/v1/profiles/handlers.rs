@@ -156,9 +156,16 @@ pub(crate) async fn save_profile(
                 ModelCapability::parse,
                 INVALID_CAPABILITIES,
             )?;
+            let max_temperature = match protocol {
+                Some(LlmTransport::AnthropicMessages) => {
+                    crate::ai::providers::anthropic::MAX_TEMPERATURE
+                }
+                Some(LlmTransport::OpenAiChatCompletions | LlmTransport::OpenAiResponses)
+                | None => 2.0,
+            };
             if parameters
                 .temperature
-                .is_some_and(|v| !v.is_finite() || !(0.0..=2.0).contains(&v))
+                .is_some_and(|v| !(0.0..=max_temperature).contains(&v))
                 || parameters
                     .top_p
                     .is_some_and(|v| !v.is_finite() || !(0.0..=1.0).contains(&v))

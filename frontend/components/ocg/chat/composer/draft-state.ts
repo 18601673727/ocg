@@ -316,6 +316,59 @@ export function createComposerDraft(props: ComposerProps) {
     if (results.some((result) => result.status === "rejected"))
       setError("Some unfinished Jobs could not be loaded. Retry to see their latest state.");
   };
+  async function startDraftAfterJob(job: MutableJob, text = "") {
+    if (scope.current.conversation && job.conversation !== scope.current.conversation)
+      throw new Error("The saved Job belongs to another conversation.");
+
+    const state = work.current;
+    const sessionId = props.sessionId;
+    let historyError: string | null = null;
+    try {
+      await client.presentMutableJob?.(sessionId, job);
+    } catch (cause) {
+      historyError = `Could not load Job ${job.id} in history. ${errorMessage(cause)}`;
+    }
+    if (!alive.current || work.current !== state || props.sessionId !== sessionId) return;
+
+    const localImages = images().filter(
+      (image) =>
+        state.desired.attachments.includes(image.id) && !job.input.attachments.includes(image.id),
+    );
+    const desired = {
+      ...empty(),
+      text,
+      attachments: localImages.map((image) => image.id),
+      configuration: config(props.selection),
+    };
+    forgetUnfinished(job.context);
+    forgetQueued(job.id);
+    localStorage.removeItem(pendingKey(job.context));
+    clearGlobalContext(job.context);
+    work.current = {
+      context: rotateContext(sessionId, job.conversation),
+      job: null,
+      desired,
+      initial: null,
+      association: { conversation: job.conversation },
+      dirty: hasDraftContent(desired),
+      conflict: false,
+      promise: null,
+    };
+    draftBeforeQueueEdit.current = null;
+    setEditingQueue(false);
+    setConfirmed(null);
+    setInput(desired);
+    setImages(localImages);
+    setConflict(false);
+    setUncertain(false);
+    uncertainRef.current = false;
+    setError(historyError);
+    setQueued((jobs) => jobs.filter((item) => item.id !== job.id));
+    setUnfinished((jobs) => jobs.filter((item) => item.id !== job.id));
+    if (work.current.dirty) scheduleAutosave();
+    setStatus(`Job ${job.id} is ${job.phase}. A new draft is ready.`);
+  }
+
   createEffect(
     () => [api, props.context, loadImages, refreshQueue, refreshUnfinished],
     () => {
@@ -334,10 +387,17 @@ export function createComposerDraft(props: ComposerProps) {
           let job = await api.currentMutableJob(props.context);
           if (pending?.context === props.context) {
             const submitted = await api.readMutableJob(props.context, pending.job);
+            if (cancelled) return;
+            if (submitted.phase !== "unsubmitted" && submitted.phase !== "queued") {
+              await startDraftAfterJob(submitted);
+              if (cancelled) return;
+              setReady(true);
+              await refreshQueue();
+              await refreshUnfinished();
+              return;
+            }
             if (
-              (submitted.phase === "queued" ||
-                submitted.phase === "executing" ||
-                submitted.phase === "completed") &&
+              submitted.phase === "queued" &&
               (await inputFingerprint(submitted.input)) === pending.fingerprint
             ) {
               savePointer({
@@ -741,6 +801,11 @@ export function createComposerDraft(props: ComposerProps) {
         fingerprint: string;
       };
       const saved = await api.readMutableJob(pending.context, pending.job);
+      if (saved.phase !== "unsubmitted" && saved.phase !== "queued") {
+        const localText = work.current.desired.text;
+        await startDraftAfterJob(saved, localText === saved.input.text ? "" : localText);
+        return;
+      }
       if ((await inputFingerprint(saved.input)) !== pending.fingerprint)
         throw new Error(
           "The saved input changed; the pending submission cannot be reconciled automatically.",
@@ -920,6 +985,10 @@ export function createComposerDraft(props: ComposerProps) {
     setBusy(true);
     try {
       const job = await api.readMutableJob(work.current.context, work.current.job.id);
+      if (job.phase !== "unsubmitted" && job.phase !== "queued") {
+        await startDraftAfterJob(job);
+        return;
+      }
       const restored = await loadImages(api, job.input.attachments);
       const unsavedImages = images().filter(
         (image) =>
@@ -932,18 +1001,16 @@ export function createComposerDraft(props: ComposerProps) {
       };
       work.current.job = job;
       work.current.desired = desired;
-      work.current.conflict = job.phase !== "unsubmitted" && job.phase !== "queued";
+      work.current.conflict = false;
       work.current.dirty = unsavedImages.length > 0;
-      setConflict(work.current.conflict);
+      setConflict(false);
       setInput(desired);
       setImages([...restored, ...unsavedImages]);
       setConfirmed(job);
       setError(
-        work.current.conflict
-          ? `This Job is ${job.phase} and cannot be edited.`
-          : desired.attachments.length > 8
-            ? "Remove images to meet the eight-image limit before saving."
-            : null,
+        desired.attachments.length > 8
+          ? "Remove images to meet the eight-image limit before saving."
+          : null,
       );
       setStatus(work.current.dirty ? "Local image changes not saved" : "Saved");
       if (isEmptyDraft(job, desired, pendingImagesRef.current)) scheduleAutosave();

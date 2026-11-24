@@ -16,6 +16,7 @@ use crate::db::entities::{
 
 pub(crate) const API_VERSION: &str = "2023-06-01";
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.anthropic.com/v1";
+pub(crate) const MAX_TEMPERATURE: f64 = 1.0;
 pub(crate) const DEFAULT_MAX_TOKENS: u32 = 16_384;
 
 pub(crate) fn max_tokens(parameters: &LlmParameters) -> u32 {
@@ -37,6 +38,15 @@ pub(crate) fn parameter_refusal(
     }
     if parameters.frequency_penalty.is_some() {
         return Some(("frequency_penalty", UNSUPPORTED));
+    }
+    if parameters
+        .temperature
+        .is_some_and(|value| !(0.0..=MAX_TEMPERATURE).contains(&value))
+    {
+        return Some((
+            "temperature",
+            "Anthropic Messages requires temperature in 0..=1",
+        ));
     }
     if parameters.temperature.is_some() && parameters.top_p.is_some() {
         return Some((

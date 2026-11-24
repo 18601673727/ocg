@@ -146,6 +146,7 @@ export function SettingsSurface(props: {
   const [llmModel, setLlmModel] = createSignal("");
   const [llmProtocol, setLlmProtocol] = createSignal<LlmProtocol>("openai_chat_completions");
   const isAnthropic = () => llmProtocol() === "anthropic_messages";
+  const maxTemperature = () => (isAnthropic() ? 1 : 2);
   const [llmEndpoint, setLlmEndpoint] = createSignal("");
   const [llmCredentialRef, setLlmCredentialRef] = createSignal("");
   const [llmSecret, setLlmSecret] = createSignal("");
@@ -365,9 +366,9 @@ export function SettingsSurface(props: {
       const parsedTemp = llmTemperature().trim() === "" ? null : Number(llmTemperature().trim());
       if (
         parsedTemp !== null &&
-        (!Number.isFinite(parsedTemp) || parsedTemp < 0 || parsedTemp > 2)
+        (!Number.isFinite(parsedTemp) || parsedTemp < 0 || parsedTemp > maxTemperature())
       ) {
-        setLlmError(i18n.t("settings.llm.validation.temperature"));
+        setLlmError(i18n.t("settings.llm.validation.temperature", { max: maxTemperature() }));
         return;
       }
       const parsedTopP = llmTopP().trim() === "" ? null : Number(llmTopP().trim());
@@ -1010,8 +1011,12 @@ export function SettingsSurface(props: {
 
                             <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-4">
                               <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
-                                {i18n.t("settings.llm.temperature")}
+                                {i18n.t("settings.llm.temperature", { max: maxTemperature() })}
                                 <Input
+                                  type="number"
+                                  min={0}
+                                  max={maxTemperature()}
+                                  step="any"
                                   value={llmTemperature()}
                                   onInput={(e) => setLlmTemperature(e.target.value)}
                                   placeholder="0.7"

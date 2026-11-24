@@ -10,7 +10,9 @@ use crate::db::protection::{ProtectionReason, ProtectionWatch};
 use crate::db::redb::QueueCounts;
 use crate::db::redb::StorageError;
 use crate::db::scheduler_wake::SchedulerWakeSubscription;
-use crate::db::shared::{Admission, Opened, ReadJob, ReadMessage, Shared, admitted};
+use crate::db::shared::{
+    Admission, MaintenanceRequest, Opened, ReadJob, ReadMessage, Shared, admitted,
+};
 use crate::db::worker::{DatabaseHandle, run, settle};
 use crate::db::{errors, redb};
 use crate::host::data_directory::DataDirectory;
@@ -146,16 +148,19 @@ impl DatabaseHandle {
             let lock = self.shared.protection.lock(vec![reason.clone()]);
             *admission = Admission::Protected(lock);
         }
-        if let Err(error) = self
-            .maintenance_sender
-            .try_send(Maintenance::FilesystemFailure { reason })
-        {
+        if let Err(error) = self.maintenance_sender.try_send(MaintenanceRequest::new(
+            Maintenance::FilesystemFailure { reason },
+            self.shared.clone(),
+        )) {
             log::debug!("failed to enqueue filesystem protection maintenance notice: {error}");
         }
         true
     }
 
     pub(crate) fn pause_for_update(&self) -> Result<Option<UpdatePause>, DatabaseError> {
+        if self.shared.in_flight_maintenance.load(Ordering::SeqCst) != 0 {
+            return Ok(None);
+        }
         let _staging = self
             .shared
             .staging
@@ -183,6 +188,8 @@ impl DatabaseHandle {
             || counts.running != 0
             || counts.held != 0
             || !self.sender.is_empty()
+            || !self.maintenance_sender.is_empty()
+            || self.shared.in_flight_maintenance.load(Ordering::SeqCst) != 0
             || self.shared.in_flight_commands.load(Ordering::SeqCst) != 0
         {
             return Ok(None);
@@ -416,9 +423,15 @@ impl DatabaseHandle {
                 .admission
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
+            if self.shared.update_paused.load(Ordering::SeqCst) {
+                return Err(MaintenanceError::ShuttingDown);
+            }
             admission.check_maintenance()?;
             self.maintenance_sender
-                .try_send(Maintenance::CompactStorage(reply))
+                .try_send(MaintenanceRequest::new(
+                    Maintenance::CompactStorage(reply),
+                    self.shared.clone(),
+                ))
                 .map_err(|error| match error {
                     flume::TrySendError::Full(_) => MaintenanceError::MaintenanceQueueFull,
                     flume::TrySendError::Disconnected(_) => MaintenanceError::WorkerStopped,

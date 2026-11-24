@@ -1,5 +1,5 @@
 import { ContractError, type Conversation, type Output } from "../../contracts";
-import { type JobStreamSubscription, readTranscriptEvidence } from "../api-client";
+import { ApiError, type JobStreamSubscription, readTranscriptEvidence } from "../api-client";
 import { reconcileJob } from "../job-status";
 import type { PublishScheduler } from "./publish-scheduler";
 import { needsWatch, TURN_PAGE_SIZE, type Turn, turnAttachments } from "./turn";
@@ -255,9 +255,23 @@ export class TurnStreams {
         }
       } catch (error) {
         if (!signal.aborted && !entry.stopped) {
-          recoveryAfter = Date.now() + recoveryDelay;
-          recoveryDelay = Math.min(recoveryDelay * 2, MAX_RECOVERY_DELAY_MS);
-          turn.error = `Status refresh unavailable: ${error instanceof Error ? error.message : String(error)}. Displayed state may be stale.${needsReplay ? " Reload to retry now." : ""}`;
+          const detail = error instanceof Error ? error.message : String(error);
+          if (
+            error instanceof ContractError ||
+            (error instanceof ApiError &&
+              (error.code === "not_found" ||
+                (error.status >= 400 &&
+                  error.status < 500 &&
+                  ![401, 408, 429].includes(error.status))))
+          ) {
+            recoveryAfter = 0;
+            finish();
+            turn.error = `Status refresh stopped: ${detail}. Displayed state may be stale.`;
+          } else {
+            recoveryAfter = Date.now() + recoveryDelay;
+            recoveryDelay = Math.min(recoveryDelay * 2, MAX_RECOVERY_DELAY_MS);
+            turn.error = `Status refresh unavailable: ${detail}. Displayed state may be stale.${needsReplay ? " Reload to retry now." : ""}`;
+          }
           this.publications.publish(turn.sessionId);
         }
       } finally {

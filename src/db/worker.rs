@@ -21,8 +21,8 @@ use crate::db::redb::{
 };
 use crate::db::scheduler_wake::{SchedulerWake, affects_scheduling};
 use crate::db::shared::{
-    Admission, Opened, ReadMessage, ReadWorkerExit, ReleaseOnPanic, Shared, StagingBarrier,
-    flush_staged, serve_reads,
+    Admission, MaintenanceRequest, Opened, ReadMessage, ReadWorkerExit, ReleaseOnPanic, Shared,
+    StagingBarrier, flush_staged, serve_reads,
 };
 use crate::db::{entities, redb};
 use crate::host::data_directory::DataDirectory;
@@ -146,7 +146,7 @@ pub struct DatabaseWorker {
 pub struct DatabaseHandle {
     pub(super) sender: flume::Sender<Message>,
     pub(super) read_sender: flume::Sender<ReadMessage>,
-    pub(super) maintenance_sender: flume::Sender<Maintenance>,
+    pub(super) maintenance_sender: flume::Sender<MaintenanceRequest>,
     pub(super) shared: Arc<Shared>,
 }
 
@@ -280,6 +280,7 @@ impl DatabaseWorker {
                     reclamation_omitted_at_open: reclamation.omitted,
                     probes: std::sync::Mutex::new(std::collections::HashMap::new()),
                     in_flight_commands: AtomicUsize::new(0),
+                    in_flight_maintenance: AtomicUsize::new(0),
                     credential_key: credential_key_cell,
                     credential_key_writer: std::sync::Mutex::new(()),
                     undecryptable_credentials_at_open,
@@ -449,7 +450,7 @@ pub(super) fn space_shortfalls(
 pub(super) struct WriteWorker {
     pub(super) shared: Arc<Shared>,
     pub(super) receiver: flume::Receiver<Message>,
-    pub(super) maintenance: flume::Receiver<Maintenance>,
+    pub(super) maintenance: flume::Receiver<MaintenanceRequest>,
     pub(super) directory: PathBuf,
     pub(super) paths: [(ProtectedArea, PathBuf); 3],
     pub(super) config: FilesystemConfig,
@@ -467,7 +468,7 @@ pub(super) enum SpaceRefusal {
 }
 
 pub(super) enum Event {
-    Maintenance(Result<Maintenance, flume::RecvError>),
+    Maintenance(Result<MaintenanceRequest, flume::RecvError>),
     Message(Result<Message, flume::RecvError>),
     CheckDue,
 }
@@ -507,8 +508,8 @@ impl WriteWorker {
         }
     }
 
-    pub(super) fn handle(&mut self, maintenance: Maintenance) {
-        match maintenance {
+    pub(super) fn handle(&mut self, maintenance: MaintenanceRequest) {
+        match maintenance.message {
             Maintenance::FilesystemFailure { reason } => {
                 let active = matches!(
                     self.shared.admission(),
@@ -519,7 +520,11 @@ impl WriteWorker {
                 }
             }
             Maintenance::CompactStorage(reply) => {
-                let result = self.compact_storage();
+                let result = if self.shared.update_paused.load(Ordering::SeqCst) {
+                    Err(MaintenanceError::ShuttingDown)
+                } else {
+                    self.compact_storage()
+                };
                 send_reply(&reply, result);
             }
         }
@@ -1133,7 +1138,7 @@ impl WriteWorker {
             }
         }
         for maintenance in self.maintenance.drain() {
-            maintenance.refuse_policy(false);
+            maintenance.message.refuse_policy(false);
         }
         self.shared.protection.close();
         match self.storage_failure {

@@ -116,8 +116,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         this.listedRoots.has(session.conversationId) &&
         !visible.has(session.conversationId)
       ) {
-        this.removeSession(session.id);
-        this.roots.delete(session.conversationId);
+        this.evictSession(session.id, session.conversationId);
       }
     }
     this.listedRoots = visible;
@@ -207,6 +206,17 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   private removeSession(sessionId: string) {
     this.publications.cancel(sessionId);
     this.emit({ type: "conversation.session-deleted", sessionId });
+  }
+
+  private evictSession(sessionId: string, root: string) {
+    this.selections.delete(sessionId);
+    this.earlier.delete(sessionId);
+    this.loadingEarlier.delete(sessionId);
+    this.tips.delete(sessionId);
+    this.roots.delete(root);
+    this.unlisted.delete(sessionId);
+    this.evictTurns((_, turn) => turn.sessionId === sessionId);
+    this.removeSession(sessionId);
   }
 
   private sessionRoot(sessionId: string): string {
@@ -305,13 +315,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       await this.api.editConversation(root, { hidden: true }, this.lifetime.signal);
       this.hiddenRoots.add(root);
       this.listedRoots.delete(root);
-      this.selections.delete(sessionId);
-      this.earlier.delete(sessionId);
-      this.loadingEarlier.delete(sessionId);
-      this.removeSession(sessionId);
-      this.evictTurns((_, turn) => turn.sessionId === sessionId);
-      this.tips.delete(sessionId);
-      this.roots.delete(root);
+      this.evictSession(sessionId, root);
     } finally {
       this.hiding.delete(sessionId);
     }
@@ -403,12 +407,15 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   }
 
   private async readConversation(job: string): Promise<string> {
+    const sessionsAtStart = this.getSnapshot().sessions;
     const root = await this.api.resolveConversation(job, this.lifetime.signal);
     const signal = this.lifetime.signal;
     const [page, state] = await Promise.all([
       this.api.readConversationTurns(root, undefined, TURN_PAGE_SIZE, signal),
       this.roots.has(root) ? undefined : this.api.readExecutionState(root, { signal }),
     ]);
+    const original = sessionsAtStart.find((session) => session.conversationId === root);
+    if (this.disposed || (original && !this.roots.has(root))) return original?.id ?? root;
     const conversation = { ...page, turns: [...page.turns].reverse() };
     const hiddenBefore = this.hiddenRoots.has(root);
     const id = this.roots.get(root) ?? root;
