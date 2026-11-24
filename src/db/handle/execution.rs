@@ -666,14 +666,47 @@ impl DatabaseHandle {
         &self,
         handoff: &DevelopmentHandoff,
         cause: entities::UncertaintyReason,
+        failure: Option<entities::AvailabilityStat>,
     ) -> Result<(), DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
+        if let Some(secret) = &handoff.prepared.credentials.spellings
+            && let Some(observation) = failure.as_ref().map(|stat| &stat.observation)
+            && [
+                observation.raw_finish_reason.as_deref(),
+                observation
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.message.as_str()),
+                observation
+                    .failure
+                    .as_ref()
+                    .and_then(|failure| failure.provider_code.as_deref()),
+                observation
+                    .failure
+                    .as_ref()
+                    .and_then(|failure| failure.response_body.as_deref()),
+                observation
+                    .failure
+                    .as_ref()
+                    .and_then(|failure| failure.request_id.as_deref()),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|text| secret.found_in(text))
+        {
+            return Err(DatabaseError::Rejected(Violation::InvalidValue(
+                "outcome",
+                "failure evidence contains credential material",
+            )));
+        }
         let result = self
-            .write(
-                0,
+            .write_sized(
+                (proof, cause, failure),
+                |(_, _, failure)| failure.as_ref().map_or(0, debug_bytes),
                 OperationKind::FinalizeJob,
-                (proof, cause),
-                |batch, (proof, cause)| batch.record_development_uncertain(&proof, cause),
+                |batch, (proof, cause, failure)| {
+                    batch.record_development_uncertain(&proof, cause, failure)
+                },
             )
             .await;
         guard.known = !matches!(result, Err(DatabaseError::OutcomeUnknown { .. }));

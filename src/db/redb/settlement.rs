@@ -17,7 +17,7 @@ use crate::db::redb::reservations::mutable_configuration_requirement;
 use crate::db::redb::rows::decode_output;
 use crate::db::redb::schema::{
     CHILDREN, CONVERSATIONS, DEPENDENCY_WAITERS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, META,
-    MUTABLE_READY, RECURRENCE_DUE, RECURRENCES,
+    MUTABLE_READY, RECURRENCE_DUE, RECURRENCES, TURNS,
 };
 use crate::db::redb::{reads, state};
 use ::redb::{Database, ReadableTable};
@@ -550,6 +550,45 @@ impl Batch {
         Ok(policy.enabled.then_some((project_id, project, policy)))
     }
 
+    fn planning_task_context(
+        &mut self,
+        job: &crate::db::entities::MutableJob,
+    ) -> Result<String, BatchError> {
+        let mut context = self.step(|tx| {
+            let first = reads::jobs::turn_first(&tx.open_table(TURNS)?, job.parent_id)?;
+            let jobs = tx.open_table(JOBS)?;
+            let mut context = String::new();
+            for (label, source, limit) in [
+                ("Original task", first.filter(|id| *id != job.id), 4096),
+                (
+                    "Previous request",
+                    job.previous
+                        .filter(|id| Some(*id) != first && *id != job.id),
+                    2048,
+                ),
+            ] {
+                let Some(source) = source else { continue };
+                let row = jobs
+                    .get(source.get())?
+                    .ok_or_else(|| StorageError::corrupted("planning context turn is missing"))?;
+                let source = decode_mutable_job(source.get(), row.value())?;
+                if source.parent_id != job.parent_id {
+                    return Err(StorageError::corrupted(
+                        "planning context crosses conversations",
+                    ));
+                }
+                context.push_str(label);
+                context.push_str(":\n");
+                context.extend(source.input.text().chars().take(limit));
+                context.push_str("\n\n");
+            }
+            Ok(context)
+        })?;
+        context.push_str("Current request:\n");
+        context.extend(job.input.text().chars().take(4096));
+        Ok(context)
+    }
+
     pub(super) fn maybe_attach_planning_decision(
         &mut self,
         parent: &JobSpec,
@@ -583,11 +622,11 @@ impl Batch {
         };
         let wrapped = FrozenConfiguration::Decision(frozen_decision.clone());
         let storable = self.storable_frozen(&wrapped)?;
+        let task = self.planning_task_context(job)?;
         let request = DecisionRequest {
             question: DecisionQuestion::Choice {
                 prompt: format!(
-                    "Decide whether the task below can run directly or requires structured job_plan planning before side-effecting tools.\nTask: {}",
-                    job.input.text()
+                    "Decide whether the current request can run directly or requires structured job_plan planning before side-effecting tools. Interpret follow-ups such as continue in the context of the original task and previous request.\n\n{task}"
                 ),
                 options: vec![
                     ChoiceOption {
@@ -744,6 +783,19 @@ impl Batch {
                 "planning decision outcome unusable; side-effecting tool refused",
             ));
         };
+        let has_plan = self.previous_tool_evidence(call)?.iter().any(|prev| {
+            prev.name == "job_plan"
+                && matches!(prev.decision.fact, ToolDecision::Admitted(_))
+                && !prev.outcome.as_ref().is_some_and(|o| {
+                    matches!(
+                        o.fact,
+                        ToolOutcome::NotApplied { .. } | ToolOutcome::NotInvoked { .. }
+                    )
+                })
+        });
+        if has_plan {
+            return Ok(());
+        }
         if let Some(conf) = confidence
             && (conf.value * 1000.0) < f64::from(policy.minimum_confidence_millis)
         {
@@ -755,16 +807,6 @@ impl Batch {
         if selected == "direct" {
             return Ok(());
         }
-        let has_plan = self.previous_tool_evidence(call)?.iter().any(|prev| {
-            prev.name == "job_plan"
-                && matches!(prev.decision.fact, ToolDecision::Admitted(_))
-                && !prev.outcome.as_ref().is_some_and(|o| {
-                    matches!(
-                        o.fact,
-                        ToolOutcome::NotApplied { .. } | ToolOutcome::NotInvoked { .. }
-                    )
-                })
-        });
         if !has_plan {
             return self.reject(Violation::InvalidValue(
                 "job_plan",

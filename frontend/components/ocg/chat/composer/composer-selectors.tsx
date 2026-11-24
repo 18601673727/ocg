@@ -27,11 +27,14 @@ export function ComposerSelectors(props: {
         selection={composer.selection}
         onChange={(value) => {
           const projectChanged = value.project !== composer.selection?.project;
-          composer.onSelectionChange(value);
-          if (draft.ready() && explicit) {
-            explicit = false;
-            if (!projectChanged) draft.configure(value);
+          const manual = draft.ready() && explicit;
+          explicit = false;
+          if (manual && projectChanged) {
+            void draft.changeProject(value);
+            return;
           }
+          composer.onSelectionChange(value);
+          if (manual) draft.configure(value);
         }}
         onPreference={composer.onPreference}
         onSupportChange={draft.modelSupport}
@@ -45,7 +48,11 @@ export function ComposerSelectors(props: {
                 ? t("chat.draft.saving")
                 : undefined
         }
-        projectLocked={Boolean(composer.conversation || draft.confirmed() || draft.association())}
+        projectLocked={Boolean(
+          composer.conversation ||
+            draft.association()?.conversation ||
+            (draft.confirmed() && draft.confirmed()!.phase !== "unsubmitted"),
+        )}
         lockedProject={
           draft.confirmed()
             ? draft.confirmed()!.project

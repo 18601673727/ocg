@@ -19,7 +19,7 @@ import { ContextTranscript } from "./context-transcript";
 import { ConversationArtifacts } from "./conversation-artifacts";
 import { ConversationView, useConversationView, useThreadMessage } from "./conversation-view";
 import { DecisionDetails } from "./decision-details";
-import { FileChanges } from "./file-changes";
+import { FileChanges, FileChangesProvider } from "./file-changes";
 import { readModelPreference, writeModelPreference } from "./model-preference";
 import { contextForSession, MutableComposer } from "./mutable-composer";
 import { planningBlocker } from "./planning-decision";
@@ -267,36 +267,40 @@ export const ChatScreen: Component<ChatScreenProps> = (props) => {
   };
   return (
     <ConversationView sessionId={props.session.id}>
-      <ChatComposerContext value={composerValue}>
-        <div class="flex h-full min-h-0 w-full flex-col">
-          <Thread
-            Assistant={ChatAssistantMessage}
-            Composer={
-              props.session.archived || props.session.closed ? HistoryComposer : ChatComposerSlot
-            }
-            Welcome={Welcome}
-            footerAction={props.backButton}
-            afterMessages={
-              <>
-                <ContextTranscript conversation={props.session.conversationId} />
-                {selectedPlanPlanJobId().plan && <TaskStatus plan={selectedPlanPlanJobId().plan} />}
-                <ConversationArtifacts sessionId={props.session.id} />
-                <ConversationCardStrip
-                  turn={props.session.sessionId}
-                  conversationId={props.session.conversationId}
-                  onOpen={props.onOpenConversation}
-                />
-                <ConversationChildrenStrip
-                  conversationId={props.session.conversationId}
-                  turn={props.session.sessionId}
-                  plan={selectedPlanPlanJobId().plan}
-                  onOpen={props.onOpenConversation}
-                />
-              </>
-            }
-          />
-        </div>
-      </ChatComposerContext>
+      <FileChangesProvider>
+        <ChatComposerContext value={composerValue}>
+          <div class="flex h-full min-h-0 w-full flex-col">
+            <Thread
+              Assistant={ChatAssistantMessage}
+              Composer={
+                props.session.archived || props.session.closed ? HistoryComposer : ChatComposerSlot
+              }
+              Welcome={Welcome}
+              footerAction={props.backButton}
+              afterMessages={
+                <>
+                  <ContextTranscript conversation={props.session.conversationId} />
+                  {selectedPlanPlanJobId().plan && (
+                    <TaskStatus plan={selectedPlanPlanJobId().plan} />
+                  )}
+                  <ConversationArtifacts sessionId={props.session.id} />
+                  <ConversationCardStrip
+                    turn={props.session.sessionId}
+                    conversationId={props.session.conversationId}
+                    onOpen={props.onOpenConversation}
+                  />
+                  <ConversationChildrenStrip
+                    conversationId={props.session.conversationId}
+                    turn={props.session.sessionId}
+                    plan={selectedPlanPlanJobId().plan}
+                    onOpen={props.onOpenConversation}
+                  />
+                </>
+              }
+            />
+          </div>
+        </ChatComposerContext>
+      </FileChangesProvider>
     </ConversationView>
   );
 };

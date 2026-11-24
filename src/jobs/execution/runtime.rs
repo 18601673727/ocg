@@ -578,6 +578,7 @@ async fn settle_tool_stop(
             .record_development_uncertain(
                 handoff,
                 cancellation_uncertainty(cancellation, crate::db::entities::UncertaintyReason::StopRequestedWithoutConfirmedTermination),
+                None,
             )
             .await?;
         return Err(DatabaseError::Rejected(Violation::InvalidValue(
@@ -886,10 +887,20 @@ async fn settle_development_error(
         }
         DevelopmentSettlement::Held(reason) => {
             let cancellation = config.cancellation.reason();
+            let failure = matches!(&error, ProviderExecutionError::Rejected { .. })
+                .then(|| providers::error_observations(&error).into_iter().next())
+                .flatten()
+                .map(|observation| AvailabilityStat {
+                    job: handoff.token().job,
+                    request,
+                    observed_at: Timestamp::now(),
+                    observation,
+                });
             database
                 .record_development_uncertain(
                     handoff,
                     cancellation_uncertainty(cancellation, reason),
+                    failure,
                 )
                 .await?;
             Err(DatabaseError::Rejected(Violation::InvalidValue(
@@ -930,6 +941,7 @@ async fn settle_development_unsent(
             .record_development_uncertain(
                 handoff,
                 cancellation_uncertainty(cancellation, UncertaintyReason::RequestPossiblySent),
+                None,
             )
             .await?;
         return Err(DatabaseError::Rejected(Violation::InvalidValue(

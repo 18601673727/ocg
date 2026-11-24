@@ -140,7 +140,8 @@ impl ActivityProjection {
                 self.unknown_done = true;
             } else if let RequestPayload::Availability { failure, .. } = &event.payload {
                 if let Some(failure) = failure {
-                    let mut reason = String::new();
+                    let mut reason = failure.to_string();
+                    reason.push('\n');
                     if let Some(code) = &failure.provider_code {
                         reason.push_str("Provider code: ");
                         reason.push_str(code);
@@ -151,7 +152,12 @@ impl ActivityProjection {
                         reason.push_str(request_id);
                         reason.push_str(". ");
                     }
-                    reason.push_str(&failure.message);
+                    if let Some(body) = &failure.response_body
+                        && body != &failure.message
+                    {
+                        reason.push('\n');
+                        reason.push_str(body);
+                    }
                     self.unknown_reason = Some(cut_unknown_reason(&reason));
                 }
                 self.unknown_done = true;

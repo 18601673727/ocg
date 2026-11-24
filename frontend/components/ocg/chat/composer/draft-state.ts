@@ -2,7 +2,12 @@ import { createEffect, createMemo, createSignal } from "solid-js";
 import { elementRef } from "@/lib/ui-state";
 import type { ChatImage, ChatModelSelection } from "../../contracts";
 import { useI18n } from "../../i18n";
-import { ApiError, type MutableJob, type MutableJobInput } from "../../runtime/api-client";
+import {
+  ApiError,
+  configurationIdentity,
+  type MutableJob,
+  type MutableJobInput,
+} from "../../runtime/api-client";
 import { useOcgRuntime } from "../../runtime/runtime-context";
 import { useConversationView } from "../conversation-view";
 import type { ModelSupport } from "../model-selector";
@@ -453,6 +458,23 @@ export function createComposerDraft(props: ComposerProps) {
     () => cancelAutosave,
   );
 
+  async function discardJob(job: MutableJob) {
+    try {
+      await api.discardMutableJob(job.context, job.id, job.revision);
+    } catch (cause) {
+      if (
+        cause instanceof ApiError &&
+        cause.status >= 400 &&
+        cause.status < 500 &&
+        cause.status !== 404
+      ) {
+        throw cause;
+      }
+      const current = await api.currentMutableJob(job.context).catch(() => undefined);
+      if (current !== null) throw cause;
+    }
+  }
+
   const flush = async function flushWork(autosave = false): Promise<void> {
     if (!autosave) cancelAutosave();
     else if (!alive.current || autosaveTimer.current !== null) return;
@@ -502,20 +524,7 @@ export function createComposerDraft(props: ComposerProps) {
             rememberUnfinished(state.context);
           } else if (isEmptyDraft(state.job, state.desired, pendingImagesRef.current)) {
             const id = state.job.id;
-            try {
-              await api.discardMutableJob(state.context, id, state.job.revision);
-            } catch (cause) {
-              if (
-                cause instanceof ApiError &&
-                cause.status >= 400 &&
-                cause.status < 500 &&
-                cause.status !== 404
-              ) {
-                throw cause;
-              }
-              const current = await api.currentMutableJob(state.context).catch(() => undefined);
-              if (current !== null) throw cause;
-            }
+            await discardJob(state.job);
             forgetUnfinished(state.context);
             state.context = rotateContext(props.sessionId, scope.current.conversation);
             state.job = null;
@@ -1062,6 +1071,91 @@ export function createComposerDraft(props: ComposerProps) {
   function configure(value: ChatModelSelection) {
     change({ ...work.current.desired, configuration: config(value) });
   }
+  async function changeProject(value: ChatModelSelection) {
+    const state = work.current;
+    if (
+      !api ||
+      !ready() ||
+      busy() ||
+      busyRef.current ||
+      uncertain() ||
+      state.conflict ||
+      props.conversation ||
+      state.association?.conversation ||
+      (state.job && state.job.phase !== "unsubmitted")
+    )
+      return;
+    cancelAutosave();
+    setBusy(true);
+    setError(null);
+    let replacement: MutableJob | null = null;
+    try {
+      // Let pending uploads update the input before freezing the replacement draft.
+      if (uploadTask.current) await uploadTask.current;
+      cancelAutosave();
+      busyRef.current = true;
+      await state.promise;
+      if (state.initial && !state.job) await flush();
+      if (!alive.current || work.current !== state) return;
+      if (state.job && state.job.phase !== "unsubmitted")
+        throw new Error(t("chat.draft.notUnsubmitted", { phase: state.job.phase }));
+      const desired = structuredClone({ ...state.desired, configuration: config(value) });
+      if (state.job || hasDraftContent(desired)) {
+        const context = configurationIdentity();
+        const association = value.project ? { project: value.project } : {};
+        let created: MutableJob;
+        try {
+          created = await api.createMutableJob(context, desired, `create-${context}`, association);
+        } catch (cause) {
+          const observed = await api.currentMutableJob(context).catch(() => null);
+          if (!observed) throw cause;
+          created = observed;
+        }
+        if (
+          created.phase !== "unsubmitted" ||
+          created.project !== (value.project ?? null) ||
+          !same(created.input, desired)
+        )
+          throw new ApiError("mutable_job_conflict", 409, false);
+        replacement = created;
+        rememberUnfinished(context);
+        // Persist the new draft before removing the old one so a failed switch keeps the input.
+        if (state.job) await discardJob(state.job);
+        const oldJob = state.job?.id;
+        forgetUnfinished(state.context);
+        clearGlobalContext(state.context);
+        state.context = context;
+        state.job = replacement;
+        state.initial = null;
+        state.association = association;
+        bindComposerContext(props.sessionId, context);
+        replacement = null;
+        setConfirmed(state.job);
+        setUnfinished((jobs) => jobs.filter((job) => job.id !== oldJob));
+      }
+      scope.current = { conversation: undefined, project: value.project };
+      state.desired = desired;
+      state.dirty = state.job ? !same(state.job.input, desired) : hasDraftContent(desired);
+      setInput(desired);
+      props.onSelectionChange(value);
+    } catch (cause) {
+      if (replacement) {
+        try {
+          await discardJob(replacement);
+          forgetUnfinished(replacement.context);
+        } catch {
+          // Keep its recovery pointer if removing the unused replacement cannot be confirmed.
+        }
+      }
+      if (alive.current) setError(errorMessage(cause));
+    } finally {
+      busyRef.current = false;
+      if (alive.current) {
+        setBusy(false);
+        if (work.current === state && state.dirty) scheduleAutosave();
+      }
+    }
+  }
   return {
     input,
     confirmed,
@@ -1079,6 +1173,7 @@ export function createComposerDraft(props: ComposerProps) {
     canAttach,
     modelSupport,
     configure,
+    changeProject,
     association: () => work.current.association,
     queued,
     unfinished,

@@ -951,9 +951,13 @@ impl Batch {
         &mut self,
         proof: &crate::db::handoff::DevelopmentWriteProof,
         cause: crate::db::entities::UncertaintyReason,
+        failure: Option<crate::db::entities::AvailabilityStat>,
     ) -> Result<(), BatchError> {
         self.require_development_write_for(proof, None)?;
         let token = proof.token();
+        if let Some(failure) = failure {
+            self.record_development_provider_failure(token.job, failure)?;
+        }
         self.transition_pool_allocation(
             token,
             crate::db::entities::AllocationPhase::Uncertain,

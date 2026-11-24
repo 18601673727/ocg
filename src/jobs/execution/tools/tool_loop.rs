@@ -333,6 +333,7 @@ pub(crate) async fn answer_calls(
                     Violation::InvalidValue(
                         "job_plan",
                         "project decision policy requires job_plan before side-effecting tools"
+                            | "planning decision confidence below policy minimum; call job_plan first"
                     )
                 ) {
                     let refusal = InvalidToolCall::at(
