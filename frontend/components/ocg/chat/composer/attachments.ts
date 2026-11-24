@@ -4,7 +4,7 @@ import type { ChatImage } from "../../contracts";
 import type { ApiClient } from "../../runtime/api-client";
 import type { ConversationRuntimeClient } from "../../runtime/conversation-client";
 export const IMAGE_TYPES = ["image/png", "image/jpeg", "image/gif", "image/webp"];
-export type PendingImage = { file: File; url: string; failed: boolean };
+export type PendingImage = { file: File; url: string; failed: boolean; progress: number };
 function fileData(file: File): Promise<string> {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
@@ -60,7 +60,7 @@ export function createAttachmentQueue(
     if (!client.uploadChatImage) {
       setPending(
         pendingImagesRef.current.map((item) =>
-          pending.includes(item) ? { ...item, failed: true } : item,
+          pending.some((entry) => entry.url === item.url) ? { ...item, failed: true } : item,
         ),
       );
       setError("Image upload is unavailable.");
@@ -69,18 +69,28 @@ export function createAttachmentQueue(
     setUploading((n) => n + pending.length);
     for (const item of pending) {
       try {
-        const image = await client.uploadChatImage({
-          project_id: "",
-          name: item.file.name,
-          data_url: await fileData(item.file),
-        });
-        setPending(pendingImagesRef.current.filter((entry) => entry !== item));
+        const image = await client.uploadChatImage(
+          {
+            project_id: "",
+            name: item.file.name,
+            data_url: await fileData(item.file),
+          },
+          undefined,
+          (progress) => {
+            setPending(
+              pendingImagesRef.current.map((entry) =>
+                entry.url === item.url ? { ...entry, progress } : entry,
+              ),
+            );
+          },
+        );
+        setPending(pendingImagesRef.current.filter((entry) => entry.url !== item.url));
         URL.revokeObjectURL(item.url);
         onUpload(image);
       } catch (cause) {
         setPending(
           pendingImagesRef.current.map((entry) =>
-            entry === item ? { ...entry, failed: true } : entry,
+            entry.url === item.url ? { ...entry, failed: true } : entry,
           ),
         );
         if (isAlive()) setError(cause instanceof Error ? cause.message : String(cause));
@@ -107,6 +117,7 @@ export function createAttachmentQueue(
       file,
       url: URL.createObjectURL(file),
       failed: false,
+      progress: 0,
     }));
     setPending([...pendingImagesRef.current, ...selected]);
     startUploads(selected);
@@ -118,7 +129,7 @@ export function createAttachmentQueue(
   function retryUploads() {
     const retry = pendingImagesRef.current
       .filter((item) => item.failed)
-      .map((item) => ({ ...item, failed: false }));
+      .map((item) => ({ ...item, failed: false, progress: 0 }));
     setPending([...pendingImagesRef.current.filter((item) => !item.failed), ...retry]);
     startUploads(retry);
   }

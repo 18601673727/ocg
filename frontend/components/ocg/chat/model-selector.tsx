@@ -1,25 +1,26 @@
-import { ExternalLink } from "@lucide/solid";
 import { createEffect, createMemo, createSignal } from "solid-js";
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { type Ref } from "@/lib/ui-state";
 import type { AgentProfile, ChatModelSelection, Project } from "../contracts";
 import { useI18n } from "../i18n";
 import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context";
-import { settingsPath } from "../settings/settings-sections";
 import { ModelSelectorView } from "./model-selector-view";
 
 const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 type Catalog = { agents: AgentProfile[]; projects: Project[] };
 
-export type ModelImageSupport = { llmProfile: string | undefined; supported: boolean };
+export type ModelSupport = {
+  llmProfile: string | undefined;
+  images: boolean;
+  notice?: string;
+};
 
 export function ModelSelector(props: {
   sessionId?: string;
   selection?: ChatModelSelection;
   onChange: (selection: ChatModelSelection) => void;
   onPreference?: (selection: ChatModelSelection) => void;
-  onImageSupportChange: (support: ModelImageSupport) => void;
+  onSupportChange: (support: ModelSupport) => void;
   busy: boolean;
   projectLocked?: boolean;
   lockedProject?: string | null;
@@ -103,12 +104,6 @@ export function ModelSelector(props: {
   const agentId = createMemo(() => agent()?.id);
   const llmId = createMemo(() => llm()?.id);
   const supportsImages = createMemo(() => llm()?.declared_capabilities.includes("vision") ?? false);
-  createEffect(
-    () => [llmId(), supportsImages(), props.onImageSupportChange],
-    () => {
-      props.onImageSupportChange({ llmProfile: llmId(), supported: supportsImages() });
-    },
-  );
   const model = createMemo(() => llm()?.model);
   const efforts = createMemo(
     () =>
@@ -134,6 +129,27 @@ export function ModelSelector(props: {
         !error() &&
         !agent(),
     ),
+  );
+  const notice = createMemo(
+    () =>
+      error() ??
+      (catalog() && fixedAgent() && !agent()
+        ? i18n.t("chat.agentUnavailable")
+        : needsSetup()
+          ? i18n.t("chat.setupModels")
+          : llm() && !llm().declared_capabilities.includes("tools")
+            ? i18n.t("chat.toolsWarning")
+            : undefined),
+  );
+  createEffect(
+    () => [llmId(), supportsImages(), notice()],
+    () => {
+      props.onSupportChange({
+        llmProfile: llmId(),
+        images: supportsImages(),
+        notice: notice(),
+      });
+    },
   );
   createEffect(
     () => [needsSetup()],
@@ -218,10 +234,6 @@ export function ModelSelector(props: {
         }
         disabled={disabled()}
         loading={!catalog() && !error()}
-        error={
-          error() ??
-          (catalog() && fixedAgent() && !agent() ? i18n.t("chat.agentUnavailable") : undefined)
-        }
         providerLabel={i18n.t("chat.agent")}
         defaultEffort={llm()?.default_effort}
         project={{
@@ -274,27 +286,6 @@ export function ModelSelector(props: {
           },
         }}
       />
-      {needsSetup() && (
-        <a
-          href={settingsPath("models")}
-          target="_blank"
-          rel="noopener noreferrer"
-          class="mt-2 inline-flex items-start gap-1.5 rounded-sm px-1 text-xs leading-5 text-primary underline-offset-2 hover:underline focus-visible:outline-2 focus-visible:outline-ring"
-        >
-          <ExternalLink class="mt-0.5 size-3.5 shrink-0" aria-hidden="true" />
-          <span>
-            {i18n.t("chat.setupModels")}
-            <span class="sr-only"> ({i18n.t("chat.setupNewTab")})</span>
-          </span>
-        </a>
-      )}
-      {llm() && !llm().declared_capabilities.includes("tools") && (
-        <DismissibleNotice
-          tone="warning"
-          message={i18n.t("chat.toolsWarning")}
-          class="mt-1 px-1 text-xs text-muted-foreground"
-        />
-      )}
     </div>
   );
 }

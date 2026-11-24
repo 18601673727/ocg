@@ -345,7 +345,11 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     this.selections.set(sessionId, selection);
   }
 
-  async uploadChatImage(request: ChatImageUploadRequest, signal?: AbortSignal): Promise<ChatImage> {
+  async uploadChatImage(
+    request: ChatImageUploadRequest,
+    signal?: AbortSignal,
+    onUploadProgress?: (progress: number) => void,
+  ): Promise<ChatImage> {
     const match =
       /^data:(image\/png|image\/jpeg|image\/gif|image\/webp);base64,([A-Za-z0-9+/=]+)$/.exec(
         request.data_url,
@@ -364,6 +368,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     const attachment = await this.api.uploadAttachment(
       { mime, data_base64: data, display_name: request.name },
       signal,
+      onUploadProgress,
     );
     return {
       id: attachment.id,

@@ -76,7 +76,53 @@ export function createTransport(options: ApiClientOptions) {
     signal?: AbortSignal;
     context?: string;
     revision?: number;
+    onUploadProgress?: (progress: number) => void;
   };
+  function upload(
+    url: string,
+    body: string,
+    headers: Record<string, string>,
+    progress: (value: number) => void,
+    signal?: AbortSignal,
+  ): Promise<Response> {
+    return new Promise((resolve, reject) => {
+      signal?.throwIfAborted();
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", url);
+      xhr.withCredentials = !programmatic;
+      for (const [name, value] of Object.entries(headers)) xhr.setRequestHeader(name, value);
+      const abort = () => xhr.abort();
+      xhr.upload.onprogress = (event) => {
+        if (event.lengthComputable && event.total > 0) progress(event.loaded / event.total);
+      };
+      xhr.upload.onload = () => progress(1);
+      xhr.onload = () => {
+        if (xhr.responseURL !== url) {
+          reject(new ApiError("unexpected_redirect", 0, false));
+          return;
+        }
+        const responseHeaders = new Headers();
+        for (const line of xhr
+          .getAllResponseHeaders()
+          .trim()
+          .split(/[\r\n]+/)) {
+          const colon = line.indexOf(":");
+          if (colon > 0) responseHeaders.append(line.slice(0, colon), line.slice(colon + 1).trim());
+        }
+        resolve(
+          new Response(xhr.responseText || null, {
+            status: xhr.status,
+            headers: responseHeaders,
+          }),
+        );
+      };
+      xhr.onerror = () => reject(new ApiError("connection_lost", 0, true));
+      xhr.onabort = () => reject(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+      xhr.onloadend = () => signal?.removeEventListener("abort", abort);
+      signal?.addEventListener("abort", abort, { once: true });
+      xhr.send(body);
+    });
+  }
   async function request(
     method: "GET" | "POST" | "DELETE",
     path: string,
@@ -95,16 +141,26 @@ export function createTransport(options: ApiClientOptions) {
     }
     let response: Response;
     try {
-      response = await fetchImpl(`${base}${path}`, {
-        method,
-        headers,
-        signal: settings.signal,
-        ...(settings.body === undefined ? {} : { body: JSON.stringify(settings.body) }),
-        mode: "same-origin",
-        credentials: programmatic ? "omit" : "same-origin",
-        cache: "no-store",
-        redirect: "error",
-      });
+      const body = settings.body === undefined ? undefined : JSON.stringify(settings.body);
+      response =
+        method === "POST" && body !== undefined && settings.onUploadProgress
+          ? await upload(
+              `${base}${path}`,
+              body,
+              headers,
+              settings.onUploadProgress,
+              settings.signal,
+            )
+          : await fetchImpl(`${base}${path}`, {
+              method,
+              headers,
+              signal: settings.signal,
+              ...(body === undefined ? {} : { body }),
+              mode: "same-origin",
+              credentials: programmatic ? "omit" : "same-origin",
+              cache: "no-store",
+              redirect: "error",
+            });
     } catch {
       throw new ApiError("connection_lost", 0, true);
     }

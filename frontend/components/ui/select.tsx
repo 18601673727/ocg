@@ -3,6 +3,7 @@ import { createEffect } from "solid-js";
 import { splitProps } from "@/lib/ui-state";
 
 import { cn } from "@/lib/utils";
+import "./select.css";
 
 type OptionValue = string | number;
 type SelectProps<T extends OptionValue> = Omit<
@@ -39,7 +40,7 @@ export function Select<T extends OptionValue>(props: SelectProps<T>) {
       data-slot="select-trigger"
       data-size={local.size ?? "default"}
       class={cn(
-        "w-fit min-w-0 rounded-lg border border-transparent bg-muted/70 px-3 py-2 text-sm outline-none hover:bg-muted focus-visible:border-ring focus-visible:ring-1 focus-visible:ring-ring/50 disabled:cursor-not-allowed disabled:opacity-50 data-[size=default]:h-9 data-[size=sm]:h-8",
+        "ocg-select inline-flex w-fit min-w-0 items-center justify-between gap-3 rounded-lg border border-input bg-background px-3 py-1.5 pr-9 text-sm text-foreground outline-none transition-colors hover:bg-muted/60 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-50 data-[size=default]:h-9 data-[size=sm]:h-8",
         local.class,
       )}
       onChange={(event) => {

@@ -1,10 +1,8 @@
 import { ChevronDown, Cpu } from "@lucide/solid";
 import { createMemo, createUniqueId } from "solid-js";
-import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { Select, SelectItem } from "@/components/ui/select";
 import { ariaState, assignRef, type Ref } from "@/lib/ui-state";
 import { useI18n } from "../i18n";
-import { useConversationError } from "./conversation-errors";
 
 type SelectorField = {
   value: string;
@@ -19,7 +17,6 @@ export type ModelSelectorViewProps = {
   status: string;
   disabled: boolean;
   loading: boolean;
-  error?: string;
   project: SelectorField & { disabled: boolean; placeholder: string };
   provider: SelectorField;
   model: SelectorField;
@@ -30,7 +27,6 @@ export function ModelSelectorView(props: ModelSelectorViewProps) {
   const i18n = useI18n();
   const id = createUniqueId();
   let trigger: HTMLButtonElement | undefined;
-  const errorInHeader = useConversationError(() => props.error);
   const providerName = createMemo(
     () => props.provider.options.find((option) => option.value === props.provider.value)?.label,
   );
@@ -216,11 +212,6 @@ export function ModelSelectorView(props: ModelSelectorViewProps) {
           </div>
         </div>
       </fieldset>
-      {props.error && !errorInHeader() && (
-        <DismissibleNotice message={props.error} class="mt-2 break-words text-xs text-destructive">
-          {props.error}
-        </DismissibleNotice>
-      )}
     </div>
   );
 }

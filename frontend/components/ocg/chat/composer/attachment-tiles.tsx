@@ -32,6 +32,7 @@ export default function AttachmentTiles(props: { draft: ComposerDraft }) {
           name={item.file.name}
           isComposer
           isUploading={!item.failed}
+          uploadProgress={item.progress}
           isError={item.failed}
           errorMessage={item.failed ? "Upload failed" : undefined}
           remove={

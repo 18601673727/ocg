@@ -15,6 +15,7 @@ import {
 } from "@/components/ocg/runtime/api-client";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select, SelectItem } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { elementRef } from "@/lib/ui-state";
 import { type I18nKey, useI18n } from "../i18n";
@@ -1371,33 +1372,51 @@ export function PoolsSection(props: { client: ApiClient }) {
             </label>
             <label class="text-xs">
               {i18n.t("settings.pools.executorPool")}
-              <select
-                class="block h-9 rounded border bg-background px-2"
+              <Select
+                class="flex"
                 value={executorPool()}
-                onChange={(event) => setExecutorPool(event.target.value)}
+                items={[
+                  { value: "", label: "—" },
+                  ...(executorPool() && !pools()?.some((pool) => pool.id === executorPool())
+                    ? [{ value: executorPool(), label: executorPool() }]
+                    : []),
+                  ...(pools() ?? []).map((pool) => ({
+                    value: pool.id,
+                    label: `${pool.name} · ${pool.id}`,
+                  })),
+                ]}
+                onValueChange={(value) => setExecutorPool(value ?? "")}
               >
-                <option value="">—</option>
+                <SelectItem value="">—</SelectItem>
                 {executorPool() && !pools()?.some((pool) => pool.id === executorPool()) ? (
-                  <option value={executorPool()}>{executorPool()}</option>
+                  <SelectItem value={executorPool()}>{executorPool()}</SelectItem>
                 ) : null}
                 {pools()?.map((pool) => (
-                  <option value={pool.id}>
+                  <SelectItem value={pool.id}>
                     {pool.name} · {pool.id}
-                  </option>
+                  </SelectItem>
                 ))}
-              </select>
+              </Select>
             </label>
             <label class="text-xs">
               {i18n.t("settings.pools.executorCapability")}
-              <select
-                class="block h-9 rounded border bg-background px-2"
+              <Select
+                class="flex"
                 value={capability()}
-                onChange={(event) => setCapability(event.target.value)}
+                items={EXECUTOR_CAPABILITIES.map(({ key, label }) => ({
+                  value: key,
+                  label: label ?? i18n.t("settings.pools.operationDecision"),
+                }))}
+                onValueChange={(value) => {
+                  if (value !== null) setCapability(value);
+                }}
               >
                 {EXECUTOR_CAPABILITIES.map(({ key, label }) => (
-                  <option value={key}>{label ?? i18n.t("settings.pools.operationDecision")}</option>
+                  <SelectItem value={key}>
+                    {label ?? i18n.t("settings.pools.operationDecision")}
+                  </SelectItem>
                 ))}
-              </select>
+              </Select>
             </label>
             <Button
               type="button"

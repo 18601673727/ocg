@@ -184,11 +184,13 @@ export function createApiClient(options: ApiClientOptions) {
         display_name?: string;
       },
       signal?: AbortSignal,
+      onUploadProgress?: (progress: number) => void,
     ): Promise<Attachment> {
       const answer = await send("POST", "/api/v1/attachments", {
         body: payload,
         sign: true,
         signal,
+        onUploadProgress,
       });
       return (answer.input as { attachment: Attachment }).attachment;
     },

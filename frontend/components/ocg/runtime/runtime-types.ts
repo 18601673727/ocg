@@ -33,6 +33,7 @@ export interface OcgRuntimeClient {
   uploadChatImage?(
     request: import("../contracts").ChatImageUploadRequest,
     signal?: AbortSignal,
+    onUploadProgress?: (progress: number) => void,
   ): Promise<import("../contracts").ChatImage>;
   retryMessage(sessionId: string, messageId: string): Promise<void>;
   subscribe(listener: (event: OcgRuntimeEvent) => void): () => void;

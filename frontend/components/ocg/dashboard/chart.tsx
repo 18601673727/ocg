@@ -10,7 +10,6 @@ import { type ReliabilitySummary, summarizeReliability } from "./reliability-cha
 import { type RankedUsage, summarize } from "./usage-chart-data";
 
 const DAY_US = 86_400_000_000;
-const select = "rounded-md border border-input bg-background px-3 py-2 text-sm";
 type Bucket = "day" | "week";
 
 async function paginateCursor<Page>({
@@ -69,7 +68,6 @@ function ChartToolbar(props: {
           if (next !== null) props.onDaysChange(next);
         }}
         id={`${props.id}-period`}
-        class={select}
       >
         <SelectItem value={7}>{i18n.t("observations.last7")}</SelectItem>
         <SelectItem value={30}>{i18n.t("observations.last30")}</SelectItem>
@@ -86,7 +84,6 @@ function ChartToolbar(props: {
         ]}
         onValueChange={(next) => props.onBucketChange(next === "week" ? "week" : "day")}
         id={`${props.id}-bucket`}
-        class={select}
       >
         <SelectItem value="day">{i18n.t("observations.day")}</SelectItem>
         <SelectItem value="week">{i18n.t("observations.week")}</SelectItem>

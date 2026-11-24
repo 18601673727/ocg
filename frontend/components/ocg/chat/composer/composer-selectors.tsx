@@ -32,7 +32,7 @@ export function ComposerSelectors(props: {
           }
         }}
         onPreference={composer.onPreference}
-        onImageSupportChange={draft.imageSupport}
+        onSupportChange={draft.modelSupport}
         busy={draft.busy() || !draft.ready() || draft.uncertain() || draft.conflict()}
         statusText={
           draft.conflict()

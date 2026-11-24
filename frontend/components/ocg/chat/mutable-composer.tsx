@@ -26,7 +26,7 @@ export function MutableComposer(props: ComposerProps) {
   const {
     input,
     confirmed,
-    statusText,
+    statusInfo,
     error,
     busy,
     uncertain,
@@ -129,6 +129,52 @@ export function MutableComposer(props: ComposerProps) {
               </Loading>
             </Show>
           </ComposerAttachments>
+          {uncertain() && (
+            <div role="alert" class="text-xs text-destructive">
+              Submission outcome is uncertain.{" "}
+              <Button
+                type="button"
+                size="xs"
+                variant="ghost"
+                disabled={busy()}
+                onClick={() => void reconcileSubmission()}
+              >
+                Reconcile submission
+              </Button>
+            </div>
+          )}
+          {queueError() && (
+            <div role="alert" class="text-xs text-destructive">
+              {queueError()}
+              <Button type="button" size="xs" variant="ghost" onClick={() => void refreshQueue()}>
+                Retry
+              </Button>
+            </div>
+          )}
+          {(error() || conflict()) && (
+            <div role="alert" class="text-xs text-destructive">
+              {error()}{" "}
+              {!uncertain() && (
+                <Button
+                  type="button"
+                  size="xs"
+                  variant="ghost"
+                  disabled={busy() || (conflict() && uploading() > 0)}
+                  onClick={() =>
+                    !ready()
+                      ? window.location.reload()
+                      : conflict()
+                        ? void loadSaved()
+                        : (void flush().catch(() => {}),
+                          void refreshQueue(),
+                          void refreshUnfinished())
+                  }
+                >
+                  {!ready() ? "Reload" : conflict() ? "Load saved version" : "Retry"}
+                </Button>
+              )}
+            </div>
+          )}
           <textarea
             id="mutable-job-input"
             data-slot="composer-input"
@@ -197,7 +243,26 @@ export function MutableComposer(props: ComposerProps) {
               onClick={() => inputRef.current?.click()}
             />
             <ComposerSelectors composer={props} draft={draft} trigger={modelTriggerRef} />
-            <ComposerActions class="shrink-0">
+            <ComposerActions class="min-w-0 shrink-0">
+              <Show when={statusInfo().label || statusInfo().job}>
+                <p
+                  data-slot="composer-status"
+                  role="status"
+                  class="flex min-w-0 max-w-56 items-center gap-1.5 text-xs text-muted-foreground"
+                  title={[
+                    statusInfo().label,
+                    statusInfo().job,
+                    statusInfo().revision ? `revision ${statusInfo().revision}` : undefined,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")}
+                >
+                  <span class="truncate">{statusInfo().label}</span>
+                  <Show when={statusInfo().job}>
+                    {(job) => <span class="shrink-0 font-mono">#{job().slice(-8)}</span>}
+                  </Show>
+                </p>
+              </Show>
               {editingQueue() ? (
                 <Button type="submit" size="sm" disabled={sendDisabled()}>
                   Save queued Job
@@ -235,56 +300,6 @@ export function MutableComposer(props: ComposerProps) {
           </div>
         </Show>
       </form>
-
-      <p role="status" class="text-xs text-muted-foreground">
-        {pendingImages().length ? "Images not yet saved" : statusText()}
-        {confirmed() ? ` · revision ${confirmed()!.revision}` : ""}
-        {uploading() ? ` · uploading ${uploading()}` : ""}
-      </p>
-      {uncertain() && (
-        <div role="alert" class="text-xs text-destructive">
-          Submission outcome is uncertain.{" "}
-          <Button
-            type="button"
-            size="xs"
-            variant="ghost"
-            disabled={busy()}
-            onClick={() => void reconcileSubmission()}
-          >
-            Reconcile submission
-          </Button>
-        </div>
-      )}
-      {queueError() && (
-        <div role="alert" class="text-xs text-destructive">
-          {queueError()}
-          <Button type="button" size="xs" variant="ghost" onClick={() => void refreshQueue()}>
-            Retry
-          </Button>
-        </div>
-      )}
-      {error() && (
-        <div role="alert" class="text-xs text-destructive">
-          {error()}{" "}
-          {!uncertain() && (
-            <Button
-              type="button"
-              size="xs"
-              variant="ghost"
-              disabled={busy() || (conflict() && uploading() > 0)}
-              onClick={() =>
-                !ready()
-                  ? window.location.reload()
-                  : conflict()
-                    ? void loadSaved()
-                    : (void flush().catch(() => {}), void refreshQueue(), void refreshUnfinished())
-              }
-            >
-              {!ready() ? "Reload" : conflict() ? "Load saved version" : "Retry"}
-            </Button>
-          )}
-        </div>
-      )}
     </Composer>
   );
 }

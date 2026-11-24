@@ -6,6 +6,11 @@ import { type PresentedMessage, presentOcgMessages } from "./message-presentatio
 import { planningConclusion } from "./planning-decision";
 
 const EMPTY: ChatMessage[] = [];
+type SubmissionNotice = {
+  sessionId: string;
+  user: ChatMessage;
+  answer: ChatMessage;
+};
 const MessageContext = createContext<Accessor<PresentedMessage>>();
 const ConversationContext = createContext<{
   messages: Accessor<PresentedMessage[]>;
@@ -14,6 +19,11 @@ const ConversationContext = createContext<{
   loadingEarlier: Accessor<boolean>;
   loadEarlier: () => Promise<void>;
   retry: (message: string) => Promise<void>;
+  reportSubmissionNotice: (
+    sessionId: string,
+    message: string | undefined,
+    input: Pick<ChatMessage, "content" | "images" | "jobId">,
+  ) => void;
 }>();
 
 export { MessageContext };
@@ -23,11 +33,53 @@ export function ConversationView(props: { sessionId: string; children: JSX.Eleme
   const history = useOcgRuntimeSnapshot(
     (snapshot) => snapshot.messagesBySession[props.sessionId] ?? EMPTY,
   );
-  const messages = createMemo(() =>
-    presentOcgMessages(
-      history().filter((message) => !message.planningTarget || !planningConclusion(message)),
-    ),
-  );
+  const [submissionNotices, setSubmissionNotices] = createSignal<SubmissionNotice[]>([]);
+  function reportSubmissionNotice(
+    sessionId: string,
+    message: string | undefined,
+    input: Pick<ChatMessage, "content" | "images" | "jobId">,
+  ) {
+    const previous = submissionNotices().filter(
+      (item) => item.sessionId !== sessionId || !input.jobId || item.user.jobId !== input.jobId,
+    );
+    if (!message) {
+      setSubmissionNotices(previous);
+      return;
+    }
+    const id = crypto.randomUUID();
+    const createdAt = new Date().toISOString();
+    const notice: SubmissionNotice = {
+      sessionId,
+      user: { ...input, id: `${id}-input`, role: "user", status: "completed", createdAt },
+      answer: {
+        id,
+        role: "assistant",
+        content: "",
+        failureReason: message,
+        status: "failed",
+        createdAt,
+      },
+    };
+    setSubmissionNotices([...previous, notice]);
+  }
+  const messages = createMemo(() => {
+    const pending = new Set(
+      submissionNotices().filter((notice) => notice.sessionId === props.sessionId),
+    );
+    const items: ChatMessage[] = [];
+    for (const message of history()) {
+      if (message.planningTarget && planningConclusion(message)) continue;
+      items.push(message);
+      if (message.role !== "user") continue;
+      for (const notice of pending) {
+        if (!message.jobId || notice.user.jobId !== message.jobId) continue;
+        items.push(notice.answer);
+        pending.delete(notice);
+      }
+    }
+    for (const notice of pending) items.push(notice.user, notice.answer);
+    return presentOcgMessages(items);
+  });
   const byJob = createMemo<Map<string, ChatMessage[]>>((previous) => {
     const groups = new Map<string, ChatMessage[]>();
     const items = history();
@@ -70,6 +122,7 @@ export function ConversationView(props: { sessionId: string; children: JSX.Eleme
     loadingEarlier,
     loadEarlier,
     retry: (message: string) => client.retryMessage(props.sessionId, message),
+    reportSubmissionNotice,
   };
   return <ConversationContext value={value}>{props.children}</ConversationContext>;
 }

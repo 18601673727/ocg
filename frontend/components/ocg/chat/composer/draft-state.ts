@@ -6,7 +6,7 @@ import { ApiError, type MutableJob, type MutableJobInput } from "../../runtime/a
 import { executionLabel } from "../../runtime/job-status";
 import { useOcgRuntime } from "../../runtime/runtime-context";
 import { useConversationView } from "../conversation-view";
-import type { ModelImageSupport } from "../model-selector";
+import type { ModelSupport } from "../model-selector";
 import { createAttachmentQueue, loadImages, type PendingImage } from "./attachments";
 import {
   bindComposerContext,
@@ -146,16 +146,23 @@ export function createComposerDraft(props: ComposerProps) {
   const [confirmed, setConfirmed] = createSignal<MutableJob | null>(null);
   const [ready, setReady] = createSignal(false);
   const [status, setStatus] = createSignal<string | { submittedJob: string }>("Loading saved Job…");
-  const { byJob } = useConversationView();
-  const statusText = createMemo(() => {
+  const { byJob, reportSubmissionNotice } = useConversationView();
+  const statusInfo = createMemo(() => {
     const current = status();
-    if (typeof current === "string") return current;
+    if (typeof current === "string")
+      return {
+        label: current === "New Job" ? "" : current,
+        job: confirmed()?.id,
+        revision: confirmed()?.revision,
+      };
     const execution = byJob()
       .get(current.submittedJob)
       ?.find((message) => message.execution)?.execution;
-    return execution
-      ? `Job ${current.submittedJob} · ${executionLabel(i18n.t, execution)}`
-      : `Job ${current.submittedJob}`;
+    return {
+      label: execution ? executionLabel(i18n.t, execution) : "",
+      job: current.submittedJob,
+      revision: undefined,
+    };
   });
   const [error, setError] = createSignal<string | null>(null);
   const [busy, setBusy] = createSignal(false);
@@ -170,8 +177,8 @@ export function createComposerDraft(props: ComposerProps) {
   const [queued, setQueued] = createSignal<MutableJob[]>([]);
   const [unfinished, setUnfinished] = createSignal<MutableJob[]>([]);
   const [editingQueue, setEditingQueue] = createSignal(false);
-  const [support, setSupport] = createSignal<ModelImageSupport | null>(null);
-  const imageSupport = (value: ModelImageSupport) => setSupport(value);
+  const [support, setSupport] = createSignal<ModelSupport | null>(null);
+  const modelSupport = (value: ModelSupport) => setSupport(value);
   const [queuedLoading, setQueuedLoading] = createSignal(false);
   const inputDisabled = createMemo(() => !ready() || busy() || conflict() || uncertain());
   const attachments = createAttachmentQueue(
@@ -203,7 +210,7 @@ export function createComposerDraft(props: ComposerProps) {
   );
   const { pendingImages, pendingImagesRef, uploading, uploadTask } = attachments;
   const canAttach: () => boolean = createMemo(
-    () => !inputDisabled() && uploading() === 0 && Boolean(support()?.supported),
+    () => !inputDisabled() && uploading() === 0 && Boolean(support()?.images),
   );
   const sendDisabled = createMemo(
     () =>
@@ -675,12 +682,24 @@ export function createComposerDraft(props: ComposerProps) {
       uncertain()
     )
       return;
+    const selectedSupport = support();
+    const submissionSessionId = props.sessionId;
+    const submission = {
+      content: input().text,
+      images: images(),
+      jobId: work.current.job?.id,
+    };
+    const notice =
+      selectedSupport?.llmProfile === work.current.desired.configuration?.llm_profile
+        ? selectedSupport?.notice
+        : undefined;
     busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
       await flush();
       const state = work.current;
+      submission.jobId = state.job?.id;
       if (!state.job || state.dirty || state.conflict)
         throw new Error("Save the Job before sending.");
       if (editingQueue()) {
@@ -750,6 +769,7 @@ export function createComposerDraft(props: ComposerProps) {
       }
       if (result.phase !== "queued" && result.phase !== "executing" && result.phase !== "completed")
         throw new Error(`Job is ${result.phase}; input has not been cleared.`);
+      reportSubmissionNotice(submissionSessionId, notice, submission);
       bindComposerContext(props.sessionId, state.context, result.conversation);
       try {
         if (!client.presentMutableJob) throw new Error("History is unavailable.");
@@ -780,7 +800,13 @@ export function createComposerDraft(props: ComposerProps) {
       await refreshQueue();
       await refreshUnfinished();
     } catch (cause) {
-      setError(errorMessage(cause));
+      submission.jobId = work.current.job?.id ?? submission.jobId;
+      reportSubmissionNotice(
+        submissionSessionId,
+        [notice, errorMessage(cause)].filter(Boolean).join("\n"),
+        submission,
+      );
+      setError(null);
     } finally {
       busyRef.current = false;
       if (alive.current) setBusy(false);
@@ -1076,7 +1102,7 @@ export function createComposerDraft(props: ComposerProps) {
   return {
     input,
     confirmed,
-    statusText,
+    statusInfo,
     error,
     busy,
     uncertain,
@@ -1088,7 +1114,7 @@ export function createComposerDraft(props: ComposerProps) {
     attachments,
     removeImage,
     canAttach,
-    imageSupport,
+    modelSupport,
     configure,
     association: () => work.current.association,
     queued,
