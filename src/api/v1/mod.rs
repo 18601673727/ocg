@@ -14,7 +14,7 @@ use ntex::server::Server;
 use ntex::service::cfg::SharedCfg;
 use ntex::time::Seconds;
 use ntex::web::{self, App, HttpRequest, HttpResponse, HttpServer};
-use serde_json::{Value, json};
+use serde_json::Value;
 
 use crate::db::NativeStops;
 use crate::db::entities::{

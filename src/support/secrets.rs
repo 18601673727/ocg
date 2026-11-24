@@ -13,9 +13,18 @@ pub(crate) fn wipe_string(text: &mut String) {
 pub(crate) fn wipe_vec(bytes: &mut Vec<u8>) {
     bytes.clear();
     bytes.resize(bytes.capacity(), 0);
-    std::hint::black_box(&*bytes);
-    compiler_fence(Ordering::SeqCst);
+    retain_wipe(bytes);
     bytes.clear();
+}
+
+pub(crate) fn wipe_bytes(bytes: &mut [u8]) {
+    bytes.fill(0);
+    retain_wipe(bytes);
+}
+
+fn retain_wipe(bytes: &[u8]) {
+    std::hint::black_box(bytes);
+    compiler_fence(Ordering::SeqCst);
 }
 
 #[derive(Default)]

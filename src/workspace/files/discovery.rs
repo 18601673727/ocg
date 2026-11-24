@@ -164,99 +164,59 @@ pub(crate) fn list(
 }
 
 #[derive(Debug)]
-struct NamePattern {
-    pattern: Vec<char>,
-    wildcard: bool,
+enum NamePattern {
+    Literal(String),
+    Wildcard(Vec<char>),
 }
 
 impl NamePattern {
     fn new(pattern: &str) -> Self {
-        Self {
-            pattern: pattern.to_ascii_lowercase().chars().collect(),
-            wildcard: pattern.contains(['*', '?']),
+        if pattern.contains(['*', '?']) {
+            Self::Wildcard(pattern.chars().collect())
+        } else {
+            Self::Literal(pattern.to_owned())
         }
     }
 
     fn matches(&self, name: &str) -> bool {
-        // ASCII names match byte-wise without allocating; only non-ASCII names
-        // need the lowercase char vectors for case-insensitive comparison.
-        if self.pattern.iter().all(char::is_ascii) && name.is_ascii() {
-            let lowered = name.to_ascii_lowercase();
-            let name = lowered.as_bytes();
-            let pattern = self
-                .pattern
-                .iter()
-                .map(|character| *character as u8)
-                .collect::<Vec<_>>();
-            return if self.wildcard {
-                wildcard_match_bytes(&pattern, name)
-            } else {
+        match self {
+            Self::Literal(pattern) => {
                 pattern.is_empty()
                     || name
+                        .as_bytes()
                         .windows(pattern.len())
-                        .any(|window| window == pattern.as_slice())
-            };
-        }
-        let name = name.to_ascii_lowercase().chars().collect::<Vec<_>>();
-        if self.wildcard {
-            wildcard_match(&self.pattern, &name)
-        } else {
-            name.windows(self.pattern.len())
-                .any(|window| window == self.pattern.as_slice())
+                        .any(|window| window.eq_ignore_ascii_case(pattern.as_bytes()))
+            }
+            Self::Wildcard(pattern) => wildcard_match(pattern, name),
         }
     }
 }
 
-fn wildcard_match(pattern: &[char], name: &[char]) -> bool {
-    let (mut at, mut position) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while position < name.len() {
+fn wildcard_match(pattern: &[char], name: &str) -> bool {
+    let mut at = 0;
+    let mut name = name.chars();
+    let mut star = None;
+    while let Some(character) = name.clone().next() {
         match pattern.get(at) {
             Some('*') => {
-                star = Some((at, position));
+                star = Some((at, name.clone()));
                 at += 1;
             }
-            Some(&character) if character == '?' || character == name[position] => {
+            Some(&expected) if expected == '?' || expected.eq_ignore_ascii_case(&character) => {
                 at += 1;
-                position += 1;
+                name.next();
             }
-            _ => match star {
-                Some((star_at, star_position)) => {
-                    at = star_at + 1;
-                    position = star_position + 1;
-                    star = Some((star_at, star_position + 1));
+            Some(_) | None => match &mut star {
+                Some((star_at, retry)) => {
+                    retry.next();
+                    name = retry.clone();
+                    at = *star_at + 1;
                 }
                 None => return false,
             },
         }
     }
     pattern[at..].iter().all(|character| *character == '*')
-}
-
-fn wildcard_match_bytes(pattern: &[u8], name: &[u8]) -> bool {
-    let (mut at, mut position) = (0, 0);
-    let mut star: Option<(usize, usize)> = None;
-    while position < name.len() {
-        match pattern.get(at) {
-            Some(b'*') => {
-                star = Some((at, position));
-                at += 1;
-            }
-            Some(&character) if character == b'?' || character == name[position] => {
-                at += 1;
-                position += 1;
-            }
-            Some(_) | None => match star {
-                Some((star_at, star_position)) => {
-                    at = star_at + 1;
-                    position = star_position + 1;
-                    star = Some((star_at, star_position + 1));
-                }
-                None => return false,
-            },
-        }
-    }
-    pattern[at..].iter().all(|character| *character == b'*')
 }
 
 #[derive(Debug)]

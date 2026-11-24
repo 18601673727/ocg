@@ -424,11 +424,13 @@ pub(crate) fn active_job_in(
         let row = jobs
             .get(id)?
             .ok_or_else(|| StorageError::corrupted("active Allocation references a missing Job"))?;
-        if !jobs::active_allocation_turn_of(id, row.value(), conversation)? {
+        if jobs::mutable_job_parent(id, row.value())? != conversation {
             continue;
         }
-        let job = crate::db::redb::jobs::decode_mutable_job(id, row.value())?;
-        return Ok(Some(job));
+        let job = jobs::decode_mutable_job(id, row.value())?;
+        if job.summary_source.is_none() {
+            return Ok(Some(job));
+        }
     }
     Ok(None)
 }

@@ -52,15 +52,22 @@ fn append_omitted_notice(conversation: &mut ChatConversation) {
 
 const IMAGE_TOKEN_WEIGHT: u64 = 1600;
 
+fn is_response_image(item: &serde_json::Value) -> bool {
+    matches!(
+        item.get("type").and_then(serde_json::Value::as_str),
+        Some("image" | "input_image" | "image_url")
+    )
+}
+
 fn response_item_images(items: &[serde_json::Value]) -> usize {
     let mut images: usize = 0;
     for item in items {
-        if item["type"] == "image" {
+        if is_response_image(item) {
             images = images.saturating_add(1);
         }
         if let Some(content) = item["content"].as_array() {
             for part in content {
-                if part["type"] == "image" || part["type"] == "input_image" {
+                if is_response_image(part) {
                     images = images.saturating_add(1);
                 }
             }
@@ -116,25 +123,7 @@ fn tool_bytes(tool: &ToolWire) -> usize {
 }
 
 pub(crate) fn estimate_request_tokens(conversation: &ChatConversation, max_tokens: u32) -> u64 {
-    let mut bytes: usize = 0;
-    let mut images: usize = 0;
-
-    for message in &conversation.messages {
-        let (m_bytes, m_images) = message_weights(message);
-        bytes = bytes.saturating_add(m_bytes);
-        images = images.saturating_add(m_images);
-    }
-
-    for tool in &conversation.tools {
-        bytes = bytes.saturating_add(tool_bytes(tool));
-    }
-
-    let text_tokens = bytes.div_ceil(3) as u64;
-    let image_tokens = (images as u64).saturating_mul(IMAGE_TOKEN_WEIGHT);
-    let output_tokens = u64::from(max_tokens);
-    text_tokens
-        .saturating_add(image_tokens)
-        .saturating_add(output_tokens)
+    ContextEstimate::new(conversation, max_tokens).tokens()
 }
 
 /// Incremental form of `estimate_request_tokens` for a conversation that only
@@ -150,7 +139,11 @@ pub(crate) struct ContextEstimate {
 impl ContextEstimate {
     pub(crate) fn new(conversation: &ChatConversation, max_tokens: u32) -> Self {
         let mut estimate = Self {
-            bytes: conversation.tools.iter().map(tool_bytes).sum(),
+            bytes: conversation
+                .tools
+                .iter()
+                .map(tool_bytes)
+                .fold(0, usize::saturating_add),
             images: 0,
             weighed: 0,
             max_tokens,

@@ -1,7 +1,7 @@
 use super::contracts::envelope;
 use super::{
     DatabaseHandle, JOB_NOT_FOUND, JobId, JobOutputRecord, OUTPUT_TOO_LARGE, OutputKind, Refusal,
-    Shared, Value, dashboard, json,
+    Shared, Value, dashboard,
 };
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -74,7 +74,7 @@ pub(super) async fn outputs(
     let mut more = records.len() > limit;
     for record in records.iter().take(limit) {
         let output = output_view(record);
-        let cost = dashboard::serialized_len(&json!(output))? + 1;
+        let cost = dashboard::serialized_len(&output)? + 1;
         if size + cost > shared.response_bytes {
             if page.is_empty() {
                 return Err(OUTPUT_TOO_LARGE);

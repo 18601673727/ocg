@@ -54,7 +54,7 @@ pub(super) fn jobs_query(query: &str) -> Result<(Option<JobId>, usize, Vec<Strin
     Ok((before, limit, terms))
 }
 
-pub(super) fn serialized_len(value: &Value) -> Result<usize, Refusal> {
+pub(super) fn serialized_len(value: &impl serde::Serialize) -> Result<usize, Refusal> {
     crate::db::serialized_len(value).map_err(|_| super::INCONSISTENT_RECORD)
 }
 

@@ -105,7 +105,7 @@ pub(crate) async fn supervise_development_generative(
         .as_ref()
         .map_or(1, |tools| tools.limits.max_provider_requests);
     let mut conversation = first_conversation.clone();
-    let mut estimate = ContextEstimate::new(&conversation, limits.max_tokens);
+    let mut estimate = None;
     let mut body = prepared.clone();
     let mut request = RequestNumber::FIRST;
     let mut output_seq = 1u32;
@@ -252,18 +252,20 @@ pub(crate) async fn supervise_development_generative(
                 return settle_tool_stop(database, handoff, output_seq, Some(&result), stop).await;
             }
         };
-        estimate.extend(&conversation);
-        if let Some(window) = limits.context_window
-            && estimate.tokens() > u64::from(window)
-        {
-            return settle_tool_stop(
-                database,
-                handoff,
-                output_seq,
-                Some(&result),
-                ToolLoopStop::ContextWindow,
-            )
-            .await;
+        if let Some(window) = limits.context_window {
+            let estimate = estimate
+                .get_or_insert_with(|| ContextEstimate::new(&conversation, limits.max_tokens));
+            estimate.extend(&conversation);
+            if estimate.tokens() > u64::from(window) {
+                return settle_tool_stop(
+                    database,
+                    handoff,
+                    output_seq,
+                    Some(&result),
+                    ToolLoopStop::ContextWindow,
+                )
+                .await;
+            }
         }
         body = match crate::ai::generative_model::request_body(&frozen.llm, &conversation) {
             Ok(body) => body,

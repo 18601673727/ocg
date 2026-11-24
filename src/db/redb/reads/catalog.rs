@@ -169,7 +169,6 @@ pub(crate) fn read_configs(
             break;
         }
         let (key, bytes) = entry?;
-        last = Some(ConfigId::new(key.value()));
         let row = ConfigRow::decode_at(key.value(), bytes.value())?;
         if kind.is_none_or(|kind| kind == row.kind) {
             if records.len() == limit {
@@ -178,6 +177,7 @@ pub(crate) fn read_configs(
             }
             records.push(config_record(row));
         }
+        last = Some(ConfigId::new(key.value()));
     }
     Ok(CursorPage {
         records,
