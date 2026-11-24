@@ -47,10 +47,9 @@ pub(super) fn run(
     let report =
         crate::host::runtime::run_hosted_reporting(directory, false, move |database| async move {
             let outcome: Result<(), Box<dyn std::error::Error>> = async {
-                match action {
+                let record = match action {
                     Action::Create { draft } => {
-                        let record = database.create_scheduled_external_policy(draft).await?;
-                        print_record(&record)?;
+                        database.create_scheduled_external_policy(draft).await?
                     }
                     Action::List { after, limit } => {
                         let page = database.scheduled_external_policies(after, limit).await?;
@@ -64,41 +63,37 @@ pub(super) fn run(
                                 "transport_feature": feature_json(),
                             }))?
                         );
+                        return Ok(());
                     }
-                    Action::Show { id } => match database.scheduled_external_policy(id).await? {
-                        Some(record) => print_record(&record)?,
-                        None => {
-                            return Err(format!("scheduled external policy {id} not found").into());
-                        }
-                    },
+                    Action::Show { id } => database
+                        .scheduled_external_policy(id)
+                        .await?
+                        .ok_or_else(|| format!("scheduled external policy {id} not found"))?,
                     Action::Update {
                         id,
                         revision,
                         draft,
                     } => {
-                        let record = database
+                        database
                             .update_scheduled_external_policy(id, revision, draft)
-                            .await?;
-                        print_record(&record)?;
+                            .await?
                     }
                     Action::SetEnabled {
                         id,
                         revision,
                         enabled,
                     } => {
-                        let record = database
+                        database
                             .set_scheduled_external_policy_enabled(id, revision, enabled)
-                            .await?;
-                        print_record(&record)?;
+                            .await?
                     }
                     Action::Revoke { id, revision } => {
-                        let record = database
+                        database
                             .revoke_scheduled_external_policy(id, revision)
-                            .await?;
-                        print_record(&record)?;
+                            .await?
                     }
-                }
-                Ok(())
+                };
+                print_record(&record)
             }
             .await;
             *returned.borrow_mut() = Some(outcome);
@@ -143,13 +138,7 @@ fn parse(arguments: Vec<String>) -> Result<Action, Box<dyn std::error::Error>> {
             let mut fields = PoliciesFields::default();
             while let Some(flag) = arguments.next() {
                 match flag.as_str() {
-                    "--revision" => {
-                        set_once(
-                            &mut revision,
-                            parse_revision(next_value(&mut arguments, "--revision")?)?,
-                            "--revision",
-                        )?;
-                    }
+                    "--revision" => set_revision(&mut arguments, &mut revision)?,
                     _ => fields.set(&flag, next_value(&mut arguments, &flag)?)?,
                 }
             }
@@ -161,45 +150,25 @@ fn parse(arguments: Vec<String>) -> Result<Action, Box<dyn std::error::Error>> {
                 draft,
             })
         }
-        "enable" | "disable" => {
+        "enable" | "disable" | "revoke" => {
             let id = parse_id(next_value(&mut arguments, "policy id")?)?;
             let mut revision = None;
             while let Some(flag) = arguments.next() {
-                match flag.as_str() {
-                    "--revision" => {
-                        set_once(
-                            &mut revision,
-                            parse_revision(next_value(&mut arguments, "--revision")?)?,
-                            "--revision",
-                        )?;
-                    }
-                    _ => return Err(other_flag(&flag).into()),
+                if flag != "--revision" {
+                    return Err(other_flag(&flag).into());
                 }
+                set_revision(&mut arguments, &mut revision)?;
             }
             let revision = revision.ok_or_else(|| missing("--revision"))?;
-            Ok(Action::SetEnabled {
-                id,
-                revision,
-                enabled: command == "enable",
+            Ok(if command == "revoke" {
+                Action::Revoke { id, revision }
+            } else {
+                Action::SetEnabled {
+                    id,
+                    revision,
+                    enabled: command == "enable",
+                }
             })
-        }
-        "revoke" => {
-            let id = parse_id(next_value(&mut arguments, "policy id")?)?;
-            let mut revision = None;
-            while let Some(flag) = arguments.next() {
-                match flag.as_str() {
-                    "--revision" => {
-                        set_once(
-                            &mut revision,
-                            parse_revision(next_value(&mut arguments, "--revision")?)?,
-                            "--revision",
-                        )?;
-                    }
-                    _ => return Err(other_flag(&flag).into()),
-                }
-            }
-            let revision = revision.ok_or_else(|| missing("--revision"))?;
-            Ok(Action::Revoke { id, revision })
         }
         other => Err(format!(
             "unknown scheduled-external-policy command `{other}`; see `ocg help`"
@@ -231,10 +200,7 @@ impl PoliciesFields {
             "--timeout-secs" => &mut self.timeout_secs,
             other => return Err(other_flag(other).into()),
         };
-        if slot.replace(value).is_some() {
-            return Err(format!("{flag} was given twice").into());
-        }
-        Ok(())
+        set_once(slot, value, flag)
     }
 
     fn draft(self) -> Result<ScheduledExternalPolicyConfig, Box<dyn std::error::Error>> {
@@ -303,7 +269,7 @@ fn usage_error() -> Box<dyn std::error::Error> {
         .into()
 }
 
-fn set_once<T: Copy>(
+fn set_once<T>(
     slot: &mut Option<T>,
     value: T,
     flag: &str,
@@ -320,8 +286,12 @@ fn parse_id(value: String) -> Result<ScheduledExternalPolicyId, Box<dyn std::err
         .map_err(|_| "policy id must be a lowercase hyphenated UUID".into())
 }
 
-fn parse_revision(value: String) -> Result<u32, Box<dyn std::error::Error>> {
-    parse_u32(value, "--revision")
+fn set_revision(
+    arguments: &mut std::vec::IntoIter<String>,
+    revision: &mut Option<u32>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let value = parse_u32(next_value(arguments, "--revision")?, "--revision")?;
+    set_once(revision, value, "--revision")
 }
 
 fn parse_limit(value: String) -> Result<usize, Box<dyn std::error::Error>> {
