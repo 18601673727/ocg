@@ -749,34 +749,28 @@ pub(super) async fn changed_observation(
 ) -> Result<Option<Value>, Refusal> {
     match change {
         ObservationChange::Metrics(job, id) => {
-            let Some(previous) = id.get().checked_sub(1) else {
-                return Err(INTERNAL);
-            };
+            let previous = id.get().checked_sub(1).ok_or(INTERNAL)?;
             let records = shared
                 .database
                 .job_metrics(job, Some(MetricsId::new(previous)), 1)
                 .await?;
-            let Some(record) = records.first().filter(|record| record.id == id) else {
-                return Ok(None);
-            };
-            if record.target.is_some() || record.decision_target.is_some() {
-                Ok(Some(serde_json::json!(usage_record(record))))
-            } else {
-                Ok(None)
-            }
+            Ok(records
+                .first()
+                .filter(|record| {
+                    record.id == id && (record.target.is_some() || record.decision_target.is_some())
+                })
+                .map(|record| serde_json::json!(usage_record(record))))
         }
         ObservationChange::Availability(job, id) => {
-            let Some(previous) = id.get().checked_sub(1) else {
-                return Err(INTERNAL);
-            };
+            let previous = id.get().checked_sub(1).ok_or(INTERNAL)?;
             let records = shared
                 .database
                 .job_availability(job, Some(AvailabilityStatId::new(previous)), 1)
                 .await?;
-            let Some(record) = records.first().filter(|record| record.id == id) else {
-                return Ok(None);
-            };
-            Ok(Some(serde_json::json!(availability_record(record))))
+            Ok(records
+                .first()
+                .filter(|record| record.id == id)
+                .map(|record| serde_json::json!(availability_record(record))))
         }
     }
 }

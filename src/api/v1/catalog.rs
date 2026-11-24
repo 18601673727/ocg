@@ -20,12 +20,20 @@ pub(super) fn page_query<T>(
     query: &str,
     parse_before: impl Fn(&str) -> Result<T, Refusal>,
 ) -> Result<(Option<T>, usize), Refusal> {
-    page_query_with(query, parse_before, |_, _| Err(INVALID_REQUEST))
+    page_query_with(
+        query,
+        parse_before,
+        DEFAULT_CONVERSATION_PAGE,
+        MAX_CONVERSATION_PAGE,
+        |_, _| Err(INVALID_REQUEST),
+    )
 }
 
 fn page_query_with<T>(
     query: &str,
     parse_before: impl Fn(&str) -> Result<T, Refusal>,
+    default_limit: usize,
+    max_limit: usize,
     mut extra: impl FnMut(&str, &str) -> Result<(), Refusal>,
 ) -> Result<(Option<T>, usize), Refusal> {
     let (mut before, mut limit) = (None, None);
@@ -39,7 +47,7 @@ fn page_query_with<T>(
                 "limit" if limit.is_none() => {
                     limit = Some(
                         decimal::<usize>(value)
-                            .filter(|limit| (1..=MAX_CONVERSATION_PAGE).contains(limit))
+                            .filter(|limit| (1..=max_limit).contains(limit))
                             .ok_or(INVALID_REQUEST)?,
                     );
                 }
@@ -47,7 +55,7 @@ fn page_query_with<T>(
             }
         }
     }
-    Ok((before, limit.unwrap_or(DEFAULT_CONVERSATION_PAGE)))
+    Ok((before, limit.unwrap_or(default_limit)))
 }
 
 const MAX_SEARCH_QUERY_BYTES: usize = 500;
@@ -67,7 +75,7 @@ pub(super) fn conversation_query(
 ) -> Result<ConversationQuery, Refusal> {
     let mut terms = None;
     let mut scope = None;
-    let (before, limit) = page_query_with(query, routing::job_id, |key, value| {
+    let parse_extra = |key: &str, value: &str| {
         match key {
             "query" if search && terms.is_none() => terms = Some(search_terms(value)?),
             "scope" if !archived && scope.is_none() => {
@@ -83,7 +91,14 @@ pub(super) fn conversation_query(
             _ => return Err(INVALID_REQUEST),
         }
         Ok(())
-    })?;
+    };
+    let (before, limit) = page_query_with(
+        query,
+        routing::job_id,
+        DEFAULT_CONVERSATION_PAGE,
+        MAX_CONVERSATION_PAGE,
+        parse_extra,
+    )?;
     Ok(ConversationQuery {
         terms: if search {
             terms.ok_or(INVALID_REQUEST)?
@@ -193,26 +208,13 @@ pub(super) const MAX_PROFILE_PAGE: usize = 100;
 const DEFAULT_PROFILE_PAGE: usize = 50;
 
 pub(super) fn agent_profile_query(query: &str) -> Result<(Option<ProfileId>, usize), Refusal> {
-    let (mut before, mut limit) = (None, None);
-    if !query.is_empty() {
-        for pair in query.split('&') {
-            let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
-            match key {
-                "before" if before.is_none() => {
-                    before = Some(super::profiles::profile_id(value)?);
-                }
-                "limit" if limit.is_none() => {
-                    limit = Some(
-                        decimal::<usize>(value)
-                            .filter(|limit| (1..=MAX_PROFILE_PAGE).contains(limit))
-                            .ok_or(INVALID_REQUEST)?,
-                    );
-                }
-                _ => return Err(INVALID_REQUEST),
-            }
-        }
-    }
-    Ok((before, limit.unwrap_or(DEFAULT_PROFILE_PAGE)))
+    page_query_with(
+        query,
+        profiles::profile_id,
+        DEFAULT_PROFILE_PAGE,
+        MAX_PROFILE_PAGE,
+        |_, _| Err(INVALID_REQUEST),
+    )
 }
 
 pub(super) async fn job_input(
