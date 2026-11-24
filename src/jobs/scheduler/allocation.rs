@@ -1,4 +1,5 @@
 use std::cell::{Cell, RefCell};
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -7,13 +8,14 @@ use super::wake::Scheduler;
 use crate::ai::providers::CancellationToken;
 use crate::db::NativeStops;
 use crate::db::entities::{
-    DevelopmentFreshReservation, DevelopmentReadyCursor, DevelopmentReservation,
+    AllocationPhase, DevelopmentFreshReservation, DevelopmentReadyCursor, DevelopmentReservation,
     ExecutionOperation, ExecutionPoolId, ExecutorId, LlmTransport, PoolAllocation,
 };
 use crate::db::{
     DatabaseError, DatabaseHandle, DevelopmentReservationError, SchedulerWakeSubscription,
 };
 use crate::jobs::execution::runtime::WorkspaceTools;
+use crate::workspace::process;
 
 const EXECUTOR_PAGE: usize = 100;
 const MAX_EXECUTOR_PAGES: usize = 16;
@@ -279,11 +281,32 @@ impl Allocator {
         if recheck {
             self.database.recheck_interrupted().await?;
         }
-        if crate::workspace::process::groups_tracked()
-            && let Err(error) =
-                ntex::rt::spawn_blocking(crate::workspace::process::retry_unproven_groups).await
-        {
-            log::warn!("failed to retry unproven groups on a blocking worker: {error}");
+        if process::groups_tracked() {
+            if let Err(error) = ntex::rt::spawn_blocking(process::retry_unproven_groups).await {
+                log::warn!("failed to retry unproven groups on a blocking worker: {error}");
+            }
+            let mut by_job = BTreeMap::<_, Vec<_>>::new();
+            for call in process::cleaned_calls() {
+                by_job.entry(call.job).or_default().push(call);
+            }
+            for (job, calls) in by_job {
+                match self.database.development_trial_job(job).await {
+                    Ok(None | Some((_, None)))
+                    | Ok(Some((
+                        _,
+                        Some(PoolAllocation {
+                            phase: AllocationPhase::Released,
+                            ..
+                        }),
+                    ))) => {
+                        process::forget_cleaned(&calls);
+                    }
+                    Ok(Some((_, Some(_)))) => {}
+                    Err(error) => {
+                        log::warn!("failed to check allocation for cleaned calls of {job}: {error}")
+                    }
+                }
+            }
         }
         let available = MAX_DISPATCHES.saturating_sub(self.running.borrow().len());
         if self.halted.get() || self.shutdown.is_cancelled() || available == 0 {

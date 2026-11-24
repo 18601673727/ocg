@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::os::fd::OwnedFd;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Child, Command, ExitStatus};
@@ -113,7 +112,6 @@ pub(crate) struct Process {
     group: Pid,
     stopped: Arc<AtomicBool>,
     started_at: Instant,
-    job: Option<JobId>,
     running: Option<RunningGroup>,
 }
 
@@ -165,10 +163,6 @@ pub(crate) fn begin_call(
 }
 
 impl StartingCall {
-    pub(crate) fn job(&self) -> JobId {
-        self.call.job
-    }
-
     pub(crate) fn admission_pending(&mut self) {
         self.admitted = true;
     }
@@ -238,7 +232,6 @@ struct GroupHandles {
 
 struct UnprovenGroup {
     id: u64,
-    job: Option<JobId>,
     group: Pid,
     handles: Option<GroupHandles>,
 }
@@ -247,19 +240,16 @@ static UNPROVEN_GROUPS: Mutex<Vec<UnprovenGroup>> = Mutex::new(Vec::new());
 
 static NEXT_UNPROVEN_ID: AtomicU64 = AtomicU64::new(0); // The OS can reuse a reaped leader's PID.
 
-fn record_unproven_group(job: Option<JobId>, group: Pid, handles: GroupHandles) {
+fn record_unproven_group(group: Pid, handles: GroupHandles) {
     UNPROVEN_GROUPS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .push(UnprovenGroup {
             id: NEXT_UNPROVEN_ID.fetch_add(1, Ordering::Relaxed),
-            job,
             group,
             handles: Some(handles),
         });
 }
-
-static UNCONFIRMED_STOPS: Mutex<BTreeSet<JobId>> = Mutex::new(BTreeSet::new());
 
 pub(crate) fn groups_tracked() -> bool {
     !CALLS
@@ -270,10 +260,6 @@ pub(crate) fn groups_tracked() -> bool {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .is_empty()
-        || !UNCONFIRMED_STOPS
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .is_empty()
 }
 
 pub(crate) fn stop_settled(job: JobId) {
@@ -281,10 +267,22 @@ pub(crate) fn stop_settled(job: JobId) {
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
         .retain(|(call, state)| call.job != job || *state != CallState::Cleaned);
-    UNCONFIRMED_STOPS
+}
+
+pub(crate) fn cleaned_calls() -> Vec<ToolCallRef> {
+    CALLS
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .remove(&job);
+        .iter()
+        .filter_map(|(call, state)| (*state == CallState::Cleaned).then_some(*call))
+        .collect()
+}
+
+pub(crate) fn forget_cleaned(calls: &[ToolCallRef]) {
+    CALLS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .retain(|(call, state)| *state != CallState::Cleaned || !calls.contains(call));
 }
 
 pub(crate) fn calls_cleaned(calls: &[ToolCallRef]) -> bool {
@@ -302,7 +300,6 @@ pub(crate) fn calls_cleaned(calls: &[ToolCallRef]) -> bool {
 // Take the handles and permit out of the shared registry while probing. Drop returns them on failure.
 struct Probe {
     id: u64,
-    job: Option<JobId>,
     group: Pid,
     handles: Option<GroupHandles>,
 }
@@ -319,7 +316,6 @@ fn take_probes(wanted: impl Fn(&UnprovenGroup) -> bool) -> Vec<Probe> {
         if let Some(handles) = entry.handles.take() {
             probes.push(Probe {
                 id: entry.id,
-                job: entry.job,
                 group: entry.group,
                 handles: Some(handles),
             });
@@ -348,16 +344,6 @@ impl Probe {
         let mut groups = UNPROVEN_GROUPS
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if let Some(job) = self.job
-            && !groups
-                .iter()
-                .any(|entry| entry.id != self.id && entry.job == Some(job))
-        {
-            UNCONFIRMED_STOPS
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(job);
-        }
         groups.retain(|entry| entry.id != self.id);
         drop(groups);
         if let Some(running) = handles.as_mut().and_then(|handles| handles.running.take()) {
@@ -475,7 +461,6 @@ impl Process {
             // The child already exists. Keep the normal finish/proof and outcome path.
             stop_signal.request();
         }
-        let job = starting.as_ref().map(StartingCall::job);
         let running = starting.map(|starting| starting.running(group));
         Ok(Self {
             child,
@@ -484,7 +469,6 @@ impl Process {
             group,
             stopped: stop_signal.stopped,
             started_at: Instant::now(),
-            job,
             running,
         })
     }
@@ -545,7 +529,6 @@ impl Process {
         }
         if let Err(error) = prove_empty(self.group, &self.sentinel) {
             record_unproven_group(
-                self.job,
                 self.group,
                 GroupHandles {
                     sentinel: self.sentinel,
