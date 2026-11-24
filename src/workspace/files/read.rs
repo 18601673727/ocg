@@ -163,16 +163,8 @@ impl Workspace {
 
     pub(crate) fn read(&self, path: &str) -> Result<String, Refusal> {
         let (directory, name) = self.parent(path)?;
-        let file = open_within(&directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(
-            |refusal| match refusal {
-                Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
-                other => other,
-            },
-        )?;
-        let metadata = readable(&file, MAX_RANGED_FILE_BYTES).map_err(|refusal| match refusal {
-            Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
-            other => other,
-        })?;
+        let file = open_ranged_file(&directory, name)?;
+        let metadata = readable(&file, MAX_RANGED_FILE_BYTES).map_err(ranged_size_refusal)?;
         if metadata.len() > MAX_FILE_BYTES as u64 {
             return Err(Refusal::TooLargeToReadWhole {
                 bytes: metadata.len(),
@@ -191,25 +183,22 @@ impl Workspace {
             return Err(Refusal::InvalidRange);
         }
         let (directory, name) = self.parent(path)?;
-        let file = open_within(&directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(
-            |refusal| match refusal {
-                Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
-                other => other,
-            },
-        )?;
+        let file = open_ranged_file(&directory, name)?;
         read_lines(&file, start_line, line_count)
     }
 
     #[cfg(unix)]
     pub(crate) fn snapshot_range(&self, path: &str, line: u64) -> Result<Value, Refusal> {
+        let read_nearby = || {
+            self.read_range(path, line.saturating_sub(8).max(1), 80)
+                .map(|range| range.to_json(path))
+        };
         match self.read(path) {
             Ok(content) => {
                 let count = content.matches('\n').count() as u64
                     + u64::from(!content.is_empty() && !content.ends_with('\n'));
                 if count > MAX_RANGE_LINES {
-                    return self
-                        .read_range(path, line.saturating_sub(8).max(1), 80)
-                        .map(|range| range.to_json(path));
+                    return read_nearby();
                 }
                 Ok(json!({
                     "path": path,
@@ -220,10 +209,7 @@ impl Workspace {
                     "line_truncated": false,
                 }))
             }
-            Err(Refusal::TooLargeToReadWhole { .. }) => {
-                let range = self.read_range(path, line.saturating_sub(8).max(1), 80)?;
-                Ok(range.to_json(path))
-            }
+            Err(Refusal::TooLargeToReadWhole { .. }) => read_nearby(),
             Err(error) => Err(error),
         }
     }
@@ -408,6 +394,17 @@ fn open_directory(path: &Path) -> std::io::Result<File> {
 
 pub(super) fn open_at(directory: &File, name: &str, step: Step) -> Result<File, Refusal> {
     open_within(directory, name, step, MAX_FILE_BYTES)
+}
+
+fn open_ranged_file(directory: &File, name: &str) -> Result<File, Refusal> {
+    open_within(directory, name, Step::File, MAX_RANGED_FILE_BYTES).map_err(ranged_size_refusal)
+}
+
+fn ranged_size_refusal(refusal: Refusal) -> Refusal {
+    match refusal {
+        Refusal::TooLarge { .. } => Refusal::TooLargeForRange,
+        other => other,
+    }
 }
 
 pub(crate) fn open_within(

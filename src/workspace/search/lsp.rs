@@ -1122,6 +1122,15 @@ fn answer(
         return section;
     }
     let name = question.name.as_deref().unwrap_or_default();
+    let matches_body = |symbol: &Symbol| {
+        if question.name.is_some() {
+            name_rank(symbol, name).is_some()
+        } else {
+            question
+                .line
+                .is_some_and(|line| symbol.start <= line && line <= symbol.end)
+        }
+    };
     let bare_name = name.rsplit("::").next().unwrap_or(name);
     let mut paths: Vec<Arc<str>> = if matches!(question.op, Op::Refs) {
         index
@@ -1154,17 +1163,10 @@ fn answer(
             break;
         }
         if matches!(question.op, Op::Body)
-            && !index.files.get(path).is_some_and(|file| {
-                file.symbols.iter().any(|symbol| {
-                    if question.name.is_some() {
-                        name_rank(symbol, name).is_some()
-                    } else {
-                        question
-                            .line
-                            .is_some_and(|line| symbol.start <= line && line <= symbol.end)
-                    }
-                })
-            })
+            && !index
+                .files
+                .get(path)
+                .is_some_and(|file| file.symbols.iter().any(matches_body))
         {
             continue;
         }
@@ -1228,15 +1230,7 @@ fn answer(
         if matches!(question.op, Op::Body) {
             let mut found: Vec<&Symbol> = symbols
                 .iter()
-                .filter(|symbol| {
-                    if question.name.is_some() {
-                        name_rank(symbol, name).is_some()
-                    } else {
-                        question
-                            .line
-                            .is_some_and(|line| symbol.start <= line && line <= symbol.end)
-                    }
-                })
+                .filter(|symbol| matches_body(symbol))
                 .collect();
             if question.name.is_none() {
                 found.sort_by_key(|symbol| symbol.end_byte - symbol.start_byte);
