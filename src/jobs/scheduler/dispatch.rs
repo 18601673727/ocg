@@ -568,12 +568,7 @@ async fn start_and_exchange(
 async fn reported(database: &DatabaseHandle, token: AllocationToken, detail: String) -> Dispatched {
     match database.development_trial_job(token.job).await {
         Ok(Some((record, Some(allocation)))) if allocation.token == token => {
-            if allocation.phase == AllocationPhase::Released
-                && record
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.kind != OutcomeKind::Unknown)
-            {
+            if allocation.phase == AllocationPhase::Released {
                 crate::workspace::process::stop_settled(token.job);
             }
             let cancelled_before_start = allocation.phase == AllocationPhase::Released

@@ -970,9 +970,15 @@ impl Batch {
             crate::db::entities::AllocationPhase::Uncertain,
             Some(cause),
         )?;
-        if self
-            .step(|tx| Ok(super::recovery::held::unfinished_commands(tx, token.job)?.is_empty()))?
-        {
+        let commands = self.step(|tx| {
+            Ok(
+                super::recovery::held::unfinished_command_calls(tx, token.job)?
+                    .into_iter()
+                    .map(|(call, _)| call)
+                    .collect::<Vec<_>>(),
+            )
+        })?;
+        if commands.is_empty() || crate::workspace::process::calls_cleaned(&commands) {
             self.release_uncertain(
                 token,
                 proof.revision(),

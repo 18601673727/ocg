@@ -233,6 +233,7 @@ struct GroupHandles {
     sentinel: OwnedFd,
     leader: Child,
     _permit: Permit,
+    running: Option<RunningGroup>,
 }
 
 struct UnprovenGroup {
@@ -286,6 +287,18 @@ pub(crate) fn stop_settled(job: JobId) {
         .remove(&job);
 }
 
+pub(crate) fn calls_cleaned(calls: &[ToolCallRef]) -> bool {
+    if calls.is_empty() {
+        return false;
+    }
+    let tracked = CALLS.lock().unwrap_or_else(PoisonError::into_inner);
+    calls.iter().all(|call| {
+        tracked
+            .iter()
+            .any(|(key, state)| key == call && *state == CallState::Cleaned)
+    })
+}
+
 // Take the handles and permit out of the shared registry while probing. Drop returns them on failure.
 struct Probe {
     id: u64,
@@ -331,7 +344,7 @@ impl Probe {
     }
 
     fn proven(mut self) {
-        let handles = self.handles.take();
+        let mut handles = self.handles.take();
         let mut groups = UNPROVEN_GROUPS
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
@@ -347,6 +360,9 @@ impl Probe {
         }
         groups.retain(|entry| entry.id != self.id);
         drop(groups);
+        if let Some(running) = handles.as_mut().and_then(|handles| handles.running.take()) {
+            running.proven();
+        }
         drop(handles);
     }
 }
@@ -535,9 +551,9 @@ impl Process {
                     sentinel: self.sentinel,
                     leader: self.child,
                     _permit: self.permit,
+                    running: self.running,
                 },
             );
-            drop(self.running);
             return Err(FinishError::NotProven(error));
         }
         if let Some(running) = self.running {

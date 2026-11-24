@@ -230,7 +230,23 @@ pub(crate) fn unfinished_commands(
     tx: &impl crate::db::redb::TxRead,
     job: crate::db::entities::JobId,
 ) -> Result<Vec<Option<crate::db::entities::CommandGroup>>, StorageError> {
-    let mut groups = Vec::new();
+    Ok(unfinished_command_calls(tx, job)?
+        .into_iter()
+        .map(|(_, group)| group)
+        .collect())
+}
+
+pub(crate) fn unfinished_command_calls(
+    tx: &impl crate::db::redb::TxRead,
+    job: crate::db::entities::JobId,
+) -> Result<
+    Vec<(
+        crate::db::entities::ToolCallRef,
+        Option<crate::db::entities::CommandGroup>,
+    )>,
+    StorageError,
+> {
+    let mut calls = Vec::new();
     for entry in tx
         .table(TOOL_CALLS)?
         .range((job.get(), 0, 0)..=(job.get(), u32::MAX, u32::MAX))?
@@ -244,10 +260,10 @@ pub(crate) fn unfinished_commands(
                 .as_ref()
                 .is_none_or(|outcome| !outcome.fact.is_definite())
         {
-            groups.push(call.group);
+            calls.push((call.call, call.group));
         }
     }
-    Ok(groups)
+    Ok(calls)
 }
 
 pub(crate) fn stop_proof(

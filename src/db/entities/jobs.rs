@@ -599,7 +599,7 @@ impl UncertaintyReason {
                 "A worker acknowledgement is pending or ambiguous; whether the work stopped is unknown."
             }
             Self::StopRequestedWithoutConfirmedTermination => {
-                "A stop was requested locally but termination was never confirmed."
+                "A local stop was requested before termination could be confirmed."
             }
             Self::Unclassified => "The reason the outcome is uncertain could not be established.",
             Self::HostShutdown => {

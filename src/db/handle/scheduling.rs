@@ -50,7 +50,7 @@ impl DatabaseHandle {
             let candidates = page
                 .records
                 .into_iter()
-                .filter(|row| row.allocation.token.epoch < epoch)
+                .filter(|row| row.allocation.token.epoch <= epoch)
                 .collect::<Vec<_>>();
             if !candidates.is_empty() {
                 let proved = ntex::rt::spawn_blocking(move || {
@@ -59,13 +59,18 @@ impl DatabaseHandle {
                     candidates
                         .into_iter()
                         .filter_map(|row| {
-                            redb::stop_proof(
-                                &row.allocation,
-                                &row.commands,
-                                host.as_deref(),
-                                boot.as_deref(),
-                            )
-                            .map(|proof| {
+                            let proof = if row.allocation.token.epoch == epoch {
+                                crate::workspace::process::calls_cleaned(&row.command_calls)
+                                    .then_some(entities::StopProof::Proof)
+                            } else {
+                                redb::stop_proof(
+                                    &row.allocation,
+                                    &row.commands,
+                                    host.as_deref(),
+                                    boot.as_deref(),
+                                )
+                            };
+                            proof.map(|proof| {
                                 (
                                     row.allocation.token,
                                     row.allocation.job_revision,
@@ -80,15 +85,25 @@ impl DatabaseHandle {
                 match proved {
                     Ok(proved) => {
                         for candidate in proved {
-                            self.write(
-                                0,
-                                OperationKind::ReleaseCapacity,
-                                candidate,
-                                |batch, (token, revision, bytes, proof)| {
-                                    batch.release_uncertain(token, revision, proof, Some(&bytes))
-                                },
-                            )
-                            .await?;
+                            let job = candidate.0.job;
+                            let released = self
+                                .write(
+                                    0,
+                                    OperationKind::ReleaseCapacity,
+                                    candidate,
+                                    |batch, (token, revision, bytes, proof)| {
+                                        batch.release_uncertain(
+                                            token,
+                                            revision,
+                                            proof,
+                                            Some(&bytes),
+                                        )
+                                    },
+                                )
+                                .await?;
+                            if released {
+                                crate::workspace::process::stop_settled(job);
+                            }
                         }
                     }
                     Err(error) => log::warn!("interrupted allocation proof worker failed: {error}"),

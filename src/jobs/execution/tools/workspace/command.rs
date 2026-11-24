@@ -70,9 +70,9 @@ pub(crate) fn register(
 ) -> Result<(), ToolRegistryError> {
     registry.register(
         command::TOOL_NAME,
-        Some(
-            "Run one of the Project's commands in the authorized Workspace root, optionally appending literal entries from `arguments`, and return its argv, exit code, stdout, stderr, wall_ms, cpu_user_ms, cpu_system_ms and peak_rss_bytes. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. The command's executable, configured arguments, directory and environment cannot be replaced.",
-        ),
+        Some(&format!(
+            "Run one of the Project's commands in the authorized Workspace root, optionally appending literal entries from `arguments`, and return its argv, exit code, stdout, stderr, wall_ms, cpu_user_ms, cpu_system_ms and peak_rss_bytes. The command has a {timeout:?} time limit, including time spent waiting over SSH. Use short status checks that return promptly when polling background work. A nonzero exit code, such as a failing build or test, is a normal result to read, not a failure of this tool. Output is limited to about 12 KiB; `truncated` says whether part of it was omitted. The command's executable, configured arguments, directory and environment cannot be replaced.",
+        )),
         command::parameters(commands),
         Arc::new(RunCommand(command::RunCommand::new(
             workspace,

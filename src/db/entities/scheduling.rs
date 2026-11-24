@@ -237,6 +237,7 @@ pub(crate) struct UncertainAllocation {
     pub since: Timestamp,
     pub allocation_bytes: Vec<u8>,
     pub commands: Vec<Option<super::CommandGroup>>,
+    pub command_calls: Vec<super::ToolCallRef>,
     pub evidence: String,
 }
 

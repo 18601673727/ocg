@@ -1050,10 +1050,12 @@ pub(crate) fn read_uncertain_allocations(
             .ok_or_else(|| StorageError::corrupted("uncertain Allocation missing"))?
             .value()
             .to_vec();
+        let commands = super::recovery::held::unfinished_command_calls(&rx, allocation.token.job)?;
         uncertain.push(UncertainAllocation {
             allocation_bytes,
             evidence: super::reads::jobs::unknown_execution_note(&rx, allocation.token.job)?,
-            commands: super::recovery::held::unfinished_commands(&rx, allocation.token.job)?,
+            command_calls: commands.iter().map(|(call, _)| *call).collect(),
+            commands: commands.into_iter().map(|(_, group)| group).collect(),
             allocation,
             since: outcome.at,
         });
