@@ -789,7 +789,7 @@ fn result(selected: &Selected, argv: &[String], ended: &Ended) -> Value {
         if let Some(signal) = ended.finished.status.signal() {
             value["signal"] = json!(signal);
         }
-        if budget == 0 || value.to_string().len() <= RESULT_BYTES {
+        if budget == 0 || crate::db::serialized_len(&value).unwrap_or(usize::MAX) <= RESULT_BYTES {
             return value;
         }
         budget /= 2;

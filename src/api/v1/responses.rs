@@ -1,6 +1,7 @@
 use super::contracts::envelope;
 use super::{
-    INVALID_REQUEST, JobId, OUTPUT_TOO_LARGE, Refusal, RequestNumber, Shared, Value, json, routing,
+    INCONSISTENT_RECORD, INVALID_REQUEST, JobId, OUTPUT_TOO_LARGE, Refusal, RequestNumber, Shared,
+    Value, json, routing,
 };
 
 #[derive(serde::Serialize, ts_rs::TS)]
@@ -70,9 +71,9 @@ fn provider_response_page(
                 has_more,
             }))
         };
-    let mut size = envelope(Vec::new(), Some(u32::MAX), Some(u32::MAX), true)
-        .to_string()
-        .len();
+    let mut size =
+        crate::db::serialized_len(&envelope(Vec::new(), Some(u32::MAX), Some(u32::MAX), true))
+            .map_err(|_| INCONSISTENT_RECORD)?;
     let mut page = Vec::new();
     let mut more = records.has_more;
     let mut next = None;
@@ -94,7 +95,8 @@ fn provider_response_page(
             requests_tools: record.requests_tools,
             created_at_us: record.recorded_at.as_unix_micros(),
         };
-        let base = json!(response).to_string().len() + 1;
+        let base =
+            crate::db::serialized_len(&json!(response)).map_err(|_| INCONSISTENT_RECORD)? + 1;
         let available = response_bytes.saturating_sub(size + base);
         let mut bytes = 0;
         let mut end = offset;

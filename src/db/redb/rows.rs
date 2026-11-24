@@ -1002,15 +1002,15 @@ pub(crate) fn load_credential_key(
     directory: &Path,
 ) -> Result<Option<std::sync::Arc<CredentialKey>>, StorageError> {
     let path = directory.join(CREDENTIAL_KEY_FILE_NAME);
-    let bytes = match std::fs::read(&path) {
+    let mut bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(::redb::Error::Io(error).into()),
     };
     let _ = crate::host::data_directory::restrict_file(&path);
-    CredentialKey::from_bytes(&bytes)
-        .map(std::sync::Arc::new)
-        .map(Some)
+    let key = CredentialKey::from_bytes(&bytes);
+    crate::support::secrets::wipe_vec(&mut bytes);
+    key.map(std::sync::Arc::new).map(Some)
 }
 
 pub(crate) fn create_credential_key(
@@ -1022,7 +1022,7 @@ pub(crate) fn create_credential_key(
     aws_lc_rs::rand::SystemRandom::new()
         .fill(&mut raw)
         .map_err(|_| StorageError::corrupted("system random source unavailable"))?;
-    let key = std::sync::Arc::new(CredentialKey::from_bytes(&raw)?);
+    let key = CredentialKey::from_bytes(&raw).map(std::sync::Arc::new);
     let key_path = directory.join(CREDENTIAL_KEY_FILE_NAME);
     let temp_path = directory.join(format!(
         ".{CREDENTIAL_KEY_FILE_NAME}.{}.{}.tmp",
@@ -1039,8 +1039,20 @@ pub(crate) fn create_credential_key(
         rustix::fs::OFlags::NOFOLLOW.bits() as i32,
     );
     crate::host::data_directory::private_file(&mut options);
-    let mut file = options.open(&temp_path).map_err(::redb::Error::Io)?;
-    if let Err(error) = file.write_all(&raw).and_then(|()| file.sync_all()) {
+    let mut file = match options.open(&temp_path) {
+        Ok(file) => file,
+        Err(error) => {
+            raw.fill(0);
+            std::hint::black_box(&raw);
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            return Err(::redb::Error::Io(error).into());
+        }
+    };
+    let written = file.write_all(&raw).and_then(|()| file.sync_all());
+    raw.fill(0);
+    std::hint::black_box(&raw);
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    if let Err(error) = written {
         drop(file);
         let _ = std::fs::remove_file(&temp_path);
         return Err(::redb::Error::Io(error).into());
@@ -1068,7 +1080,7 @@ pub(crate) fn create_credential_key(
         .and_then(|dir| dir.sync_all())
         .map_err(::redb::Error::Io)?;
     let _ = crate::host::data_directory::restrict_file(&key_path);
-    Ok(key)
+    key
 }
 
 impl Recurrence {

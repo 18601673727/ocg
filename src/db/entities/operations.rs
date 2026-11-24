@@ -214,6 +214,8 @@ pub enum Violation {
     AttachmentCleanedUp(AttachmentId),
     #[error("the submission key already created {job}")]
     SubmissionKeyUsed { job: JobId, same_request: bool },
+    #[error("the Project's decision policy requires job_plan before side-effecting tools")]
+    PlanRequired,
     #[error("pending Job capacity ({max_pending_jobs} Jobs) is full; the Job was not admitted")]
     PendingJobsLimit { max_pending_jobs: u64 },
 }

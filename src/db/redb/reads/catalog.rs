@@ -164,7 +164,7 @@ pub(crate) fn read_configs(
     let mut last = None;
     let mut more = false;
     for (scanned, entry) in table.range(..end)?.rev().enumerate() {
-        if records.len() == limit || scanned == MAX_PAGE {
+        if scanned == MAX_PAGE {
             more = true;
             break;
         }
@@ -172,6 +172,10 @@ pub(crate) fn read_configs(
         last = Some(ConfigId::new(key.value()));
         let row = ConfigRow::decode_at(key.value(), bytes.value())?;
         if kind.is_none_or(|kind| kind == row.kind) {
+            if records.len() == limit {
+                more = true;
+                break;
+            }
             records.push(config_record(row));
         }
     }

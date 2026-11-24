@@ -23,7 +23,8 @@ use crate::support::cancellation::CancellationReason;
 
 const DEFAULT_MAX_PROVIDER_REQUESTS: u32 = 2048;
 
-const HANDLER_TIMEOUT: Duration = Duration::from_secs(120 + 5);
+const HANDLER_TIMEOUT: Duration = crate::workspace::command::COMMAND_TIMEOUT
+    .saturating_add(crate::workspace::process::STOP_GRACE);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ToolLoopLimits {
@@ -328,13 +329,7 @@ pub(crate) async fn answer_calls(
                 if let Some(starting) = &mut starting {
                     starting.admission_refused();
                 }
-                if matches!(
-                    &violation,
-                    Violation::InvalidValue(
-                        "job_plan",
-                        "project decision policy requires job_plan before side-effecting tools"
-                    )
-                ) {
+                if matches!(&violation, Violation::PlanRequired) {
                     let refusal = InvalidToolCall::at(
                         ToolCallRefusal::Unauthorized,
                         index,

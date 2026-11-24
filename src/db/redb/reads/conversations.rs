@@ -158,7 +158,11 @@ fn conversation_job_state(
             return Ok("waiting_for_user");
         }
     }
-    let active = active_job_in(rx, conversation)?;
+    let active = if runtime.state.outcome.is_some() {
+        None
+    } else {
+        active_job_in(rx, conversation)?
+    };
     let turn = active
         .as_ref()
         .map(|job| job.id)

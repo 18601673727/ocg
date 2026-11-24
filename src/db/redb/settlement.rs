@@ -766,10 +766,7 @@ impl Batch {
                 })
         });
         if !has_plan {
-            return self.reject(Violation::InvalidValue(
-                "job_plan",
-                "project decision policy requires job_plan before side-effecting tools",
-            ));
+            return self.reject(Violation::PlanRequired);
         }
         Ok(())
     }

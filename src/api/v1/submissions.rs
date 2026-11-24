@@ -769,6 +769,11 @@ fn not_admitted(error: &DatabaseError) -> Refusal {
             Violation::InvalidValue(field, reason) => {
                 Refusal::new(StatusCode::UNPROCESSABLE_ENTITY, field, reason)
             }
+            Violation::PlanRequired => Refusal::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "job_plan",
+                "the Project's decision policy requires job_plan before side-effecting tools",
+            ),
             Violation::NotFound(_) => Refusal::new(
                 StatusCode::NOT_FOUND,
                 "record_not_found",

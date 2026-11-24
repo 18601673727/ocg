@@ -208,13 +208,13 @@ pub(super) async fn tools(
             has_more: more,
         }))
     };
-    let mut size = envelope(Vec::new(), None, true).to_string().len();
+    let mut size = dashboard::serialized_len(&envelope(Vec::new(), None, true))?;
     let mut page = Vec::new();
     let mut next = None;
     let mut more = records.len() > limit;
     for record in records.iter().take(limit) {
         let tool = tool_view(record);
-        let cost = json!(tool).to_string().len() + 1;
+        let cost = dashboard::serialized_len(&json!(tool))? + 1;
         if size + cost > shared.response_bytes {
             if page.is_empty() {
                 return Err(OUTPUT_TOO_LARGE);

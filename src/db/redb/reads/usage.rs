@@ -277,7 +277,14 @@ fn scan_usage_totals(
     };
     let mut find_hour = |rev: bool| -> Result<Option<i64>, StorageError> {
         let mut iter = table.range(range_start..=end)?;
+        // Bound the probe like the main scan so a narrow agent filter cannot
+        // walk the whole table when its rows sit far from the probed edge.
+        let mut examined = 0;
         while let Some(entry) = if rev { iter.next_back() } else { iter.next() } {
+            if examined >= budget.rows {
+                break;
+            }
+            examined += 1;
             let key = entry?.0.value();
             if matches_agent(key.1)? {
                 return Ok(Some(key.0));

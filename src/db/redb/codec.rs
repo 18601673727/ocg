@@ -271,13 +271,14 @@ pub(super) type DecodeResult<T> = Result<T, StorageError>;
 
 impl<'a> Dec<'a> {
     pub(super) fn new(bytes: &'a [u8], tag: u8) -> DecodeResult<Self> {
+        let expected = crate::db::redb::schema::FORMAT_VERSION;
         match bytes {
-            [found, version, ..]
-                if *found == tag
-                    && u64::from(*version) == crate::db::redb::schema::FORMAT_VERSION =>
-            {
+            [found, version, ..] if *found == tag && u64::from(*version) == expected => {
                 Ok(Dec { bytes, at: 2 })
             }
+            [found, version, ..] if *found == tag => Err(StorageError::corrupted(format!(
+                "record of type {tag} has format version {version}, expected {expected}"
+            ))),
             _ => Err(StorageError::corrupted(format!(
                 "expected a record of type {tag}"
             ))),
@@ -294,11 +295,15 @@ impl<'a> Dec<'a> {
     }
 
     pub(super) fn take(&mut self, n: usize) -> DecodeResult<&'a [u8]> {
+        let end = self
+            .at
+            .checked_add(n)
+            .ok_or_else(|| StorageError::corrupted("truncated record"))?;
         let slice = self
             .bytes
-            .get(self.at..self.at + n)
+            .get(self.at..end)
             .ok_or_else(|| StorageError::corrupted("truncated record"))?;
-        self.at += n;
+        self.at = end;
         Ok(slice)
     }
     pub(super) fn take_array<const N: usize>(&mut self) -> DecodeResult<[u8; N]> {
