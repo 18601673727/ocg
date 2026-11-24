@@ -84,7 +84,7 @@ impl JobsQuery {
             }
         }
         let terms = match raw {
-            Some(raw) => catalog::conversation_search_query(&format!("query={raw}"))?.0,
+            Some(raw) => catalog::search_terms(raw)?,
             None => Vec::new(),
         };
         Ok(Self {
@@ -235,8 +235,14 @@ impl Feed {
                 )
             }
             Page::Conversations(before) => {
-                let reply =
-                    catalog::conversations(&self.shared.database, before, 100, false).await?;
+                let reply = catalog::conversations(
+                    &self.shared.database,
+                    before,
+                    100,
+                    false,
+                    Default::default(),
+                )
+                .await?;
                 let next = cursor(&reply.body)?;
                 self.page = match next {
                     Some(id) => Page::Conversations(Some(id)),

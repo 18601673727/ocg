@@ -5,8 +5,8 @@ use super::jobs::tool_evidence;
 use crate::db::entities::JobId;
 use crate::db::entities::{
     Actor, ChildConversationEntry, ContextState, ContextWorkDetails, ContextWorkState,
-    ConversationEntry, ConversationsPage, JobLifecycle, JobLimits, JobSpec,
-    MutableConversationPage, MutableConversationTurn, Origin, OutputKind, Recurrence,
+    ConversationEntry, ConversationSearchScope, ConversationsPage, JobLifecycle, JobLimits,
+    JobSpec, MutableConversationPage, MutableConversationTurn, Origin, OutputKind, Recurrence,
 };
 use crate::db::entities::{ConfigId, ExecutionOperation, MutableJobPhase, OutcomeKind};
 use crate::db::redb::allocations::pools_offering_capability;
@@ -22,12 +22,13 @@ use crate::db::redb::reads::read;
 use crate::db::redb::rows::{decode_output, decode_project};
 use crate::db::redb::schema::MAX_PAGE;
 use crate::db::redb::schema::{
-    ATTACHMENTS, CHILD_GROUPS, CHILDREN, CONVERSATION_SEARCH, CONVERSATIONS, JOB_OUTPUTS, JOBS,
-    MESSAGES, META, OPEN_APPROVALS, POOL_ALLOCATIONS, PROJECTS, RECURRENCES, TURNS,
+    ATTACHMENTS, CHILD_GROUPS, CHILDREN, CONVERSATION_SEARCH, CONVERSATIONS, JOB_OUTPUTS,
+    JOB_RUNTIME, JOBS, MESSAGES, META, OPEN_APPROVALS, POOL_ALLOCATIONS, PROJECTS, RECURRENCES,
+    REQUEST_EVENTS, TURNS,
 };
 use crate::db::redb::{StorageError, TxRead};
 use crate::db::redb::{allocations, indexes, rows, state};
-use ::redb::{Database, ReadTransaction};
+use ::redb::{Database, ReadOnlyTable, ReadTransaction};
 use std::collections::BTreeSet;
 
 pub(crate) fn read_mutable_conversation_turn_page(
@@ -247,6 +248,7 @@ pub(crate) fn conversation_summary(
         None => (outcome, row.created_at),
     };
     Ok(ConversationEntry {
+        snippet: None,
         root_job: conversation,
         tip_job: tip.unwrap_or(conversation),
         agent: row.agent,
@@ -321,8 +323,9 @@ pub(crate) fn read_conversations(
     before: Option<JobId>,
     limit: usize,
     archived: bool,
+    scope: ConversationSearchScope,
 ) -> Result<ConversationsPage, StorageError> {
-    conversation_page(database, before, limit, &[], archived)
+    conversation_page(database, before, limit, &[], archived, scope)
 }
 
 pub(crate) fn read_conversation_search(
@@ -330,8 +333,9 @@ pub(crate) fn read_conversation_search(
     terms: &[String],
     before: Option<JobId>,
     limit: usize,
+    scope: ConversationSearchScope,
 ) -> Result<ConversationsPage, StorageError> {
-    conversation_page(database, before, limit, terms, false)
+    conversation_page(database, before, limit, terms, false, scope)
 }
 
 fn conversation_page(
@@ -340,9 +344,16 @@ fn conversation_page(
     limit: usize,
     terms: &[String],
     archived: bool,
+    scope: ConversationSearchScope,
 ) -> Result<ConversationsPage, StorageError> {
     let rx = read(database)?;
     let groups = rx.open_table(CONVERSATIONS)?;
+    let tables = if terms.is_empty() {
+        None
+    } else {
+        Some(SearchTables::open(&rx)?)
+    };
+    let bounded = archived || tables.is_some() || scope != ConversationSearchScope::All;
     let limit = limit.clamp(1, 100);
     let mut conversations = Vec::new();
     let mut last = None;
@@ -353,7 +364,7 @@ fn conversation_page(
         .rev()
         .enumerate()
     {
-        if (archived || !terms.is_empty()) && examined == 5_000 {
+        if bounded && examined == 5_000 {
             has_more = true;
             last = last_examined;
             break;
@@ -365,6 +376,14 @@ fn conversation_page(
         if !indexes::searchable_conversation(&row) {
             continue;
         }
+        let in_scope = match scope {
+            ConversationSearchScope::All => true,
+            ConversationSearchScope::Conversations => row.project.is_none(),
+            ConversationSearchScope::Project(project) => row.project == Some(project),
+        };
+        if !in_scope {
+            continue;
+        }
         let metadata = read_job_lifecycle(&rx, conversation)?;
         if metadata.hidden_at.is_some() != archived {
             continue;
@@ -372,23 +391,27 @@ fn conversation_page(
         let Some(tip) = turn_head(&rx, conversation)? else {
             continue;
         };
-        let matches = if terms.is_empty() {
-            true
-        } else {
+        let snippet = if let Some(tables) = &tables {
             let title = conversation_title(&rx, conversation, &metadata)?;
-            conversation_matches(&rx, conversation, &title, terms)?
+            let Some(snippet) = conversation_matches(tables, &groups, conversation, &title, terms)?
+            else {
+                continue;
+            };
+            snippet
+        } else {
+            None
         };
-        if matches {
-            if conversations.len() == limit {
-                has_more = true;
-                break;
-            }
-            last = Some(conversation);
-            conversations.push(conversation_summary(&rx, &row, Some(tip))?);
-            if !terms.is_empty() && conversations.len() == limit {
-                has_more = true;
-                break;
-            }
+        if conversations.len() == limit {
+            has_more = true;
+            break;
+        }
+        last = Some(conversation);
+        let mut summary = conversation_summary(&rx, &row, Some(tip))?;
+        summary.snippet = snippet;
+        conversations.push(summary);
+        if bounded && conversations.len() == limit {
+            has_more = true;
+            break;
         }
     }
     Ok(ConversationsPage {
@@ -398,71 +421,137 @@ fn conversation_page(
     })
 }
 
+struct SearchTables {
+    index: ReadOnlyTable<crate::db::redb::schema::ConversationSearchKey, ()>,
+    outputs: ReadOnlyTable<(u128, u32), &'static [u8]>,
+    attachments: ReadOnlyTable<u128, &'static [u8]>,
+    jobs: ReadOnlyTable<u128, &'static [u8]>,
+    states: ReadOnlyTable<u128, &'static [u8]>,
+    events: ReadOnlyTable<(u128, u32, u32), &'static [u8]>,
+    messages: ReadOnlyTable<&'static [u8], &'static [u8]>,
+}
+
+impl SearchTables {
+    fn open(rx: &ReadTransaction) -> Result<Self, StorageError> {
+        Ok(Self {
+            index: rx.open_table(CONVERSATION_SEARCH)?,
+            outputs: rx.open_table(JOB_OUTPUTS)?,
+            attachments: rx.open_table(ATTACHMENTS)?,
+            jobs: rx.open_table(JOBS)?,
+            states: rx.open_table(JOB_RUNTIME)?,
+            events: rx.open_table(REQUEST_EVENTS)?,
+            messages: rx.open_table(MESSAGES)?,
+        })
+    }
+}
+
+fn match_excerpt(text: &str, term: &str) -> Option<String> {
+    let offset = text.to_lowercase().find(term)?;
+    // Lowercasing can expand a source character. Translate the match back
+    // to the original text before selecting a window for display.
+    let mut folded_bytes = 0;
+    let (start, _) = text.char_indices().find(|(_, ch)| {
+        folded_bytes += ch.to_lowercase().map(char::len_utf8).sum::<usize>();
+        folded_bytes > offset
+    })?;
+    let clean = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    const MAX: usize = 140;
+    let length = clean.chars().count();
+    if length <= MAX {
+        return Some(clean);
+    }
+    let position = text[..start]
+        .split_whitespace()
+        .map(|word| word.chars().count() + 1)
+        .sum::<usize>();
+    let left = position.saturating_sub(MAX / 2).min(length - (MAX - 2));
+    let mut excerpt = String::new();
+    if left > 0 {
+        excerpt.push('…');
+    }
+    excerpt.extend(clean.chars().skip(left).take(MAX - 2));
+    if left + MAX - 2 < length {
+        excerpt.push('…');
+    }
+    Some(excerpt)
+}
+
 fn conversation_matches(
-    rx: &ReadTransaction,
+    tables: &SearchTables,
+    conversations: &ReadOnlyTable<u128, &'static [u8]>,
     conversation: JobId,
     title: &str,
     terms: &[String],
-) -> Result<bool, StorageError> {
+) -> Result<Option<Option<String>>, StorageError> {
     let title = title.to_lowercase();
-    let index = rx.open_table(CONVERSATION_SEARCH)?;
-    let outputs = rx.open_table(JOB_OUTPUTS)?;
+    let mut snippet = None;
     for term in terms {
-        if title.contains(term) {
+        let in_title = title.contains(term);
+        if in_title && snippet.is_some() {
             continue;
         }
         let chars = term.chars().take(3).collect::<Vec<_>>();
         let gram = indexes::search_gram(&chars);
-        let mut matched = false;
-        for candidate in
-            index.range((conversation.get(), gram, 0)..=(conversation.get(), gram, u128::MAX))?
+        let mut body_match = None;
+        for candidate in tables
+            .index
+            .range((conversation.get(), gram, 0)..=(conversation.get(), gram, u128::MAX))?
         {
             let (_, _, turn) = candidate?.0.value();
-            let turn = JobId::new(turn);
-            {
-                let job = mutable_job_record_in(rx, turn)?
-                    .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
-                if job.job.parent_id != conversation
-                    || job.job.phase == crate::db::entities::MutableJobPhase::Unsubmitted
-                {
-                    return Err(StorageError::corrupted(
-                        "search turn has invalid conversation",
-                    ));
-                }
-                if indexes::search_input_text(&rx.open_table(ATTACHMENTS)?, &job.job.input)?
-                    .to_lowercase()
-                    .contains(term)
-                {
-                    matched = true;
-                    break;
-                }
-                let completed = job
-                    .outcome
-                    .as_ref()
-                    .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
-                for output in outputs.range((turn.get(), 0)..=(turn.get(), u32::MAX))? {
-                    let (key, bytes) = output?;
-                    let output = rows::decode_output(key.value(), bytes.value())?;
-                    let answer = super::super::observations::answer_text(rx, turn, &output)?;
-                    if answer
-                        .as_deref()
-                        .or_else(|| indexes::search_output_text(&output, completed))
-                        .is_some_and(|text| text.to_lowercase().contains(term))
-                    {
-                        matched = true;
-                        break;
-                    }
-                }
-                if matched {
+            let bytes = tables
+                .jobs
+                .get(turn)?
+                .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
+            let job = crate::db::redb::jobs::decode_mutable_job(turn, bytes.value())?;
+            if job.parent_id != conversation || job.phase == MutableJobPhase::Unsubmitted {
+                return Err(StorageError::corrupted(
+                    "search turn has invalid conversation",
+                ));
+            }
+            body_match = match_excerpt(
+                &indexes::search_input_text(&tables.attachments, &job.input)?,
+                term,
+            );
+            if body_match.is_some() {
+                break;
+            }
+            let state = tables
+                .states
+                .get(turn)?
+                .ok_or_else(|| StorageError::corrupted("search turn state missing"))?;
+            let completed = state::decode_state(turn, state.value())?
+                .outcome
+                .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+            for output in tables.outputs.range((turn, 0)..=(turn, u32::MAX))? {
+                let (key, bytes) = output?;
+                let output = rows::decode_output(key.value(), bytes.value())?;
+                let answer = super::super::observations::answer_text_in(
+                    &tables.jobs,
+                    &tables.states,
+                    conversations,
+                    &tables.events,
+                    &tables.messages,
+                    job.id,
+                    &output,
+                )?;
+                body_match = answer
+                    .as_deref()
+                    .or_else(|| indexes::search_output_text(&output, completed))
+                    .and_then(|text| match_excerpt(text, term));
+                if body_match.is_some() {
                     break;
                 }
             }
+            if body_match.is_some() {
+                break;
+            }
         }
-        if !matched {
-            return Ok(false);
+        if !in_title && body_match.is_none() {
+            return Ok(None);
         }
+        snippet = snippet.or(body_match);
     }
-    Ok(true)
+    Ok(Some(snippet))
 }
 
 const TURN_PAGE_OUTPUTS: usize = 1000;

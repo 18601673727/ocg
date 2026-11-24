@@ -11,6 +11,25 @@ import type * as Api from "@/components/ocg/contracts/api";
 import { ApiError, type Send } from "./transport";
 import { identity, jobIdentity, sequence, submissionKey } from "./validators";
 
+export type ConversationSearchScope = "all" | "conversations" | `project:${string}`;
+
+type ListSettings = {
+  scope?: ConversationSearchScope;
+  before?: string;
+  limit?: number;
+  signal?: AbortSignal;
+};
+
+function appendScope(query: string[], scope?: ConversationSearchScope) {
+  if (scope === undefined || scope === "all") return;
+  if (scope !== "conversations") {
+    if (typeof scope !== "string" || !scope.startsWith("project:"))
+      throw new ContractError("scope", "a conversation search scope");
+    identity(scope.slice("project:".length), "scope.project");
+  }
+  query.push(`scope=${encodeURIComponent(scope)}`);
+}
+
 export type ConversationEdit =
   | { title: string; hidden?: never }
   | { hidden: boolean; title?: never }
@@ -21,6 +40,21 @@ export type ConversationEdit =
     };
 
 export function createConversationsApi(send: Send, conversationListeners: Set<() => void>) {
+  async function readConversations(settings: ListSettings & { archived?: boolean } = {}) {
+    const query = [`limit=${settings.limit ?? 50}`];
+    if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
+    if (settings.archived && settings.scope !== undefined)
+      throw new ContractError("scope", "an unarchived conversation listing");
+    appendScope(query, settings.scope);
+    return (
+      await send(
+        "GET",
+        `/api/v1/conversations${settings.archived ? "/archived" : ""}?${query.join("&")}`,
+        { signal: settings.signal },
+      )
+    ).input as Api.Conversations;
+  }
+
   return {
     onConversationsChanged(listener: () => void) {
       conversationListeners.add(listener);
@@ -29,26 +63,16 @@ export function createConversationsApi(send: Send, conversationListeners: Set<()
       };
     },
 
-    async readConversations(
-      settings: { before?: string; limit?: number; archived?: boolean; signal?: AbortSignal } = {},
-    ) {
-      const query = [`limit=${settings.limit ?? 50}`];
-      if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
-      return (
-        await send(
-          "GET",
-          `/api/v1/conversations${settings.archived ? "/archived" : ""}?${query.join("&")}`,
-          { signal: settings.signal },
-        )
-      ).input as Api.Conversations;
+    readConversations,
+    listConversations(settings: ListSettings = {}) {
+      return readConversations(settings);
     },
 
-    async searchConversations(settings: {
-      query: string;
-      before?: string;
-      limit?: number;
-      signal?: AbortSignal;
-    }) {
+    async searchConversations(
+      settings: ListSettings & {
+        query: string;
+      },
+    ) {
       const trimmed = settings.query.trim();
       if (!trimmed) throw new ContractError("query", "a non-empty search query");
       if (new TextEncoder().encode(trimmed).length > 500)
@@ -56,6 +80,7 @@ export function createConversationsApi(send: Send, conversationListeners: Set<()
       const query = [`query=${encodeURIComponent(trimmed)}`];
       if (settings.before) query.push(`before=${jobIdentity(settings.before)}`);
       query.push(`limit=${settings.limit ?? 50}`);
+      appendScope(query, settings.scope);
       return (
         await send("GET", `/api/v1/conversations/search?${query.join("&")}`, {
           signal: settings.signal,

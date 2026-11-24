@@ -234,7 +234,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
       return () => clearInterval(timer);
     },
   );
-  const projectNames = new Map(projects().map(({ id, name }) => [id, name]));
+  const projectNames = createMemo(() => new Map(projects().map(({ id, name }) => [id, name])));
   const previewFor = (session: ChatSession): ConversationPreviewDetails => {
     const status =
       session.jobState ??
@@ -244,7 +244,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
         ? "running"
         : undefined);
     return {
-      project: session.projectId ? projectNames.get(session.projectId) : null,
+      project: session.projectId ? projectNames().get(session.projectId) : null,
       status: status && runtimeStateLabel(i18n.t, status),
       updatedAt: session.updatedAt,
     };
@@ -260,7 +260,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
       }, new Map<string, ChatSession[]>()),
     ].map(([id, items]) => ({
       id,
-      name: projectNames.get(id) ?? (id || i18n.t("sidebar.noProject")),
+      name: projectNames().get(id) ?? (id || i18n.t("sidebar.noProject")),
       items: [...items].sort(
         (a, b) =>
           Number(selectedPinnedTogglePinned().pinned.has(b.conversationId ?? b.id)) -
@@ -513,6 +513,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
                   <Plus class="size-4" />
                 </RailButton>
                 <ConversationSearch
+                  projects={projects()}
                   sessions={props.sessions}
                   activeSessionId={props.activeSessionId}
                   onSelect={props.onSelect}
@@ -694,6 +695,7 @@ export function OcgSidebar(props: OcgSidebarProps) {
                   </span>
                 </Button>
                 <ConversationSearch
+                  projects={projects()}
                   sessions={props.sessions}
                   activeSessionId={props.activeSessionId}
                   onSelect={props.onSelect}

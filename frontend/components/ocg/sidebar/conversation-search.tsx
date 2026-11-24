@@ -12,24 +12,28 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Select, SelectItem } from "@/components/ui/select";
 import { Skeleton } from "@/components/ui/skeleton";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { ariaState, bindElementRef, elementRef, type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
+import type { Project } from "../contracts";
 import { useI18n } from "../i18n";
 import { SELECTED_ROW } from "../primitives/selection";
-import type { ApiClient } from "../runtime/api-client";
+import type { ApiClient, ConversationSearchScope } from "../runtime/api-client";
 import type { ChatSession } from "../types";
 import {
   appendSearchResults,
   conversationSearchMatches,
   type SearchConversation,
   type SearchMatch,
+  sessionMatchesScope,
 } from "./conversation-search-results";
 
 export type ConversationSearchProps = {
   trigger: View;
   sessions: readonly ChatSession[];
+  projects?: readonly Project[];
   activeSessionId: string;
   onSelect: (id: string) => void;
   onOpenConversation?: (conversation: string) => void;
@@ -42,6 +46,7 @@ export function ConversationSearch(props: ConversationSearchProps) {
   const i18n = useI18n();
   const [open, setOpen] = createSignal(false);
   const [query, setQuery] = createSignal("");
+  const [scope, setScope] = createSignal<ConversationSearchScope>("all");
   const [serverResults, setServerResults] = createSignal<readonly SearchConversation[] | null>(
     null,
   );
@@ -56,18 +61,41 @@ export function ConversationSearch(props: ConversationSearchProps) {
   const hintId = createUniqueId();
   const needle = createMemo(() => query().trim());
 
+  const projectNames = createMemo(() => new Map(props.projects?.map(({ id, name }) => [id, name])));
+  const resetPage = () => {
+    setHighlightedId(null);
+    setServerResults(null);
+    setNextBefore(null);
+    setFailed(false);
+    setBefore(undefined);
+  };
+  const changeScope = (next: ConversationSearchScope | null) => {
+    if (!next || next === scope()) return;
+    resetPage();
+    setScope(next);
+    setLoading(Boolean(props.api && (needle() || next !== "all")));
+  };
   const changeOpen = (next: boolean) => {
     setOpen(next);
     if (!next) {
+      resetPage();
       setQuery("");
-      setServerResults(null);
-      setNextBefore(null);
+      setScope("all");
       setLoading(false);
-      setFailed(false);
-      setBefore(undefined);
-      setHighlightedId(null);
     }
   };
+
+  createEffect(
+    () => [scope(), props.projects] as const,
+    ([selected, projects]) => {
+      if (
+        selected.startsWith("project:") &&
+        projects &&
+        !projects.some(({ id }) => selected === `project:${id}`)
+      )
+        changeScope("all");
+    },
+  );
 
   createEffect(
     () => [open(), changeOpen],
@@ -93,40 +121,46 @@ export function ConversationSearch(props: ConversationSearchProps) {
   );
 
   createEffect(
-    () => [open(), props.api, needle(), before(), attempt()],
-    () => {
-      if (!open() || !props.api || !needle()) return;
-      let cancelled = false;
+    () => ({
+      open: open(),
+      api: props.api,
+      query: needle(),
+      scope: scope(),
+      before: before(),
+      attempt: attempt(),
+    }),
+    (current, previous) => {
+      const { api, query, scope, before } = current;
+      if (!current.open || !api || (!query && scope === "all")) return;
       const controller = new AbortController();
+      const settings = { scope, before, limit: 50, signal: controller.signal };
+      const debounce =
+        query && before === undefined && query !== previous?.query && scope === previous?.scope;
       const timer = setTimeout(
         () => {
           setLoading(true);
           setFailed(false);
-          void props
-            .api!.searchConversations({
-              query: needle(),
-              before: before(),
-              limit: 50,
-              signal: controller.signal,
-            })
+          const request = query
+            ? api.searchConversations({ ...settings, query })
+            : api.listConversations(settings);
+          void request
             .then((answer) => {
-              if (cancelled) return;
+              if (controller.signal.aborted) return;
               setServerResults((previous) =>
-                appendSearchResults(before() ? (previous ?? []) : [], answer.conversations),
+                appendSearchResults(before ? (previous ?? []) : [], answer.conversations),
               );
               setNextBefore(answer.has_more ? answer.next_before : null);
             })
             .catch(() => {
-              if (!cancelled) setFailed(true);
+              if (!controller.signal.aborted) setFailed(true);
             })
             .finally(() => {
-              if (!cancelled) setLoading(false);
+              if (!controller.signal.aborted) setLoading(false);
             });
         },
-        before() === undefined ? 200 : 0,
+        debounce ? 200 : 0,
       );
       return () => {
-        cancelled = true;
         clearTimeout(timer);
         controller.abort();
       };
@@ -135,11 +169,14 @@ export function ConversationSearch(props: ConversationSearchProps) {
 
   const untitledLabel = i18n.t("sidebar.newChat");
   const matches = createMemo<readonly SearchMatch[]>(() => {
-    if (!needle()) return props.sessions;
-    if (serverResults()) return conversationSearchMatches(props.sessions, serverResults()!);
+    if (!needle() && scope() === "all") return props.sessions;
+    const results = serverResults();
+    if (results) return conversationSearchMatches(props.sessions, results);
     const lowered = needle().toLowerCase();
-    return props.sessions.filter((session) =>
-      (session.title || untitledLabel).toLowerCase().includes(lowered),
+    return props.sessions.filter(
+      (session) =>
+        sessionMatchesScope(session, scope()) &&
+        (session.title || untitledLabel).toLowerCase().includes(lowered),
     );
   });
 
@@ -157,9 +194,8 @@ export function ConversationSearch(props: ConversationSearchProps) {
     },
   );
 
-  const close = () => setOpen(false);
   const select = (match: SearchMatch) => {
-    close();
+    changeOpen(false);
     if (match.conversation && props.onOpenConversation)
       props.onOpenConversation(match.conversation);
     else props.onSelect(match.id);
@@ -187,8 +223,8 @@ export function ConversationSearch(props: ConversationSearchProps) {
           <DialogDescription>{i18n.t("sidebar.searchConversationsBody")}</DialogDescription>
         </DialogHeader>
 
-        <div class="px-4 pt-3 pb-2 sm:px-6">
-          <div class="relative">
+        <div class="flex flex-col gap-2 px-4 pt-3 pb-2 sm:flex-row sm:items-center sm:px-6">
+          <div class="relative min-w-0 flex-1">
             <Search
               class="pointer-events-none absolute top-3 left-3 size-4 text-muted-foreground"
               aria-hidden="true"
@@ -206,14 +242,12 @@ export function ConversationSearch(props: ConversationSearchProps) {
               aria-describedby={hintId}
               value={query()}
               onInput={(event) => {
-                setQuery(event.target.value);
-                setHighlightedId(null);
-                if (event.target.value.trim() === needle()) return;
-                setServerResults(null);
-                setNextBefore(null);
-                setFailed(false);
-                setLoading(Boolean(props.api && event.target.value.trim()));
-                setBefore(undefined);
+                const next = event.currentTarget.value;
+                if (next.trim() !== needle()) {
+                  resetPage();
+                  setLoading(Boolean(props.api && (next.trim() || scope() !== "all")));
+                }
+                setQuery(next);
               }}
               onKeyDown={(event) => {
                 if (event.isComposing) return;
@@ -242,6 +276,20 @@ export function ConversationSearch(props: ConversationSearchProps) {
               class="h-11 pl-9 text-base sm:h-10 sm:text-sm"
             />
           </div>
+          <Select<ConversationSearchScope>
+            value={scope()}
+            onValueChange={changeScope}
+            aria-label={i18n.t("sidebar.searchScopeLabel")}
+            class="max-w-full sm:max-w-44"
+          >
+            <SelectItem value="all">{i18n.t("sidebar.searchScopeAll")}</SelectItem>
+            <SelectItem value="conversations">
+              {i18n.t("sidebar.searchScopeConversations")}
+            </SelectItem>
+            {(props.projects ?? []).map((project) => (
+              <SelectItem value={`project:${project.id}`}>{project.name}</SelectItem>
+            ))}
+          </Select>
           <span id={hintId} class="sr-only">
             {i18n.t("sidebar.searchKeyboardHint")}
           </span>
@@ -287,6 +335,8 @@ export function ConversationSearch(props: ConversationSearchProps) {
             class="flex flex-col gap-px pb-2"
           >
             {matches().map((session, index) => {
+              const project =
+                scope() === "all" && session.projectId && projectNames().get(session.projectId);
               const active = session.id === props.activeSessionId;
               const highlighted = index === highlightedIndex();
               return (
@@ -309,8 +359,22 @@ export function ConversationSearch(props: ConversationSearchProps) {
                     )}
                   >
                     <MessageSquare class="size-3.5 shrink-0" aria-hidden="true" />
-                    <span class="line-clamp-2 min-w-0 flex-1 break-words">
-                      {session.title || untitledLabel}
+                    <span class="min-w-0 flex-1">
+                      <span class="flex items-center gap-2">
+                        <span class="line-clamp-2 min-w-0 break-words">
+                          {session.title || untitledLabel}
+                        </span>
+                        {project && (
+                          <span class="max-w-[45%] shrink-0 truncate rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                            {project}
+                          </span>
+                        )}
+                      </span>
+                      {session.snippet && (
+                        <span class="line-clamp-2 text-xs text-muted-foreground">
+                          {session.snippet}
+                        </span>
+                      )}
                     </span>
                   </button>
                 </li>

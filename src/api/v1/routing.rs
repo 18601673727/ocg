@@ -20,15 +20,10 @@ pub(super) enum Route {
         terms: Vec<String>,
     },
     Conversations {
-        before: Option<JobId>,
-        limit: usize,
+        page: catalog::ConversationQuery,
         archived: bool,
     },
-    ConversationSearch {
-        query: Vec<String>,
-        before: Option<JobId>,
-        limit: usize,
-    },
+    ConversationSearch(catalog::ConversationQuery),
     Usage(dashboard::ObservationQuery),
     UsageSummary(dashboard::UsageSummaryQuery),
     UsageRetries(dashboard::UsageRetriesQuery),
@@ -179,7 +174,7 @@ pub(super) fn authorize(caller: &Caller, route: Route) -> Result<Route, Refusal>
             | Route::StartUpdate
             | Route::Jobs { .. }
             | Route::Conversations { .. }
-            | Route::ConversationSearch { .. }
+            | Route::ConversationSearch(..)
             | Route::Usage(_)
             | Route::UsageSummary(_)
             | Route::UsageRetries(_)
@@ -309,11 +304,8 @@ pub(super) fn route(
         })
     };
     let conversations = |archived| {
-        catalog::conversations_query(query).map(|(before, limit)| Route::Conversations {
-            before,
-            limit,
-            archived,
-        })
+        catalog::conversation_query(query, false, archived)
+            .map(|page| Route::Conversations { page, archived })
     };
     let get = |parse: ParseRoute<'_>| resolve(endpoint.get(parse));
     let post = |limit, parse: ParseRoute<'_>| resolve(endpoint.post(limit, parse));
@@ -599,23 +591,16 @@ pub(super) fn route(
             Ok(Route::Events { job, after_seq })
         }),
         ["conversations"] => get(&|| conversations(false)),
-        ["conversations", job] if !job.is_empty() => {
-            resolve(
-                endpoint
-                    .get(&|| match *job {
-                        "archived" => conversations(true),
-                        "search" => catalog::conversation_search_query(query).map(
-                            |(query, before, limit)| Route::ConversationSearch {
-                                query,
-                                before,
-                                limit,
-                            },
-                        ),
-                        _ => Err(NOT_FOUND),
-                    })
-                    .post(MAX_SUBMISSION_BYTES, &|| Ok(Route::JobEdit(job_id(job)?))),
-            )
-        }
+        ["conversations", job] if !job.is_empty() => resolve(
+            endpoint
+                .get(&|| match *job {
+                    "archived" => conversations(true),
+                    "search" => catalog::conversation_query(query, true, false)
+                        .map(Route::ConversationSearch),
+                    _ => Err(NOT_FOUND),
+                })
+                .post(MAX_SUBMISSION_BYTES, &|| Ok(Route::JobEdit(job_id(job)?))),
+        ),
         ["jobs", job, "withdraw"] => post(MAX_SUBMISSION_BYTES, &|| {
             Ok(Route::MutableJob(mutable_jobs::Action::Withdraw(job_id(
                 job,
@@ -785,16 +770,13 @@ pub(super) async fn respond(
             limit,
             terms,
         } => dashboard::jobs(shared, before, limit, terms).await,
-        Route::Conversations {
-            before,
-            limit,
-            archived,
-        } => catalog::conversations(database, before, limit, archived).await,
-        Route::ConversationSearch {
-            query,
-            before,
-            limit,
-        } => catalog::search_conversations(database, query, before, limit).await,
+        Route::Conversations { page, archived } => {
+            catalog::conversations(database, page.before, page.limit, archived, page.scope).await
+        }
+        Route::ConversationSearch(page) => {
+            catalog::search_conversations(database, page.scope, page.terms, page.before, page.limit)
+                .await
+        }
         Route::Usage(query) => dashboard::usage(shared, query).await,
         Route::UsageSummary(query) => dashboard::usage_summary(shared, query).await,
         Route::UsageRetries(query) => dashboard::usage_retries(shared, query).await,

@@ -45,7 +45,7 @@ pub(super) fn jobs_query(query: &str) -> Result<(Option<JobId>, usize, Vec<Strin
         .transpose()?;
     let limit = page_limit(values.remove("limit"))?;
     let terms = match values.remove("query") {
-        Some(query) => catalog::conversation_search_query(&format!("query={query}"))?.0,
+        Some(query) => catalog::search_terms(query)?,
         None => Vec::new(),
     };
     if !values.is_empty() {

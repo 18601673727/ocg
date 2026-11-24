@@ -73,19 +73,25 @@ impl DatabaseHandle {
         before: Option<JobId>,
         limit: usize,
         archived: bool,
+        scope: entities::ConversationSearchScope,
     ) -> Result<crate::db::entities::ConversationsPage, DatabaseError> {
-        self.read(move |database| redb::read_conversations(database, before, limit, archived))
-            .await
+        self.read(move |database| {
+            redb::read_conversations(database, before, limit, archived, scope)
+        })
+        .await
     }
 
     pub async fn search_conversations(
         &self,
+        scope: entities::ConversationSearchScope,
         terms: Vec<String>,
         before: Option<JobId>,
         limit: usize,
     ) -> Result<crate::db::entities::ConversationsPage, DatabaseError> {
-        self.read(move |database| redb::read_conversation_search(database, &terms, before, limit))
-            .await
+        self.read(move |database| {
+            redb::read_conversation_search(database, &terms, before, limit, scope)
+        })
+        .await
     }
 
     pub async fn job_tree(

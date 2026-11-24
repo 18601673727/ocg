@@ -1,10 +1,25 @@
-import type { ApiClient } from "../runtime/api-client";
+import type { ApiClient, ConversationSearchScope } from "../runtime/api-client";
 import type { ChatSession } from "../types";
 
 export type SearchConversation = Awaited<
   ReturnType<ApiClient["searchConversations"]>
 >["conversations"][number];
-export type SearchMatch = { id: string; title: string; conversation?: string };
+export type SearchMatch = {
+  id: string;
+  title: string;
+  conversation?: string;
+  projectId?: string | null;
+  snippet?: string;
+};
+
+export function sessionMatchesScope(
+  session: { projectId?: string | null },
+  scope: ConversationSearchScope,
+): boolean {
+  if (scope === "all") return true;
+  if (scope === "conversations") return !session.projectId;
+  return session.projectId === scope.slice("project:".length);
+}
 
 export function appendSearchResults(
   previous: readonly SearchConversation[],
@@ -28,6 +43,12 @@ export function conversationSearchMatches(
         session.id === item.root_job ||
         session.id === item.tip_job,
     );
-    return { id: local?.id ?? item.root_job, title: item.title, conversation: item.root_job };
+    return {
+      id: local?.id ?? item.root_job,
+      title: item.title,
+      conversation: item.root_job,
+      projectId: item.project ?? local?.projectId ?? null,
+      snippet: item.snippet,
+    };
   });
 }

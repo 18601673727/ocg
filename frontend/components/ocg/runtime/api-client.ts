@@ -17,7 +17,7 @@ import { createSubscriptions } from "./api/subscriptions";
 import { type ApiClientOptions, ApiError, createTransport } from "./api/transport";
 import { identity } from "./api/validators";
 
-export { type ConversationEdit } from "./api/conversations-api";
+export { type ConversationEdit, type ConversationSearchScope } from "./api/conversations-api";
 export { type MutableJob, type MutableJobInput } from "./api/jobs-api";
 export { type ObservationSettings } from "./api/observations-api";
 export {

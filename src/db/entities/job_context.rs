@@ -671,8 +671,17 @@ pub(crate) struct MutableConversationTurn {
     pub evidence: Vec<ToolEvidenceRecord>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConversationSearchScope {
+    #[default]
+    All,
+    Conversations,
+    Project(ProjectId),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ConversationEntry {
+    pub snippet: Option<String>,
     pub root_job: JobId,
     pub tip_job: JobId,
     pub agent: Option<ConfigId>,

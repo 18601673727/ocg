@@ -8,8 +8,8 @@ use super::{
 };
 use crate::ai::compact::reserved_output_tokens;
 use crate::db::entities::{
-    ConfigBody, ConfigKind, DependencyCondition, DependencyState, JobEdit, JobId, JobTree,
-    LlmTransport, ProfileId, RecordRef, Recurrence, TreeFacts, TreeNode, Violation,
+    ConfigBody, ConfigKind, ConversationSearchScope, DependencyCondition, DependencyState, JobEdit,
+    JobId, JobTree, LlmTransport, ProfileId, RecordRef, Recurrence, TreeFacts, TreeNode, Violation,
 };
 use crate::db::{DatabaseError, DatabaseHandle};
 
@@ -19,6 +19,14 @@ const DEFAULT_CONVERSATION_PAGE: usize = 20;
 pub(super) fn page_query<T>(
     query: &str,
     parse_before: impl Fn(&str) -> Result<T, Refusal>,
+) -> Result<(Option<T>, usize), Refusal> {
+    page_query_with(query, parse_before, |_, _| Err(INVALID_REQUEST))
+}
+
+fn page_query_with<T>(
+    query: &str,
+    parse_before: impl Fn(&str) -> Result<T, Refusal>,
+    mut extra: impl FnMut(&str, &str) -> Result<(), Refusal>,
 ) -> Result<(Option<T>, usize), Refusal> {
     let (mut before, mut limit) = (None, None);
     if !query.is_empty() {
@@ -35,46 +43,60 @@ pub(super) fn page_query<T>(
                             .ok_or(INVALID_REQUEST)?,
                     );
                 }
-                _ => return Err(INVALID_REQUEST),
+                _ => extra(key, value)?,
             }
         }
     }
     Ok((before, limit.unwrap_or(DEFAULT_CONVERSATION_PAGE)))
 }
 
-pub(super) fn conversations_query(query: &str) -> Result<(Option<JobId>, usize), Refusal> {
-    page_query(query, routing::job_id)
-}
-
 const MAX_SEARCH_QUERY_BYTES: usize = 500;
 const MAX_SEARCH_TERMS: usize = 10;
 
-pub(super) fn conversation_search_query(
+pub(super) struct ConversationQuery {
+    pub(super) terms: Vec<String>,
+    pub(super) before: Option<JobId>,
+    pub(super) limit: usize,
+    pub(super) scope: ConversationSearchScope,
+}
+
+pub(super) fn conversation_query(
     query: &str,
-) -> Result<(Vec<String>, Option<JobId>, usize), Refusal> {
-    let (mut raw, mut before, mut limit) = (None, None, None);
-    if !query.is_empty() {
-        for pair in query.split('&') {
-            let (key, value) = pair.split_once('=').ok_or(INVALID_REQUEST)?;
-            match key {
-                "query" if raw.is_none() => {
-                    raw = Some(value);
-                }
-                "before" if before.is_none() => {
-                    before = Some(routing::job_id(value)?);
-                }
-                "limit" if limit.is_none() => {
-                    limit = Some(
-                        decimal::<usize>(value)
-                            .filter(|limit| (1..=MAX_CONVERSATION_PAGE).contains(limit))
-                            .ok_or(INVALID_REQUEST)?,
-                    );
-                }
-                _ => return Err(INVALID_REQUEST),
+    search: bool,
+    archived: bool,
+) -> Result<ConversationQuery, Refusal> {
+    let mut terms = None;
+    let mut scope = None;
+    let (before, limit) = page_query_with(query, routing::job_id, |key, value| {
+        match key {
+            "query" if search && terms.is_none() => terms = Some(search_terms(value)?),
+            "scope" if !archived && scope.is_none() => {
+                let decoded = decode_query_value(value).ok_or(INVALID_REQUEST)?;
+                scope = Some(match decoded.as_str() {
+                    "all" => ConversationSearchScope::All,
+                    "conversations" => ConversationSearchScope::Conversations,
+                    value => ConversationSearchScope::Project(super::projects::project_id(
+                        value.strip_prefix("project:").ok_or(INVALID_REQUEST)?,
+                    )?),
+                });
             }
+            _ => return Err(INVALID_REQUEST),
         }
-    }
-    let raw = raw.ok_or(INVALID_REQUEST)?;
+        Ok(())
+    })?;
+    Ok(ConversationQuery {
+        terms: if search {
+            terms.ok_or(INVALID_REQUEST)?
+        } else {
+            Vec::new()
+        },
+        before,
+        limit,
+        scope: scope.unwrap_or_default(),
+    })
+}
+
+pub(super) fn search_terms(raw: &str) -> Result<Vec<String>, Refusal> {
     let decoded = decode_query_value(raw).ok_or(INVALID_REQUEST)?;
     if decoded.len() > MAX_SEARCH_QUERY_BYTES {
         return Err(INVALID_REQUEST);
@@ -99,15 +121,15 @@ pub(super) fn conversation_search_query(
     if !term.is_empty() {
         terms.push(term.to_lowercase());
     }
-    terms.sort();
-    terms.dedup();
     if terms.is_empty() || terms.len() > MAX_SEARCH_TERMS {
         return Err(INVALID_REQUEST);
     }
+    terms.sort();
+    terms.dedup();
     if terms.iter().any(|term| term.chars().count() > 50) {
         return Err(INVALID_REQUEST);
     }
-    Ok((terms, before, limit.unwrap_or(DEFAULT_CONVERSATION_PAGE)))
+    Ok(terms)
 }
 
 fn decode_query_value(value: &str) -> Option<String> {
@@ -837,18 +859,24 @@ pub(super) async fn conversations(
     before: Option<JobId>,
     limit: usize,
     archived: bool,
+    scope: ConversationSearchScope,
 ) -> Result<Reply, Refusal> {
-    let page = database.conversations(before, limit, archived).await?;
+    let page = database
+        .conversations(before, limit, archived, scope)
+        .await?;
     Ok(Reply::ok(envelope(conversation_page(page))))
 }
 
 pub(super) async fn search_conversations(
     database: &DatabaseHandle,
+    scope: ConversationSearchScope,
     terms: Vec<String>,
     before: Option<JobId>,
     limit: usize,
 ) -> Result<Reply, Refusal> {
-    let page = database.search_conversations(terms, before, limit).await?;
+    let page = database
+        .search_conversations(scope, terms, before, limit)
+        .await?;
     Ok(Reply::ok(envelope(conversation_page(page))))
 }
 
@@ -863,6 +891,7 @@ fn conversation_page(page: crate::db::entities::ConversationsPage) -> serde_json
             tip_job: c.tip_job.to_string(),
             agent: c.agent.map(|id| ProfileId::from(id).to_string()),
             title: c.title,
+            snippet: c.snippet,
             project: c.project.map(|id| id.to_string()),
             state: c.state,
             on_hold: c.on_hold.as_ref().map(|by| HoldView { by: actor_view(by) }),
@@ -1201,6 +1230,9 @@ pub(crate) struct HoldView {
 #[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Conversation")]
 pub(crate) struct ConversationView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    snippet: Option<String>,
     job_state: String,
     has_children: bool,
     root_job: String,

@@ -753,6 +753,9 @@ export const en = {
   "sidebar.collapse": "Collapse sidebar",
   "sidebar.showChildren": "Show child conversations of {title}",
   "sidebar.hideChildren": "Hide child conversations of {title}",
+  "sidebar.searchScopeLabel": "Search scope",
+  "sidebar.searchScopeAll": "All",
+  "sidebar.searchScopeConversations": "Conversations",
   "sidebar.searchChats": "Search chats",
   "sidebar.searchChatsLabel": "Search titles and messages",
   "sidebar.searchKeyboardHint":
