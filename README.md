@@ -121,7 +121,28 @@ Keep the OCG data directory separate from project workspaces. The [data layout](
 
 ## Performance
 
-### Backend reference (2026-11-20)
+### Backend reference (2026-11-25)
+
+Measured on **2026-11-25** (Singapore time) from commit [`0c4bdd5`](https://github.com/18601673727/ocg/commit/0c4bdd585a9320ca5700e00fe6eea7c6151ee503) on `chuncheon`, using Rust 1.99.1 and Cargo's optimized `bench` profile. The host ran Debian Linux 6.12.113 on ARM64 with two logical CPUs and 11.66 GiB RAM. Benchmark data was isolated on ext4 on `/dev/sda2`. The existing OCG service remained running.
+
+The reference profile used concurrency eight, 1,000 jobs or completed-job fixtures, and 1,000 workspace files, as applicable. Startup measured ten launches after two warm-up launches. Memory, admission, throughput, and streaming used 32 warm-up jobs per trial. History used 625 first-page and cursor-page pairs per reader, and search used 200 iterations per reader. Streaming used three markers per job at 20 ms intervals. Except for startup, values are medians of three corresponding trial statistics.
+
+| Metric | Result |
+| --- | --- |
+| Startup readiness | 36.087 ms median, 35.760–36.878 ms range |
+| Memory | 17.82 MiB idle, 70.27 MiB sampled loaded peak |
+| Job admission | 25.600 ms p50, 31.669 ms p95 |
+| Job throughput | 33.025 jobs/s, 243.031 ms completion p50, 275.538 ms p95 |
+| Streaming delivery | 17.207 ms p50, 27.585 ms p95 |
+| History read | 3.714 ms p50, 9.466 ms p95 |
+| Workspace search | 0.026 ms p50, 0.282 ms p95 |
+| Database footprint | 46.13 MiB, 47.136 KiB apparent growth per completed job |
+
+All eight sections recorded 73 successful measurements in total. The records contain zero failed, rejected, timed-out, or unfinished benchmark operations. The memory peak is sampled. Database growth uses an equivalent empty baseline and apparent file lengths, which can differ from allocated disk space.
+
+The source archive, optimized build log, runner, per-section JSONL and stderr, combined results, and summary are preserved at `/srv/ocg-backend-bench-0c4bdd5/` on `chuncheon`. All 410 tracked files in the extracted source matched the archive and the archive matched commit `0c4bdd5`. The combined `results/reference.jsonl` SHA-256 is `55a48ae42e73c5ae9ad69139704f01adfde3bab4a9e0f87591d933183d532176`. The benchmark binary SHA-256 is `3a897b15dd89bc06040c5d4c4945f6c92aa356fcb7e3f7cb5bd9167d1820d23d`. Use the eight-section recipe under the earlier ext4 reference with this source revision to reproduce the run.
+
+### Previous backend reference (2026-11-20)
 
 Measured [`1c20348`](https://github.com/18601673727/ocg/commit/1c20348b660027990d7be59ab2aa1e1e80721023) with the benchmark executor fix in this working tree on `chuncheon`, using the optimized Cargo benchmark profile and Rust 1.99.1. The host ran Debian Linux 6.12.113 on ARM64 with 2 vCPUs and 11.66 GiB RAM. Benchmark data used a separate ext4 directory on `/dev/sda2`. The existing OCG service remained running.
 
@@ -142,7 +163,7 @@ All eight sections completed successfully, with 73 successful measurements and n
 
 The previous `d421854` run reported 11.67 jobs/s and 714.79 ms completion p95. It used eight clients but created only one benchmark Executor. Together with the one default Executor, that limited execution to two simultaneous allocations. Its results are preserved at `/srv/ocg-backend-bench-d421854/`.
 
-The earlier ext4 reference below reported 38.10 jobs/s and 236.15 ms completion p95 with eight execution slots. The current reference offers 22 tools per model request, including 12 Job-management tools, while the earlier workload offered 10. In a separate three-trial experiment on the current snapshot, an agent with coding capability only retained the two file reads and increased throughput to 32.60 jobs/s median. A separate experimental cache for compiled parameter validators retained all offered tools and raised throughput to 32.10 jobs/s median while reducing backend CPU time from 27 to 24 seconds per 1,000 jobs. Combining the coding-only agent with the cache yielded 33.09 jobs/s median and 19 seconds of backend CPU time. These experiments change different aspects of the workload or implementation and do not fully explain the remaining difference. CPU sampling also identified schema compilation and redb activity; traced write-call counts increased in the newer version. The precise contribution of the remaining changes is unquantified.
+The earlier ext4 reference below reported 38.10 jobs/s and 236.15 ms completion p95 with eight execution slots. The November 20 reference offered 22 tools per model request, including 12 Job-management tools, while the earlier workload offered 10. In a separate three-trial experiment on the November 20 snapshot, an agent with coding capability only retained the two file reads and increased throughput to 32.60 jobs/s median. A separate experimental cache for compiled parameter validators retained all offered tools and raised throughput to 32.10 jobs/s median while reducing backend CPU time from 27 to 24 seconds per 1,000 jobs. Combining the coding-only agent with the cache yielded 33.09 jobs/s median and 19 seconds of backend CPU time. These experiments change different aspects of the workload or implementation and do not fully explain the remaining difference. CPU sampling also identified schema compilation and redb activity; traced write-call counts increased in the newer version. The precise contribution of the remaining changes is unquantified.
 
 The measured source snapshot, build log, preflight, per-section JSONL and stderr, combined results and summary are preserved at `/srv/ocg-backend-bench-1c20348/`. All 382 tracked source files were checked against the measured snapshot, including the uncommitted benchmark patch. The combined JSONL SHA-256 is `23e1d33ed526af3f26ad52e22f19b56de92db99faee37386ca949456b0d9da26`. The extracted source has no Git metadata, so the benchmark's reported clean-tree status does not independently identify the commit. The diagnostic cache is isolated at `/srv/ocg-bench-schema-cache-probe/`. Use the eight-section commands in the earlier ext4 reference to reproduce this run.
 
@@ -281,7 +302,7 @@ These are separate runs with different source snapshots, client behavior, run ti
 <details>
 <summary>Reproduce the reference profile</summary>
 
-Run from the repository root in Bash at the commit containing this README. The script creates a fresh result directory and runs all eight sections sequentially. To compare against the published numbers, run on a matching two-core ARM64 machine and set `OCG_BENCH_PARENT` to a directory on **ext4**. The published run used `/srv/ocg-bench-current.zewYsE`; do not reuse its data directory or the production OCG database.
+Run from the repository root in Bash with the source snapshot for the reference run you want to reproduce. The script creates a fresh result directory and runs all eight sections sequentially. To compare against the published numbers, run on a matching two-core ARM64 machine and set `OCG_BENCH_PARENT` to a directory on **ext4**. The November 7 run used `/srv/ocg-bench-current.zewYsE`; do not reuse its data directory or the production OCG database.
 
 ```bash
 set -euo pipefail
