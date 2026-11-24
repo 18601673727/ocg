@@ -35,7 +35,7 @@ import {
   parseConversationPath,
 } from "./conversation-path";
 import { PageTitleVisibilityContext } from "./page-title";
-import { isReachableView, type WorkspaceView } from "./view-domain";
+import { isJobIdentity, isReachableView, type WorkspaceView } from "./view-domain";
 import { WorkspaceHome } from "./workspace-home";
 import { WorkspaceNavigation } from "./workspace-link";
 
@@ -80,13 +80,14 @@ function currentLocation() {
     url.searchParams.get("view") ??
     (settingsSection ? "settings" : url.pathname.replace(/^\/|\/$/g, "").replace(/\.html$/, ""));
   const chain = parseConversationPath(url.pathname);
+  const job = url.searchParams.get("job");
   return {
     view: chain
       ? ("chat" as WorkspaceView)
       : isReachableView(requested)
         ? requested
         : ("chat" as WorkspaceView),
-    job: chain?.at(-1) ?? null,
+    job: chain?.at(-1) ?? (isJobIdentity(job) ? job : null),
     chain,
     settingsSection: settingsSection ?? "models",
   };
