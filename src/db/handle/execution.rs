@@ -666,7 +666,7 @@ impl DatabaseHandle {
         &self,
         handoff: &DevelopmentHandoff,
         cause: entities::UncertaintyReason,
-        failure: Option<entities::AvailabilityStat>,
+        mut failure: Option<entities::AvailabilityStat>,
     ) -> Result<(), DatabaseError> {
         let (mut guard, proof) = self.begin_development_write(handoff)?;
         if let Some(secret) = &handoff.prepared.credentials.spellings
@@ -694,10 +694,11 @@ impl DatabaseHandle {
             .flatten()
             .any(|text| secret.found_in(text))
         {
-            return Err(DatabaseError::Rejected(Violation::InvalidValue(
-                "outcome",
-                "failure evidence contains credential material",
-            )));
+            log::warn!(
+                "dropping failure evidence for job {} because it contains credential material",
+                proof.token().job
+            );
+            failure = None;
         }
         let result = self
             .write_sized(

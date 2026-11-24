@@ -955,7 +955,14 @@ impl Batch {
     ) -> Result<(), BatchError> {
         self.require_development_write_for(proof, None)?;
         let token = proof.token();
-        if let Some(failure) = failure {
+        if let Some(failure) = failure
+            && failure.job == token.job
+            && failure.observation.status_code.is_some()
+            && failure.observation.failure.is_some()
+            && self
+                .development_usage_prefix(token.job, failure.request)?
+                .is_some()
+        {
             self.record_development_provider_failure(token.job, failure)?;
         }
         self.transition_pool_allocation(
