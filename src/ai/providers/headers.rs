@@ -4,8 +4,21 @@ use ntex::http::header::{HeaderName, HeaderValue};
 use super::{CredentialResolver, ProviderExecutionError};
 use crate::db::entities::FrozenHeaders;
 
-pub(crate) fn authorization(credential: &str) -> Result<HeaderValue, ProviderExecutionError> {
-    Ok(crate::network::http::authorization(credential)?)
+pub(super) fn credential_header(
+    credential: Option<&str>,
+    anthropic: bool,
+) -> Result<Option<(&'static str, HeaderValue)>, ProviderExecutionError> {
+    let Some(credential) = credential else {
+        return Ok(None);
+    };
+    Ok(Some(if anthropic {
+        ("x-api-key", super::anthropic::api_key(credential)?)
+    } else {
+        (
+            "authorization",
+            crate::network::http::authorization(credential)?,
+        )
+    }))
 }
 
 #[derive(Default)]

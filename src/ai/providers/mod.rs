@@ -96,7 +96,7 @@ pub(super) async fn send(
     sink: Option<&mut dyn ProviderOutputSink>,
     transport: Option<crate::db::entities::LlmTransport>,
 ) -> Result<(ClientResponse, Instant, observe::Redactor), ProviderExecutionError> {
-    use self::headers::{authorization, resolve_request_headers};
+    use self::headers::{credential_header, resolve_request_headers};
     use self::transport::provider_client_for;
 
     let stream = transport.is_some();
@@ -105,14 +105,7 @@ pub(super) async fn send(
     let credential = resolver.resolve(credential_ref).await?;
     let headers = resolve_request_headers(frozen_headers, resolver).await?;
     let redactor = observe::Redactor::new(credential.as_deref()).with_secrets(headers.secrets());
-    let authorization = credential
-        .as_deref()
-        .map(if anthropic {
-            anthropic::api_key
-        } else {
-            authorization
-        })
-        .transpose()?;
+    let authorization = credential_header(credential.as_deref(), anthropic)?;
     let cancelled = || ProviderExecutionError::NotDelivered {
         message: format!("{operation} execution was cancelled before sending"),
     };
@@ -153,15 +146,8 @@ pub(super) async fn send(
             anthropic.then_some(anthropic::API_VERSION),
             |version, request| request.set_header("anthropic-version", version),
         )
-        .if_some(authorization, |authorization, request| {
-            request.set_header(
-                if anthropic {
-                    "x-api-key"
-                } else {
-                    "authorization"
-                },
-                authorization,
-            )
+        .if_some(authorization, |(name, value), request| {
+            request.set_header(name, value)
         });
     if config.cancellation.is_cancelled() {
         return Err(cancelled());

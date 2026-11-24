@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::headers::{RequestHeaders, authorization};
+use super::headers::{RequestHeaders, credential_header};
 use super::transport::provider_client_for;
 use super::{ACCEPT, DestinationPolicy, Duration, Value, anthropic};
 
@@ -18,17 +18,11 @@ pub(crate) async fn list_models(
     protocol: Option<crate::db::entities::LlmTransport>,
     headers: &RequestHeaders,
 ) -> Result<Vec<ProviderModel>, ModelListError> {
-    let base = super::endpoint(endpoint, "models").map_err(|_| ModelListError::Unreachable)?;
+    let base = super::model_endpoint(endpoint).map_err(|_| ModelListError::Unreachable)?;
     let anthropic = protocol == Some(crate::db::entities::LlmTransport::AnthropicMessages);
     let decision = protocol.is_none();
-    let authorization = credential
-        .map(if anthropic {
-            anthropic::api_key
-        } else {
-            authorization
-        })
-        .transpose()
-        .map_err(|_| ModelListError::Unreachable)?;
+    let authorization =
+        credential_header(credential, anthropic).map_err(|_| ModelListError::Unreachable)?;
     ntex::time::timeout(Duration::from_secs(30), async {
         let client = provider_client_for(&DestinationPolicy::Standard, &base)
             .await
@@ -45,15 +39,8 @@ pub(crate) async fn list_models(
                 let request = headers
                     .apply(client.get(&endpoint))
                     .set_header(ACCEPT, "application/json")
-                    .if_some(authorization.clone(), |authorization, request| {
-                        request.set_header(
-                            if anthropic {
-                                "x-api-key"
-                            } else {
-                                "authorization"
-                            },
-                            authorization,
-                        )
+                    .if_some(authorization.clone(), |(name, value), request| {
+                        request.set_header(name, value)
                     });
                 let request = if anthropic {
                     request.set_header("anthropic-version", anthropic::API_VERSION)
