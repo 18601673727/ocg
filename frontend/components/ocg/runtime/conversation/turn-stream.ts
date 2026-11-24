@@ -230,14 +230,38 @@ export class TurnStreams {
         }
         turn.error = undefined;
         this.publications.publish(turn.sessionId);
+        let continuationRetry = false;
         if (details.task_plan && !loadedContinuation) {
-          loadedContinuation = true;
-          await this.openConversation(details.task_plan.continuation);
-          if (entry.stopped || signal.aborted) return;
+          try {
+            await this.openConversation(details.task_plan.continuation);
+            if (entry.stopped || signal.aborted) return;
+            loadedContinuation = true;
+          } catch (error) {
+            if (entry.stopped || signal.aborted) return;
+            const detail = error instanceof Error ? error.message : String(error);
+            if (
+              error instanceof ContractError ||
+              (error instanceof ApiError &&
+                (error.code === "not_found" ||
+                  (error.status >= 400 &&
+                    error.status < 500 &&
+                    ![401, 408, 429].includes(error.status))))
+            ) {
+              loadedContinuation = true;
+              console.warn(`Failed to load continuation for ${jobId}: ${detail}`);
+            } else {
+              continuationRetry = true;
+            }
+          }
         }
         const active = needsWatch(turn);
         recoveryAfter = 0;
-        recoveryDelay = CATALOG_REFRESH_DELAY_MS;
+        if (continuationRetry) {
+          recoveryAfter = Date.now() + recoveryDelay;
+          recoveryDelay = Math.min(recoveryDelay * 2, MAX_RECOVERY_DELAY_MS);
+        } else {
+          recoveryDelay = CATALOG_REFRESH_DELAY_MS;
+        }
         if (active && details.mutable_phase !== "queued" && (needsReplay || !entry.subscription)) {
           needsReplay = false;
           replayThrough = 0;
@@ -250,7 +274,7 @@ export class TurnStreams {
             (readReplies || turn.outputs.firstSeq > 1));
         if (!evidenceCurrent) {
           queued = true;
-        } else if (!active) {
+        } else if (!active && !continuationRetry) {
           finish();
         }
       } catch (error) {
