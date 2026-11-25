@@ -629,6 +629,7 @@ export const en = {
     'Nothing was sent. The model "{name}" has no Context window set, so OCG cannot run it.',
   "chat.missingField.contextWindowLink": "Open the Context window field",
   "chat.failureDetails": "Details: {text}",
+  "chat.openJobs": "Open Jobs",
   "chat.setupModels":
     "Set up a chat model in Settings → Models, then assign it to an agent under Agents.",
   "chat.setupNewTab": "Opens in a new tab",
@@ -803,6 +804,7 @@ export const en = {
   "common.close": "Close",
   "common.reload": "Reload",
   "common.retry": "Retry",
+  "common.stop": "Stop",
   "common.reset": "Reset",
   "common.loading": "Loading…",
   "common.loadMore": "Load more",

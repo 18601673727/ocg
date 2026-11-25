@@ -306,6 +306,7 @@ function UserMessage() {
 export function AssistantMessage(props: { footer?: JSX.Element }) {
   const { t } = useI18n();
   const message = useThreadMessage();
+  const { retry } = useConversationView();
   const running = createMemo(
     () => message().status === "streaming" || message().status === "pending",
   );
@@ -424,12 +425,51 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
               </Show>
               <ImageGallery images={message().images} />
               {props.footer}
-              <Show when={failure() || message().status === "failed"}>
+              <Show
+                when={failure() || message().status === "failed" || message().status === "unknown"}
+              >
                 <p role="alert" class="text-destructive mt-2 text-sm whitespace-pre-wrap">
-                  {failure() ?? t("chat.failed")}
+                  {failure() ??
+                    (message().status === "unknown" ? t("job.activity.unknown") : t("chat.failed"))}
                 </p>
               </Show>
-              <Show when={message().failureLink}>
+              <Show
+                when={message().failureLink}
+                fallback={
+                  <Show
+                    when={
+                      failure() || message().status === "failed" || message().status === "unknown"
+                    }
+                  >
+                    <p class="mt-1.5 text-sm">
+                      <Show
+                        when={message().canRetry}
+                        fallback={
+                          <WorkspaceLink
+                            href={
+                              message().jobId
+                                ? `/?view=jobs&job=${encodeURIComponent(message().jobId!)}`
+                                : "/?view=jobs"
+                            }
+                            class="underline underline-offset-2"
+                          >
+                            {t("chat.openJobs")}
+                          </WorkspaceLink>
+                        }
+                      >
+                        <Button
+                          type="button"
+                          size="xs"
+                          variant="outline"
+                          onClick={() => void retry(message().id)}
+                        >
+                          {t("common.retry")}
+                        </Button>
+                      </Show>
+                    </p>
+                  </Show>
+                }
+              >
                 {(link) => (
                   <p class="mt-1 text-sm">
                     <WorkspaceLink href={link().href} class="underline underline-offset-2">

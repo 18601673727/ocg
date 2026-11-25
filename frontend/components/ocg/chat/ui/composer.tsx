@@ -94,9 +94,10 @@ export function ComposerSend(
   viewProps: Omit<ElementProps<"button">, "children"> & {
     idle: boolean;
     mode: "send" | "loading" | "stop";
+    stopLabel?: string;
   },
 ) {
-  const [, props] = splitProps(viewProps, ["idle", "mode", "class"]);
+  const [, props] = splitProps(viewProps, ["idle", "mode", "stopLabel", "class"]);
 
   return (
     <button
@@ -106,7 +107,10 @@ export function ComposerSend(
       data-state={viewProps.mode}
       aria-busy={viewProps.mode === "loading" ? "true" : undefined}
       class={cn(
-        "group/composer-action grid size-8 place-items-center rounded-full",
+        "group/composer-action rounded-full",
+        viewProps.mode === "stop"
+          ? "flex h-8 w-auto items-center justify-center gap-1.5 px-3 text-xs font-medium"
+          : "grid size-8 place-items-center",
         !viewProps.idle
           ? inkButton
           : "bg-foreground/[0.06] text-muted-foreground inset-ring-border dark:bg-foreground/[0.09] inset-ring transition-colors forced-colors:border forced-colors:border-[GrayText] forced-colors:text-[GrayText]",
@@ -116,21 +120,19 @@ export function ComposerSend(
     >
       {viewProps.mode === "send" ? (
         <ArrowUpIcon class="col-start-1 row-start-1 size-4" aria-hidden="true" />
+      ) : viewProps.mode === "stop" ? (
+        <>
+          <SquareIcon
+            data-slot="composer-stop-icon"
+            class="size-3 shrink-0 fill-current"
+            aria-hidden="true"
+          />
+          <span>{viewProps.stopLabel ?? "Stop"}</span>
+        </>
       ) : (
         <LoaderCircleIcon
           data-slot="composer-spinner"
-          class={cn(
-            "col-start-1 row-start-1 size-4 animate-spin motion-reduce:animate-none",
-            viewProps.mode === "stop" &&
-              "group-hover/composer-action:opacity-0 group-focus-visible/composer-action:opacity-0 pointer-coarse:opacity-0",
-          )}
-          aria-hidden="true"
-        />
-      )}
-      {viewProps.mode === "stop" && (
-        <SquareIcon
-          data-slot="composer-stop-icon"
-          class="col-start-1 row-start-1 size-3 fill-current opacity-0 group-hover/composer-action:opacity-100 group-focus-visible/composer-action:opacity-100 pointer-coarse:opacity-100"
+          class="col-start-1 row-start-1 size-4 animate-spin motion-reduce:animate-none"
           aria-hidden="true"
         />
       )}

@@ -311,6 +311,7 @@ export function MutableComposer(props: ComposerProps) {
             <ComposerActions class="ms-auto min-w-0 shrink-0">
               <ComposerSend
                 mode={actionMode()}
+                stopLabel={i18n.t("common.stop")}
                 type={actionMode() === "send" ? "submit" : "button"}
                 idle={actionMode() === "send" && sendDisabled()}
                 disabled={actionMode() === "loading" || (actionMode() === "send" && sendDisabled())}
