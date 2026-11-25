@@ -160,6 +160,20 @@ function ImportContent(props: {
     },
   );
   const existing = createMemo(() => new Set(provider()?.models ?? []));
+  // Other saved Sources with the same Endpoint, by model id. Each Source has its own
+  // credentials and terms, so this only informs; it never blocks an import.
+  const elsewhere = createMemo(() => {
+    const names = new Map<string, string[]>();
+    const target = endpoint()?.trim();
+    if (!target) return names;
+    for (const entry of providers()) {
+      if (entry.id === sourceId() || entry.endpoint?.trim() !== target) continue;
+      for (const model of entry.models) {
+        names.set(model, [...(names.get(model) ?? []), sourceName(entry.name)]);
+      }
+    }
+    return names;
+  });
   const importable = createMemo(() => models().filter((model) => !existing().has(model.id)));
   const matching = createMemo(() =>
     models().filter((model) =>
@@ -458,6 +472,13 @@ function ImportContent(props: {
                     {model.context_window ? (
                       <span class="mt-1 block text-xs text-muted-foreground">
                         {model.context_window.toLocaleString()} Token
+                      </span>
+                    ) : null}
+                    {elsewhere().get(model.id) ? (
+                      <span class="mt-1 block text-xs text-muted-foreground">
+                        {i18n.t("settings.llm.addedElsewhere", {
+                          names: elsewhere().get(model.id)!.join(", "),
+                        })}
                       </span>
                     ) : null}
                   </span>

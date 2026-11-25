@@ -1160,6 +1160,7 @@ export const zh: Dictionary = {
   "settings.llm.searchModels": "搜索模型",
   "settings.llm.clearSelection": "清空选择",
   "settings.llm.alreadyAdded": "已添加",
+  "settings.llm.addedElsewhere": "同一端点也在 {names} 中",
   "settings.llm.enabled": "已启用",
   "settings.llm.disabled": "已停用",
   "settings.llm.enable": "启用",

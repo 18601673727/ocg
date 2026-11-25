@@ -1242,6 +1242,7 @@ export const en = {
   "settings.llm.searchModels": "Search models",
   "settings.llm.clearSelection": "Clear selection",
   "settings.llm.alreadyAdded": "Already added",
+  "settings.llm.addedElsewhere": "Also in {names} with this endpoint",
   "settings.llm.enabled": "Enabled",
   "settings.llm.disabled": "Disabled",
   "settings.llm.enable": "Enable",
