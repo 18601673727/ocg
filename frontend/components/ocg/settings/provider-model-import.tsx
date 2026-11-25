@@ -474,7 +474,7 @@ function ImportContent(props: {
                         {model.context_window.toLocaleString()} Token
                       </span>
                     ) : null}
-                    {elsewhere().get(model.id) ? (
+                    {!existing().has(model.id) && elsewhere().get(model.id) ? (
                       <span class="mt-1 block text-xs text-muted-foreground">
                         {i18n.t("settings.llm.addedElsewhere", {
                           names: elsewhere().get(model.id)!.join(", "),
