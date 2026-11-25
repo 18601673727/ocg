@@ -12,7 +12,7 @@ use super::validation::{
     PROFILE_REVISION_REQUIRED, UNSUPPORTED_DECISION_PROTOCOL, UNSUPPORTED_PROTOCOL,
     WRONG_PROFILE_KIND, config_revision, map_mutation_error, normalize_endpoint,
     normalize_instructions, parse_capability_set, parse_profile_refs, profile_id,
-    resolve_credential_input, revision_guard, valid_single_line,
+    resolve_credential_input, revision_guard, valid_single_line, validate_credential_origin,
 };
 use super::wire::ProfileRequest;
 use crate::db::entities::{
@@ -20,7 +20,7 @@ use crate::db::entities::{
     DecisionAgentConfig, DecisionCapability, DecisionLimits, DecisionProtocol, LlmParameters,
     LlmTransport, ModelCapability, ProfileId, Violation,
 };
-use crate::db::mutations::{ModelProfileDefinition, ModelProfileSave};
+use crate::db::mutations::{ModelProfileDefinition, ModelProfileSave, ProfileCredentialRef};
 use crate::db::{DatabaseError, DatabaseHandle};
 use ntex::http::StatusCode;
 use serde::Deserialize;
@@ -68,6 +68,7 @@ enum PreparedProfileSave {
 struct CommonModelInput {
     name: String,
     model: String,
+    connection_protocol: Option<LlmTransport>,
     endpoint: Option<String>,
     credential_ref: Option<String>,
     credential: Option<String>,
@@ -93,24 +94,87 @@ async fn prepare_model_save(
     let name = input.name.trim().to_owned();
     let model = input.model.trim().to_owned();
     let endpoint = normalize_endpoint(input.endpoint.as_deref())?;
+    let previous = previous_model_connection(database, existing_id, kind).await?;
+    let connection_protocol = input
+        .connection_protocol
+        .or(match &previous {
+            Some((record, _)) => match &record.body {
+                ConfigBody::Connection(connection) => Some(connection.protocol),
+                ConfigBody::Model(_)
+                | ConfigBody::Agent(_)
+                | ConfigBody::DecisionModel(_)
+                | ConfigBody::DecisionAgent(_) => None,
+            },
+            None => None,
+        })
+        .unwrap_or(LlmTransport::OpenAiChatCompletions);
+    let (previous_headers, previous_credential_ref, allow_stored_secrets) = match &previous {
+        Some((record, _)) => {
+            let ConfigBody::Connection(connection) = &record.body else {
+                return Err(INCONSISTENT_RECORD);
+            };
+            (
+                connection.headers.clone(),
+                connection.credential_ref.clone(),
+                if kind == ConfigKind::DecisionModel {
+                    match (connection.endpoint.as_deref(), endpoint.as_deref()) {
+                        (_, None) => true,
+                        (Some(previous), Some(next)) => {
+                            crate::ai::providers::provider_origins_match(
+                                Some(previous),
+                                connection.protocol,
+                                Some(next),
+                                connection_protocol,
+                            )
+                        }
+                        (None, Some(_)) => false,
+                    }
+                } else {
+                    crate::ai::providers::provider_origins_match(
+                        connection.endpoint.as_deref(),
+                        connection.protocol,
+                        endpoint.as_deref(),
+                        connection_protocol,
+                    )
+                },
+            )
+        }
+        None => (Vec::new(), None, true),
+    };
     let (credential_ref, secret) = resolve_credential_input(
         &name,
         input.credential_ref.as_deref(),
         input.credential.as_deref(),
         input.clear_credential,
     )?;
-    let previous = previous_model_connection(database, existing_id, kind).await?;
-    let previous_headers = match &previous {
-        Some((record, _)) => {
-            let ConfigBody::Connection(connection) = &record.body else {
-                return Err(INCONSISTENT_RECORD);
+    if secret.is_none() {
+        let reused_reference = match &credential_ref {
+            ProfileCredentialRef::Preserve => previous_credential_ref.as_deref(),
+            ProfileCredentialRef::Explicit(reference) => Some(reference.as_str()),
+            ProfileCredentialRef::Clear | ProfileCredentialRef::PreserveOrGenerate(_) => None,
+        };
+        if let Some(reference) = reused_reference {
+            let target_endpoint = if kind == ConfigKind::DecisionModel {
+                endpoint.as_deref()
+            } else {
+                Some(crate::ai::providers::effective_provider_endpoint(
+                    endpoint.as_deref(),
+                    connection_protocol,
+                ))
             };
-            connection.headers.clone()
+            if let Some(target_endpoint) = target_endpoint {
+                validate_credential_origin(database, reference, target_endpoint, false).await?;
+            }
         }
-        None => Vec::new(),
-    };
+    }
     let guard = revision_guard(previous.map(|(_, guard)| guard), input.expected_edit_seq)?;
-    let plan = plan_headers(database, input.headers, &previous_headers).await?;
+    let plan = plan_headers(
+        database,
+        input.headers,
+        &previous_headers,
+        allow_stored_secrets,
+    )
+    .await?;
     Ok(ModelProfileSave {
         headers: plan.change,
         existing_id,
@@ -197,6 +261,7 @@ pub(crate) async fn save_profile(
                 CommonModelInput {
                     name,
                     model,
+                    connection_protocol: protocol,
                     endpoint,
                     credential_ref,
                     credential,
@@ -350,6 +415,7 @@ pub(crate) async fn save_profile(
                 CommonModelInput {
                     name,
                     model,
+                    connection_protocol: Some(LlmTransport::OpenAiChatCompletions),
                     endpoint,
                     credential_ref,
                     credential,

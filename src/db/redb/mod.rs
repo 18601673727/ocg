@@ -41,9 +41,9 @@ pub(crate) use batch::{
 };
 pub(crate) use reads::catalog::{
     StoredCredential, credential_count, read_agent_model_configs, read_attachment, read_config,
-    read_configs, read_credential, read_credential_ref_in_use, read_global_compaction_settings,
-    read_global_outbound_headers, read_handoff_credential, read_profile_page, read_project,
-    read_projects, read_submission,
+    read_configs, read_credential, read_credential_ref_origin_matches,
+    read_global_compaction_settings, read_global_outbound_headers, read_handoff_credential,
+    read_profile_page, read_project, read_projects, read_submission,
 };
 pub(crate) use reads::check_readable;
 pub(crate) use reads::conversations::{

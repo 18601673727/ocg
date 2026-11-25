@@ -8,6 +8,7 @@ use super::validation::{
     MAX_PROFILE_NAME_BYTES, MAX_PROVIDER_MESSAGE_BYTES, PROFILE_NOT_FOUND, UNSUPPORTED_PROTOCOL,
     WRONG_PROFILE_KIND, default_credential_ref, map_mutation_error, parse_capability_set,
     profile_id, valid_credential_ref, valid_secret_header, valid_single_line,
+    validate_credential_origin,
 };
 use super::wire::{ImportedModelsView, ProviderModelsView};
 use crate::ai::providers::CredentialResolver;
@@ -30,13 +31,6 @@ fn bounded_provider_message(mut message: String) -> String {
         message.truncate(end);
     }
     message
-}
-
-async fn saved_connection_credential(
-    database: &DatabaseHandle,
-    reference: &str,
-) -> Result<bool, Refusal> {
-    Ok(database.credential_ref_in_use(reference).await?)
 }
 
 #[derive(Deserialize)]
@@ -129,7 +123,14 @@ pub(crate) async fn import_models(
             {
                 return Err(INVALID_CREDENTIAL);
             }
-            headers = plan_headers(database, provider.headers, &[]).await?.change;
+            if credential.is_none()
+                && let Some(reference) = reference.as_deref()
+            {
+                validate_credential_origin(database, reference, endpoint, false).await?;
+            }
+            headers = plan_headers(database, provider.headers, &[], true)
+                .await?
+                .change;
             let (credential_ref, secret) = match credential {
                 Some(secret) => {
                     let credential_ref = match reference {
@@ -245,11 +246,10 @@ pub(crate) async fn provider_models(
         Some(credential) => Some(credential),
         None => match request.credential_ref.as_deref() {
             Some(reference) => {
-                if !valid_credential_ref(reference)
-                    || !saved_connection_credential(database, reference).await?
-                {
+                if !valid_credential_ref(reference) {
                     return Err(INVALID_CREDENTIAL_REF);
                 }
+                validate_credential_origin(database, reference, &request.endpoint, true).await?;
                 database
                     .resolve(Some(reference))
                     .await
@@ -265,8 +265,8 @@ pub(crate) async fn provider_models(
         return Err(INVALID_CREDENTIAL);
     }
     use crate::ai::providers::ModelListError;
-    let saved_headers = match request.profile_id.as_deref() {
-        None => Vec::new(),
+    let (saved_headers, allow_stored_headers) = match request.profile_id.as_deref() {
+        None => (Vec::new(), true),
         Some(id) => {
             let kind = match protocol {
                 DiscoveryProtocol::Generative(_) => ConfigKind::Model,
@@ -277,13 +277,28 @@ pub(crate) async fn provider_models(
                     let ConfigBody::Connection(connection) = record.body else {
                         return Err(INCONSISTENT_RECORD);
                     };
-                    connection.headers
+                    let allow_stored_headers =
+                        kind != ConfigKind::DecisionModel || connection.endpoint.is_some();
+                    let allow_stored_headers = allow_stored_headers
+                        && crate::ai::providers::provider_origins_match(
+                            connection.endpoint.as_deref(),
+                            connection.protocol,
+                            Some(&request.endpoint),
+                            connection.protocol,
+                        );
+                    (connection.headers, allow_stored_headers)
                 }
-                None => Vec::new(),
+                None => (Vec::new(), true),
             }
         }
     };
-    let plan = plan_headers(database, request.headers, &saved_headers).await?;
+    let plan = plan_headers(
+        database,
+        request.headers,
+        &saved_headers,
+        allow_stored_headers,
+    )
+    .await?;
     let listed = crate::ai::providers::list_models(
         &request.endpoint,
         credential.as_deref(),

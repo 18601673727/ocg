@@ -101,13 +101,18 @@ impl DatabaseHandle {
             .await
     }
 
-    pub(crate) async fn credential_ref_in_use(
+    pub(crate) async fn credential_ref_origin_matches(
         &self,
         reference: &str,
-    ) -> Result<bool, DatabaseError> {
+        endpoint: &str,
+        live_only: bool,
+    ) -> Result<Option<bool>, DatabaseError> {
         let reference = reference.to_owned();
-        self.read(move |database| redb::read_credential_ref_in_use(database, &reference))
-            .await
+        let endpoint = endpoint.to_owned();
+        self.read(move |database| {
+            redb::read_credential_ref_origin_matches(database, &reference, &endpoint, live_only)
+        })
+        .await
     }
 
     pub async fn configs(

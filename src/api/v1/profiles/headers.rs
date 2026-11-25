@@ -62,11 +62,23 @@ pub(super) async fn plan_headers(
     database: &DatabaseHandle,
     inputs: Option<Vec<OutboundHeaderInput>>,
     previous: &[OutboundHeader],
+    allow_stored_secrets: bool,
 ) -> Result<HeaderPlan, Refusal> {
     let global = database.global_outbound_headers().await?;
     let mut supplied = BTreeMap::new();
     let (change, connection) = match inputs {
-        None => (HeaderChange::Preserve, previous.to_vec()),
+        None => {
+            if !allow_stored_secrets
+                && previous
+                    .iter()
+                    .any(|field| matches!(&field.value, OutboundHeaderValue::Secret(_)))
+            {
+                return Err(INVALID_HEADERS.with_reason(
+                    "stored secret headers can only be reused with the Provider origin they were saved for; enter their values again".to_owned(),
+                ));
+            }
+            (HeaderChange::Preserve, previous.to_vec())
+        }
         Some(inputs) => {
             let mut edits = Vec::with_capacity(inputs.len());
             let mut fields = Vec::with_capacity(inputs.len());
@@ -95,6 +107,11 @@ pub(super) async fn plan_headers(
                                 "header `{name}` has no stored secret; supply its value"
                             )));
                         };
+                        if !allow_stored_secrets {
+                            return Err(INVALID_HEADERS.with_reason(
+                                "stored secret headers can only be reused with the Provider origin they were saved for; enter their values again".to_owned(),
+                            ));
+                        }
                         (
                             HeaderEditValue::Secret(None),
                             OutboundHeaderValue::Secret(reference),

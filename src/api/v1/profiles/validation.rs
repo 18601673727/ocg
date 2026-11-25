@@ -57,6 +57,11 @@ pub(super) const INVALID_CREDENTIAL: Refusal = Refusal::new(
     "invalid_credential",
     "credential secret must be 1..=4096 bytes and a valid HTTP Bearer token",
 );
+const CREDENTIAL_ORIGIN_MISMATCH: Refusal = Refusal::new(
+    StatusCode::UNPROCESSABLE_ENTITY,
+    "credential_origin_mismatch",
+    "stored credentials can only be reused with the Provider origin they were saved for; enter the credential again",
+);
 pub(super) const INVALID_CAPABILITIES: Refusal = Refusal::new(
     StatusCode::UNPROCESSABLE_ENTITY,
     "invalid_capabilities",
@@ -169,6 +174,23 @@ pub(super) fn normalize_endpoint(endpoint: Option<&str>) -> Result<Option<String
             }
             Ok(Some(url.to_owned()))
         }
+    }
+}
+
+pub(super) async fn validate_credential_origin(
+    database: &crate::db::DatabaseHandle,
+    reference: &str,
+    endpoint: &str,
+    require_live: bool,
+) -> Result<(), Refusal> {
+    match database
+        .credential_ref_origin_matches(reference, endpoint, require_live)
+        .await?
+    {
+        Some(true) => Ok(()),
+        Some(false) => Err(CREDENTIAL_ORIGIN_MISMATCH),
+        None if require_live => Err(INVALID_CREDENTIAL_REF),
+        None => Ok(()),
     }
 }
 
