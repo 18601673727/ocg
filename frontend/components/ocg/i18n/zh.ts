@@ -294,7 +294,6 @@ export const zh: Dictionary = {
   "chat.agentUnavailable": "此对话的智能体不可用。请刷新配置或开始新对话。",
   "chat.project": "项目",
   "chat.pureConversation": "纯对话",
-  "chat.toolsWarning": "工具：此模型未声明工具支持。",
 
   "nav.usage": "用量",
   "usage.input": "输入",

@@ -328,7 +328,6 @@ export const en = {
     "This conversation's Agent is unavailable. Refresh Profiles or start a new conversation.",
   "chat.project": "Project",
   "chat.pureConversation": "Chat only",
-  "chat.toolsWarning": "Tools: this model does not declare tool support.",
 
   "nav.usage": "Usage",
   "usage.input": "Input",
