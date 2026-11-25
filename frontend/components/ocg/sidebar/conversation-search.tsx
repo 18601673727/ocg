@@ -1,4 +1,4 @@
-import { ChevronDown, MessageSquare, Search, X } from "@lucide/solid";
+import { MessageSquare, Search, X } from "@lucide/solid";
 import { createEffect, createMemo, createSignal, createUniqueId } from "solid-js";
 import { Button } from "@/components/ui/button";
 import {
@@ -276,26 +276,20 @@ export function ConversationSearch(props: ConversationSearchProps) {
               class="h-11 pl-9 text-base sm:h-10 sm:text-sm"
             />
           </div>
-          <div class="relative inline-flex w-fit min-w-0 max-w-full sm:max-w-44">
-            <Select<ConversationSearchScope>
-              value={scope()}
-              onValueChange={changeScope}
-              aria-label={i18n.t("sidebar.searchScopeLabel")}
-              class="max-w-full not-supports-[appearance:base-select]:appearance-none sm:data-[size=default]:h-10"
-            >
-              <SelectItem value="all">{i18n.t("sidebar.searchScopeAll")}</SelectItem>
-              <SelectItem value="conversations">
-                {i18n.t("sidebar.searchScopeConversations")}
-              </SelectItem>
-              {(props.projects ?? []).map((project) => (
-                <SelectItem value={`project:${project.id}`}>{project.name}</SelectItem>
-              ))}
-            </Select>
-            <ChevronDown
-              class="pointer-events-none absolute end-3 top-1/2 size-4 -translate-y-1/2 text-foreground supports-[appearance:base-select]:hidden"
-              aria-hidden="true"
-            />
-          </div>
+          <Select<ConversationSearchScope>
+            value={scope()}
+            onValueChange={changeScope}
+            aria-label={i18n.t("sidebar.searchScopeLabel")}
+            class="max-w-full sm:max-w-44 sm:data-[size=default]:h-10"
+          >
+            <SelectItem value="all">{i18n.t("sidebar.searchScopeAll")}</SelectItem>
+            <SelectItem value="conversations">
+              {i18n.t("sidebar.searchScopeConversations")}
+            </SelectItem>
+            {(props.projects ?? []).map((project) => (
+              <SelectItem value={`project:${project.id}`}>{project.name}</SelectItem>
+            ))}
+          </Select>
           <span id={hintId} class="sr-only">
             {i18n.t("sidebar.searchKeyboardHint")}
           </span>

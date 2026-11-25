@@ -1,4 +1,5 @@
 .ocg-select {
+  --ocg-select-chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' style='color-scheme:light dark'%3E%3Cpath d='m6 9 6 6 6-6' fill='none' stroke='CanvasText' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
   line-height: 1.25rem;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -8,13 +9,31 @@
   display: none;
 }
 
+@supports not (appearance: base-select) {
+  .ocg-select {
+    appearance: none;
+    padding-inline-end: 2.25rem;
+    background-image: var(--ocg-select-chevron);
+    background-position: right 0.75rem center;
+    background-repeat: no-repeat;
+    background-size: 1rem;
+  }
+
+  .ocg-select:dir(rtl) {
+    background-position: left 0.75rem center;
+  }
+
+  @media (forced-colors: active) {
+    .ocg-select {
+      appearance: auto;
+      background-image: none;
+    }
+  }
+}
+
 @supports (appearance: base-select) {
   .ocg-select {
     appearance: base-select;
-
-    /* Chevron 12px from the right edge; the 8px text gap comes from gap-2.
-       The fitSelected measurement span reserves the same 36px (8 + 16 + 12)
-       when base-select is supported. */
     padding-inline-end: 0.75rem;
   }
 
@@ -53,9 +72,7 @@
     height: 1rem;
     margin-inline-start: 0;
     background: var(--muted-foreground);
-    mask:
-      url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m6 9 6 6 6-6' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")
-      center / contain no-repeat;
+    mask: var(--ocg-select-chevron) center / contain no-repeat;
     transition: transform 160ms;
   }
 
