@@ -17,7 +17,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select, SelectItem } from "@/components/ui/select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
-import { elementRef } from "@/lib/ui-state";
+import { elementRef, type FormEvent } from "@/lib/ui-state";
 import { type I18nKey, useI18n } from "../i18n";
 import { describeError, refusalText, Section } from "./settings-parts";
 
@@ -906,6 +906,7 @@ export function PoolsSection(props: { client: ApiClient }) {
   const [executorNext, setExecutorNext] = createSignal<string | null>(null);
   const [executorLoading, setExecutorLoading] = createSignal(false);
   const [executorError, setExecutorError] = createSignal<string | null>(null);
+  const [executorNotice, setExecutorNotice] = createSignal<string | null>(null);
   const [failedExecutorPage, setFailedExecutorPage] = createSignal<{
     cursor: string | undefined;
     history: (string | undefined)[];
@@ -1039,10 +1040,12 @@ export function PoolsSection(props: { client: ApiClient }) {
     }
   }
 
-  async function createExecutor() {
+  async function createExecutor(e: FormEvent) {
+    e.preventDefault();
     const option = EXECUTOR_CAPABILITIES.find(({ key }) => key === capability());
     if (!option) return;
     setActionError(null);
+    setExecutorNotice(null);
     setCreating(true);
     try {
       const id = executorIdentity.current ?? configurationIdentity();
@@ -1055,6 +1058,7 @@ export function PoolsSection(props: { client: ApiClient }) {
       );
       executorIdentity.current = null;
       setExecutorName("");
+      setExecutorNotice(i18n.t("settings.pools.executorCreatedNotice"));
       navigateExecutors(undefined, []);
     } catch (error) {
       setActionError(refusalText(i18n.t, error, NATIVE_CREATE_REFUSALS));
@@ -1362,71 +1366,88 @@ export function PoolsSection(props: { client: ApiClient }) {
               {i18n.t("settings.pools.nextPage")}
             </Button>
           </div>
-          <div class="flex flex-wrap items-end gap-2">
-            <label class="text-xs">
-              {i18n.t("settings.pools.executorName")}
-              <Input
-                value={executorName()}
-                onInput={(event) => setExecutorName(event.target.value)}
-              />
-            </label>
-            <label class="text-xs">
-              {i18n.t("settings.pools.executorPool")}
-              <Select
-                class="flex"
-                value={executorPool()}
-                items={[
-                  { value: "", label: "—" },
-                  ...(executorPool() && !pools()?.some((pool) => pool.id === executorPool())
-                    ? [{ value: executorPool(), label: executorPool() }]
-                    : []),
-                  ...(pools() ?? []).map((pool) => ({
-                    value: pool.id,
-                    label: `${pool.name} · ${pool.id}`,
-                  })),
-                ]}
-                onValueChange={(value) => setExecutorPool(value ?? "")}
-              >
-                <SelectItem value="">—</SelectItem>
-                {executorPool() && !pools()?.some((pool) => pool.id === executorPool()) ? (
-                  <SelectItem value={executorPool()}>{executorPool()}</SelectItem>
-                ) : null}
-                {pools()?.map((pool) => (
-                  <SelectItem value={pool.id}>
-                    {pool.name} · {pool.id}
+          <form
+            onSubmit={(e) => void createExecutor(e)}
+            class="flex flex-col gap-3 rounded-md border border-border p-3"
+          >
+            <h4 class="text-sm font-semibold">{i18n.t("settings.pools.executorCreateTitle")}</h4>
+            <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                {i18n.t("settings.pools.executorName")}
+                <Input
+                  value={executorName()}
+                  onInput={(event) => setExecutorName(event.target.value)}
+                  placeholder={i18n.t("settings.pools.executorNamePlaceholder")}
+                  spellcheck="false"
+                />
+              </label>
+              <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
+                {i18n.t("settings.pools.executorPool")}
+                <Select
+                  class="w-full rounded-md border-input bg-background px-3 text-sm text-foreground data-[size=default]:h-10"
+                  value={executorPool()}
+                  items={[
+                    { value: "", label: i18n.t("settings.pools.executorPoolPlaceholder") },
+                    ...(executorPool() && !pools()?.some((pool) => pool.id === executorPool())
+                      ? [{ value: executorPool(), label: executorPool() }]
+                      : []),
+                    ...(pools() ?? []).map((pool) => ({
+                      value: pool.id,
+                      label: `${pool.name} · ${pool.id}`,
+                    })),
+                  ]}
+                  onValueChange={(value) => setExecutorPool(value ?? "")}
+                >
+                  <SelectItem value="">
+                    {i18n.t("settings.pools.executorPoolPlaceholder")}
                   </SelectItem>
-                ))}
-              </Select>
-            </label>
-            <label class="text-xs">
-              {i18n.t("settings.pools.executorCapability")}
-              <Select
-                class="flex"
-                value={capability()}
-                items={EXECUTOR_CAPABILITIES.map(({ key, label }) => ({
-                  value: key,
-                  label: label ?? i18n.t("settings.pools.operationDecision"),
-                }))}
-                onValueChange={(value) => {
-                  if (value !== null) setCapability(value);
-                }}
+                  {executorPool() && !pools()?.some((pool) => pool.id === executorPool()) ? (
+                    <SelectItem value={executorPool()}>{executorPool()}</SelectItem>
+                  ) : null}
+                  {pools()?.map((pool) => (
+                    <SelectItem value={pool.id}>
+                      {pool.name} · {pool.id}
+                    </SelectItem>
+                  ))}
+                </Select>
+              </label>
+              <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground sm:col-span-2">
+                {i18n.t("settings.pools.executorCapability")}
+                <Select
+                  class="w-full rounded-md border-input bg-background px-3 text-sm text-foreground data-[size=default]:h-10"
+                  value={capability()}
+                  items={EXECUTOR_CAPABILITIES.map(({ key, label }) => ({
+                    value: key,
+                    label: label ?? i18n.t("settings.pools.operationDecision"),
+                  }))}
+                  onValueChange={(value) => {
+                    if (value !== null) setCapability(value);
+                  }}
+                >
+                  {EXECUTOR_CAPABILITIES.map(({ key, label }) => (
+                    <SelectItem value={key}>
+                      {label ?? i18n.t("settings.pools.operationDecision")}
+                    </SelectItem>
+                  ))}
+                </Select>
+              </label>
+            </div>
+            {executorNotice() ? (
+              <p role="status" class="text-sm text-emerald-700 dark:text-emerald-400">
+                {executorNotice()}
+              </p>
+            ) : null}
+            <div class="flex justify-end gap-2">
+              <Button
+                type="submit"
+                disabled={creating() || !executorName().trim() || !executorPool()}
               >
-                {EXECUTOR_CAPABILITIES.map(({ key, label }) => (
-                  <SelectItem value={key}>
-                    {label ?? i18n.t("settings.pools.operationDecision")}
-                  </SelectItem>
-                ))}
-              </Select>
-            </label>
-            <Button
-              type="button"
-              size="xs"
-              disabled={creating() || !executorName().trim() || !executorPool()}
-              onClick={() => void createExecutor()}
-            >
-              {i18n.t("settings.pools.executorCreate")}
-            </Button>
-          </div>
+                {creating()
+                  ? i18n.t("settings.pools.executorCreating")
+                  : i18n.t("settings.pools.executorCreate")}
+              </Button>
+            </div>
+          </form>
         </div>
       ) : null}
 

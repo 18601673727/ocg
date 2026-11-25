@@ -42,7 +42,7 @@ export function Select<T extends OptionValue>(props: SelectProps<T>) {
       data-slot="select-trigger"
       data-size={local.size ?? "default"}
       class={cn(
-        "ocg-select inline-flex w-fit min-w-0 items-center justify-between gap-3 rounded-lg border border-input bg-background px-3 py-1.5 pr-9 text-sm text-foreground outline-none transition-colors hover:bg-muted/60 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-50 data-[size=default]:h-9 data-[size=sm]:h-8",
+        "ocg-select inline-flex w-fit min-w-0 items-center justify-between gap-2 rounded-lg border border-input bg-background px-3 py-1.5 pr-9 text-sm text-foreground outline-none transition-colors hover:bg-muted/60 focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20 disabled:cursor-not-allowed disabled:opacity-50 data-[size=default]:h-9 data-[size=sm]:h-8",
         local.class,
         local.fitSelected && "absolute inset-0 h-full w-full max-w-full",
       )}
@@ -53,6 +53,9 @@ export function Select<T extends OptionValue>(props: SelectProps<T>) {
         local.onValueChange?.(item?.value ?? (selected as T));
       }}
     >
+      <button type="button">
+        <selectedcontent />
+      </button>
       {local.children}
     </select>
   );
@@ -62,9 +65,10 @@ export function Select<T extends OptionValue>(props: SelectProps<T>) {
         aria-hidden="true"
         data-size={local.size ?? "default"}
         class={cn(
-          "pointer-events-none invisible inline-flex min-w-0 items-center overflow-hidden whitespace-pre rounded-lg border px-3 py-1.5 pr-9 text-sm data-[size=default]:h-9 data-[size=sm]:h-8",
+          "pointer-events-none invisible inline-flex min-w-0 items-center overflow-hidden whitespace-pre rounded-lg border px-3 py-1.5 text-sm data-[size=default]:h-9 data-[size=sm]:h-8",
           local.class,
-          "pe-10",
+          // Keep the native picker's width allowance and match the custom icon when supported.
+          "pe-10 supports-[appearance:base-select]:pe-9",
         )}
       >
         {local.items?.find((item) => item.value === local.value)?.label ?? ""}

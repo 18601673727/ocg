@@ -4,10 +4,30 @@
   white-space: nowrap;
 }
 
+.ocg-select > button {
+  display: none;
+}
+
 @supports (appearance: base-select) {
   .ocg-select {
     appearance: base-select;
+
+    /* Chevron 12px from the right edge; the 8px text gap comes from gap-2.
+       The fitSelected measurement span reserves the same 36px (8 + 16 + 12)
+       when base-select is supported. */
     padding-inline-end: 0.75rem;
+  }
+
+  .ocg-select > button {
+    display: flex;
+    flex: 1;
+    min-inline-size: 0;
+  }
+
+  .ocg-select selectedcontent {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .ocg-select::picker(select) {
@@ -31,7 +51,7 @@
     flex-shrink: 0;
     width: 1rem;
     height: 1rem;
-    margin-inline-start: 0.75rem;
+    margin-inline-start: 0;
     background: var(--muted-foreground);
     mask:
       url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m6 9 6 6 6-6' fill='none' stroke='black' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E")

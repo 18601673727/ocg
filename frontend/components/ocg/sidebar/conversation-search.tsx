@@ -1,4 +1,4 @@
-import { MessageSquare, Search, X } from "@lucide/solid";
+import { ChevronDown, MessageSquare, Search, X } from "@lucide/solid";
 import { createEffect, createMemo, createSignal, createUniqueId } from "solid-js";
 import { Button } from "@/components/ui/button";
 import {
@@ -207,7 +207,7 @@ export function ConversationSearch(props: ConversationSearchProps) {
       <DialogContent
         initialFocus={() => inputRef.current}
         showCloseButton={false}
-        class="flex max-h-[min(36rem,85dvh)] flex-col gap-0 p-0"
+        class="flex max-h-[min(36rem,85dvh)] flex-col gap-0 p-0 sm:max-w-xl"
       >
         <DialogHeader class="gap-0 border-b border-border px-4 pt-[max(1rem,env(safe-area-inset-top))] pb-3 sm:px-6">
           <div class="flex items-center gap-2">
@@ -226,7 +226,7 @@ export function ConversationSearch(props: ConversationSearchProps) {
         <div class="flex flex-col gap-2 px-4 pt-3 pb-2 sm:flex-row sm:items-center sm:px-6">
           <div class="relative min-w-0 flex-1">
             <Search
-              class="pointer-events-none absolute top-3 left-3 size-4 text-muted-foreground"
+              class="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 text-muted-foreground"
               aria-hidden="true"
             />
             <Input
@@ -276,20 +276,26 @@ export function ConversationSearch(props: ConversationSearchProps) {
               class="h-11 pl-9 text-base sm:h-10 sm:text-sm"
             />
           </div>
-          <Select<ConversationSearchScope>
-            value={scope()}
-            onValueChange={changeScope}
-            aria-label={i18n.t("sidebar.searchScopeLabel")}
-            class="max-w-full sm:max-w-44"
-          >
-            <SelectItem value="all">{i18n.t("sidebar.searchScopeAll")}</SelectItem>
-            <SelectItem value="conversations">
-              {i18n.t("sidebar.searchScopeConversations")}
-            </SelectItem>
-            {(props.projects ?? []).map((project) => (
-              <SelectItem value={`project:${project.id}`}>{project.name}</SelectItem>
-            ))}
-          </Select>
+          <div class="relative inline-flex w-fit min-w-0 max-w-full sm:max-w-44">
+            <Select<ConversationSearchScope>
+              value={scope()}
+              onValueChange={changeScope}
+              aria-label={i18n.t("sidebar.searchScopeLabel")}
+              class="max-w-full not-supports-[appearance:base-select]:appearance-none sm:data-[size=default]:h-10"
+            >
+              <SelectItem value="all">{i18n.t("sidebar.searchScopeAll")}</SelectItem>
+              <SelectItem value="conversations">
+                {i18n.t("sidebar.searchScopeConversations")}
+              </SelectItem>
+              {(props.projects ?? []).map((project) => (
+                <SelectItem value={`project:${project.id}`}>{project.name}</SelectItem>
+              ))}
+            </Select>
+            <ChevronDown
+              class="pointer-events-none absolute end-3 top-1/2 size-4 -translate-y-1/2 text-foreground supports-[appearance:base-select]:hidden"
+              aria-hidden="true"
+            />
+          </div>
           <span id={hintId} class="sr-only">
             {i18n.t("sidebar.searchKeyboardHint")}
           </span>
@@ -360,12 +366,10 @@ export function ConversationSearch(props: ConversationSearchProps) {
                   >
                     <MessageSquare class="size-3.5 shrink-0" aria-hidden="true" />
                     <span class="min-w-0 flex-1">
-                      <span class="flex items-center gap-2">
-                        <span class="line-clamp-2 min-w-0 break-words">
-                          {session.title || untitledLabel}
-                        </span>
+                      <span class="flex min-w-0 items-center gap-2">
+                        <span class="min-w-0 truncate">{session.title || untitledLabel}</span>
                         {project && (
-                          <span class="max-w-[45%] shrink-0 truncate rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
+                          <span class="ml-auto max-w-[45%] shrink-0 truncate rounded bg-muted px-1.5 py-0.5 text-xs text-muted-foreground">
                             {project}
                           </span>
                         )}
@@ -429,17 +433,20 @@ export function ConversationSearch(props: ConversationSearchProps) {
               </p>
             ))}
           {nextBefore() && (
-            <Button
-              variant="outline"
-              size="sm"
-              disabled={loading() || failed()}
-              onClick={() => {
-                setLoading(true);
-                setBefore(nextBefore() ?? undefined);
-              }}
-            >
-              {i18n.t("sidebar.searchMore")}
-            </Button>
+            <div class="pt-1 pb-2">
+              <Button
+                variant="outline"
+                size="sm"
+                class="w-full"
+                disabled={loading() || failed()}
+                onClick={() => {
+                  setLoading(true);
+                  setBefore(nextBefore() ?? undefined);
+                }}
+              >
+                {i18n.t("sidebar.searchMore")}
+              </Button>
+            </div>
           )}
         </ScrollArea>
       </DialogContent>
