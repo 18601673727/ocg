@@ -42,7 +42,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   private readonly stopAccepted = new Set<string>();
   private readonly loading = new Map<string, Promise<string>>();
   private readonly earlier = new Map<string, string | null>();
-  private readonly loadingEarlier = new Map<string, Promise<void>>();
+  private readonly loadingEarlier = new Map<string, Promise<boolean>>();
   private conversationListLoaded = false;
   private unsubscribeConversations: (() => void) | null = null;
 
@@ -507,17 +507,21 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     );
   }
 
-  loadEarlierHistory(sessionId: string): Promise<void> {
+  loadEarlierHistory(sessionId: string, scope?: "turns"): Promise<boolean> {
     const existing = this.loadingEarlier.get(sessionId);
     if (existing) return existing;
     const cursor = this.earlier.get(sessionId);
-    if (this.disposed) return Promise.resolve();
-    const partial = [...this.turns.values()]
-      .filter((turn) => turn.sessionId === sessionId && turn.outputs.firstSeq > 1)
-      .sort(
-        (a, b) => b.job.created_at_us - a.job.created_at_us || b.job.id.localeCompare(a.job.id),
-      )[0];
-    if (!cursor && !partial) return Promise.resolve();
+    if (this.disposed) return Promise.resolve(false);
+    const partial =
+      scope === "turns"
+        ? undefined
+        : [...this.turns.values()]
+            .filter((turn) => turn.sessionId === sessionId && turn.outputs.firstSeq > 1)
+            .sort(
+              (a, b) =>
+                b.job.created_at_us - a.job.created_at_us || b.job.id.localeCompare(a.job.id),
+            )[0];
+    if (!cursor && !partial) return Promise.resolve(false);
     const root = this.sessionRoot(sessionId);
     const isCurrent = () =>
       !this.disposed &&
@@ -534,7 +538,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
               beforeSeq: before,
               signal: this.lifetime.signal,
             });
-            if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
+            if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return false;
             loaded = [
               ...new Map(
                 [...earlier.outputs, ...loaded].map((output) => [output.seq, output]),
@@ -558,7 +562,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
             const evidence = await readTranscriptEvidence(this.api, partial.job.id, {
               signal: this.lifetime.signal,
             });
-            if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
+            if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return false;
             applyTranscriptEvidence(partial, evidenceRevision, evidence, true);
           } else {
             if (partial.outputs.firstSeq !== previousFirstSeq) {
@@ -569,7 +573,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
               const firstSeq = partial.outputs.firstSeq;
               const times = new Map(partial.partialToolTimes);
               const boundaries = await this.reader.readPartialToolBoundaries(partial, times);
-              if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return;
+              if (!isCurrent() || this.turns.get(partial.job.id) !== partial) return false;
               if (
                 partial.evidenceRevision === evidenceRevision &&
                 partial.outputs.firstSeq === firstSeq
@@ -580,16 +584,16 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
             }
           }
           this.publications.publish(sessionId);
-          return;
+          return partial.outputs.firstSeq < previousFirstSeq;
         }
-        if (!cursor) return;
+        if (!cursor) return false;
         const page = await this.api.readConversationTurns(
           root,
           cursor,
           TURN_PAGE_SIZE,
           this.lifetime.signal,
         );
-        if (!isCurrent()) return;
+        if (!isCurrent()) return false;
         const held = new Set(
           [...this.turns.values()]
             .filter((turn) => turn.sessionId === sessionId)
@@ -599,7 +603,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         const loaded = await Promise.all(
           add.map((turn) => this.readHistoryTurn(sessionId, turn, isCurrent)),
         );
-        if (!isCurrent()) return;
+        if (!isCurrent()) return false;
         for (const turn of loaded) {
           if (!turn || !this.historyTurnIsCurrent(turn)) continue;
           for (const image of turn.images) this.reader.images.set(image.id, image);
@@ -608,8 +612,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         }
         this.earlier.set(sessionId, next);
         this.publications.publish(sessionId);
+        return true;
       } catch (error) {
         if (isCurrent()) throw error;
+        return false;
       }
     })().finally(() => {
       if (this.loadingEarlier.get(sessionId) === task) this.loadingEarlier.delete(sessionId);

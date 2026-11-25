@@ -17,6 +17,7 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { TYPOGRAPHY_SCALE } from "@/lib/design-tokens";
 import { ariaState, bindElementRef, elementRef, type View } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
+import type { ThreadSearchTarget } from "../chat/thread-position";
 import type { Project } from "../contracts";
 import { useI18n } from "../i18n";
 import { SELECTED_ROW } from "../primitives/selection";
@@ -36,7 +37,7 @@ export type ConversationSearchProps = {
   projects?: readonly Project[];
   activeSessionId: string;
   onSelect: (id: string) => void;
-  onOpenConversation?: (conversation: string) => void;
+  onOpenConversation?: (conversation: string, searchTarget?: ThreadSearchTarget) => void;
   api?: ApiClient;
   conversationList?: "loading" | "loaded" | "failed";
   onRetryConversations?: () => void;
@@ -197,7 +198,7 @@ export function ConversationSearch(props: ConversationSearchProps) {
   const select = (match: SearchMatch) => {
     changeOpen(false);
     if (match.conversation && props.onOpenConversation)
-      props.onOpenConversation(match.conversation);
+      props.onOpenConversation(match.conversation, match.searchTarget);
     else props.onSelect(match.id);
   };
 

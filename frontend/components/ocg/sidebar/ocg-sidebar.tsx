@@ -47,6 +47,7 @@ import {
   type View,
 } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
+import type { ThreadSearchTarget } from "../chat/thread-position";
 import type { Project } from "../contracts";
 import type * as Api from "../contracts/api";
 import { runtimeStateLabel, useI18n } from "../i18n";
@@ -113,7 +114,7 @@ type OcgSidebarProps = {
   onSelect: (id: string) => void;
   api?: ApiClient;
   activeAncestors?: string[];
-  onOpenConversation?: (conversation: string) => void;
+  onOpenConversation?: (conversation: string, searchTarget?: ThreadSearchTarget) => void;
   onOpenArchivedConversation?: (conversation: Api.Conversation) => Promise<boolean>;
   onRestoreConversation?: (conversation: Api.Conversation) => Promise<void>;
   onNewChat: () => void;

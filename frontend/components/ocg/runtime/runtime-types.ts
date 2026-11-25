@@ -21,7 +21,7 @@ export interface OcgRuntimeClient {
   openConversation?(job: string): Promise<string>;
   presentMutableJob?(sessionId: string, job: import("./api-client").MutableJob): Promise<void>;
   hasEarlierHistory?(sessionId: string): boolean;
-  loadEarlierHistory?(sessionId: string): Promise<void>;
+  loadEarlierHistory?(sessionId: string, scope?: "turns"): Promise<boolean>;
   setChatSelection?(sessionId: string, selection: import("../contracts").ChatModelSelection): void;
   retryConversations?(): void;
   createSession(input: CreateSessionInput): Promise<ChatSession>;

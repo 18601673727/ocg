@@ -17,6 +17,7 @@ import {
   confirmMutableComposerNavigation,
   MUTABLE_CONTEXT_KEY,
 } from "../chat/mutable-composer";
+import type { ThreadSearchTarget } from "../chat/thread-position";
 import { useI18n } from "../i18n";
 import { JobDetailsContext } from "../job/job-details-context";
 import type { ApiClient } from "../runtime/api-client";
@@ -113,7 +114,9 @@ export function AppShell(props: AppShellProps) {
 function AppShellContent(props: AppShellProps) {
   const runtime = useOcgRuntime();
   const i18n = useI18n();
-  const [location, setLocation] = createSignal(currentLocation());
+  const [location, setLocation] = createSignal<
+    ReturnType<typeof currentLocation> & { searchTarget?: ThreadSearchTarget }
+  >(currentLocation());
   const lastLocationUrl = elementRef(window.location.href);
   const [detailJob, setDetailJob] = createSignal(
     (() => (location().view === "jobs" ? location().job : null))(),
@@ -387,13 +390,14 @@ function AppShellContent(props: AppShellProps) {
     job: string | null = null,
     keepDraft?: string,
     keepAncestors = false,
+    searchTarget?: ThreadSearchTarget,
   ) => {
     if (!isReachableView(view)) return;
     discardEmptyDraft(keepDraft);
     const href = view === "chat" ? (job ? conversationPath([job]) : "/") : `/${view}`;
     window.history.pushState(null, "", href);
     lastLocationUrl.current = window.location.href;
-    setLocation({ view, job, chain: null, settingsSection: "models" });
+    setLocation({ view, job, chain: null, settingsSection: "models", searchTarget });
     if (!keepAncestors) setAncestors([]);
     setMobile(false);
   };
@@ -416,13 +420,13 @@ function AppShellContent(props: AppShellProps) {
     setLocation({ view: "settings", job: null, chain: null, settingsSection: section });
   };
 
-  function openNestedConversation(job: string) {
+  function openNestedConversation(job: string, searchTarget?: ThreadSearchTarget) {
     void confirmMutableComposerNavigation().then((allowed) => {
       if (!allowed) return;
       const conversationId = session()?.conversationId;
       if (!ancestors().length && conversationId) setAncestors([conversationId]);
       setSessionId("");
-      goDirect("chat", job, undefined, true);
+      goDirect("chat", job, undefined, true, searchTarget);
     });
   }
 
@@ -507,7 +511,7 @@ function AppShellContent(props: AppShellProps) {
       runningSessionIds={runningSessionIds()}
       api={props.client}
       activeAncestors={ancestors()}
-      onOpenConversation={(job) => void openNestedConversation(job)}
+      onOpenConversation={openNestedConversation}
       onOpenArchivedConversation={openArchivedConversation}
       onRestoreConversation={
         runtime.client.restoreConversation
@@ -634,6 +638,7 @@ function AppShellContent(props: AppShellProps) {
                             <div class="flex min-h-0 flex-1 flex-col">
                               <ChatScreen
                                 onOpenConversation={(job) => void openNestedConversation(job)}
+                                searchTarget={location().searchTarget}
                                 onOpenPlanningDecision={(decisionId) => {
                                   setPlanningFocus({ sessionId: session()!.id, decisionId });
                                   setInspectorOpen(true);

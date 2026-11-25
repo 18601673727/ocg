@@ -18,6 +18,7 @@ export type {
   Conversation,
   ConversationEdited,
   ConversationLimits,
+  ConversationSearchMatch,
   Conversations,
   DecisionAgentProfile,
   DecisionLimits,

@@ -5,8 +5,9 @@ use super::jobs::tool_evidence;
 use crate::db::entities::JobId;
 use crate::db::entities::{
     Actor, ChildConversationEntry, ContextState, ContextWorkDetails, ContextWorkState,
-    ConversationEntry, ConversationSearchScope, ConversationsPage, JobLifecycle, JobLimits,
-    JobSpec, MutableConversationPage, MutableConversationTurn, Origin, OutputKind, Recurrence,
+    ConversationEntry, ConversationSearchMatch, ConversationSearchScope, ConversationsPage,
+    JobLifecycle, JobLimits, JobSpec, MutableConversationPage, MutableConversationTurn, Origin,
+    OutputKind, Recurrence,
 };
 use crate::db::entities::{ConfigId, ExecutionOperation, MutableJobPhase, OutcomeKind};
 use crate::db::redb::allocations::pools_offering_capability;
@@ -248,7 +249,7 @@ pub(crate) fn conversation_summary(
         None => (outcome, row.created_at),
     };
     Ok(ConversationEntry {
-        snippet: None,
+        search_match: None,
         root_job: conversation,
         tip_job: tip.unwrap_or(conversation),
         agent: row.agent,
@@ -391,13 +392,14 @@ fn conversation_page(
         let Some(tip) = turn_head(&rx, conversation)? else {
             continue;
         };
-        let snippet = if let Some(tables) = &tables {
+        let search_match = if let Some(tables) = &tables {
             let title = conversation_title(&rx, conversation, &metadata)?;
-            let Some(snippet) = conversation_matches(tables, &groups, conversation, &title, terms)?
+            let Some(search_match) =
+                conversation_matches(tables, &groups, conversation, &title, terms)?
             else {
                 continue;
             };
-            snippet
+            search_match
         } else {
             None
         };
@@ -407,7 +409,7 @@ fn conversation_page(
         }
         last = Some(conversation);
         let mut summary = conversation_summary(&rx, &row, Some(tip))?;
-        summary.snippet = snippet;
+        summary.search_match = search_match;
         conversations.push(summary);
         if bounded && conversations.len() == limit {
             has_more = true;
@@ -482,12 +484,12 @@ fn conversation_matches(
     conversation: JobId,
     title: &str,
     terms: &[String],
-) -> Result<Option<Option<String>>, StorageError> {
+) -> Result<Option<Option<ConversationSearchMatch>>, StorageError> {
     let title = title.to_lowercase();
-    let mut snippet = None;
+    let mut search_match = None;
     for term in terms {
         let in_title = title.contains(term);
-        if in_title && snippet.is_some() {
+        if in_title && search_match.is_some() {
             continue;
         }
         let chars = term.chars().take(3).collect::<Vec<_>>();
@@ -508,11 +510,15 @@ fn conversation_matches(
                     "search turn has invalid conversation",
                 ));
             }
-            body_match = match_excerpt(
+            if let Some(snippet) = match_excerpt(
                 &indexes::search_input_text(&tables.attachments, &job.input)?,
                 term,
-            );
-            if body_match.is_some() {
+            ) {
+                body_match = Some(ConversationSearchMatch {
+                    turn: job.id,
+                    answer: false,
+                    snippet,
+                });
                 break;
             }
             let state = tables
@@ -534,11 +540,16 @@ fn conversation_matches(
                     job.id,
                     &output,
                 )?;
-                body_match = answer
+                if let Some(snippet) = answer
                     .as_deref()
                     .or_else(|| indexes::search_output_text(&output, completed))
-                    .and_then(|text| match_excerpt(text, term));
-                if body_match.is_some() {
+                    .and_then(|text| match_excerpt(text, term))
+                {
+                    body_match = Some(ConversationSearchMatch {
+                        turn: job.id,
+                        answer: true,
+                        snippet,
+                    });
                     break;
                 }
             }
@@ -549,9 +560,9 @@ fn conversation_matches(
         if !in_title && body_match.is_none() {
             return Ok(None);
         }
-        snippet = snippet.or(body_match);
+        search_match = search_match.or(body_match);
     }
-    Ok(Some(snippet))
+    Ok(Some(search_match))
 }
 
 const TURN_PAGE_OUTPUTS: usize = 1000;

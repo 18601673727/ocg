@@ -24,11 +24,13 @@ import { readModelPreference, writeModelPreference } from "./model-preference";
 import { contextForSession, MutableComposer } from "./mutable-composer";
 import { planningBlocker } from "./planning-decision";
 import { AssistantMessage, Thread } from "./thread";
+import type { ThreadSearchTarget } from "./thread-position";
 
 export interface ChatScreenProps {
   session: ChatSession;
   onOpenConversation: (conversation: string) => void;
   onOpenPlanningDecision: (decisionId: string) => void;
+  searchTarget?: ThreadSearchTarget;
   backButton?: View;
 }
 
@@ -183,7 +185,12 @@ function PlanningDecisionNotice() {
   return (
     <Show when={message().jobId}>
       {(id) => (
-        <div class="flex min-w-0 items-center gap-3 text-xs text-muted-foreground">
+        <div
+          data-message-id={message().id}
+          data-turn-id={id()}
+          tabindex={-1}
+          class="flex min-w-0 items-center gap-3 text-xs text-muted-foreground focus-visible:outline-2 focus-visible:outline-ring"
+        >
           <span class="min-w-0 truncate" title={reason()} role="status">
             {reason()}
           </span>
@@ -271,6 +278,8 @@ export const ChatScreen: Component<ChatScreenProps> = (props) => {
         <ChatComposerContext value={composerValue}>
           <div class="flex h-full min-h-0 w-full flex-col">
             <Thread
+              conversationId={props.session.conversationId}
+              searchTarget={props.searchTarget}
               Assistant={ChatAssistantMessage}
               Composer={
                 props.session.archived || props.session.closed ? HistoryComposer : ChatComposerSlot

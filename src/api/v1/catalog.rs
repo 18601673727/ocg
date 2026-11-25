@@ -893,7 +893,14 @@ fn conversation_page(page: crate::db::entities::ConversationsPage) -> serde_json
             tip_job: c.tip_job.to_string(),
             agent: c.agent.map(|id| ProfileId::from(id).to_string()),
             title: c.title,
-            snippet: c.snippet,
+            search_match: c
+                .search_match
+                .as_ref()
+                .map(|hit| ConversationSearchMatchView {
+                    turn: hit.turn.to_string(),
+                    answer: hit.answer,
+                }),
+            snippet: c.search_match.map(|hit| hit.snippet),
             project: c.project.map(|id| id.to_string()),
             state: c.state,
             on_hold: c.on_hold.as_ref().map(|by| HoldView { by: actor_view(by) }),
@@ -1230,11 +1237,21 @@ pub(crate) struct HoldView {
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ConversationSearchMatch")]
+pub(crate) struct ConversationSearchMatchView {
+    turn: String,
+    answer: bool,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "Conversation")]
 pub(crate) struct ConversationView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     snippet: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    search_match: Option<ConversationSearchMatchView>,
     job_state: String,
     has_children: bool,
     root_job: String,

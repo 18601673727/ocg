@@ -36,11 +36,21 @@ import { providerRejectionText } from "../runtime/provider-rejection";
 import { MessageContext, useConversationView, useThreadMessage } from "./conversation-view";
 import { ImageGallery } from "./image-attachments";
 import { followAfterScroll } from "./message-bounds";
+import {
+  captureThreadPosition,
+  readThreadPosition,
+  savedMessageElement,
+  searchMessageElement,
+  type ThreadSearchTarget,
+  writeThreadPosition,
+} from "./thread-position";
 import { ToolActivityLabel } from "./tool-activity-label";
 import { presentToolCall } from "./tool-part";
 import { WorkspaceToolFallback } from "./workspace-tool";
 
 export type ThreadProps = {
+  conversationId?: string;
+  searchTarget?: ThreadSearchTarget;
   Assistant: Component;
   Composer: Component<{ autoFocus: boolean }>;
   Welcome: Component;
@@ -52,12 +62,36 @@ export function Thread(props: ThreadProps) {
   const { t } = useI18n();
   const view = useConversationView();
   const empty = createMemo(() => view.messages().length === 0);
+  const conversationId = createMemo(() => props.conversationId);
   const [following, setFollowing] = createSignal(true);
+  const [positioning, setPositioning] = createSignal(false);
   const [historyError, setHistoryError] = createSignal<string>();
   let viewport!: HTMLDivElement;
   const [body, setBody] = createSignal<HTMLDivElement>();
   let lastTop = 0;
   let frame = 0;
+  let saveTimer: number | undefined;
+  let conversation: string | undefined;
+
+  const atBottom = () => viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= 8;
+
+  function rememberPosition() {
+    if (!conversation || positioning() || !viewport?.isConnected || empty()) return;
+    if (following()) {
+      writeThreadPosition(conversation);
+    } else {
+      const position = captureThreadPosition(viewport);
+      if (position) writeThreadPosition(conversation, position);
+    }
+  }
+
+  function rememberAfterScroll() {
+    if (saveTimer !== undefined) return;
+    saveTimer = window.setTimeout(() => {
+      saveTimer = undefined;
+      rememberPosition();
+    }, 120);
+  }
 
   function follow() {
     cancelAnimationFrame(frame);
@@ -75,7 +109,69 @@ export function Thread(props: ThreadProps) {
     observer.observe(content);
     return () => observer.disconnect();
   });
-  onCleanup(() => cancelAnimationFrame(frame));
+  createEffect(
+    () => [body(), conversationId(), props.searchTarget] as const,
+    ([content, id, target]) => {
+      conversation = id;
+      setPositioning(false);
+      if (!content || !id) return;
+      const position = target ? undefined : readThreadPosition(id);
+      if (!target && !position) return;
+
+      let active = true;
+      setPositioning(true);
+      setFollowing(false);
+      const findRow = () => {
+        if (target) return searchMessageElement(viewport, view.messages(), target);
+        return position ? savedMessageElement(viewport, position) : null;
+      };
+      const nextFrame = () =>
+        new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+
+      void (async () => {
+        await nextFrame();
+        if (!active) return;
+        let row = findRow();
+        while (!row) {
+          const advanced = await view.loadEarlier("turns");
+          await nextFrame();
+          if (!active) return;
+          row = findRow();
+          if (!advanced) break;
+        }
+        if (!row) {
+          setFollowing(true);
+          follow();
+          return;
+        }
+        viewport.scrollTop +=
+          row.getBoundingClientRect().top -
+          viewport.getBoundingClientRect().top -
+          (position?.offset ?? 64);
+        lastTop = viewport.scrollTop;
+        setFollowing(atBottom());
+        if (target) row.focus({ preventScroll: true });
+        setPositioning(false);
+        rememberPosition();
+      })()
+        .catch((error) => {
+          if (active) setHistoryError(error instanceof Error ? error.message : String(error));
+        })
+        .finally(() => {
+          if (active) setPositioning(false);
+        });
+      return () => {
+        active = false;
+      };
+    },
+  );
+  window.addEventListener("pagehide", rememberPosition);
+  onCleanup(() => {
+    window.removeEventListener("pagehide", rememberPosition);
+    clearTimeout(saveTimer);
+    cancelAnimationFrame(frame);
+    rememberPosition();
+  });
 
   async function loadEarlier(button: HTMLButtonElement) {
     const rows = viewport.querySelector("[data-slot='aui_message-group']");
@@ -118,9 +214,10 @@ export function Thread(props: ThreadProps) {
         class="ocg-subtle-scrollbar relative flex min-h-0 flex-1 flex-col overflow-x-auto overflow-y-auto overscroll-contain"
         style={{ "overflow-anchor": following() ? "none" : "auto" }}
         onScroll={() => {
-          const atBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= 8;
-          setFollowing(atBottom || followAfterScroll(following(), lastTop, viewport));
+          if (positioning()) return;
+          setFollowing(atBottom() || followAfterScroll(following(), lastTop, viewport));
           lastTop = viewport.scrollTop;
+          rememberAfterScroll();
         }}
       >
         <div
@@ -140,7 +237,7 @@ export function Thread(props: ThreadProps) {
               size="sm"
               data-slot="aui_thread-load-earlier"
               class="text-muted-foreground mb-6 self-center rounded-full"
-              disabled={view.loadingEarlier()}
+              disabled={view.loadingEarlier() || positioning()}
               onClick={(event) => void loadEarlier(event.currentTarget)}
             >
               {view.loadingEarlier() ? t("aui.loadingEarlier") : t("aui.loadEarlier")}
@@ -177,13 +274,22 @@ export function Thread(props: ThreadProps) {
                 {props.footerAction}
               </div>
             </Show>
-            <Show when={!following()}>
+            <Show when={positioning() && view.loadingEarlier()}>
+              <p
+                role="status"
+                class="absolute -top-9 self-center rounded-full bg-card px-3 py-1 text-sm text-muted-foreground shadow-sm"
+              >
+                {t("aui.loadingEarlier")}
+              </p>
+            </Show>
+            <Show when={!following() && !positioning()}>
               <FloatingIconButton
                 tooltip={t("aui.scrollBottom")}
                 class="absolute -top-12 z-10 self-center"
                 onClick={() => {
                   setFollowing(true);
                   follow();
+                  rememberPosition();
                 }}
               >
                 <ArrowDown />
@@ -278,9 +384,12 @@ function UserMessage() {
   return (
     <div
       data-slot="aui_user-message-root"
+      data-message-id={message().id}
+      data-turn-id={message().jobId}
       data-role="user"
+      tabindex={-1}
       style={{ contain: message().queued ? undefined : "layout style" }}
-      class="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 [contain-intrinsic-size:auto_80px] [&>*]:col-start-2"
+      class="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 [contain-intrinsic-size:auto_80px] focus-visible:outline-2 focus-visible:outline-ring [&>*]:col-start-2"
     >
       <ImageGallery images={message().images} compact />
       <div class="group/user-message relative col-start-2 min-w-0 justify-self-end">
@@ -345,10 +454,13 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
         >
           <div
             data-slot="aui_assistant-message-root"
+            data-message-id={message().id}
+            data-turn-id={message().jobId}
             data-role="assistant"
+            tabindex={-1}
             style={{ contain: running() ? undefined : "layout style" }}
             data-intermediate={message().intermediate || undefined}
-            class="relative -mb-7.5 pb-7.5"
+            class="relative -mb-7.5 pb-7.5 focus-visible:outline-2 focus-visible:outline-ring"
           >
             <div
               data-slot="aui_assistant-message-content"
@@ -504,6 +616,9 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
       {(kind) => (
         <div
           data-slot="context-compacted"
+          data-message-id={message().id}
+          data-turn-id={message().jobId}
+          tabindex={-1}
           class="my-4 flex items-center gap-3 px-2 text-xs text-muted-foreground"
           role="status"
         >

@@ -35,11 +35,12 @@ pub use identity::{
 pub(in crate::db) use job_context::summary_chunks;
 pub use job_context::{
     Actor, Appended, ChildConversationEntry, CompactionMode, CompactionPolicy, CompactionPreset,
-    CompactionRequest, ConversationEntry, ConversationSearchScope, ConversationsPage, CustomPolicy,
-    GlobalCompactionSettings, JobAction, JobEdit, JobLimits, MAX_JOB_DEPTH, NativeSummaryBoundary,
-    NativeSummaryManifest, NativeSummaryResultLink, Origin, PredictionAcceptance, PredictionMode,
-    PredictiveCompaction, Recurrence, RecurrenceHalt, RecurrencePhase, ResolvedCompaction,
-    SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopProof, SummarizationResult, SummarizationStage,
+    CompactionRequest, ConversationEntry, ConversationSearchMatch, ConversationSearchScope,
+    ConversationsPage, CustomPolicy, GlobalCompactionSettings, JobAction, JobEdit, JobLimits,
+    MAX_JOB_DEPTH, NativeSummaryBoundary, NativeSummaryManifest, NativeSummaryResultLink, Origin,
+    PredictionAcceptance, PredictionMode, PredictiveCompaction, Recurrence, RecurrenceHalt,
+    RecurrencePhase, ResolvedCompaction, SUMMARIZER_OUTPUT_RESERVE, SourceBoundary, StopProof,
+    SummarizationResult, SummarizationStage,
 };
 pub(crate) use job_context::{
     ContextState, ContextWorkDetails, ContextWorkState, MutableConversationPage,

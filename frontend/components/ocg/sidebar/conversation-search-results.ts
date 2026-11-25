@@ -1,3 +1,4 @@
+import type { ThreadSearchTarget } from "../chat/thread-position";
 import type { ApiClient, ConversationSearchScope } from "../runtime/api-client";
 import type { ChatSession } from "../types";
 
@@ -10,6 +11,7 @@ export type SearchMatch = {
   conversation?: string;
   projectId?: string | null;
   snippet?: string;
+  searchTarget?: ThreadSearchTarget;
 };
 
 export function sessionMatchesScope(
@@ -49,6 +51,7 @@ export function conversationSearchMatches(
       conversation: item.root_job,
       projectId: item.project ?? local?.projectId ?? null,
       snippet: item.snippet,
+      searchTarget: item.search_match && { ...item.search_match, snippet: item.snippet },
     };
   });
 }

@@ -680,8 +680,15 @@ pub enum ConversationSearchScope {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct ConversationSearchMatch {
+    pub turn: JobId,
+    pub answer: bool,
+    pub snippet: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConversationEntry {
-    pub snippet: Option<String>,
+    pub search_match: Option<ConversationSearchMatch>,
     pub root_job: JobId,
     pub tip_job: JobId,
     pub agent: Option<ConfigId>,

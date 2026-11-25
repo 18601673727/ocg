@@ -17,7 +17,7 @@ const ConversationContext = createContext<{
   byJob: Accessor<Map<string, ChatMessage[]>>;
   hasEarlier: Accessor<boolean>;
   loadingEarlier: Accessor<boolean>;
-  loadEarlier: () => Promise<void>;
+  loadEarlier: (scope?: "turns") => Promise<boolean>;
   retry: (message: string) => Promise<void>;
   reportSubmissionNotice: (
     sessionId: string,
@@ -109,11 +109,11 @@ export function ConversationView(props: { sessionId: string; children: JSX.Eleme
     return client.hasEarlierHistory(props.sessionId);
   });
   const [loadingEarlier, setLoadingEarlier] = createSignal(false);
-  async function loadEarlier() {
-    if (loadingEarlier()) return;
+  async function loadEarlier(scope?: "turns") {
+    if (loadingEarlier()) return client.loadEarlierHistory(props.sessionId, scope);
     setLoadingEarlier(true);
     try {
-      await client.loadEarlierHistory(props.sessionId);
+      return await client.loadEarlierHistory(props.sessionId, scope);
     } finally {
       setLoadingEarlier(false);
     }
