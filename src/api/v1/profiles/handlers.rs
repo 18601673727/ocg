@@ -97,7 +97,7 @@ async fn prepare_model_save(
     let previous = previous_model_connection(database, existing_id, kind).await?;
     let connection_protocol = input
         .connection_protocol
-        .or_else(|| match &previous {
+        .or(match &previous {
             Some((record, _)) => match &record.body {
                 ConfigBody::Connection(connection) => Some(connection.protocol),
                 ConfigBody::Model(_)
