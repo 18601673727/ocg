@@ -780,6 +780,18 @@ impl JobToolCall {
         )
     }
 
+    pub(crate) fn reads_limits(&self) -> bool {
+        matches!(
+            self,
+            Self::JobLimits {
+                max_depth: None,
+                max_auto_turns: None,
+                max_iterations: None,
+                ..
+            }
+        )
+    }
+
     pub(crate) fn handler_version(&self) -> String {
         let version = match self {
             Self::JobPlan { .. } => 7,

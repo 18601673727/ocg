@@ -70,7 +70,12 @@ impl Batch {
         let Some(admission) = evidence.admission() else {
             return self.reject(Violation::ToolCallNotAdmitted(call));
         };
-        if admission.handler_version != tool.handler_version() || evidence.name != tool.name() {
+        if admission.handler_version != tool.handler_version()
+            || evidence.name != tool.name()
+            || (admission.effect == ToolEffect::ReadOnly
+                && matches!(&tool, JobToolCall::JobLimits { .. })
+                && !tool.reads_limits())
+        {
             return self.reject(Violation::ToolCallNotAdmitted(call));
         }
         let effect = admission.effect;

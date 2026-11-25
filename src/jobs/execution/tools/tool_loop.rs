@@ -280,7 +280,17 @@ pub(crate) async fn answer_calls(
         }
         let index = call.index;
         let reference = site.call(call);
-        let effect = dispatch.effect;
+        let is_job_tool = JobToolCall::is_job_tool(&call.name);
+        let job_call = if is_job_tool {
+            JobToolCall::parse(&call.name, &call.arguments)
+        } else {
+            None
+        };
+        let effect = if job_call.as_ref().is_some_and(JobToolCall::reads_limits) {
+            ToolEffect::ReadOnly
+        } else {
+            dispatch.effect
+        };
         let stoppable = dispatch.spawns;
         let decided = ToolAdmission {
             handler_version: dispatch.version,
@@ -362,8 +372,8 @@ pub(crate) async fn answer_calls(
             };
             return Err(conclude(site, reference, outcome, ToolLoopStop::Refused(refusal)).await);
         }
-        if JobToolCall::is_job_tool(&call.name) {
-            let Some(job_call) = JobToolCall::parse(&call.name, &call.arguments) else {
+        if is_job_tool {
+            let Some(job_call) = job_call else {
                 let message = "the arguments do not fit the job tool".to_owned();
                 answer_failed(
                     site,
