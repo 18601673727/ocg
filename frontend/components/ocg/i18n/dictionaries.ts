@@ -1209,8 +1209,8 @@ export const en = {
   "settings.saving": "Saving…",
   "settings.origin.browser": "Browser only",
   "settings.origin.runtime": "Reported by OCG",
-  "settings.notice.updated": "{id} updated.",
-  "settings.notice.created": "{id} created.",
+  "settings.notice.updated": "{name} updated.",
+  "settings.notice.created": "{name} created.",
   "settings.llm.validation.name": "Name is required.",
   "settings.llm.validation.model": "Model Identifier is required.",
   "settings.llm.validation.capabilities": "Select at least one model capability.",
@@ -1249,6 +1249,7 @@ export const en = {
     "Set an API endpoint on this provider before discovering models, or add a new provider with an endpoint.",
   "settings.llm.importSelected": "Import {selected} / {total} models",
   "settings.llm.importing": "Importing…",
+  "settings.llm.importedNamed": "Imported {created} models: {names}.",
   "settings.llm.imported": "Imported {created} models; kept {existing} existing models.",
   "settings.llm.deleteTitle": "Delete model?",
   "settings.llm.deleteDescription":

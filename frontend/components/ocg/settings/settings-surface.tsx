@@ -457,13 +457,12 @@ export function SettingsSurface(props: {
         ? await props.client.updateProfile(editingLlmId()!, payload)
         : await props.client.createProfile(payload);
       setSnapshot(updated);
-      const savedId = updated.profile_id ?? editingLlmId() ?? "Model";
       const wasEditing = editingLlmId() !== null;
       resetLlmForm();
       setCatalogNotice(
         wasEditing
-          ? i18n.t("settings.notice.updated", { id: savedId })
-          : i18n.t("settings.notice.created", { id: savedId }),
+          ? i18n.t("settings.notice.updated", { name: trimmedName })
+          : i18n.t("settings.notice.created", { name: trimmedName }),
       );
     } catch (error) {
       if (isProfileConflict(error) && editingLlmId()) {
@@ -593,13 +592,12 @@ export function SettingsSurface(props: {
         ? await props.client.updateProfile(editingAgentId()!, payload)
         : await props.client.createProfile(payload);
       setSnapshot(updated);
-      const savedId = updated.profile_id ?? editingAgentId() ?? "Agent Profile";
       const wasEditing = editingAgentId() !== null;
       resetAgentForm();
       setAgentNotice(
         wasEditing
-          ? i18n.t("settings.notice.updated", { id: savedId })
-          : i18n.t("settings.notice.created", { id: savedId }),
+          ? i18n.t("settings.notice.updated", { name: trimmedName })
+          : i18n.t("settings.notice.created", { name: trimmedName }),
       );
     } catch (error) {
       if (isProfileConflict(error) && editingAgentId()) {

@@ -1127,8 +1127,8 @@ export const zh: Dictionary = {
   "settings.saving": "保存中…",
   "settings.origin.browser": "仅浏览器",
   "settings.origin.runtime": "由 OCG 上报",
-  "settings.notice.updated": "{id} 已更新。",
-  "settings.notice.created": "{id} 已创建。",
+  "settings.notice.updated": "{name} 已更新。",
+  "settings.notice.created": "{name} 已创建。",
   "settings.llm.validation.name": "名称为必填项。",
   "settings.llm.validation.model": "模型标识为必填项。",
   "settings.llm.validation.capabilities": "请至少选择一项模型能力。",
@@ -1167,6 +1167,7 @@ export const zh: Dictionary = {
     "请先为此来源设置 API 端点，或添加具有端点的新来源，然后再获取模型。",
   "settings.llm.importSelected": "导入 {selected} / {total} 个模型",
   "settings.llm.importing": "正在导入…",
+  "settings.llm.importedNamed": "已导入 {created} 个模型：{names}。",
   "settings.llm.imported": "已导入 {created} 个模型，保留 {existing} 个已有模型。",
   "settings.llm.deleteTitle": "删除模型？",
   "settings.llm.deleteDescription":

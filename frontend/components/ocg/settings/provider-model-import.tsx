@@ -159,13 +159,16 @@ function ImportContent(props: {
       };
     },
   );
-  const existing = new Set(provider()?.models ?? []);
-  const importable = createMemo(() => models().filter((model) => !existing.has(model.id)));
+  const existing = createMemo(() => new Set(provider()?.models ?? []));
+  const importable = createMemo(() => models().filter((model) => !existing().has(model.id)));
   const matching = createMemo(() =>
     models().filter((model) =>
       model.id.toLocaleLowerCase().includes(query().trim().toLocaleLowerCase()),
     ),
   );
+  function focusNewSource() {
+    setTimeout(() => document.getElementById("import-source-name")?.focus(), 0);
+  }
   function selectSource(id: string) {
     setSourceChoice(id);
     setModels([]);
@@ -193,15 +196,18 @@ function ImportContent(props: {
     setSaving(true);
     setError(null);
     try {
-      const answer = await props.client.importModels(
-        source,
-        importable().filter((model) => selected().has(model.id)),
-        ["chat"],
-      );
-      const message = i18n.t("settings.llm.imported", {
-        created: answer.created,
-        existing: answer.existing,
-      });
+      const chosen = importable().filter((model) => selected().has(model.id));
+      const answer = await props.client.importModels(source, chosen, ["chat"]);
+      const message =
+        answer.existing === 0
+          ? i18n.t("settings.llm.importedNamed", {
+              created: answer.created,
+              names: chosen.map((model) => model.id).join(", "),
+            })
+          : i18n.t("settings.llm.imported", {
+              created: answer.created,
+              existing: answer.existing,
+            });
       setResult(message);
       setSelected(new Set<string>());
       props.onImported(message);
@@ -322,7 +328,10 @@ function ImportContent(props: {
             size="sm"
             aria-pressed={ariaState(sourceId() === "new")}
             disabled={saving()}
-            onClick={() => selectSource("new")}
+            onClick={() => {
+              selectSource("new");
+              focusNewSource();
+            }}
           >
             {i18n.t("settings.llm.newProvider")}
           </Button>
@@ -338,6 +347,7 @@ function ImportContent(props: {
               <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
                 {i18n.t("settings.llm.provider")}
                 <Input
+                  id="import-source-name"
                   value={newName()}
                   disabled={saving()}
                   onInput={(event) => changeNewConnection(() => setNewName(event.target.value))}
@@ -427,8 +437,8 @@ function ImportContent(props: {
                   <input
                     type="checkbox"
                     class="mt-0.5 size-4 shrink-0 accent-primary"
-                    checked={existing.has(model.id) || selected().has(model.id)}
-                    disabled={saving() || existing.has(model.id)}
+                    checked={existing().has(model.id) || selected().has(model.id)}
+                    disabled={saving() || existing().has(model.id)}
                     onChange={() =>
                       setSelected((current) => {
                         const next = new Set(current);
@@ -451,7 +461,7 @@ function ImportContent(props: {
                       </span>
                     ) : null}
                   </span>
-                  {existing.has(model.id) && (
+                  {existing().has(model.id) && (
                     <span class="shrink-0 text-xs">{i18n.t("settings.llm.alreadyAdded")}</span>
                   )}
                 </label>
