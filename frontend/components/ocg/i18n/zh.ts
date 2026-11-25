@@ -848,6 +848,11 @@ export const zh: Dictionary = {
   "logs.title": "日志",
   "logs.time": "时间",
   "job.structuredData": "结构化数据",
+  "job.backendRecord": "后端记录",
+  "provider.rejected": "提供方拒绝了此请求。",
+  "provider.rejectedStatus": "提供方拒绝了此请求（HTTP {status}）。",
+  "provider.code": "提供方代码：{code}",
+  "provider.requestId": "请求 ID：{id}",
 
   "ledger.title": "资源账本",
 

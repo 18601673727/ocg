@@ -44,6 +44,7 @@ export type ChatMessage = {
   reasoningDurationMs?: number;
   intermediate?: boolean;
   failureReason?: string;
+  failureRejection?: import("./runtime/provider-rejection").ProviderRejection;
   failureAt?: number;
   failureDetail?: string;
   failureLink?: { href: string; label: string };

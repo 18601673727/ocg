@@ -1,5 +1,6 @@
 import type { ProviderResponse, ToolCall } from "@/components/ocg/contracts";
 import type { OutputSequence, OutputView } from "../runtime/output-history";
+import { type ProviderRejection, providerRejectionOf } from "../runtime/provider-rejection";
 
 export type TranscriptSettlement = {
   state: "unsettled" | "completed" | "failed" | "cancelled" | "unknown";
@@ -18,6 +19,7 @@ export type TranscriptTurn = {
   attachments?: readonly string[];
   status: "completed" | "streaming" | "pending" | "failed" | "cancelled" | "unknown";
   detail: string | null;
+  rejection?: ProviderRejection | null;
   createdAtUs: number | null;
   tools?: readonly ToolCall[];
 };
@@ -232,7 +234,10 @@ export function jobTranscript(
       ...base,
       content: visibleAnswer(progress),
       status: state,
-      detail: providerFailureDetail(result),
+      detail: result?.summary ?? null,
+      // Only a failed settlement can carry a confirmed rejection; unknown and
+      // cancelled outcomes keep the stored summary alone.
+      rejection: state === "failed" && result ? providerRejectionOf(result) : null,
     };
   }
   return [
@@ -250,23 +255,6 @@ export function jobTranscript(
       titleMetadata,
     ),
   ];
-}
-
-function providerFailureDetail(result: OutputView | null): string | null {
-  const message = result?.summary ?? null;
-  if (
-    result?.code !== "provider_rejected" ||
-    !result.value ||
-    typeof result.value !== "object" ||
-    Array.isArray(result.value)
-  )
-    return message;
-  const value = result.value as Record<string, unknown>;
-  const details = [
-    typeof value.provider_code === "string" ? `Provider code: ${value.provider_code}` : null,
-    typeof value.request_id === "string" ? `Request ID: ${value.request_id}` : null,
-  ].filter((detail): detail is string => Boolean(detail));
-  return [message, ...details].filter(Boolean).join("\n") || null;
 }
 
 function approvalAnswer(
@@ -394,6 +382,7 @@ function providerMessages(
         tools: undefined,
         status: live ? answer.status : "completed",
         detail: null,
+        rejection: null,
         intermediate: true,
       });
   };
@@ -436,6 +425,7 @@ function providerMessages(
       tools: calls,
       status: waiting ? "pending" : running ? "streaming" : "completed",
       detail: null,
+      rejection: null,
       intermediate: !isFinal,
     };
     if (reusable && !cachedMessage) projection.requestMessages.set(request, message);

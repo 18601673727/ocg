@@ -162,9 +162,10 @@ export class TurnProjection {
                 ? undefined
                 : (turn.error ??
                   turn.toolError ??
-                  message.detail ??
+                  (message.rejection ? undefined : message.detail) ??
                   turn.unknownReason ??
                   undefined),
+              failureRejection: message.intermediate ? undefined : (message.rejection ?? undefined),
               failureCode:
                 !message.intermediate && message.status === "unknown"
                   ? turn.details?.allocation?.holds_capacity

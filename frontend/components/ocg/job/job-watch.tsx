@@ -29,6 +29,7 @@ import {
   nativeExecutionStatus,
   reconcileJob,
 } from "../runtime/job-status";
+import { providerRejectionOf, providerRejectionText } from "../runtime/provider-rejection";
 import { ExecutionHistory } from "./execution-history";
 import {
   hasEvictedOutputs,
@@ -50,10 +51,12 @@ function formatMicros(micros: number | null): string {
   return micros === null ? "—" : new Date(micros / 1000).toLocaleString();
 }
 
-function OutputContent(props: { output: Output }) {
+function OutputContent(props: { output: Output; failed: boolean }) {
   const i18n = useI18n();
   const [open, setOpen] = createSignal(false);
   const body = createMemo(() => outputText(props.output));
+  // Only a failed Job presents a confirmed rejection; the stored summary stays as the backend record.
+  const rejection = createMemo(() => (props.failed ? providerRejectionOf(props.output) : null));
   const value = createMemo(() => props.output.value);
   let structured = value();
   if (
@@ -68,7 +71,23 @@ function OutputContent(props: { output: Output }) {
 
   return (
     <>
-      {props.output.summary && props.output.summary !== body() ? (
+      {rejection() ? (
+        <>
+          <p class="whitespace-pre-wrap break-words text-sm">
+            {providerRejectionText(i18n.t, rejection()!)}
+          </p>
+          {props.output.summary ? (
+            <details>
+              <summary class="cursor-pointer text-xs text-muted-foreground">
+                {i18n.t("job.backendRecord")}
+              </summary>
+              <p class="mt-1 whitespace-pre-wrap break-words font-mono text-xs">
+                {props.output.summary}
+              </p>
+            </details>
+          ) : null}
+        </>
+      ) : props.output.summary && props.output.summary !== body() ? (
         <p class="whitespace-pre-wrap break-words text-sm">{props.output.summary}</p>
       ) : null}
       {body() ? <p class="whitespace-pre-wrap break-words text-sm">{body()}</p> : null}
@@ -877,7 +896,7 @@ function JobWatchBody(props: {
                       </span>
                     )}
                   </div>
-                  <OutputContent output={output} />
+                  <OutputContent output={output} failed={settlement()?.state === "failed"} />
                 </li>
               ))}
             </ol>

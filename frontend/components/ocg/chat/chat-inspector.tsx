@@ -5,6 +5,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { bindElementRef, elementRef } from "@/lib/ui-state";
 import { runtimeStateLabel, useI18n } from "../i18n";
 import { executionDetail, executionLabel } from "../runtime/job-status";
+import { providerRejectionText } from "../runtime/provider-rejection";
 import type { ChatMessage, ChatSession } from "../types";
 import { ConversationContext } from "./conversation-context";
 import { ConversationLimitsEditor } from "./conversation-limits";
@@ -151,8 +152,14 @@ export function ChatInspector(props: {
                             <span class="sr-only">{i18n.t("chat.openInJobs")}</span>
                           </button>
                         )}
-                        {message?.failureReason && (
-                          <p class="text-destructive">{message.failureReason}</p>
+                        {message?.failureRejection ? (
+                          <p class="whitespace-pre-wrap text-destructive">
+                            {providerRejectionText(i18n.t, message.failureRejection)}
+                          </p>
+                        ) : (
+                          message?.failureReason && (
+                            <p class="text-destructive">{message.failureReason}</p>
+                          )
                         )}
                         {planning?.decision && (
                           <details

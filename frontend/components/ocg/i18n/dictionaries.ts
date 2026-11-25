@@ -909,6 +909,11 @@ export const en = {
   "logs.title": "Logs",
   "logs.time": "Time",
   "job.structuredData": "Structured data",
+  "job.backendRecord": "Backend record",
+  "provider.rejected": "The provider rejected the request.",
+  "provider.rejectedStatus": "The provider rejected the request (HTTP {status}).",
+  "provider.code": "Provider code: {code}",
+  "provider.requestId": "Request ID: {id}",
 
   "ledger.title": "Resource Ledger",
 

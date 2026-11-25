@@ -15,6 +15,7 @@ import { cn } from "@/lib/utils";
 import { type I18nKey, type TranslateFn, useI18n } from "../i18n";
 import { MarkdownBody } from "../markdown/markdown-body";
 import type { ApiClient } from "../runtime/api-client";
+import { providerRejectionText } from "../runtime/provider-rejection";
 import type { TranscriptTurn } from "./job-transcript-model";
 import { ToolActivityLabel } from "./tool-activity-label";
 import { formatToolJson, jobPlanTitles } from "./tool-activity-summary";
@@ -38,6 +39,10 @@ function TurnRow(props: {
   const { isCopied, copyToClipboard } = useCopyToClipboard();
   const i18n = useI18n();
   const isUser = createMemo(() => props.turn.role === "user");
+  const failure = createMemo(() => {
+    const rejection = props.turn.rejection;
+    return rejection ? providerRejectionText(i18n.t, rejection) : props.turn.detail;
+  });
   const note = createMemo(() => (isUser() ? undefined : STATUS_NOTE[props.turn.status]));
   const reasoning = createMemo(() =>
     !isUser() && props.turn.reasoning ? (
@@ -70,12 +75,7 @@ function TurnRow(props: {
   return (
     <>
       {(() => {
-        if (
-          !isUser() &&
-          !props.turn.content &&
-          !props.turn.detail &&
-          !props.turn.attachments?.length
-        ) {
+        if (!isUser() && !props.turn.content && !failure() && !props.turn.attachments?.length) {
           if (reasoning() || toolCalls())
             return (
               <>
@@ -161,12 +161,12 @@ function TurnRow(props: {
                 ) : (
                   <MarkdownBody content={props.turn.content} class="break-words" />
                 )}
-                {props.turn.detail ? (
+                {failure() ? (
                   <DismissibleNotice
-                    message={props.turn.detail}
+                    message={failure()!}
                     class="mt-2 whitespace-pre-wrap break-words text-xs"
                   >
-                    {props.turn.detail}
+                    {failure()}
                   </DismissibleNotice>
                 ) : null}
                 {note() ? (

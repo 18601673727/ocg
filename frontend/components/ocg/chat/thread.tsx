@@ -32,6 +32,7 @@ import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
 import { WorkspaceLink } from "../layout/workspace-link";
 import { MarkdownBody } from "../markdown/markdown-body";
+import { providerRejectionText } from "../runtime/provider-rejection";
 import { MessageContext, useConversationView, useThreadMessage } from "./conversation-view";
 import { ImageGallery } from "./image-attachments";
 import { followAfterScroll } from "./message-bounds";
@@ -319,6 +320,8 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
     ),
   );
   const failure = createMemo(() => {
+    const rejection = message().failureRejection;
+    if (rejection) return providerRejectionText(t, rejection);
     const code = message().failureCode;
     const key =
       code === "outcome-held"
