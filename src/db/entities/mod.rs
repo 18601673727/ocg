@@ -43,8 +43,8 @@ pub use job_context::{
     SummarizationResult, SummarizationStage,
 };
 pub(crate) use job_context::{
-    ChildResultReport, ContextState, ContextWorkDetails, ContextWorkState, MutableConversationPage,
-    MutableConversationTurn,
+    ChildNotice, ChildNoticeKind, ChildResultReport, ContextState, ContextWorkDetails,
+    ContextWorkState, MutableConversationPage, MutableConversationTurn,
 };
 pub use jobs::*;
 pub use metrics::*;

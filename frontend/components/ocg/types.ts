@@ -25,6 +25,7 @@ type MessageStatus = "pending" | "streaming" | "completed" | "cancelled" | "unkn
 
 export type ChatMessage = {
   childResults?: import("./contracts/api").ChildResult[];
+  childNotice?: import("./contracts/api").ChildNotice;
   decision?: import("./contracts/conversations").NativeDecisionTurn;
   planningTarget?: string;
   compaction?: import("./contracts").ConversationTurn["compaction"];

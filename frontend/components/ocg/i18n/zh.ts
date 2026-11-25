@@ -294,6 +294,8 @@ export const zh: Dictionary = {
   "chat.child.cancelledResult": "本轮已取消。",
   "chat.child.unknownResult": "暂时无法确认执行结果。",
   "chat.child.results": "子任务回传",
+  "chat.child.progressReport": "子任务进度",
+  "chat.child.helpRequest": "子任务求助",
   "chat.child.viewResult": "查看回传原文",
   "chat.child.conversationId": "对话 ID",
 

@@ -61,6 +61,7 @@ impl<'a> NativeTooling<'a> {
             ask,
             decider: context.decider,
             jobs,
+            nested: context.nested,
             plan: !context.plan_step,
         };
         use ntex::util::{Either, select};
@@ -201,6 +202,7 @@ struct Wiring {
     ask: bool,
     decider: bool,
     jobs: bool,
+    nested: bool,
     plan: bool,
 }
 
@@ -262,6 +264,7 @@ fn tools_of(
             &registry,
             wiring.decider,
             wiring.plan,
+            wiring.nested,
         )?);
     }
     if wiring.ask {

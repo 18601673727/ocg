@@ -131,6 +131,60 @@ impl Batch {
         approval: ToolCallRef,
         decision: ApprovalDecision,
     ) -> Result<Appended, BatchError> {
+        self.decide_as(approval, decision, Actor::User)
+    }
+
+    pub(super) fn answer_child_help(
+        &mut self,
+        parent: JobId,
+        approval: ToolCallRef,
+        text: &str,
+    ) -> Result<Appended, BatchError> {
+        let child = self.turn_conversation(approval.job)?;
+        if self.require_mutable_conversation(child)?.parent_id != Some(parent) {
+            return self.reject(Violation::InvalidValue(
+                "rights",
+                "only the immediate parent can answer this child help request",
+            ));
+        }
+        self.tool_rights(parent, child)?;
+        if !self
+            .tool_evidence(approval)?
+            .is_some_and(|call| call.name == "job_ask_parent")
+        {
+            return self.reject(Violation::InvalidValue(
+                "help_request",
+                "the reference does not identify a child help request",
+            ));
+        }
+        let text = text.trim();
+        if text.is_empty() || text.chars().count() > 2000 {
+            return self.reject(Violation::InvalidValue(
+                "text",
+                "expected between 1 and 2000 characters",
+            ));
+        }
+        if self.step(|tx| super::job_tree::has_current_draft(tx, child))? {
+            return self.reject(Violation::InvalidValue(
+                "child",
+                "the child has an unsent draft; retry after it is sent or discarded",
+            ));
+        }
+        self.decide_as(
+            approval,
+            ApprovalDecision::Answered {
+                text: format!("Your direct parent answered the help request. Continue your assignment with this input:\n\n{text}"),
+            },
+            Actor::Agent { conversation: parent },
+        )
+    }
+
+    fn decide_as(
+        &mut self,
+        approval: ToolCallRef,
+        decision: ApprovalDecision,
+        by: Actor,
+    ) -> Result<Appended, BatchError> {
         let Some(call) = self.tool_evidence(approval)? else {
             return self.reject(Violation::InvalidValue(
                 "approval_not_found",
@@ -200,7 +254,7 @@ impl Batch {
                 None => continuation_text(&call.name, &decision),
             },
         };
-        self.put_approval(approval, decision, Actor::User)?;
+        self.put_approval(approval, decision, by)?;
         self.step(|tx| {
             tx.open_table(OPEN_APPROVALS)?.remove(key)?;
             Ok(())
@@ -434,11 +488,52 @@ impl Batch {
         if matches!(
             &decision,
             ToolDecision::Admitted(admitted) if admitted.effect != ToolEffect::ReadOnly
-        ) && name != "job_plan"
-        {
+        ) && !matches!(
+            name,
+            "job_plan" | "job_report_progress" | "job_answer_child"
+        ) {
             self.require_planning_decision_satisfied(call)?;
         }
         let conversation = self.turn_conversation(call.job)?;
+        let help = if name == "job_ask_parent"
+            && let ToolDecision::AwaitingAnswer(admission) = &decision
+        {
+            let Some(job) = self.mutable_job(call.job)? else {
+                return self.corrupted("a parent help request was made by a non-native Job".into());
+            };
+            if !self.frozen_agent_manages_jobs(&job)? {
+                return self.reject(Violation::InvalidValue(
+                    "capabilities",
+                    "Job management requires Chat capability",
+                ));
+            }
+            let pending = self.step(|tx| {
+                let calls = tx.open_table(TOOL_CALLS)?;
+                for entry in tx.open_table(OPEN_APPROVALS)?.range(
+                    (conversation.get(), 0, 0, 0)
+                        ..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
+                )? {
+                    let (_, turn, request, index) = entry?.0.value();
+                    let reference = tool_call_ref((turn, request, index))?;
+                    let record = calls
+                        .get(tool_call_key(reference))?
+                        .ok_or_else(|| StorageError::corrupted("awaiting call missing"))?;
+                    if decode_tool_evidence(reference, record.value())?.name == "job_ask_parent" {
+                        return Ok(true);
+                    }
+                }
+                Ok(false)
+            })?;
+            if pending {
+                return self.reject(Violation::InvalidValue(
+                    "help_request",
+                    "this child already has an unanswered help request",
+                ));
+            }
+            Some(question(admission.arguments.as_str()))
+        } else {
+            None
+        };
         if !self.request_observed(call.job, call.request)? {
             return self.reject(Violation::RequestNotObserved {
                 job: call.job,
@@ -530,6 +625,9 @@ impl Batch {
                 self.put_approval(call, ApprovalDecision::Voided, closing.by)?;
             } else {
                 self.insert(OPEN_APPROVALS, approvals::open_key(conversation, call), 0)?;
+                if let Some(question) = help {
+                    self.post_child_notice(conversation, call, &question, true)?;
+                }
             }
         }
         self.probe = Some(Probe::ToolCall(call));
@@ -755,6 +853,12 @@ pub(crate) fn read_cards(
                     .get(tool_call_key(call))?
                     .ok_or_else(|| StorageError::corrupted("awaiting call missing"))?;
                 let call = decode_tool_evidence(call, bytes.value())?;
+                if call.name == "job_ask_parent"
+                    && conversation != root
+                    && row.parent_id != Some(root)
+                {
+                    continue;
+                }
                 let arguments = call
                     .decision
                     .fact

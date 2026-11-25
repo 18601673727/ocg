@@ -5,7 +5,7 @@ use crate::db::entities::identity::{
 use crate::db::entities::{
     Actor, CompactionPolicy, ConfigRef, DecisionCapability, FrozenDecisionConfig,
     FrozenExecutionConfig, JobLimits, JobUsage, NativeDecisionConfig, Origin, Recurrence,
-    RequestRef, Timestamp,
+    RequestNumber, RequestRef, Timestamp,
 };
 use std::collections::BTreeSet;
 
@@ -716,6 +716,18 @@ pub enum JobToolCall {
         conversation: String,
         text: String,
     },
+    JobReportProgress {
+        text: String,
+    },
+    JobAskParent {
+        question: String,
+    },
+    JobAnswerChild {
+        turn: String,
+        request: RequestNumber,
+        index: u32,
+        text: String,
+    },
     JobStop {
         conversation: String,
     },
@@ -772,6 +784,9 @@ impl JobToolCall {
                 | "job_assign"
                 | "job_dispatch"
                 | "job_message"
+                | "job_report_progress"
+                | "job_ask_parent"
+                | "job_answer_child"
                 | "job_stop"
                 | "job_close"
                 | "job_hold"
@@ -800,6 +815,9 @@ impl JobToolCall {
             | Self::JobAgents { .. }
             | Self::JobWorkers { .. }
             | Self::JobMessage { .. }
+            | Self::JobReportProgress { .. }
+            | Self::JobAskParent { .. }
+            | Self::JobAnswerChild { .. }
             | Self::JobStop { .. }
             | Self::JobClose { .. }
             | Self::JobHold { .. }
@@ -818,6 +836,9 @@ impl JobToolCall {
             Self::JobAssign { .. } => "job_assign",
             Self::JobDispatch { .. } => "job_dispatch",
             Self::JobMessage { .. } => "job_message",
+            Self::JobReportProgress { .. } => "job_report_progress",
+            Self::JobAskParent { .. } => "job_ask_parent",
+            Self::JobAnswerChild { .. } => "job_answer_child",
             Self::JobStop { .. } => "job_stop",
             Self::JobClose { .. } => "job_close",
             Self::JobHold { .. } => "job_hold",

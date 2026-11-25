@@ -146,7 +146,9 @@ pub(crate) const REQUEST_COMMAND_TOOL_NAME: &str = "workspace_request_command";
 
 fn needs_decision(name: &str) -> Option<fn(ToolAdmission) -> ToolDecision> {
     match name {
-        ASK_USER_TOOL_NAME | "job_dispatch" => Some(ToolDecision::AwaitingAnswer),
+        ASK_USER_TOOL_NAME | "job_dispatch" | "job_ask_parent" => {
+            Some(ToolDecision::AwaitingAnswer)
+        }
         REQUEST_COMMAND_TOOL_NAME | "job_assign" => Some(ToolDecision::AwaitingApproval),
         _ => None,
     }
@@ -252,11 +254,11 @@ pub(crate) async fn answer_calls(
     }
 
     // Keep read-only results when a user decision may pause the Turn before the next request.
-    let retain_results = tools.decider
-        && calls
-            .iter()
-            .zip(&prepared)
-            .any(|(call, dispatch)| dispatch.is_ok() && needs_decision(&call.name).is_some());
+    let retain_results = calls.iter().zip(&prepared).any(|(call, dispatch)| {
+        dispatch.is_ok()
+            && needs_decision(&call.name).is_some()
+            && (tools.decider || call.name == "job_ask_parent")
+    });
     let limits = &tools.limits;
     let mut answers = Vec::with_capacity(calls.len());
     let mut awaiting = Vec::new();
@@ -300,9 +302,22 @@ pub(crate) async fn answer_calls(
             authorization: AuthorizationBasis::RegistryGrant,
         };
         if let Some(awaiting_decision) = needs_decision(&call.name) {
-            if tools.decider {
-                record_decision(site, call, awaiting_decision(decided)).await?;
-                awaiting.push(index);
+            if tools.decider || call.name == "job_ask_parent" {
+                match record_decision(site, call, awaiting_decision(decided)).await {
+                    Ok(()) => awaiting.push(index),
+                    Err(ToolLoopStop::AdmissionRefused { violation, .. })
+                        if call.name == "job_ask_parent" =>
+                    {
+                        let refusal = InvalidToolCall::at(
+                            ToolCallRefusal::Unauthorized,
+                            index,
+                            violation.to_string(),
+                        );
+                        record_refusal(site, call, &refusal).await?;
+                        answers.push(refusal_answer(&refusal));
+                    }
+                    Err(error) => return Err(error),
+                }
             } else {
                 record_decision(
                     site,

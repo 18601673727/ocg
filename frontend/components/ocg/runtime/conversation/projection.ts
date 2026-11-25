@@ -114,6 +114,7 @@ export class TurnProjection {
       role: "user",
       content: entry.text ?? "",
       childResults: entry.child_results,
+      childNotice: entry.child_notice,
       status: "completed",
       createdAt: new Date(entry.at_us / 1000).toISOString(),
       images: entry.attachments.flatMap((id) => this.images.get(id) ?? []),

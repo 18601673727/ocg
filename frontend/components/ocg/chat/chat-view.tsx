@@ -373,6 +373,7 @@ export function ConversationChildrenStrip(props: {
 
 function ConversationQuestion(props: {
   question: string;
+  fromChild?: boolean;
   disabled: boolean;
   answer: (text: string) => void;
   dismiss: () => void;
@@ -383,7 +384,7 @@ function ConversationQuestion(props: {
     <ElicitationForm
       state="request"
       class="max-w-none"
-      server={i18n.t("chat.card.question")}
+      server={i18n.t(props.fromChild ? "chat.child.helpRequest" : "chat.card.question")}
       requestLabel=""
       message={props.question}
       fields={[
@@ -664,6 +665,7 @@ export function ConversationCardStrip(props: {
                   {(question) => (
                     <ConversationQuestion
                       question={question().question}
+                      fromChild={question().tool === "job_ask_parent"}
                       disabled={pending()}
                       answer={(text) => void act(card(), { answer: text })}
                       dismiss={reject}

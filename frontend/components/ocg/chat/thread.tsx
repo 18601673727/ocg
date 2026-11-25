@@ -29,7 +29,7 @@ import { Button } from "@/components/ui/button";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { ariaState } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
-import type { ChildResult } from "../contracts/api";
+import type { ChildNotice, ChildResult } from "../contracts/api";
 import { runtimeStateLabel, useI18n } from "../i18n";
 import { WorkspaceLink } from "../layout/workspace-link";
 import { MarkdownBody } from "../markdown/markdown-body";
@@ -257,7 +257,17 @@ export function Thread(props: ThreadProps) {
                     when={message().role === "user"}
                     fallback={<Dynamic component={props.Assistant} />}
                   >
-                    <Show when={message().childResults} fallback={<UserMessage />}>
+                    <Show
+                      when={message().childResults}
+                      fallback={
+                        <Show when={message().childNotice} fallback={<UserMessage />}>
+                          <ChildNoticeMessage
+                            notice={message().childNotice!}
+                            onOpen={props.onOpenConversation}
+                          />
+                        </Show>
+                      }
+                    >
                       <ChildResultsMessage
                         onOpen={props.onOpenConversation}
                         expand={
@@ -379,6 +389,47 @@ function MessageActions(props: { assistant?: boolean }) {
         </p>
       </Show>
     </div>
+  );
+}
+
+function ChildNoticeMessage(props: {
+  notice: ChildNotice;
+  onOpen: (conversation: string) => void;
+}) {
+  const { t } = useI18n();
+  const message = useThreadMessage();
+  const label = () =>
+    t(props.notice.kind === "help" ? "chat.child.helpRequest" : "chat.child.progressReport");
+  return (
+    <section
+      aria-label={label()}
+      data-slot="conversation-child-notice"
+      data-message-id={message().id}
+      data-turn-id={message().jobId}
+      data-role="user"
+      tabindex={-1}
+      class={cn(
+        "min-w-0 space-y-2 rounded-xl border border-border bg-muted/20 p-3 focus-visible:outline-2 focus-visible:outline-ring",
+        props.notice.kind === "help" && "border-amber-500/40",
+      )}
+    >
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="text-sm font-semibold">{label()}</h2>
+        <MessageActions />
+      </div>
+      <button
+        type="button"
+        class="inline-flex min-w-0 max-w-full items-center gap-1 rounded text-left text-sm font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+        title={props.notice.title}
+        onClick={() => props.onOpen(props.notice.conversation)}
+      >
+        <span class="truncate">{props.notice.title || t("chat.child.untitled")}</span>
+        <ArrowUpRight class="size-3.5 shrink-0" aria-hidden="true" />
+      </button>
+      <p class="whitespace-pre-wrap wrap-break-word text-sm">
+        {message().content.slice(props.notice.text_start_utf16)}
+      </p>
+    </section>
   );
 }
 

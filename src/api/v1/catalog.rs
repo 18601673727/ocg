@@ -306,6 +306,23 @@ pub(crate) struct ChildResultView {
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+#[ts(rename = "ChildNoticeKind")]
+enum ChildNoticeKindView {
+    Progress,
+    Help,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ChildNotice")]
+pub(crate) struct ChildNoticeView {
+    conversation: String,
+    title: String,
+    kind: ChildNoticeKindView,
+    text_start_utf16: u32,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "TurnEntry")]
 pub(crate) struct TurnEntryView {
     seq: u32,
@@ -313,6 +330,9 @@ pub(crate) struct TurnEntryView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     child_results: Option<Vec<ChildResultView>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    child_notice: Option<ChildNoticeView>,
     #[serde(flatten)]
     entry: TurnEntryKindView,
 }
@@ -655,6 +675,15 @@ pub(super) async fn conversation_turns(
                             answer_start_utf16: result.answer_start_utf16,
                             answer_end_utf16: result.answer_end_utf16,
                         }).collect()
+                    }),
+                    child_notice: item.child_notice.map(|notice| ChildNoticeView {
+                        conversation: notice.conversation.to_string(),
+                        title: notice.title,
+                        kind: match notice.kind {
+                            crate::db::entities::ChildNoticeKind::Progress => ChildNoticeKindView::Progress,
+                            crate::db::entities::ChildNoticeKind::Help => ChildNoticeKindView::Help,
+                        },
+                        text_start_utf16: notice.text_start_utf16,
                     }),
                     entry: TurnEntryKindView::UserMessage {
                         text: turn.job.input.text().to_owned(),

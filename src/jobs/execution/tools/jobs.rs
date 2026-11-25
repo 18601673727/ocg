@@ -95,6 +95,24 @@ fn job_tools() -> Result<Vec<JobTool>, ToolRegistryError> {
             "Message a conversation in your strict subtree.",
         ),
         (
+            "job_report_progress",
+            json!({"text":{"type":"string","minLength":1,"maxLength":2000}}),
+            vec!["text"],
+            "Send a concise, non-final progress update to your immediate parent conversation. The host selects the recipient. Continue your assigned task after reporting.",
+        ),
+        (
+            "job_ask_parent",
+            json!({"question":{"type":"string","minLength":1,"maxLength":2000}}),
+            vec!["question"],
+            "Ask your immediate parent for a specific missing input or decision when the assignment is blocked. The host delivers the question and pauses this assignment until it is answered. Send the question as a standalone tool call. Continue the assignment after the answer; the host returns your final result as usual.",
+        ),
+        (
+            "job_answer_child",
+            json!({"turn":{"type":"string","pattern":UUID},"request":{"type":"integer","minimum":1,"maximum":4294967295_u32},"index":{"type":"integer","minimum":0,"maximum":4294967295_u32},"text":{"type":"string","minLength":1,"maxLength":2000}}),
+            vec!["turn", "request", "index", "text"],
+            "Answer a pending help request from your direct child. Use the turn, request and index in the delivered help message. This continues that assignment; if you do not know the answer, ask the user instead of inventing it.",
+        ),
+        (
             "job_retry",
             json!({"turn":{"type":"string","pattern":UUID,"description":"The original turn id to retry, not its conversation id."}}),
             vec!["turn"],
@@ -159,12 +177,14 @@ pub(crate) fn register(
     registry: &ToolRegistry,
     decider: bool,
     offer_plan: bool,
+    nested: bool,
 ) -> Result<Vec<&'static str>, ToolRegistryError> {
     static TOOLS: LazyLock<Result<Vec<JobTool>, ToolRegistryError>> = LazyLock::new(job_tools);
     let mut names = Vec::new();
     for tool in TOOLS.as_ref().map_err(Clone::clone)? {
         if (!offer_plan && tool.name == "job_plan")
             || (!decider && USER_DECIDED.contains(&tool.name))
+            || (!nested && matches!(tool.name, "job_report_progress" | "job_ask_parent"))
         {
             continue;
         }

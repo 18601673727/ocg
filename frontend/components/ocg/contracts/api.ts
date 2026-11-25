@@ -11,6 +11,7 @@ export type {
   Card,
   Cards,
   Child,
+  ChildNotice,
   ChildResult,
   Children,
   Compaction,

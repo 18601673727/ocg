@@ -329,6 +329,8 @@ export const en = {
   "chat.child.cancelledResult": "This turn was cancelled.",
   "chat.child.unknownResult": "The outcome could not be confirmed.",
   "chat.child.results": "Child task results",
+  "chat.child.progressReport": "Child task progress",
+  "chat.child.helpRequest": "Child task needs help",
   "chat.child.viewResult": "View returned answer",
   "chat.child.conversationId": "Conversation ID",
 

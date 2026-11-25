@@ -121,6 +121,28 @@ impl Batch {
                     json!({"conversation": target.to_string(), "turn": turn.to_string()}),
                 )
             }
+            JobToolCall::JobReportProgress { text } => {
+                let (parent, turn) = self.post_child_notice(caller, call, &text, false)?;
+                JobToolApplied::of(json!({"parent": parent.to_string(), "turn": turn.to_string()}))
+            }
+            JobToolCall::JobAnswerChild {
+                turn,
+                request,
+                index,
+                text,
+            } => {
+                let child_turn = JobId::new(self.job_tool_id(&turn)?);
+                let appended = self.answer_child_help(
+                    caller,
+                    ToolCallRef {
+                        job: child_turn,
+                        request,
+                        index,
+                    },
+                    &text,
+                )?;
+                JobToolApplied::of(json!({"turn": appended.turn.to_string()}))
+            }
             JobToolCall::JobRetry { turn } => {
                 let turn = JobId::new(self.job_tool_id(&turn)?);
                 let Some(original) = self.mutable_job(turn)? else {
@@ -151,7 +173,9 @@ impl Batch {
             JobToolCall::JobUnhold { conversation } => {
                 self.manage(caller, &conversation, ConversationAction::Unhold)?
             }
-            JobToolCall::JobAssign { .. } | JobToolCall::JobDispatch { .. } => {
+            JobToolCall::JobAssign { .. }
+            | JobToolCall::JobDispatch { .. }
+            | JobToolCall::JobAskParent { .. } => {
                 return self.reject(Violation::InvalidValue(
                     "tool",
                     "this call is decided by the user, not applied by the host",

@@ -666,6 +666,7 @@ pub(crate) struct MutableConversationPage {
 pub(crate) struct MutableConversationTurn {
     pub planning_target: Option<JobId>,
     pub child_results: Vec<ChildResultReport>,
+    pub child_notice: Option<ChildNotice>,
     pub details: MutableJobDetails,
     pub outputs: Vec<JobOutputRecord>,
     pub outputs_truncated: bool,
@@ -678,6 +679,18 @@ pub(crate) struct ChildResultReport {
     pub state: super::OutcomeKind,
     pub answer_start_utf16: u32,
     pub answer_end_utf16: u32,
+}
+
+pub(crate) struct ChildNotice {
+    pub conversation: JobId,
+    pub title: String,
+    pub kind: ChildNoticeKind,
+    pub text_start_utf16: u32,
+}
+
+pub(crate) enum ChildNoticeKind {
+    Progress,
+    Help,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

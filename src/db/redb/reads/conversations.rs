@@ -4,16 +4,18 @@ use super::catalog::{effective_context_policy, global_compaction_settings};
 use super::jobs::tool_evidence;
 use crate::db::entities::JobId;
 use crate::db::entities::{
-    Actor, ChildConversationEntry, ChildResultReport, ContextState, ContextWorkDetails,
-    ContextWorkState, ConversationEntry, ConversationSearchMatch, ConversationSearchScope,
-    ConversationsPage, JobLifecycle, JobLimits, JobSpec, MutableConversationPage,
-    MutableConversationTurn, Origin, OutputKind, Recurrence,
+    Actor, ChildConversationEntry, ChildNotice, ChildNoticeKind, ChildResultReport, ContextState,
+    ContextWorkDetails, ContextWorkState, ConversationEntry, ConversationSearchMatch,
+    ConversationSearchScope, ConversationsPage, JobLifecycle, JobLimits, JobSpec,
+    MutableConversationPage, MutableConversationTurn, Origin, OutputKind, Recurrence,
 };
 use crate::db::entities::{ConfigId, ExecutionOperation, MutableJobPhase, OutcomeKind};
 use crate::db::redb::allocations::pools_offering_capability;
 use crate::db::redb::batch::{BatchError, Failure};
 use crate::db::redb::configs::ConfigurationResolver;
-use crate::db::redb::job_tree::{MAX_LIVE_CHILDREN, REPORT_HEADER};
+use crate::db::redb::job_tree::{
+    CHILD_HELP_HEADER, CHILD_PROGRESS_HEADER, MAX_LIVE_CHILDREN, REPORT_HEADER,
+};
 use crate::db::redb::reads::execution_context::{SummarySourceError, verify_native_summary_in};
 use crate::db::redb::reads::jobs::{
     active_job_in, first_entry_text, mutable_job_details_in, mutable_job_record_in,
@@ -130,6 +132,7 @@ pub(crate) fn read_mutable_conversation_turn_page(
         rows.push(MutableConversationTurn {
             planning_target: project_planning_target(&rx, &details.record.job)?,
             child_results: child_results(&rx, &details.record.job)?,
+            child_notice: child_notice(&rx, &details.record.job)?,
             details,
             outputs,
             outputs_truncated,
@@ -141,6 +144,44 @@ pub(crate) fn read_mutable_conversation_turn_page(
     Ok(Some(MutableConversationPage {
         turns: rows,
         has_more,
+    }))
+}
+
+fn child_notice(
+    rx: &ReadTransaction,
+    job: &crate::db::entities::MutableJob,
+) -> Result<Option<ChildNotice>, StorageError> {
+    let Actor::Agent { conversation } = job.submitted_by else {
+        return Ok(None);
+    };
+    let text = job.input.text();
+    let Some((header, _)) = text.split_once('\n') else {
+        return Ok(None);
+    };
+    let kind = match header {
+        CHILD_PROGRESS_HEADER => ChildNoticeKind::Progress,
+        CHILD_HELP_HEADER => ChildNoticeKind::Help,
+        _ => return Ok(None),
+    };
+    let Some((envelope, _)) = text.split_once("\n\n") else {
+        return Ok(None);
+    };
+    let Some(source) = read_conversation_row(rx, conversation)? else {
+        return Ok(None);
+    };
+    if source.parent_id != Some(job.parent_id) {
+        return Ok(None);
+    }
+    let title = conversation_title(
+        rx,
+        conversation,
+        &state::require(rx, conversation)?.lifecycle,
+    )?;
+    Ok(Some(ChildNotice {
+        conversation,
+        title,
+        kind,
+        text_start_utf16: (envelope.encode_utf16().count() + 2) as u32,
     }))
 }
 

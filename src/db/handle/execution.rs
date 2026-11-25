@@ -749,10 +749,13 @@ impl DatabaseHandle {
                         | JobToolCall::JobDispatch { objective, .. } => {
                             search_index_bytes(objective)
                         }
-                        JobToolCall::JobMessage { text, .. } => search_index_bytes(text),
+                        JobToolCall::JobMessage { text, .. }
+                        | JobToolCall::JobReportProgress { text }
+                        | JobToolCall::JobAnswerChild { text, .. } => search_index_bytes(text),
                         JobToolCall::JobLimits { .. }
                         | JobToolCall::JobAgents { .. }
                         | JobToolCall::JobWorkers { .. }
+                        | JobToolCall::JobAskParent { .. }
                         | JobToolCall::JobStop { .. }
                         | JobToolCall::JobClose { .. }
                         | JobToolCall::JobHold { .. }
@@ -771,7 +774,11 @@ impl DatabaseHandle {
                                     .saturating_mul(6)
                                     .saturating_add(64 * 1024)
                             }
-                            JobToolCall::JobMessage { text, .. } if text.len() <= 64 * 1024 => {
+                            JobToolCall::JobMessage { text, .. }
+                            | JobToolCall::JobReportProgress { text }
+                            | JobToolCall::JobAnswerChild { text, .. }
+                                if text.len() <= 64 * 1024 =>
+                            {
                                 byte_count(text.len())
                                     .saturating_mul(6)
                                     .saturating_add(64 * 1024)
@@ -875,7 +882,16 @@ impl DatabaseHandle {
                         Some(admission) => identity
                             .saturating_add(byte_count(admission.handler_version.len()))
                             .saturating_add(byte_count(admission.parameters.len()))
-                            .saturating_add(byte_count(admission.arguments.len())),
+                            .saturating_add(byte_count(admission.arguments.len()))
+                            .saturating_add(if evidence.name == "job_ask_parent" {
+                                search_index_bytes(admission.arguments.as_str())
+                                    .saturating_add(
+                                        byte_count(admission.arguments.len()).saturating_mul(6),
+                                    )
+                                    .saturating_add(64 * 1024)
+                            } else {
+                                0
+                            }),
                     }
                 },
                 OperationKind::RecordToolDecision,

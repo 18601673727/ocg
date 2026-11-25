@@ -62,6 +62,8 @@ pub(super) const MAX_LIVE_CHILDREN: usize = 16;
 pub(super) const MAX_LIVE_SUBTREE: usize = 64;
 pub(super) const MAX_AGENT_RETRIES: usize = 2;
 pub(super) const REPORT_HEADER: &str = "The conversations you opened have finished. Their answers follow; use them, and do not claim a failed or cancelled one completed.";
+pub(super) const CHILD_PROGRESS_HEADER: &str = "Child task progress report";
+pub(super) const CHILD_HELP_HEADER: &str = "Child task help request";
 const REPORT_TITLE_BYTES: usize = 128;
 const MAX_CHILD_SCAN: usize = 256;
 
@@ -284,6 +286,90 @@ impl Batch {
                 conversation: caller,
             },
         )
+    }
+
+    pub(super) fn post_child_notice(
+        &mut self,
+        child: JobId,
+        call: ToolCallRef,
+        text: &str,
+        help: bool,
+    ) -> Result<(JobId, JobId), BatchError> {
+        let child_row = self.require_mutable_conversation(child)?;
+        let Some(parent) = child_row.parent_id else {
+            return self.reject(Violation::InvalidValue(
+                "parent",
+                "only a child conversation may contact its immediate parent",
+            ));
+        };
+        let text = text.trim();
+        if text.is_empty() || text.chars().count() > 2000 {
+            return self.reject(Violation::InvalidValue(
+                "text",
+                "expected between 1 and 2000 characters",
+            ));
+        }
+        if self.step(|tx| has_current_draft(tx, parent))? {
+            return self.reject(Violation::InvalidValue(
+                "parent",
+                "the parent has an unsent draft; retry after it is sent or discarded",
+            ));
+        }
+        let (limits, _) = self.group_limits(parent)?;
+        let parent_row = self.require_mutable_conversation(parent)?;
+        let mut previous = self.group_head(parent)?;
+        let mut count = 0;
+        // Interim updates have their own allowance. They do not spend final-report turns.
+        for _ in 0..=u8::MAX {
+            let Some(id) = previous else { break };
+            let Some(turn) = self.mutable_job(id)? else {
+                return self.corrupted("missing turn in parent history".into());
+            };
+            previous = turn.previous;
+            match turn.submitted_by {
+                Actor::User => {
+                    previous = None;
+                    break;
+                }
+                Actor::Agent { conversation } if Some(conversation) == parent_row.parent_id => {
+                    previous = None;
+                    break;
+                }
+                Actor::Agent { .. } => {
+                    if is_child_notice(turn.input.text()) {
+                        count += 1;
+                        if count >= limits.max_auto_turns {
+                            break;
+                        }
+                    }
+                }
+                Actor::Auto | Actor::Loop => {}
+            }
+        }
+        if count >= limits.max_auto_turns || previous.is_some() {
+            return self.reject(Violation::InvalidValue(
+                "parent_notice_limit",
+                "the parent has reached its automatic limit for interim child notices",
+            ));
+        }
+        let heading = if help {
+            CHILD_HELP_HEADER
+        } else {
+            CHILD_PROGRESS_HEADER
+        };
+        let instruction = if help {
+            format!(
+                "The direct child is paused. If you can supply the requested input, call job_answer_child with turn {}, request {}, index {} and your answer. Otherwise ask the user. The child's final result will follow separately.",
+                call.job,
+                call.request.get(),
+                call.index,
+            )
+        } else {
+            "This is an interim update. The work is still in progress; wait for its separate final result.".to_owned()
+        };
+        let message = format!("{heading}\nFrom direct child {child}. {instruction}\n\n{text}");
+        let turn = self.agent_turn(parent, message, call, b"child notice", child)?;
+        Ok((parent, turn))
     }
 
     fn require_room_for_child(&mut self, parent: JobId) -> Result<(), BatchError> {
@@ -1563,9 +1649,16 @@ fn segment_waiting(
 }
 
 // A report must not move the head on which an unsubmitted user message is based.
-fn has_current_draft(tx: &impl TxRead, parent: JobId) -> Result<bool, StorageError> {
+pub(super) fn has_current_draft(tx: &impl TxRead, parent: JobId) -> Result<bool, StorageError> {
     let head = turn_head(tx, parent)?;
     has_draft(tx, parent, |draft| draft.previous == head)
+}
+
+fn is_child_notice(text: &str) -> bool {
+    matches!(
+        text.lines().next(),
+        Some(CHILD_PROGRESS_HEADER | CHILD_HELP_HEADER)
+    )
 }
 
 fn has_draft(
