@@ -625,6 +625,10 @@ export const en = {
   "settings.llm.effortsUnknown": "Not advertised by provider",
   "chat.noModels": "No runnable models",
   "chat.openModelSettings": "Set up in Settings → Models",
+  "chat.missingField.contextWindow":
+    'Nothing was sent. The model "{name}" has no Context window set, so OCG cannot run it.',
+  "chat.missingField.contextWindowLink": "Open the Context window field",
+  "chat.failureDetails": "Details: {text}",
   "chat.setupModels":
     "Set up a chat model in Settings → Models, then assign it to an agent under Agents.",
   "chat.setupNewTab": "Opens in a new tab",

@@ -10,6 +10,7 @@ import {
 } from "../../runtime/api-client";
 import { useOcgRuntime } from "../../runtime/runtime-context";
 import { useConversationView } from "../conversation-view";
+import { modelFieldFailure } from "../model-field-error";
 import type { ModelSupport } from "../model-selector";
 import { createAttachmentQueue, loadImages, type PendingImage } from "./attachments";
 import {
@@ -773,10 +774,24 @@ export function createComposerDraft(props: ComposerProps) {
       await refreshUnfinished();
     } catch (cause) {
       submission.jobId = work.current.job?.id ?? submission.jobId;
+      const raw = [notice, errorMessage(cause)].filter(Boolean).join("\n");
+      const fieldFailure = modelFieldFailure(
+        cause,
+        {
+          id: work.current.desired.configuration?.llm_profile,
+          name:
+            selectedSupport?.llmProfile === work.current.desired.configuration?.llm_profile
+              ? selectedSupport?.llmName
+              : undefined,
+        },
+        raw,
+        t,
+      );
       reportSubmissionNotice(
         submissionSessionId,
-        [notice, errorMessage(cause)].filter(Boolean).join("\n"),
+        fieldFailure?.message ?? raw,
         submission,
+        fieldFailure && { failureDetail: fieldFailure.detail, failureLink: fieldFailure.link },
       );
       setError(null);
     } finally {

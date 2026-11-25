@@ -30,6 +30,7 @@ import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { ariaState } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
 import { useI18n } from "../i18n";
+import { WorkspaceLink } from "../layout/workspace-link";
 import { MarkdownBody } from "../markdown/markdown-body";
 import { MessageContext, useConversationView, useThreadMessage } from "./conversation-view";
 import { ImageGallery } from "./image-attachments";
@@ -427,6 +428,22 @@ export function AssistantMessage(props: { footer?: JSX.Element }) {
                 <p role="alert" class="text-destructive mt-2 text-sm whitespace-pre-wrap">
                   {failure() ?? t("chat.failed")}
                 </p>
+              </Show>
+              <Show when={message().failureLink}>
+                {(link) => (
+                  <p class="mt-1 text-sm">
+                    <WorkspaceLink href={link().href} class="underline underline-offset-2">
+                      {link().label}
+                    </WorkspaceLink>
+                  </p>
+                )}
+              </Show>
+              <Show when={message().failureDetail}>
+                {(detail) => (
+                  <p class="mt-1 text-xs whitespace-pre-wrap text-muted-foreground">
+                    {t("chat.failureDetails", { text: detail() })}
+                  </p>
+                )}
               </Show>
             </div>
             <Show when={!message().intermediate && !running()}>

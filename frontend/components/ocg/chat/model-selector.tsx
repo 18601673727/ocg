@@ -12,6 +12,7 @@ type Catalog = { agents: AgentProfile[]; projects: Project[] };
 
 export type ModelSupport = {
   llmProfile: string | undefined;
+  llmName?: string;
   images: boolean;
   notice?: string;
 };
@@ -143,10 +144,11 @@ export function ModelSelector(props: {
             : undefined),
   );
   createEffect(
-    () => [llmId(), supportsImages(), notice()],
+    () => [llmId(), llm()?.name, supportsImages(), notice()],
     () => {
       props.onSupportChange({
         llmProfile: llmId(),
+        llmName: llm()?.name.trim() || llm()?.model,
         images: supportsImages(),
         notice: notice(),
       });

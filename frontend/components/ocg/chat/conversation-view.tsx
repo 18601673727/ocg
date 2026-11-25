@@ -23,6 +23,7 @@ const ConversationContext = createContext<{
     sessionId: string,
     message: string | undefined,
     input: Pick<ChatMessage, "content" | "images" | "jobId">,
+    failure?: Pick<ChatMessage, "failureDetail" | "failureLink">,
   ) => void;
 }>();
 
@@ -38,6 +39,7 @@ export function ConversationView(props: { sessionId: string; children: JSX.Eleme
     sessionId: string,
     message: string | undefined,
     input: Pick<ChatMessage, "content" | "images" | "jobId">,
+    failure?: Pick<ChatMessage, "failureDetail" | "failureLink">,
   ) {
     const previous = submissionNotices().filter(
       (item) => item.sessionId !== sessionId || !input.jobId || item.user.jobId !== input.jobId,
@@ -56,6 +58,7 @@ export function ConversationView(props: { sessionId: string; children: JSX.Eleme
         role: "assistant",
         content: "",
         failureReason: message,
+        ...failure,
         status: "failed",
         createdAt,
       },

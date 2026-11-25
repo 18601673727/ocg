@@ -160,6 +160,7 @@ export function SettingsSurface(props: {
   const [llmMaxTokens, setLlmMaxTokens] = createSignal("");
   const [llmReasoningEffort, setLlmReasoningEffort] = createSignal("");
   const [llmContextWindow, setLlmContextWindow] = createSignal("");
+  const [focusContext, setFocusContext] = createSignal(false);
   const [deletingModel, setDeletingModel] = createSignal<LlmProfile | DecisionModelProfile | null>(
     null,
   );
@@ -235,8 +236,32 @@ export function SettingsSurface(props: {
       }),
   );
 
+  createEffect(
+    () => [snapshot(), props.section],
+    () => {
+      const loaded = snapshot();
+      const params = new URLSearchParams(window.location.search);
+      const target = params.get("edit");
+      if (!loaded || props.section !== "models" || !target) return;
+      const field = params.get("field");
+      params.delete("edit");
+      params.delete("field");
+      const query = params.toString();
+      window.history.replaceState(
+        null,
+        "",
+        `${window.location.pathname}${query ? `?${query}` : ""}${window.location.hash}`,
+      );
+      const profile = loaded.llm_profiles.find((item) => item.id === target);
+      if (!profile?.editable) return;
+      startEditLlm(profile);
+      setFocusContext(field === "context_window");
+    },
+  );
+
   function resetLlmForm() {
     setLlmFormOpen(false);
+    setFocusContext(false);
     setEditingLlmId(null);
     setEditingEditSeq(null);
     setModelKind("llm");
@@ -869,6 +894,9 @@ export function SettingsSurface(props: {
                     <DialogContent
                       class="max-h-[90dvh] overflow-y-auto sm:max-w-3xl"
                       showCloseButton={!llmSaving()}
+                      initialFocus={() =>
+                        focusContext() ? document.getElementById("llm-context-window") : null
+                      }
                     >
                       <DialogHeader>
                         <DialogTitle>
@@ -1002,6 +1030,7 @@ export function SettingsSurface(props: {
                             <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
                               {i18n.t("settings.llm.contextWindow")}
                               <Input
+                                id="llm-context-window"
                                 inputmode="numeric"
                                 value={llmContextWindow()}
                                 onInput={(event) => setLlmContextWindow(event.target.value)}

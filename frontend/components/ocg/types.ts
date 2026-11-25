@@ -45,6 +45,8 @@ export type ChatMessage = {
   intermediate?: boolean;
   failureReason?: string;
   failureAt?: number;
+  failureDetail?: string;
+  failureLink?: { href: string; label: string };
   failureCode?:
     | "project-missing"
     | "configuration-required"
