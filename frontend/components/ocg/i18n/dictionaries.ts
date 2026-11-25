@@ -624,6 +624,7 @@ export const en = {
   "chat.profileDefault": "Model profile default",
   "settings.llm.effortsUnknown": "Not advertised by provider",
   "chat.noModels": "No runnable models",
+  "chat.openModelSettings": "Set up in Settings → Models",
   "chat.setupModels":
     "Set up a chat model in Settings → Models, then assign it to an agent under Agents.",
   "chat.setupNewTab": "Opens in a new tab",

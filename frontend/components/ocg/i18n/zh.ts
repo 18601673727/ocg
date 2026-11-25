@@ -574,6 +574,7 @@ export const zh: Dictionary = {
   "chat.profileDefault": "使用模型配置",
   "settings.llm.effortsUnknown": "Provider 未提供",
   "chat.noModels": "无可运行模型",
+  "chat.openModelSettings": "前往「设置 → 模型」配置",
   "chat.setupModels": "先在「设置 → 模型」中配置对话模型，再到「智能体」为智能体指定该模型。",
   "chat.setupNewTab": "在新标签页中打开",
   "chat.providerDefault": "提供商默认",

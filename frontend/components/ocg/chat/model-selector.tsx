@@ -3,6 +3,7 @@ import { type Ref } from "@/lib/ui-state";
 import type { AgentProfile, ChatModelSelection, Project } from "../contracts";
 import { useI18n } from "../i18n";
 import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context";
+import { settingsPath } from "../settings/settings-sections";
 import { ModelSelectorView } from "./model-selector-view";
 
 const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
@@ -233,6 +234,7 @@ export function ModelSelector(props: {
           (props.busy ? i18n.t("chat.settingsLocked") : i18n.t("chat.settingsNextTurn"))
         }
         disabled={disabled()}
+        setupHref={catalog() && !error() && !llm() ? settingsPath("models") : undefined}
         loading={!catalog() && !error()}
         providerLabel={i18n.t("chat.agent")}
         defaultEffort={llm()?.default_effort}

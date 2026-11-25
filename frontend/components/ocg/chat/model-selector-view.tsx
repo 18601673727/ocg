@@ -3,6 +3,7 @@ import { createMemo, createUniqueId } from "solid-js";
 import { Select, SelectItem } from "@/components/ui/select";
 import { ariaState, assignRef, type Ref } from "@/lib/ui-state";
 import { useI18n } from "../i18n";
+import { WorkspaceLink } from "../layout/workspace-link";
 
 type SelectorField = {
   value: string;
@@ -15,6 +16,7 @@ export type ModelSelectorViewProps = {
   triggerRef?: Ref<HTMLButtonElement>;
   defaultEffort?: string | null;
   status: string;
+  setupHref?: string;
   disabled: boolean;
   loading: boolean;
   project: SelectorField & { disabled: boolean; placeholder: string };
@@ -78,32 +80,49 @@ export function ModelSelectorView(props: ModelSelectorViewProps) {
           </Select>
         </div>
         <div class="min-w-0 shrink">
-          <button
-            type="button"
-            popovertarget={id + "-settings"}
-            ref={(element) => {
-              trigger = element;
-              assignRef(props.triggerRef, element);
-            }}
-            disabled={props.disabled}
-            aria-label={`${i18n.t("chat.executionSettings")} · ${selectionLabel()}`}
-            title={selectionLabel()}
-            class={`${compactClass} flex max-w-full items-center justify-between gap-2 text-left`}
-          >
-            <Cpu class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
-            <span class="truncate">
-              {providerName() && modelName() ? (
-                <>
-                  <span class="text-muted-foreground">{providerName()} / </span>
-                  <span class="font-medium">{modelName()}</span>
-                  <span class="text-muted-foreground"> / {effortName()}</span>
-                </>
-              ) : (
-                selectionLabel()
-              )}
-            </span>
-            <ChevronDown class="size-4 shrink-0 opacity-50" aria-hidden="true" />
-          </button>
+          {props.setupHref && !props.loading && !(providerName() && modelName()) ? (
+            <WorkspaceLink
+              href={props.setupHref}
+              title={i18n.t("chat.setupModels")}
+              class={`${compactClass} flex max-w-full items-center gap-2 text-left`}
+            >
+              <Cpu class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+              <span class="truncate">
+                {i18n.t("chat.noModels")}
+                {" · "}
+                <span class="text-foreground underline underline-offset-2">
+                  {i18n.t("chat.openModelSettings")}
+                </span>
+              </span>
+            </WorkspaceLink>
+          ) : (
+            <button
+              type="button"
+              popovertarget={id + "-settings"}
+              ref={(element) => {
+                trigger = element;
+                assignRef(props.triggerRef, element);
+              }}
+              disabled={props.disabled}
+              aria-label={`${i18n.t("chat.executionSettings")} · ${selectionLabel()}`}
+              title={selectionLabel()}
+              class={`${compactClass} flex max-w-full items-center justify-between gap-2 text-left`}
+            >
+              <Cpu class="size-3.5 shrink-0 text-muted-foreground" aria-hidden="true" />
+              <span class="truncate">
+                {providerName() && modelName() ? (
+                  <>
+                    <span class="text-muted-foreground">{providerName()} / </span>
+                    <span class="font-medium">{modelName()}</span>
+                    <span class="text-muted-foreground"> / {effortName()}</span>
+                  </>
+                ) : (
+                  selectionLabel()
+                )}
+              </span>
+              <ChevronDown class="size-4 shrink-0 opacity-50" aria-hidden="true" />
+            </button>
+          )}
 
           <div
             id={id + "-settings"}
