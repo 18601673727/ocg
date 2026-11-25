@@ -156,9 +156,7 @@ function TurnRow(props: {
                   </div>
                 ) : null}
                 {reasoning()}
-                {isUser() ? (
-                  <p class="whitespace-pre-wrap break-words">{props.turn.content}</p>
-                ) : (
+                {props.turn.content && (
                   <MarkdownBody content={props.turn.content} class="break-words" />
                 )}
                 {failure() ? (

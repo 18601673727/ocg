@@ -455,14 +455,17 @@ function UserMessage() {
       class="grid auto-rows-auto grid-cols-[minmax(72px,1fr)_auto] content-start gap-y-2 [contain-intrinsic-size:auto_80px] focus-visible:outline-2 focus-visible:outline-ring [&>*]:col-start-2"
     >
       <ImageGallery images={message().images} compact />
-      <div class="group/user-message relative col-start-2 min-w-0 justify-self-end">
-        <div class="peer bg-muted text-foreground rounded-(--composer-radius) px-4 py-2 whitespace-pre-wrap wrap-break-word empty:hidden">
-          {message().content}
+      <Show when={message().content.trim()}>
+        <div class="group/user-message relative col-start-2 min-w-0 max-w-full justify-self-end">
+          <MarkdownBody
+            content={message().content}
+            class="bg-muted text-foreground rounded-(--composer-radius) px-4 py-2 wrap-break-word"
+          />
+          <div class="pointer-events-none absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 opacity-0 transition-opacity group-hover/user-message:pointer-events-auto group-hover/user-message:opacity-100 group-focus-within/user-message:pointer-events-auto group-focus-within/user-message:opacity-100 motion-reduce:transition-none rtl:translate-x-full">
+            <MessageActions />
+          </div>
         </div>
-        <div class="pointer-events-none absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 opacity-0 transition-opacity group-hover/user-message:pointer-events-auto group-hover/user-message:opacity-100 group-focus-within/user-message:pointer-events-auto group-focus-within/user-message:opacity-100 peer-empty:hidden motion-reduce:transition-none rtl:translate-x-full">
-          <MessageActions />
-        </div>
-      </div>
+      </Show>
       <Show when={message().queued}>
         <p
           role="status"
