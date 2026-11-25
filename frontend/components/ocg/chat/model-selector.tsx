@@ -6,6 +6,12 @@ import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context
 import { settingsPath } from "../settings/settings-sections";
 import { ModelSelectorView } from "./model-selector-view";
 
+function targetLabel(target: { name: string; model: string }): string {
+  const name = target.name.trim();
+  if (!name || name === target.model) return target.model;
+  return `${target.model} (${name})`;
+}
+
 const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 type Catalog = { agents: AgentProfile[]; projects: Project[] };
@@ -273,7 +279,7 @@ export function ModelSelector(props: {
           value: llmId() ?? "",
           options: targets().map((target) => ({
             value: target.id,
-            label: target.name.trim() || target.model,
+            label: targetLabel(target),
           })),
           onChange: (value) => {
             if (agentId()) choose(agentId()!, value);
