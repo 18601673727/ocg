@@ -341,7 +341,7 @@ function ImportContent(props: {
                   value={newName()}
                   disabled={saving()}
                   onInput={(event) => changeNewConnection(() => setNewName(event.target.value))}
-                  placeholder="Provider"
+                  placeholder="e.g. OpenRouter"
                   autocomplete="off"
                 />
               </label>
@@ -351,7 +351,7 @@ function ImportContent(props: {
                   value={newEndpoint()}
                   disabled={saving()}
                   onInput={(event) => changeNewConnection(() => setNewEndpoint(event.target.value))}
-                  placeholder="https://api.example.com/v1"
+                  placeholder="e.g. https://api.example.com/v1"
                   spellcheck="false"
                   autocomplete="off"
                 />

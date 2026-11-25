@@ -1034,7 +1034,7 @@ export function SettingsSurface(props: {
                                 inputmode="numeric"
                                 value={llmContextWindow()}
                                 onInput={(event) => setLlmContextWindow(event.target.value)}
-                                placeholder="128000"
+                                placeholder="e.g. 128000"
                               />
                             </label>
 
@@ -1048,7 +1048,7 @@ export function SettingsSurface(props: {
                                   step="any"
                                   value={llmTemperature()}
                                   onInput={(e) => setLlmTemperature(e.target.value)}
-                                  placeholder="0.7"
+                                  placeholder="e.g. 0.7"
                                   spellcheck="false"
                                 />
                               </label>
@@ -1057,7 +1057,7 @@ export function SettingsSurface(props: {
                                 <Input
                                   value={llmTopP()}
                                   onInput={(e) => setLlmTopP(e.target.value)}
-                                  placeholder="1.0"
+                                  placeholder="e.g. 1.0"
                                   spellcheck="false"
                                 />
                               </label>
@@ -1066,7 +1066,7 @@ export function SettingsSurface(props: {
                                 <Input
                                   value={llmMaxTokens()}
                                   onInput={(e) => setLlmMaxTokens(e.target.value)}
-                                  placeholder={isAnthropic() ? undefined : "4096"}
+                                  placeholder={isAnthropic() ? undefined : "e.g. 4096"}
                                   spellcheck="false"
                                 />
                               </label>
