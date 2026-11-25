@@ -906,6 +906,7 @@ export function PoolsSection(props: { client: ApiClient }) {
   const [executorNext, setExecutorNext] = createSignal<string | null>(null);
   const [executorLoading, setExecutorLoading] = createSignal(false);
   const [executorError, setExecutorError] = createSignal<string | null>(null);
+  const [executorCreateError, setExecutorCreateError] = createSignal<string | null>(null);
   const [executorNotice, setExecutorNotice] = createSignal<string | null>(null);
   const [failedExecutorPage, setFailedExecutorPage] = createSignal<{
     cursor: string | undefined;
@@ -1045,6 +1046,7 @@ export function PoolsSection(props: { client: ApiClient }) {
     const option = EXECUTOR_CAPABILITIES.find(({ key }) => key === capability());
     if (!option) return;
     setActionError(null);
+    setExecutorCreateError(null);
     setExecutorNotice(null);
     setCreating(true);
     try {
@@ -1061,7 +1063,7 @@ export function PoolsSection(props: { client: ApiClient }) {
       setExecutorNotice(i18n.t("settings.pools.executorCreatedNotice"));
       navigateExecutors(undefined, []);
     } catch (error) {
-      setActionError(refusalText(i18n.t, error, NATIVE_CREATE_REFUSALS));
+      setExecutorCreateError(refusalText(i18n.t, error, NATIVE_CREATE_REFUSALS));
     } finally {
       setCreating(false);
     }
@@ -1432,6 +1434,11 @@ export function PoolsSection(props: { client: ApiClient }) {
                 </Select>
               </label>
             </div>
+            {executorCreateError() ? (
+              <p role="alert" class="break-words text-sm text-destructive">
+                {executorCreateError()}
+              </p>
+            ) : null}
             {executorNotice() ? (
               <p role="status" class="text-sm text-emerald-700 dark:text-emerald-400">
                 {executorNotice()}
