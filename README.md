@@ -121,22 +121,22 @@ Keep the OCG data directory separate from project workspaces. The [data layout](
 
 ## Performance
 
-Current: 2026-11-25, commit [`0c4bdd5`](https://github.com/18601673727/ocg/commit/0c4bdd585a9320ca5700e00fe6eea7c6151ee503). Last: 2026-11-20, commit [`1c20348`](https://github.com/18601673727/ocg/commit/1c20348b660027990d7be59ab2aa1e1e80721023). Both ran on the same 2-core ARM64 Linux machine (11.66 GiB RAM, ext4, optimized build). Each job makes 3 mock model requests and 2 real tool calls. 8 concurrent clients, 1,000 jobs, 1,000 workspace files. Values are medians of 3 trials; latency is p50 / p95.
+Current: 2026-11-25, OCG 0.6.1, commit [`7f69932`](https://github.com/18601673727/ocg/commit/7f69932127b0e6b2e41b23b494974014187a1e0d). Last: 2026-11-25, commit [`0c4bdd5`](https://github.com/18601673727/ocg/commit/0c4bdd585a9320ca5700e00fe6eea7c6151ee503). Both ran on the same 2-core ARM64 Linux machine (11.66 GiB RAM, ext4, optimized build). The current run used a clean install of the published 0.6.1 binary. Each job makes 3 mock model requests and 2 real tool calls. 8 concurrent clients, 1,000 jobs, 1,000 workspace files. Values are medians of 3 trials, except startup with 10 trials; latency is p50 / p95. Deltas use the previously published rounded values.
 
 | Metric | Last | Current | Delta |
 | --- | ---: | ---: | ---: |
-| Startup | 35.9 ms | 36.1 ms | +0.4% |
-| Memory, idle | 17.6 MiB | 17.8 MiB | +1.2% |
-| Memory, under load | 118.3 MiB | 70.3 MiB | −40.6% |
-| Job admission | 25.3 / 31.9 ms | 25.6 / 31.7 ms | +1.0% / −0.7% |
-| Job throughput | 31.2 jobs/s | 33.0 jobs/s | +6.0% |
-| Job completion | 257 / 294 ms | 243 / 276 ms | −5.6% / −6.3% |
-| Streaming delivery | 16.6 / 27.3 ms | 17.2 / 27.6 ms | +3.5% / +1.0% |
-| History read | 4.3 / 10.5 ms | 3.7 / 9.5 ms | −13.2% / −9.7% |
-| Workspace search | 0.036 / 0.590 ms | 0.026 / 0.282 ms | −27.8% / −52.2% |
-| Database per job | 46.6 KiB | 47.1 KiB | +1.2% |
+| Startup | 36.1 ms | 36.3 ms | +0.5% |
+| Memory, idle | 17.8 MiB | 18.1 MiB | +1.8% |
+| Memory, under load | 70.3 MiB | 70.1 MiB | −0.3% |
+| Job admission | 25.6 / 31.7 ms | 25.5 / 31.5 ms | −0.3% / −0.6% |
+| Job throughput | 33.0 jobs/s | 32.8 jobs/s | −0.5% |
+| Job completion | 243 / 276 ms | 245 / 277 ms | +0.6% / +0.5% |
+| Streaming delivery | 17.2 / 27.6 ms | 17.5 / 28.2 ms | +1.5% / +2.2% |
+| History read | 3.7 / 9.5 ms | 3.7 / 10.0 ms | −0.3% / +4.9% |
+| Workspace search | 0.026 / 0.282 ms | 0.025 / 0.267 ms | −3.8% / −5.3% |
+| Database per job | 47.1 KiB | 62.6 KiB | +33.0% |
 
-All runs finished with no failed, rejected or timed-out operations. The provider is a local mock, so model latency is not included.
+All runs finished with no failed, rejected, timed-out or unfinished operations. Database growth varied across the three current trials, at 41.9–62.9 KiB per job. The provider is a local mock, so model latency is not included.
 
 <details>
 <summary>Run the backend benchmark</summary>
