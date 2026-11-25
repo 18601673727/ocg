@@ -1,10 +1,11 @@
 import { createEffect, createSignal } from "solid-js";
 import { cn } from "@/lib/utils";
 import type { ChildConversation } from "../contracts";
-import { runtimeStateLabel, useI18n } from "../i18n";
+import { useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
 import { SELECTED_ROW } from "../primitives/selection";
 import type { ApiClient } from "../runtime/api-client";
+import { childConversationStatus } from "../runtime/job-status";
 import { ConversationPreview } from "./conversation-preview";
 import { ConversationStatus } from "./conversation-status";
 import { HoverMarquee } from "./hover-marquee";
@@ -63,15 +64,15 @@ export function SidebarConversationChildren(props: {
                 aria-label={i18n.t("chat.children")}
               >
                 {children().map((child) => {
-                  const hold =
-                    child.state !== "settled" && child.on_hold
-                      ? i18n.t(`chat.child.hold.${child.on_hold.by.kind}`)
-                      : null;
                   const jobState = child.job_state;
                   const title = child.title || i18n.t("chat.child.untitled");
-                  const stateLabel = hold ?? runtimeStateLabel(i18n.t, jobState);
+                  const stateLabel = childConversationStatus(i18n.t, child);
                   const status =
-                    !hold && (jobState === "queued" || jobState === "running") ? jobState : null;
+                    child.state === "open" &&
+                    !child.on_hold &&
+                    (jobState === "queued" || jobState === "running")
+                      ? jobState
+                      : null;
                   return (
                     <li data-sidebar-level="2" class="min-w-0 max-w-full">
                       <ConversationPreview

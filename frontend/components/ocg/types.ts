@@ -24,6 +24,7 @@ type MessageRole = "user" | "assistant" | "call" | "tool";
 type MessageStatus = "pending" | "streaming" | "completed" | "cancelled" | "unknown" | "failed";
 
 export type ChatMessage = {
+  childResults?: import("./contracts/api").ChildResult[];
   decision?: import("./contracts/conversations").NativeDecisionTurn;
   planningTarget?: string;
   compaction?: import("./contracts").ConversationTurn["compaction"];

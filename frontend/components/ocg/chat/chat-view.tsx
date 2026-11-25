@@ -4,8 +4,9 @@ import { ElicitationForm } from "@/components/ocg/chat/ui/elicitation-form";
 import { Button } from "@/components/ui/button";
 import { elementRef } from "@/lib/ui-state";
 import type { ChildConversation, ConversationCard, TaskPlan } from "../contracts";
-import { runtimeStateLabel, useI18n } from "../i18n";
+import { useI18n } from "../i18n";
 import { type ApiClient, ApiError } from "../runtime/api-client";
+import { childConversationStatus } from "../runtime/job-status";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { ApprovalRequest } from "./approval-request";
 import { useConversationError } from "./conversation-errors";
@@ -46,7 +47,12 @@ function ChildConversationCard(props: {
   onAct: (child: ChildConversation, action: "stop" | "close" | "hold" | "unhold") => Promise<void>;
 }) {
   const i18n = useI18n();
-  const [preview, setPreview] = createSignal<{ model?: string; text: string; earlier: boolean }>();
+  const [preview, setPreview] = createSignal<{
+    model?: string;
+    text: string;
+    earlier: boolean;
+    planningFailed?: boolean;
+  }>();
   const [error, setError] = createSignal<string | null>(null);
   useConversationError(error, () => props.child.id);
   createEffect(
@@ -65,6 +71,7 @@ function ChildConversationCard(props: {
         let before: string | undefined;
         let model: string | undefined;
         let earlier = false;
+        const failedPlans = new Set<string>();
         do {
           const page = await props.api.readConversationTurns(
             props.child.id,
@@ -74,9 +81,11 @@ function ChildConversationCard(props: {
           );
           for (const turn of page.turns) {
             if (turn.planning_target) {
-              earlier = true;
+              if (turn.job.settlement.state === "failed") failedPlans.add(turn.planning_target);
               continue;
             }
+            if (failedPlans.has(turn.job.id))
+              return { model, text: "", earlier, planningFailed: true };
             model ??= turn.input.configuration?.model;
             const result = turn.outputs.find((output) => output.kind === "result");
             let text = outputDisplayText(result);
@@ -84,7 +93,13 @@ function ChildConversationCard(props: {
               const detail = await props.api.readJobDetails(turn.job.id, signal);
               text = outputDisplayText(detail.result) || (!earlier && detail.unknown_reason) || "";
             }
-            if (text || props.child.state !== "settled") return { model, text, earlier };
+            if (
+              text ||
+              props.child.state !== "settled" ||
+              turn.job.settlement.state === "cancelled" ||
+              turn.job.settlement.state === "failed"
+            )
+              return { model, text, earlier };
             earlier = true;
           }
           before = page.next_before ?? undefined;
@@ -104,8 +119,24 @@ function ChildConversationCard(props: {
       return () => controller.abort();
     },
   );
-  const status = createMemo(() => runtimeStateLabel(i18n.t, props.child.job_state));
+  const status = createMemo(() => childConversationStatus(i18n.t, props.child));
   const title = createMemo(() => props.child.title || i18n.t("chat.child.untitled"));
+  const noResult = createMemo(() => {
+    if (!preview()) return i18n.t("common.loading");
+    if (preview()?.planningFailed) return i18n.t("chat.child.planningFailed");
+    switch (props.child.job_state) {
+      case "failed":
+        return i18n.t("chat.child.failedResult");
+      case "cancelled":
+        return i18n.t("chat.child.cancelledResult");
+      case "unknown":
+        return i18n.t("chat.child.unknownResult");
+      case "completed":
+        return i18n.t("chat.child.noResult");
+      default:
+        return i18n.t("chat.child.pendingResult");
+    }
+  });
   const summary = createMemo(() =>
     (preview()?.text ?? "")
       .trim()
@@ -132,24 +163,31 @@ function ChildConversationCard(props: {
         </span>
         <span class="block text-muted-foreground">
           {props.agentName || i18n.t("chat.agent")}
-          {preview()?.model ? ` · ${preview()!.model}` : ""} · {status()}
-          {props.child.on_hold
-            ? ` · ${i18n.t(`chat.child.hold.${props.child.on_hold.by.kind}`)}`
-            : ""}
+          {preview()?.model ? ` · ${preview()!.model}` : ""}
+        </span>
+        <span class="block font-medium">
+          {status()}
+          {(props.child.state === "closing" ||
+            props.child.on_hold ||
+            (props.child.state === "open" && props.child.keep_open && !props.child.recurrence)) &&
+            props.child.job_state === "completed" && (
+              <span class="font-normal text-muted-foreground">
+                {" · "}
+                {i18n.t("chat.child.lastTurnCompleted")}
+              </span>
+            )}
+          {props.child.state === "settled" && (
+            <span class="font-normal text-muted-foreground">
+              {" · "}
+              {i18n.t("chat.child.closed")}
+            </span>
+          )}
         </span>
         <span class="line-clamp-3 text-muted-foreground">
           {summary() && preview()?.earlier && (
             <strong>{i18n.t("chat.child.earlierAnswer")} · </strong>
           )}
-          {summary() ||
-            error() ||
-            i18n.t(
-              !preview()
-                ? "common.loading"
-                : props.child.state === "settled"
-                  ? "chat.child.noResult"
-                  : "chat.child.pendingResult",
-            )}
+          {summary() || error() || noResult()}
         </span>
       </div>
       {props.child.recurrence && (
@@ -303,16 +341,18 @@ export function ConversationChildrenStrip(props: {
             data-slot="conversation-child-cards"
           >
             <div class="ocg-subtle-scrollbar flex flex-nowrap items-stretch gap-3 overflow-x-auto overscroll-x-contain pb-2">
-              {orderedChildren().map((child) => (
-                <ChildConversationCard
-                  child={child}
-                  agentName={child.agent ? agentNames()[child.agent] : undefined}
-                  api={api}
-                  pending={pending() !== null}
-                  onOpen={props.onOpen}
-                  onAct={act}
-                />
-              ))}
+              <For each={orderedChildren()} keyed={(child) => child.id}>
+                {(child) => (
+                  <ChildConversationCard
+                    child={child()}
+                    agentName={agentNames()[child().agent ?? ""]}
+                    api={api}
+                    pending={pending() !== null}
+                    onOpen={props.onOpen}
+                    onAct={act}
+                  />
+                )}
+              </For>
               {hasMore() && (
                 <Button
                   size="sm"

@@ -82,35 +82,30 @@ export function DispatchSelectionCard(props: {
     ),
   );
   const agent = createMemo(() => agents().find((agent) => target() === `agent:${agent.id}`));
-  const direct = createMemo(() =>
-    target().startsWith("model:")
-      ? models().find((model) => target() === `model:${model.id}`)
-      : undefined,
-  );
   const choices = createMemo(() =>
     agent()
       ? agent()!
           .llm_targets.map((id) => models().find((model) => model.id === id))
           .filter((model) => model !== undefined)
-      : direct()
-        ? [direct()]
-        : [],
+      : [],
   );
   const model = createMemo(() =>
     modelId() ? choices().find((model) => model!.id === modelId()) : choices()[0],
   );
-  const needsProject = createMemo(() =>
-    Boolean(direct() || agent()?.capabilities.includes("coding")),
-  );
+  const needsProject = createMemo(() => Boolean(agent()?.capabilities.includes("coding")));
   const validProjects = createMemo(() =>
     projects().filter((id) => catalog()?.projects.some((project) => project.id === id)),
   );
+  const canDispatch = () =>
+    !props.disabled &&
+    Boolean(agent() && model()) &&
+    (!needsProject() || validProjects().length > 0);
   return (
     <form
       class="flex flex-col gap-3 text-sm"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!model() || (!agent() && !direct())) return;
+        if (!canDispatch()) return;
         props.onSelect({
           agent: agent()?.id ?? null,
           model: model()!.id,
@@ -259,19 +254,14 @@ export function DispatchSelectionCard(props: {
           <p class="text-xs text-muted-foreground">{i18n.t("chat.dispatch.projectRequired")}</p>
         )}
       </fieldset>
-      <p class="text-xs text-muted-foreground">
-        {i18n.t("chat.dispatch.jobCount", { count: validProjects().length || 1 })}
-      </p>
-      <Button
-        type="submit"
-        size="sm"
-        disabled={
-          props.disabled ||
-          !model() ||
-          (!agent() && !direct()) ||
-          (needsProject() && !validProjects().length)
-        }
-      >
+      {agent() && (!needsProject() || validProjects().length > 0) && (
+        <p class="text-xs text-muted-foreground">
+          {validProjects().length
+            ? i18n.t("chat.dispatch.jobCount", { count: validProjects().length })
+            : i18n.t("chat.dispatch.chatOnly")}
+        </p>
+      )}
+      <Button type="submit" size="sm" disabled={!canDispatch()}>
         {i18n.t("chat.dispatch.submit")}
       </Button>
     </form>

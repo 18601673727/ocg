@@ -1,6 +1,20 @@
-import type { ExecutionPhase, Job, JobDetails, TaskPlan } from "../contracts";
+import type { ChildConversation, ExecutionPhase, Job, JobDetails, TaskPlan } from "../contracts";
+import { runtimeStateLabel } from "../i18n";
 import type { I18nKey, TranslateFn } from "../i18n/dictionaries";
 import type { Tone } from "../primitives/tone";
+
+export function childConversationStatus(t: TranslateFn, child: ChildConversation): string {
+  if (child.state === "closing") return t("chat.child.closing");
+  if (child.state === "open" && child.on_hold) return t(`chat.child.hold.${child.on_hold.by.kind}`);
+  if (
+    child.state === "open" &&
+    child.keep_open &&
+    !child.recurrence &&
+    child.job_state === "completed"
+  )
+    return t("chat.child.open");
+  return runtimeStateLabel(t, child.job_state);
+}
 
 export function reconcileJob(current: Job, incoming: Job): Job {
   const currentSeq = current.event_seq;

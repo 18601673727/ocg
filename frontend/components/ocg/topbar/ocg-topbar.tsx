@@ -1,4 +1,4 @@
-import { ChevronRight, LayoutGrid, PanelLeft } from "@lucide/solid";
+import { ArrowLeft, ChevronRight, LayoutGrid, PanelLeft } from "@lucide/solid";
 import { createMemo } from "solid-js";
 import { WorkspaceLink } from "@/components/ocg/layout/workspace-link";
 import { Button } from "@/components/ui/button";
@@ -14,6 +14,7 @@ type OcgTopbarProps = {
   session?: ChatSession;
   onOpenMobileSidebar: () => void;
   onHome: () => void;
+  onBackToParent?: () => void;
   activeView?: WorkspaceView;
   titleVisible?: boolean;
   projectSelector?: View;
@@ -70,6 +71,19 @@ export function OcgTopbar(props: OcgTopbarProps) {
         />
         <TooltipContent side="bottom">{i18n.t("topbar.openNavigation")}</TooltipContent>
       </Tooltip>
+      {props.onBackToParent && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          class="shrink-0 rounded-full bg-card/90 px-2.5 shadow-xs hover:bg-muted"
+          aria-label={i18n.t("chat.child.back")}
+          onClick={() => props.onBackToParent?.()}
+        >
+          <ArrowLeft class="size-4" aria-hidden="true" />
+          <span class="hidden sm:inline">{i18n.t("chat.child.back")}</span>
+        </Button>
+      )}
       {(props.activeView === undefined ? "chat" : props.activeView) !== "chat" && (
         <WorkspaceLink
           href="/"

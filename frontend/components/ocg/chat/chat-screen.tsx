@@ -8,7 +8,7 @@ import {
   Show,
   useContext,
 } from "solid-js";
-import { shallowSelector, type View } from "@/lib/ui-state";
+import { shallowSelector } from "@/lib/ui-state";
 import type { ChatModelSelection } from "../contracts";
 import { useI18n } from "../i18n";
 import { TaskStatus } from "../job/task-status";
@@ -31,7 +31,6 @@ export interface ChatScreenProps {
   onOpenConversation: (conversation: string) => void;
   onOpenPlanningDecision: (decisionId: string) => void;
   searchTarget?: ThreadSearchTarget;
-  backButton?: View;
 }
 
 type ChatComposerContextValue = {
@@ -285,7 +284,7 @@ export const ChatScreen: Component<ChatScreenProps> = (props) => {
                 props.session.archived || props.session.closed ? HistoryComposer : ChatComposerSlot
               }
               Welcome={Welcome}
-              footerAction={props.backButton}
+              onOpenConversation={props.onOpenConversation}
               afterMessages={
                 <>
                   <ContextTranscript conversation={props.session.conversationId} />

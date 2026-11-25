@@ -296,10 +296,23 @@ pub(crate) enum TurnEntryKindView {
 }
 
 #[derive(serde::Serialize, ts_rs::TS)]
+#[ts(rename = "ChildResult")]
+pub(crate) struct ChildResultView {
+    conversation: String,
+    title: String,
+    state: super::jobs::SettlementState,
+    answer_start_utf16: u32,
+    answer_end_utf16: u32,
+}
+
+#[derive(serde::Serialize, ts_rs::TS)]
 #[ts(rename = "TurnEntry")]
 pub(crate) struct TurnEntryView {
     seq: u32,
     at_us: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    child_results: Option<Vec<ChildResultView>>,
     #[serde(flatten)]
     entry: TurnEntryKindView,
 }
@@ -634,6 +647,15 @@ pub(super) async fn conversation_turns(
                 let entry = TurnEntryView {
                     seq: 1,
                     at_us: at,
+                    child_results: (!item.child_results.is_empty()).then(|| {
+                        item.child_results.into_iter().map(|result| ChildResultView {
+                            conversation: result.conversation.to_string(),
+                            title: result.title,
+                            state: result.state.into(),
+                            answer_start_utf16: result.answer_start_utf16,
+                            answer_end_utf16: result.answer_end_utf16,
+                        }).collect()
+                    }),
                     entry: TurnEntryKindView::UserMessage {
                         text: turn.job.input.text().to_owned(),
                         attachments: turn

@@ -2,7 +2,7 @@ use super::{
     DEFAULT_OUTPUT_PAGE, HttpRequest, INVALID_REQUEST, JOB_NOT_FOUND, MAX_OUTPUT_PAGE, Refusal,
     Reply, Shared, contracts::envelope, decimal,
 };
-use crate::db::entities::{JobId, MutableJobPhase, OutcomeRecord, PoolAllocation};
+use crate::db::entities::{JobId, MutableJobPhase, OutcomeKind, OutcomeRecord, PoolAllocation};
 
 #[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
@@ -13,6 +13,17 @@ pub(crate) enum SettlementState {
     Failed,
     Cancelled,
     Unknown,
+}
+
+impl From<OutcomeKind> for SettlementState {
+    fn from(kind: OutcomeKind) -> Self {
+        match kind {
+            OutcomeKind::Completed => Self::Completed,
+            OutcomeKind::Failed => Self::Failed,
+            OutcomeKind::Cancelled => Self::Cancelled,
+            OutcomeKind::Unknown => Self::Unknown,
+        }
+    }
 }
 
 #[derive(Clone, serde::Serialize, ts_rs::TS)]
@@ -240,19 +251,13 @@ fn execution_phase(
 }
 
 fn settlement_view(outcome: Option<&OutcomeRecord>) -> SettlementView {
-    use crate::db::entities::OutcomeKind;
     match outcome {
         None => SettlementView {
             state: SettlementState::Unsettled,
             settled_at_us: None,
         },
         Some(outcome) => SettlementView {
-            state: match outcome.kind {
-                OutcomeKind::Completed => SettlementState::Completed,
-                OutcomeKind::Failed => SettlementState::Failed,
-                OutcomeKind::Cancelled => SettlementState::Cancelled,
-                OutcomeKind::Unknown => SettlementState::Unknown,
-            },
+            state: outcome.kind.into(),
             settled_at_us: Some(outcome.at.as_unix_micros()),
         },
     }

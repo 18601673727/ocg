@@ -1,4 +1,4 @@
-import { ArrowDown, Check, Copy, Download, Ellipsis, RefreshCw } from "@lucide/solid";
+import { ArrowDown, ArrowUpRight, Check, Copy, Download, Ellipsis, RefreshCw } from "@lucide/solid";
 import { Dynamic, type JSX } from "@solidjs/web";
 import {
   type Component,
@@ -29,7 +29,8 @@ import { Button } from "@/components/ui/button";
 import { useCopyToClipboard } from "@/hooks/use-copy-to-clipboard";
 import { ariaState } from "@/lib/ui-state";
 import { cn } from "@/lib/utils";
-import { useI18n } from "../i18n";
+import type { ChildResult } from "../contracts/api";
+import { runtimeStateLabel, useI18n } from "../i18n";
 import { WorkspaceLink } from "../layout/workspace-link";
 import { MarkdownBody } from "../markdown/markdown-body";
 import { providerRejectionText } from "../runtime/provider-rejection";
@@ -55,7 +56,7 @@ export type ThreadProps = {
   Composer: Component<{ autoFocus: boolean }>;
   Welcome: Component;
   afterMessages?: JSX.Element;
-  footerAction?: JSX.Element;
+  onOpenConversation: (conversation: string) => void;
 };
 
 export function Thread(props: ThreadProps) {
@@ -256,7 +257,15 @@ export function Thread(props: ThreadProps) {
                     when={message().role === "user"}
                     fallback={<Dynamic component={props.Assistant} />}
                   >
-                    <UserMessage />
+                    <Show when={message().childResults} fallback={<UserMessage />}>
+                      <ChildResultsMessage
+                        onOpen={props.onOpenConversation}
+                        expand={
+                          !props.searchTarget?.answer &&
+                          props.searchTarget?.turn === message().jobId
+                        }
+                      />
+                    </Show>
                   </Show>
                 </MessageContext>
               )}
@@ -269,11 +278,6 @@ export function Thread(props: ThreadProps) {
               empty() ? "relative" : "sticky bottom-0 mt-auto rounded-t-(--composer-radius)",
             )}
           >
-            <Show when={props.footerAction}>
-              <div class="absolute -top-12 z-10 -translate-x-12 self-center">
-                {props.footerAction}
-              </div>
-            </Show>
             <Show when={positioning() && view.loadingEarlier()}>
               <p
                 role="status"
@@ -375,6 +379,65 @@ function MessageActions(props: { assistant?: boolean }) {
         </p>
       </Show>
     </div>
+  );
+}
+
+function ChildResultsMessage(props: { onOpen: (conversation: string) => void; expand: boolean }) {
+  const { t } = useI18n();
+  const message = useThreadMessage();
+  const answer = (result: ChildResult) =>
+    message().content.slice(result.answer_start_utf16, result.answer_end_utf16).trim();
+  return (
+    <section
+      aria-label={t("chat.child.results")}
+      data-slot="conversation-child-results"
+      data-message-id={message().id}
+      data-turn-id={message().jobId}
+      data-role="user"
+      tabindex={-1}
+      class="min-w-0 space-y-2 rounded-xl border border-border bg-muted/20 p-3 focus-visible:outline-2 focus-visible:outline-ring"
+    >
+      <div class="flex items-center justify-between gap-3">
+        <h2 class="text-sm font-semibold">{t("chat.child.results")}</h2>
+        <MessageActions />
+      </div>
+      <ul class="divide-y divide-border">
+        <For each={message().childResults ?? []} keyed={(result) => result.conversation}>
+          {(result) => (
+            <li class="space-y-1 py-2 last:pb-0">
+              <div class="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+                <button
+                  type="button"
+                  class="inline-flex min-w-0 max-w-full items-center gap-1 rounded text-left text-sm font-medium text-primary hover:underline focus-visible:outline-2 focus-visible:outline-ring"
+                  title={result().title}
+                  onClick={() => props.onOpen(result().conversation)}
+                >
+                  <span class="truncate">{result().title || t("chat.child.untitled")}</span>
+                  <ArrowUpRight class="size-3.5 shrink-0" aria-hidden="true" />
+                </button>
+                <span
+                  class={cn(
+                    "text-xs text-muted-foreground",
+                    (result().state === "failed" || result().state === "unknown") &&
+                      "text-destructive",
+                  )}
+                >
+                  {runtimeStateLabel(t, result().state)}
+                </span>
+              </div>
+              <Show when={answer(result())}>
+                <details class="text-sm" open={props.expand}>
+                  <summary class="w-fit cursor-pointer rounded text-xs text-muted-foreground hover:text-foreground focus-visible:outline-2 focus-visible:outline-ring">
+                    {t("chat.child.viewResult")}
+                  </summary>
+                  <MarkdownBody content={answer(result())} class="mt-2 break-words" />
+                </details>
+              </Show>
+            </li>
+          )}
+        </For>
+      </ul>
+    </section>
   );
 }
 

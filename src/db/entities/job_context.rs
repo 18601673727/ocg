@@ -665,10 +665,19 @@ pub(crate) struct MutableConversationPage {
 
 pub(crate) struct MutableConversationTurn {
     pub planning_target: Option<JobId>,
+    pub child_results: Vec<ChildResultReport>,
     pub details: MutableJobDetails,
     pub outputs: Vec<JobOutputRecord>,
     pub outputs_truncated: bool,
     pub evidence: Vec<ToolEvidenceRecord>,
+}
+
+pub(crate) struct ChildResultReport {
+    pub conversation: JobId,
+    pub title: String,
+    pub state: super::OutcomeKind,
+    pub answer_start_utf16: u32,
+    pub answer_end_utf16: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

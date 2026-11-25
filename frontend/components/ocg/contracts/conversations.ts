@@ -83,6 +83,7 @@ type ProjectedEntry = {
   kind: Api.TurnEntry["kind"];
   text: string | null;
   attachments: string[];
+  child_results?: Api.ChildResult[];
 };
 export type ConversationTurn = Omit<
   Api.Turn,
@@ -133,6 +134,7 @@ export function projectConversation(page: Api.Turns): Conversation {
         at_us: entry.at_us,
         text: entry.text,
         attachments: entry.attachments,
+        child_results: entry.child_results,
       }));
       return {
         job: turn.job,

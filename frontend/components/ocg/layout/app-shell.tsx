@@ -1,6 +1,5 @@
-import { ArrowLeft, PanelRight } from "@lucide/solid";
+import { PanelRight } from "@lucide/solid";
 import { createEffect, createMemo, createSignal, Loading, lazy, Show } from "solid-js";
-import { FloatingIconButton } from "@/components/ocg/chat/ui/tooltip-icon-button";
 import type * as Api from "@/components/ocg/contracts/api";
 import { DismissibleNotice } from "@/components/ocg/primitives/dismissible-notice";
 import { Button } from "@/components/ui/button";
@@ -430,6 +429,15 @@ function AppShellContent(props: AppShellProps) {
     });
   }
 
+  async function openParentConversation() {
+    const parent = ancestors().slice(0, -1);
+    if (!parent.length || !(await confirmMutableComposerNavigation())) return;
+    window.history.pushState(null, "", conversationPath(parent));
+    lastLocationUrl.current = window.location.href;
+    setSessionId("");
+    setLocation(currentLocation());
+  }
+
   async function openArchivedConversation(conversation: Api.Conversation) {
     if (!(await confirmMutableComposerNavigation())) return false;
     runtime.client.presentArchivedConversation?.(conversation);
@@ -590,6 +598,11 @@ function AppShellContent(props: AppShellProps) {
                 titleVisible={location().view === "chat" || !pageTitleInView()}
                 onOpenMobileSidebar={() => setMobile(true)}
                 onHome={goHome}
+                onBackToParent={
+                  location().view === "chat" && session() && ancestors().length > 1
+                    ? () => void openParentConversation()
+                    : undefined
+                }
                 inspectorToggle={
                   location().view === "chat" && inspectorAvailable() && !inspectorOpen() ? (
                     <Button
@@ -643,30 +656,6 @@ function AppShellContent(props: AppShellProps) {
                                   setPlanningFocus({ sessionId: session()!.id, decisionId });
                                   setInspectorOpen(true);
                                 }}
-                                backButton={
-                                  ancestors().length > 1 ? (
-                                    <FloatingIconButton
-                                      type="button"
-                                      tooltip={i18n.t("chat.child.back")}
-                                      aria-label={i18n.t("chat.child.back")}
-                                      onClick={() => {
-                                        void confirmMutableComposerNavigation().then((allowed) => {
-                                          if (!allowed) return;
-                                          window.history.pushState(
-                                            null,
-                                            "",
-                                            conversationPath(ancestors().slice(0, -1)),
-                                          );
-                                          lastLocationUrl.current = window.location.href;
-                                          setSessionId("");
-                                          setLocation(currentLocation());
-                                        });
-                                      }}
-                                    >
-                                      <ArrowLeft />
-                                    </FloatingIconButton>
-                                  ) : undefined
-                                }
                                 session={session()!}
                               />
                             </div>

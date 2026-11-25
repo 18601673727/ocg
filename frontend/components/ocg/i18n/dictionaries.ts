@@ -288,8 +288,10 @@ export const en = {
   "chat.dispatch.waiting":
     "Execution is paused until you select the target and projects. Select up to 16 projects; each creates one Job under its own permissions.",
   "chat.dispatch.target": "Execution target",
-  "chat.dispatch.choose": "Choose an Agent or model",
-  "chat.dispatch.projectRequired": "Select at least one project for workspace execution.",
+  "chat.dispatch.choose": "Choose an Agent",
+  "chat.dispatch.projectRequired":
+    "This Agent has workspace access. Select a project to dispatch it.",
+  "chat.dispatch.chatOnly": "Creates one chat-only child task.",
   "chat.dispatch.commands": "{count} allowed commands",
   "chat.dispatch.jobCount":
     "Creates {count} Job(s). Project command permissions and execution limits still apply.",
@@ -319,6 +321,15 @@ export const en = {
   "chat.child.earlierAnswer": "Earlier answer",
   "chat.child.noResult": "No result was produced.",
   "chat.child.pendingResult": "Waiting for a result.",
+  "chat.child.closed": "Closed",
+  "chat.child.lastTurnCompleted": "Last turn completed",
+  "chat.child.planningFailed":
+    "Planning failed before this task could start. Open the child conversation for details.",
+  "chat.child.failedResult": "This turn failed. Open the child conversation for details.",
+  "chat.child.cancelledResult": "This turn was cancelled.",
+  "chat.child.unknownResult": "The outcome could not be confirmed.",
+  "chat.child.results": "Child task results",
+  "chat.child.viewResult": "View returned answer",
   "chat.child.conversationId": "Conversation ID",
 
   "chat.openInJobs": "Open in Jobs",

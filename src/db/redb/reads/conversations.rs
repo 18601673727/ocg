@@ -4,15 +4,16 @@ use super::catalog::{effective_context_policy, global_compaction_settings};
 use super::jobs::tool_evidence;
 use crate::db::entities::JobId;
 use crate::db::entities::{
-    Actor, ChildConversationEntry, ContextState, ContextWorkDetails, ContextWorkState,
-    ConversationEntry, ConversationSearchMatch, ConversationSearchScope, ConversationsPage,
-    JobLifecycle, JobLimits, JobSpec, MutableConversationPage, MutableConversationTurn, Origin,
-    OutputKind, Recurrence,
+    Actor, ChildConversationEntry, ChildResultReport, ContextState, ContextWorkDetails,
+    ContextWorkState, ConversationEntry, ConversationSearchMatch, ConversationSearchScope,
+    ConversationsPage, JobLifecycle, JobLimits, JobSpec, MutableConversationPage,
+    MutableConversationTurn, Origin, OutputKind, Recurrence,
 };
 use crate::db::entities::{ConfigId, ExecutionOperation, MutableJobPhase, OutcomeKind};
 use crate::db::redb::allocations::pools_offering_capability;
 use crate::db::redb::batch::{BatchError, Failure};
 use crate::db::redb::configs::ConfigurationResolver;
+use crate::db::redb::job_tree::{MAX_LIVE_CHILDREN, REPORT_HEADER};
 use crate::db::redb::reads::execution_context::{SummarySourceError, verify_native_summary_in};
 use crate::db::redb::reads::jobs::{
     active_job_in, first_entry_text, mutable_job_details_in, mutable_job_record_in,
@@ -128,6 +129,7 @@ pub(crate) fn read_mutable_conversation_turn_page(
         };
         rows.push(MutableConversationTurn {
             planning_target: project_planning_target(&rx, &details.record.job)?,
+            child_results: child_results(&rx, &details.record.job)?,
             details,
             outputs,
             outputs_truncated,
@@ -140,6 +142,89 @@ pub(crate) fn read_mutable_conversation_turn_page(
         turns: rows,
         has_more,
     }))
+}
+
+fn child_results(
+    rx: &ReadTransaction,
+    job: &crate::db::entities::MutableJob,
+) -> Result<Vec<ChildResultReport>, StorageError> {
+    if job.submitted_by != Actor::Auto {
+        return Ok(Vec::new());
+    }
+    let text = job.input.text();
+    let Some(report) = text.strip_prefix(REPORT_HEADER) else {
+        return Ok(Vec::new());
+    };
+    // The input is size-bounded. Point into that same text using browser string indices.
+    let utf16_at = |offset| text[..REPORT_HEADER.len() + offset].encode_utf16().count() as u32;
+    let end = utf16_at(report.len());
+    let mut results: Vec<ChildResultReport> = Vec::new();
+    let mut origin = None;
+    for (start, _) in report.match_indices("\n\n[") {
+        let Some((heading, _)) = report[start + 3..].split_once('\n') else {
+            continue;
+        };
+        let Some((title, source)) = heading.rsplit_once("] conversation ") else {
+            continue;
+        };
+        let Some((id, outcome)) = source.split_once(": ") else {
+            continue;
+        };
+        let state = match outcome {
+            "completed" => OutcomeKind::Completed,
+            "failed" => OutcomeKind::Failed,
+            "cancelled" => OutcomeKind::Cancelled,
+            "unknown" => OutcomeKind::Unknown,
+            _ => continue,
+        };
+        let Some(conversation) = crate::db::entities::parse_entity_id(id).map(JobId::new) else {
+            continue;
+        };
+        if results
+            .iter()
+            .any(|result| result.conversation == conversation)
+        {
+            continue;
+        }
+        let Some(child) = read_conversation_row(rx, conversation)? else {
+            continue;
+        };
+        let Origin::Agent { call } = child.origin else {
+            continue;
+        };
+        if child.parent_id != Some(job.parent_id)
+            || origin.is_some_and(|opening| opening != call)
+            || child.created_at > job.created_at
+        {
+            continue;
+        }
+        if let Some(previous) = results.last_mut() {
+            previous.answer_end_utf16 = utf16_at(start);
+        } else if start != 0 {
+            return Ok(Vec::new());
+        }
+        origin = Some(call);
+        let title = if title.is_empty() || title == id {
+            conversation_title(
+                rx,
+                conversation,
+                &state::require(rx, conversation)?.lifecycle,
+            )?
+        } else {
+            title.to_owned()
+        };
+        results.push(ChildResultReport {
+            conversation,
+            title,
+            state,
+            answer_start_utf16: utf16_at(start + 3 + heading.len() + 1),
+            answer_end_utf16: end,
+        });
+        if results.len() == MAX_LIVE_CHILDREN {
+            break;
+        }
+    }
+    Ok(results)
 }
 
 fn conversation_job_state(
