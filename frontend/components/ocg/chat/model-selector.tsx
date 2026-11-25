@@ -145,9 +145,7 @@ export function ModelSelector(props: {
         ? i18n.t("chat.agentUnavailable")
         : needsSetup()
           ? i18n.t("chat.setupModels")
-          : llm() && !llm().declared_capabilities.includes("tools")
-            ? i18n.t("chat.toolsWarning")
-            : undefined),
+          : undefined),
   );
   createEffect(
     () => [llmId(), llm()?.name, supportsImages(), notice()],

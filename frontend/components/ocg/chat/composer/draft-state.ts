@@ -774,7 +774,11 @@ export function createComposerDraft(props: ComposerProps) {
       await refreshUnfinished();
     } catch (cause) {
       submission.jobId = work.current.job?.id ?? submission.jobId;
-      const raw = [notice, errorMessage(cause)].filter(Boolean).join("\n");
+      const toolsNotice =
+        cause instanceof ApiError && cause.code === "tools_not_supported"
+          ? t("chat.toolsWarning")
+          : undefined;
+      const raw = [notice, toolsNotice, errorMessage(cause)].filter(Boolean).join("\n");
       const fieldFailure = modelFieldFailure(
         cause,
         {
