@@ -483,7 +483,11 @@ function RoutedRecoveryCard(props: {
     <div class="space-y-2 rounded-xl border border-border bg-card p-4 text-sm">
       <p class="font-medium">{i18n.t("chat.card.recoverStep", { title: props.card.title })}</p>
       <p class="break-words text-muted-foreground">{props.card.failure}</p>
-      <p class="text-muted-foreground">{i18n.t("chat.card.recoveryWaiting")}</p>
+      <p class="text-muted-foreground">
+        {i18n.t(
+          props.card.outcome_unknown ? "chat.card.restartInterrupted" : "chat.card.recoveryWaiting",
+        )}
+      </p>
       <Show when={props.card.alternate}>
         {(target) => (
           <p class="break-words text-muted-foreground">
@@ -526,7 +530,9 @@ function RoutedRecoveryCard(props: {
           disabled={props.disabled}
           onClick={() => props.onAction("finish")}
         >
-          {i18n.t("chat.card.returnFailure")}
+          {i18n.t(
+            props.card.outcome_unknown ? "chat.card.returnUnknown" : "chat.card.returnFailure",
+          )}
         </Button>
       </div>
     </div>

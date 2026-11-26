@@ -919,15 +919,22 @@ pub(crate) fn read_cards(
         if *origin != Origin::System {
             if row.parent_id.is_some()
                 && let Some(turn) = super::reads::jobs::turn_head(&rx, conversation)?
-                && let Some(failure) = super::job_tree::routed_step_failure(&rx, &row, turn)?
+                && let Some(recovery) = super::job_tree::routed_step_recovery(&rx, &row, turn)?
             {
-                let targets = match super::job_tools::recovery_targets(&rx, &failure) {
-                    Ok(targets) => targets,
-                    Err(BatchError(Failure::Rejected(_))) => super::job_tools::RecoveryTargets {
-                        original: None,
-                        alternate: None,
-                    },
-                    Err(BatchError(Failure::Storage(error))) => return Err(error),
+                use super::job_tree::RoutedStepRecovery;
+                let (failure, outcome_unknown, targets) = match recovery {
+                    RoutedStepRecovery::Failed(failure) => {
+                        let targets = match super::job_tools::recovery_targets(&rx, &failure) {
+                            Ok(targets) => Some(targets),
+                            Err(BatchError(Failure::Rejected(_))) => None,
+                            Err(BatchError(Failure::Storage(error))) => return Err(error),
+                        };
+                        let detail = failure.result.display_text().or(failure.result.code);
+                        (detail.unwrap_or_default(), false, targets)
+                    }
+                    RoutedStepRecovery::Interrupted(reason) => {
+                        (reason.description().to_owned(), true, None)
+                    }
                 };
                 let title = super::state::require(&rx, conversation)?.lifecycle.title;
                 cards.push(json!({
@@ -936,9 +943,10 @@ pub(crate) fn read_cards(
                     "parent": if conversation == root { None } else { parent.as_ref() },
                     "turn": turn.to_string(),
                     "title": title.unwrap_or_else(|| conversation.to_string()),
-                    "failure": failure.result.display_text().or(failure.result.code).unwrap_or_default(),
-                    "retry_original": targets.original.is_some(),
-                    "alternate": targets.alternate.map(|target| json!({
+                    "failure": failure,
+                    "outcome_unknown": outcome_unknown,
+                    "retry_original": targets.as_ref().is_some_and(|targets| targets.original.is_some()),
+                    "alternate": targets.and_then(|targets| targets.alternate).map(|target| json!({
                         "provider": target.provider,
                         "model": target.model,
                         "effort": target.effort,

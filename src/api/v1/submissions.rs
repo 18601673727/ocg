@@ -457,6 +457,7 @@ pub(crate) enum CardView {
         turn: String,
         title: String,
         failure: String,
+        outcome_unknown: bool,
         retry_original: bool,
         alternate: Option<RecoveryTargetView>,
     },

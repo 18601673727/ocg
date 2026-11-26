@@ -272,10 +272,13 @@ export const en = {
   "chat.card.recoverStep": "Recovery needed for {title}",
   "chat.card.recoveryWaiting":
     "Dependent tasks and the final report are waiting for this decision.",
+  "chat.card.restartInterrupted":
+    "OCG can continue the plan with this result marked unknown. This step will not be replayed.",
   "chat.card.recoveryTarget": "Approve to send this step to {target}.",
   "chat.card.retryOriginal": "Retry original target",
   "chat.card.approveRecoveryTarget": "Approve alternate target",
   "chat.card.returnFailure": "Continue with failure",
+  "chat.card.returnUnknown": "Continue with unknown result",
   "chat.card.planNote":
     "This plan has {count} steps. Approval will create child tasks and a final synthesis.",
   "chat.card.independentStep": "No prerequisite steps",

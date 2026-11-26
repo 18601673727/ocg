@@ -396,7 +396,10 @@ pub(crate) fn read_conversation_children(
         let child = JobId::new(entry?.0.value().1);
         let row = read_conversation_row(&rx, child)?
             .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
-        let conversation = conversation_summary(&rx, &row, conversation_tip(&rx, &row)?)?;
+        let mut conversation = conversation_summary(&rx, &row, conversation_tip(&rx, &row)?)?;
+        if conversation.job_state == "cancelled" && conversation.tip_settlement_state == "unknown" {
+            conversation.job_state = outcome_label(OutcomeKind::Unknown).to_owned();
+        }
         children.push(ChildConversationEntry {
             conversation,
             origin: row.origin,

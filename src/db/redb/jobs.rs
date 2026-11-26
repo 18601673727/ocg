@@ -1575,7 +1575,7 @@ impl Batch {
         if job.retry.is_none()
             && let Some(previous) = job.previous
             && self
-                .step(|tx| super::job_tree::routed_step_failure(tx, &parent, previous))?
+                .step(|tx| super::job_tree::routed_step_recovery(tx, &parent, previous))?
                 .is_some()
         {
             return self.reject(Violation::InvalidValue(

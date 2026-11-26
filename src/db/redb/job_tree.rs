@@ -8,12 +8,13 @@ use crate::db::entities::{
     ComposerContextId, DependencyState, ExecutionConfiguration, JobAction, JobClosing,
     JobLifecycle, JobQueuePriority, JobToolCall, MutableFrozenConfiguration, MutableJob,
     MutableJobContent, MutableJobInput, NativeStopRequest, OutcomeCause, OutcomeRecord,
-    RequestFingerprint, Submission, ToolCallRef, ToolEvidenceRecord, Violation,
+    RequestFingerprint, Submission, ToolCallRef, ToolEvidenceRecord, UncertaintyReason, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::schema::{
     CHILD_GROUPS, CHILDREN, CONVERSATIONS, DRAFT_CONTEXTS, JOB_OUTPUTS, JOBS, LIVE_CHILDREN,
-    OPEN_APPROVALS, PENDING_CHILD_NOTICES, RECURRENCES, RETRY_JOBS, TOOL_CALLS, TURNS,
+    OPEN_APPROVALS, PENDING_CHILD_NOTICES, POOL_ALLOCATIONS, RECURRENCES, RETRY_JOBS, TOOL_CALLS,
+    TURNS,
 };
 use crate::db::redb::{rows, state};
 use ::redb::ReadableTable;
@@ -74,6 +75,11 @@ pub(super) struct RoutedStepFailure {
     pub(super) job: MutableJob,
     pub(super) result: crate::db::entities::JobOutputRecord,
     pub(super) route: crate::db::entities::JobPlanRoute,
+}
+
+pub(super) enum RoutedStepRecovery {
+    Failed(Box<RoutedStepFailure>),
+    Interrupted(UncertaintyReason),
 }
 
 pub(crate) const HELD_BY_USER: u32 = 1;
@@ -1231,10 +1237,10 @@ impl Batch {
             ));
         }
         let replacement = match (
-            self.step(|tx| routed_step_failure(tx, &spec, turn))?,
+            self.step(|tx| routed_step_recovery(tx, &spec, turn))?,
             confirmation,
         ) {
-            (Some(failure), None) => {
+            (Some(RoutedStepRecovery::Failed(failure)), None) => {
                 let targets =
                     self.inspect(|tx| super::job_tools::recovery_targets(tx, &failure))?;
                 let Some(configuration) = targets.original else {
@@ -1245,7 +1251,9 @@ impl Batch {
                 };
                 Some(configuration)
             }
-            (Some(failure), Some(confirmation)) if by == Actor::User => {
+            (Some(RoutedStepRecovery::Failed(failure)), Some(confirmation))
+                if by == Actor::User =>
+            {
                 let targets =
                     self.inspect(|tx| super::job_tools::recovery_targets(tx, &failure))?;
                 let Some(alternate) = targets
@@ -1266,7 +1274,7 @@ impl Batch {
                 ));
             }
             (None, None) if !routed => None,
-            (None, None) => {
+            (_, None) => {
                 return self.reject(Violation::InvalidValue(
                     "recovery_finished",
                     "the failed step no longer awaits recovery",
@@ -1380,12 +1388,12 @@ impl Batch {
         let spec = self.require_mutable_conversation(conversation)?;
         if self.group_head(conversation)? != Some(turn)
             || self
-                .step(|tx| routed_step_failure(tx, &spec, turn))?
+                .step(|tx| routed_step_recovery(tx, &spec, turn))?
                 .is_none()
         {
             return self.reject(Violation::InvalidValue(
                 "recovery_finished",
-                "the failed step no longer awaits recovery",
+                "the step no longer awaits recovery",
             ));
         }
         let action = self.close(conversation, Actor::User)?;
@@ -1867,11 +1875,11 @@ fn routed_assignment(
         .ok_or_else(|| StorageError::corrupted("routed child has no corresponding plan step"))
 }
 
-pub(super) fn routed_step_failure(
+pub(super) fn routed_step_recovery(
     tx: &impl TxRead,
     spec: &JobSpec,
     turn: JobId,
-) -> Result<Option<RoutedStepFailure>, StorageError> {
+) -> Result<Option<RoutedStepRecovery>, StorageError> {
     let (Some(parent), Origin::Agent { call }) = (spec.parent_id, &spec.origin) else {
         return Ok(None);
     };
@@ -1880,12 +1888,65 @@ pub(super) fn routed_step_failure(
         || runtime.lifecycle.closing.is_some()
         || runtime.lifecycle.reported.is_some()
         || turn_head(tx, spec.id)? != Some(turn)
-        || !state::require(tx, turn)?
-            .state
-            .outcome
-            .is_some_and(|outcome| outcome.kind == OutcomeKind::Failed)
     {
         return Ok(None);
+    }
+    let Some(outcome) = state::require(tx, turn)?.state.outcome else {
+        return Ok(None);
+    };
+    let interruption = match (outcome.kind, outcome.cause) {
+        (OutcomeKind::Failed, _) => None,
+        (
+            OutcomeKind::Unknown,
+            Some(OutcomeCause::Uncertain(
+                reason @ (UncertaintyReason::HostShutdown | UncertaintyReason::HostExited),
+            )),
+        ) => Some(reason),
+        _ => return Ok(None),
+    };
+    let job = required_turn(tx, turn)?;
+    if !matches!(job.frozen, Some(MutableFrozenConfiguration::Generative(_))) {
+        return Ok(None);
+    }
+    let Some(route) = routed_assignment(tx, spec, &job)? else {
+        return Ok(None);
+    };
+    if has_open_approvals(tx, spec.id)? {
+        return Ok(None);
+    }
+    let mut waiting_dependent = false;
+    for sibling in call_siblings(tx, parent, spec.id, *call)? {
+        if sibling == spec.id {
+            continue;
+        }
+        let lifecycle = state::require(tx, sibling)?.lifecycle;
+        if !lifecycle
+            .after
+            .iter()
+            .any(|(prerequisite, _)| *prerequisite == spec.id)
+        {
+            continue;
+        }
+        if let Some(head) = turn_head(tx, sibling)? {
+            if required_turn(tx, head)?.phase == crate::db::entities::MutableJobPhase::Executing {
+                return Ok(None);
+            }
+            waiting_dependent |= state::require(tx, head)?.state.outcome.is_none();
+        }
+    }
+    if let Some(reason) = interruption {
+        if !waiting_dependent {
+            return Ok(None);
+        }
+        let allocations = tx.table(POOL_ALLOCATIONS)?;
+        let allocation = allocations
+            .get(turn.get())?
+            .ok_or_else(|| StorageError::corrupted("interrupted Job has no Allocation"))?;
+        let allocation =
+            super::allocations::decode_pool_allocation(turn.get(), allocation.value())?;
+        return Ok(
+            (!allocation.holds_capacity()).then_some(RoutedStepRecovery::Interrupted(reason))
+        );
     }
     let outputs = tx.table(JOB_OUTPUTS)?;
     let Some((key, value)) = outputs
@@ -1907,37 +1968,19 @@ pub(super) fn routed_step_failure(
                     | "build_failed"
                     | "start_refused"
                     | "executor_unavailable_before_start"
+                    | "host_shutdown"
+                    | "host_shutdown_before_start"
             )
         )
     {
         return Ok(None);
     }
-    let job = required_turn(tx, turn)?;
-    if !matches!(job.frozen, Some(MutableFrozenConfiguration::Generative(_))) {
+    if retry_has_effects(tx, turn)? {
         return Ok(None);
     }
-    let Some(route) = routed_assignment(tx, spec, &job)? else {
-        return Ok(None);
-    };
-    if retry_has_effects(tx, turn)? || has_open_approvals(tx, spec.id)? {
-        return Ok(None);
-    }
-    for sibling in call_siblings(tx, parent, spec.id, *call)? {
-        if sibling == spec.id {
-            continue;
-        }
-        let lifecycle = state::require(tx, sibling)?.lifecycle;
-        if lifecycle
-            .after
-            .iter()
-            .any(|(prerequisite, _)| *prerequisite == spec.id)
-            && let Some(head) = turn_head(tx, sibling)?
-            && required_turn(tx, head)?.phase == crate::db::entities::MutableJobPhase::Executing
-        {
-            return Ok(None);
-        }
-    }
-    Ok(Some(RoutedStepFailure { job, result, route }))
+    Ok(Some(RoutedStepRecovery::Failed(Box::new(
+        RoutedStepFailure { job, result, route },
+    ))))
 }
 
 fn child_notice_drop_reason(reason: &Violation) -> Option<ChildNoticeDrop> {
@@ -2162,7 +2205,7 @@ pub(super) fn prerequisite_state_in_cached(
     };
     if has_open_approvals(tx, prerequisite)?
         || turn_awaits_tool_decision(tx, head)?
-        || routed_step_failure(tx, &row, head)?.is_some()
+        || routed_step_recovery(tx, &row, head)?.is_some()
         || conversation_has_pending_children_cached(tx, prerequisite, 0, pending_children)?
     {
         return Ok(DependencyState::Waiting);
@@ -2302,7 +2345,7 @@ fn segment_waiting(
 ) -> Result<bool, StorageError> {
     let first = segment.first;
     let last = segment.head;
-    if routed_step_failure(tx, &conversation_row(tx, conversation)?, last)?.is_some() {
+    if routed_step_recovery(tx, &conversation_row(tx, conversation)?, last)?.is_some() {
         return Ok(true);
     }
     if tx
