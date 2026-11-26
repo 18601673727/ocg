@@ -422,10 +422,21 @@ function AppShellContent(props: AppShellProps) {
   function openNestedConversation(job: string, searchTarget?: ThreadSearchTarget) {
     void confirmMutableComposerNavigation().then((allowed) => {
       if (!allowed) return;
-      const conversationId = session()?.conversationId;
-      if (!ancestors().length && conversationId) setAncestors([conversationId]);
+      const active = session();
+      if (
+        location().view === "chat" &&
+        active &&
+        (active.conversationId === job || active.id === job)
+      ) {
+        setLocation((previous) => ({ ...previous, searchTarget }));
+        setMobile(false);
+        return;
+      }
+      const keepAncestors = !searchTarget;
+      const conversationId = active?.conversationId;
+      if (keepAncestors && !ancestors().length && conversationId) setAncestors([conversationId]);
       setSessionId("");
-      goDirect("chat", job, undefined, true, searchTarget);
+      goDirect("chat", job, undefined, keepAncestors, searchTarget);
     });
   }
 

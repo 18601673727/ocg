@@ -110,12 +110,17 @@ export function Thread(props: ThreadProps) {
     observer.observe(content);
     return () => observer.disconnect();
   });
+  let positionedKey: string | undefined;
+  let positionedTarget: ThreadSearchTarget | undefined;
   createEffect(
-    () => [body(), conversationId(), props.searchTarget] as const,
-    ([content, id, target]) => {
+    () => [body(), conversationId(), props.searchTarget, empty()] as const,
+    ([content, id, target, isEmpty]) => {
       conversation = id;
       setPositioning(false);
-      if (!content || !id) return;
+      if (!content || !id || isEmpty) return;
+      if (positionedKey === id && positionedTarget === target) return;
+      positionedKey = id;
+      positionedTarget = target;
       const position = target ? undefined : readThreadPosition(id);
       if (!target && !position) return;
 

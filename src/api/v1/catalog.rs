@@ -136,6 +136,9 @@ pub(super) fn search_terms(raw: &str) -> Result<Vec<String>, Refusal> {
     if !term.is_empty() {
         terms.push(term.to_lowercase());
     }
+    if terms.iter().any(|term| term.trim().is_empty()) {
+        return Err(INVALID_REQUEST);
+    }
     if terms.is_empty() || terms.len() > MAX_SEARCH_TERMS {
         return Err(INVALID_REQUEST);
     }

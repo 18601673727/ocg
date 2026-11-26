@@ -561,6 +561,47 @@ pub(super) fn project_answer(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub(super) fn answer_text_for_turn(
+    events: &impl ReadableTable<(u128, u32, u32), &'static [u8]>,
+    messages: &impl ReadableTable<&'static [u8], &'static [u8]>,
+    id: JobId,
+    output: &crate::db::entities::JobOutputRecord,
+    is_generative: bool,
+    not_chunk_group: bool,
+    completed: bool,
+) -> Result<Option<String>, StorageError> {
+    use crate::db::entities::OutputKind;
+    if !is_generative
+        || !not_chunk_group
+        || !completed
+        || output.kind != OutputKind::Result
+        || output.code.is_some()
+        || output
+            .value
+            .as_ref()
+            .and_then(|value| value.get("finish_reason"))
+            .and_then(|value| value.as_str())
+            == Some("tool_calls")
+    {
+        return Ok(None);
+    }
+    let Some(number) = output.answer_request else {
+        return Ok(None);
+    };
+    if latest_request(events, id)? != Some(number) {
+        return Ok(None);
+    }
+    let Some(digest) = received_digest(events, id, number)? else {
+        return Ok(None);
+    };
+    let body = messages
+        .get(digest.as_bytes().as_slice())?
+        .ok_or_else(|| StorageError::corrupted("response references a missing message"))?;
+    let decoded = decode_message(digest, body.value())?;
+    Ok(decoded.answer().map(str::to_owned))
+}
+
+#[allow(clippy::too_many_arguments)]
 pub(super) fn answer_text_in(
     jobs: &impl ReadableTable<u128, &'static [u8]>,
     states: &impl ReadableTable<u128, &'static [u8]>,
@@ -586,40 +627,34 @@ pub(super) fn answer_text_in(
         return Ok(None);
     };
     let job = jobs::decode_mutable_job(id.get(), row.value())?;
-    if job.summary_source.is_some()
-        || !matches!(job.input.content, MutableJobContent::Generative { .. })
-    {
+    let is_generative = job.summary_source.is_none()
+        && matches!(job.input.content, MutableJobContent::Generative { .. });
+    if !is_generative {
         return Ok(None);
     }
     let Some(parent) = conversations.get(job.parent_id.get())? else {
         return Ok(None);
     };
-    if JobSpec::decode_at(job.parent_id.get(), parent.value())?.is_chunk_group() {
+    let not_chunk_group =
+        !JobSpec::decode_at(job.parent_id.get(), parent.value())?.is_chunk_group();
+    if !not_chunk_group {
         return Ok(None);
     }
     let Some(runtime) = states.get(id.get())? else {
         return Ok(None);
     };
-    if !state::decode_state(id.get(), runtime.value())?
+    let completed = state::decode_state(id.get(), runtime.value())?
         .outcome
-        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed)
-    {
-        return Ok(None);
-    }
-    let Some(number) = output.answer_request else {
-        return Ok(None);
-    };
-    if latest_request(events, id)? != Some(number) {
-        return Ok(None);
-    }
-    let Some(digest) = received_digest(events, id, number)? else {
-        return Ok(None);
-    };
-    let body = messages
-        .get(digest.as_bytes().as_slice())?
-        .ok_or_else(|| StorageError::corrupted("response references a missing message"))?;
-    let decoded = decode_message(digest, body.value())?;
-    Ok(decoded.answer().map(str::to_owned))
+        .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+    answer_text_for_turn(
+        events,
+        messages,
+        id,
+        output,
+        is_generative,
+        not_chunk_group,
+        completed,
+    )
 }
 
 pub(super) fn latest_request(

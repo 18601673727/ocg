@@ -700,17 +700,25 @@ fn conversation_page(
     } else {
         Some(SearchTables::open(&rx)?)
     };
+    let term_specs: Vec<(&str, u64)> = terms
+        .iter()
+        .map(|term| {
+            let chars = term.chars().take(3).collect::<Vec<_>>();
+            (term.as_str(), indexes::search_gram(&chars))
+        })
+        .collect();
     let bounded = archived || tables.is_some() || scope != ConversationSearchScope::All;
     let limit = limit.clamp(1, 100);
     let mut conversations = Vec::new();
     let mut last = None;
     let mut last_examined = None;
     let mut has_more = false;
-    for (examined, item) in groups
+    let mut items = groups
         .range(..before.map_or(u128::MAX, JobId::get))?
         .rev()
         .enumerate()
-    {
+        .peekable();
+    while let Some((examined, item)) = items.next() {
         if bounded && examined == 5_000 {
             has_more = true;
             last = last_examined;
@@ -739,9 +747,13 @@ fn conversation_page(
             continue;
         };
         let search_match = if let Some(tables) = &tables {
-            let title = conversation_title(&rx, conversation, &metadata)?;
-            let Some(search_match) =
-                conversation_matches(tables, &groups, conversation, &title, terms)?
+            let custom_title_lower = metadata.title.as_deref().map(str::to_lowercase);
+            let Some(search_match) = conversation_matches(
+                tables,
+                conversation,
+                custom_title_lower.as_deref(),
+                &term_specs,
+            )?
             else {
                 continue;
             };
@@ -758,7 +770,7 @@ fn conversation_page(
         summary.search_match = search_match;
         conversations.push(summary);
         if bounded && conversations.len() == limit {
-            has_more = true;
+            has_more = items.peek().is_some();
             break;
         }
     }
@@ -793,8 +805,8 @@ impl SearchTables {
     }
 }
 
-fn match_excerpt(text: &str, term: &str) -> Option<String> {
-    let offset = text.to_lowercase().find(term)?;
+fn match_excerpt_lower(text: &str, lower: &str, term: &str) -> Option<String> {
+    let offset = lower.find(term)?;
     // Lowercasing can expand a source character. Translate the match back
     // to the original text before selecting a window for display.
     let mut folded_bytes = 0;
@@ -808,10 +820,19 @@ fn match_excerpt(text: &str, term: &str) -> Option<String> {
     if length <= MAX {
         return Some(clean);
     }
-    let position = text[..start]
-        .split_whitespace()
-        .map(|word| word.chars().count() + 1)
-        .sum::<usize>();
+    let prefix = &text[..start];
+    let mut position = 0usize;
+    let mut words = 0usize;
+    for word in prefix.split_whitespace() {
+        if words > 0 {
+            position += 1;
+        }
+        position += word.chars().count();
+        words += 1;
+    }
+    if words > 0 && prefix.chars().last().is_some_and(char::is_whitespace) {
+        position += 1;
+    }
     let left = position.saturating_sub(MAX / 2).min(length - (MAX - 2));
     let mut excerpt = String::new();
     if left > 0 {
@@ -824,49 +845,45 @@ fn match_excerpt(text: &str, term: &str) -> Option<String> {
     Some(excerpt)
 }
 
-fn conversation_matches(
-    tables: &SearchTables,
-    conversations: &ReadOnlyTable<u128, &'static [u8]>,
-    conversation: JobId,
-    title: &str,
-    terms: &[String],
-) -> Result<Option<Option<ConversationSearchMatch>>, StorageError> {
-    let title = title.to_lowercase();
-    let mut search_match = None;
-    for term in terms {
-        let in_title = title.contains(term);
-        if in_title && search_match.is_some() {
-            continue;
+struct CachedSearchTurn {
+    id: JobId,
+    is_generative: bool,
+    input_text: String,
+    input_lower: String,
+    outputs: Option<Vec<(String, String)>>,
+}
+
+impl CachedSearchTurn {
+    fn load(tables: &SearchTables, conversation: JobId, turn: u128) -> Result<Self, StorageError> {
+        let bytes = tables
+            .jobs
+            .get(turn)?
+            .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
+        let job = crate::db::redb::jobs::decode_mutable_job(turn, bytes.value())?;
+        if job.parent_id != conversation || job.phase == MutableJobPhase::Unsubmitted {
+            return Err(StorageError::corrupted(
+                "search turn has invalid conversation",
+            ));
         }
-        let chars = term.chars().take(3).collect::<Vec<_>>();
-        let gram = indexes::search_gram(&chars);
-        let mut body_match = None;
-        for candidate in tables
-            .index
-            .range((conversation.get(), gram, 0)..=(conversation.get(), gram, u128::MAX))?
-        {
-            let (_, _, turn) = candidate?.0.value();
-            let bytes = tables
-                .jobs
-                .get(turn)?
-                .ok_or_else(|| StorageError::corrupted("search turn missing"))?;
-            let job = crate::db::redb::jobs::decode_mutable_job(turn, bytes.value())?;
-            if job.parent_id != conversation || job.phase == MutableJobPhase::Unsubmitted {
-                return Err(StorageError::corrupted(
-                    "search turn has invalid conversation",
-                ));
-            }
-            if let Some(snippet) = match_excerpt(
-                &indexes::search_input_text(&tables.attachments, &job.input)?,
-                term,
-            ) {
-                body_match = Some(ConversationSearchMatch {
-                    turn: job.id,
-                    answer: false,
-                    snippet,
-                });
-                break;
-            }
+        let is_generative = job.summary_source.is_none()
+            && matches!(
+                job.input.content,
+                crate::db::entities::MutableJobContent::Generative { .. }
+            );
+        let input_text = indexes::search_input_text(&tables.attachments, &job.input)?;
+        let input_lower = input_text.to_lowercase();
+        Ok(Self {
+            id: job.id,
+            is_generative,
+            input_text,
+            input_lower,
+            outputs: None,
+        })
+    }
+
+    fn outputs(&mut self, tables: &SearchTables) -> Result<&[(String, String)], StorageError> {
+        if self.outputs.is_none() {
+            let turn = self.id.get();
             let state = tables
                 .states
                 .get(turn)?
@@ -874,25 +891,90 @@ fn conversation_matches(
             let completed = state::decode_state(turn, state.value())?
                 .outcome
                 .is_some_and(|outcome| outcome.kind == OutcomeKind::Completed);
+            let mut texts = Vec::new();
             for output in tables.outputs.range((turn, 0)..=(turn, u32::MAX))? {
                 let (key, bytes) = output?;
+                if rows::output_kind(bytes.value())? != OutputKind::Result {
+                    continue;
+                }
                 let output = rows::decode_output(key.value(), bytes.value())?;
-                let answer = super::super::observations::answer_text_in(
-                    &tables.jobs,
-                    &tables.states,
-                    conversations,
+                let answer = super::super::observations::answer_text_for_turn(
                     &tables.events,
                     &tables.messages,
-                    job.id,
+                    self.id,
                     &output,
+                    self.is_generative,
+                    true,
+                    completed,
                 )?;
-                if let Some(snippet) = answer
-                    .as_deref()
-                    .or_else(|| indexes::search_output_text(&output, completed))
-                    .and_then(|text| match_excerpt(text, term))
+                if let Some(text) = answer
+                    .or_else(|| indexes::search_output_text(&output, completed).map(str::to_owned))
                 {
+                    let lower = text.to_lowercase();
+                    texts.push((text, lower));
+                }
+            }
+            self.outputs = Some(texts);
+        }
+        Ok(self.outputs.as_deref().unwrap_or(&[]))
+    }
+}
+
+fn conversation_matches(
+    tables: &SearchTables,
+    conversation: JobId,
+    custom_title_lower: Option<&str>,
+    terms: &[(&str, u64)],
+) -> Result<Option<Option<ConversationSearchMatch>>, StorageError> {
+    // Probe index existence for every non-title term before decoding any turns.
+    for &(term, gram) in terms {
+        if custom_title_lower.is_some_and(|title| title.contains(term)) {
+            continue;
+        }
+        if tables
+            .index
+            .range((conversation.get(), gram, 0)..=(conversation.get(), gram, u128::MAX))?
+            .next()
+            .transpose()?
+            .is_none()
+        {
+            return Ok(None);
+        }
+    }
+    let mut cache: std::collections::HashMap<u128, CachedSearchTurn> =
+        std::collections::HashMap::new();
+    let mut search_match = None;
+    for &(term, gram) in terms {
+        let in_title = custom_title_lower.is_some_and(|title| title.contains(term));
+        if in_title && search_match.is_some() {
+            continue;
+        }
+        let mut body_match = None;
+        for candidate in tables
+            .index
+            .range((conversation.get(), gram, 0)..=(conversation.get(), gram, u128::MAX))?
+        {
+            let (_, _, turn) = candidate?.0.value();
+            let cached = match cache.entry(turn) {
+                std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(CachedSearchTurn::load(tables, conversation, turn)?)
+                }
+            };
+            if let Some(snippet) =
+                match_excerpt_lower(&cached.input_text, &cached.input_lower, term)
+            {
+                body_match = Some(ConversationSearchMatch {
+                    turn: cached.id,
+                    answer: false,
+                    snippet,
+                });
+                break;
+            }
+            for (text, lower) in cached.outputs(tables)? {
+                if let Some(snippet) = match_excerpt_lower(text, lower, term) {
                     body_match = Some(ConversationSearchMatch {
-                        turn: job.id,
+                        turn: cached.id,
                         answer: true,
                         snippet,
                     });
