@@ -917,6 +917,35 @@ pub(crate) fn read_cards(
         let (origin, project) = (&row.origin, row.project);
         let parent = row.parent_id.map(|id| id.to_string());
         if *origin != Origin::System {
+            if row.parent_id.is_some()
+                && let Some(turn) = super::reads::jobs::turn_head(&rx, conversation)?
+                && let Some(failure) = super::job_tree::routed_step_failure(&rx, &row, turn)?
+            {
+                let targets = match super::job_tools::recovery_targets(&rx, &failure) {
+                    Ok(targets) => targets,
+                    Err(BatchError(Failure::Rejected(_))) => super::job_tools::RecoveryTargets {
+                        original: None,
+                        alternate: None,
+                    },
+                    Err(BatchError(Failure::Storage(error))) => return Err(error),
+                };
+                let title = super::state::require(&rx, conversation)?.lifecycle.title;
+                cards.push(json!({
+                    "kind": "routed_recovery",
+                    "conversation": conversation.to_string(),
+                    "parent": if conversation == root { None } else { parent.as_ref() },
+                    "turn": turn.to_string(),
+                    "title": title.unwrap_or_else(|| conversation.to_string()),
+                    "failure": failure.result.display_text().or(failure.result.code).unwrap_or_default(),
+                    "retry_original": targets.original.is_some(),
+                    "alternate": targets.alternate.map(|target| json!({
+                        "provider": target.provider,
+                        "model": target.model,
+                        "effort": target.effort,
+                        "confirmation": target.confirmation,
+                    })),
+                }));
+            }
             let waiting = super::job_tree::waiting_child_reports_cached(
                 &rx,
                 conversation,

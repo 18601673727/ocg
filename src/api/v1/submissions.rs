@@ -418,6 +418,15 @@ pub(crate) struct ApprovalAssessmentView {
 }
 
 #[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
+#[ts(rename = "RecoveryTarget")]
+pub(crate) struct RecoveryTargetView {
+    provider: String,
+    model: String,
+    effort: Option<String>,
+    confirmation: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, ts_rs::TS)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[ts(rename = "Card")]
 pub(crate) enum CardView {
@@ -441,6 +450,15 @@ pub(crate) enum CardView {
         arguments: String,
         confirmation: Option<String>,
         routing_error: Option<String>,
+    },
+    RoutedRecovery {
+        conversation: String,
+        parent: Option<String>,
+        turn: String,
+        title: String,
+        failure: String,
+        retry_original: bool,
+        alternate: Option<RecoveryTargetView>,
     },
     Approval {
         conversation: String,
@@ -914,7 +932,18 @@ pub(super) async fn action(
     let value: Value = serde_json::from_slice(body).map_err(|_| INVALID_ROUTE_BODY)?;
     let object = value.as_object().ok_or(INVALID_ROUTE_BODY)?;
     if action == "retry" {
-        if object.len() != 1 {
+        let confirmation = object
+            .get("recovery_confirmation")
+            .map(|value| {
+                value
+                    .as_str()
+                    .filter(|value| {
+                        value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+                    .ok_or(INVALID_ROUTE_BODY)
+            })
+            .transpose()?;
+        if object.len() != 1 + usize::from(confirmation.is_some()) {
             return Err(INVALID_ROUTE_BODY);
         }
         let turn = super::routing::job_id(
@@ -923,11 +952,16 @@ pub(super) async fn action(
                 .and_then(Value::as_str)
                 .ok_or(INVALID_ROUTE_BODY)?,
         )?;
-        let appended = shared
-            .database
-            .retry(conversation, turn, Actor::User)
-            .await
-            .map_err(action_error)?;
+        let appended = match confirmation {
+            Some(confirmation) => {
+                shared
+                    .database
+                    .retry_routed_target(conversation, turn, confirmation.to_owned())
+                    .await
+            }
+            None => shared.database.retry(conversation, turn, Actor::User).await,
+        }
+        .map_err(action_error)?;
         return Ok(Reply::ok(envelope(serde_json::json!(AppendView {
             conversation: conversation.to_string(),
             turn: appended.turn.to_string(),
@@ -935,12 +969,24 @@ pub(super) async fn action(
             joined: appended.joined,
         }))));
     }
-    if !object.is_empty() {
+    let failed_turn = object
+        .get("failed_turn")
+        .map(|value| super::routing::job_id(value.as_str().ok_or(INVALID_ROUTE_BODY)?))
+        .transpose()?;
+    if object.len() != usize::from(action == "close" && failed_turn.is_some()) {
         return Err(INVALID_ROUTE_BODY);
     }
     let result = match action {
         "stop" => shared.database.stop_turn(conversation, Actor::User).await,
-        "close" => shared.database.close(conversation, Actor::User).await,
+        "close" => match failed_turn {
+            Some(turn) => {
+                shared
+                    .database
+                    .finish_routed_failure(conversation, turn)
+                    .await
+            }
+            None => shared.database.close(conversation, Actor::User).await,
+        },
         "hold" => shared.database.hold(conversation, Actor::User).await,
         "unhold" => shared.database.unhold(conversation, Actor::User).await,
         _ => return Err(INVALID_ROUTE_BODY),

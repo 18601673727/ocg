@@ -269,6 +269,13 @@ export const en = {
   "chat.card.routedPlanNote":
     "Review the automatically selected targets and approve the plan once. Dependent tasks receive the results of their prerequisites.",
   "chat.card.routeCapabilities": "Capabilities",
+  "chat.card.recoverStep": "Recovery needed for {title}",
+  "chat.card.recoveryWaiting":
+    "Dependent tasks and the final report are waiting for this decision.",
+  "chat.card.recoveryTarget": "Approve to send this step to {target}.",
+  "chat.card.retryOriginal": "Retry original target",
+  "chat.card.approveRecoveryTarget": "Approve alternate target",
+  "chat.card.returnFailure": "Continue with failure",
   "chat.card.planNote":
     "This plan has {count} steps. Approval will create child tasks and a final synthesis.",
   "chat.card.independentStep": "No prerequisite steps",

@@ -70,6 +70,12 @@ pub(super) const CHILD_HELP_HEADER: &str = "Child task help request";
 const REPORT_TITLE_BYTES: usize = 128;
 const MAX_CHILD_SCAN: usize = 256;
 
+pub(super) struct RoutedStepFailure {
+    pub(super) job: MutableJob,
+    pub(super) result: crate::db::entities::JobOutputRecord,
+    pub(super) route: crate::db::entities::JobPlanRoute,
+}
+
 pub(crate) const HELD_BY_USER: u32 = 1;
 pub(crate) const HELD_BY_AGENT: u32 = 2;
 
@@ -1146,7 +1152,17 @@ impl Batch {
         turn: JobId,
         by: Actor,
     ) -> Result<Appended, BatchError> {
-        self.require_mutable_conversation(conversation)?;
+        self.retry_with_target(conversation, turn, by, None)
+    }
+
+    pub(crate) fn retry_with_target(
+        &mut self,
+        conversation: JobId,
+        turn: JobId,
+        by: Actor,
+        confirmation: Option<&str>,
+    ) -> Result<Appended, BatchError> {
+        let spec = self.require_mutable_conversation(conversation)?;
         let Some(original) = self.mutable_job(turn)? else {
             return self.reject(Violation::InvalidValue("turn", "turn not found"));
         };
@@ -1192,29 +1208,7 @@ impl Batch {
                 "the original Job still holds execution capacity",
             ));
         }
-        let may_have_applied_tool = self.step(|tx| {
-            use crate::db::entities::{ToolEffect, ToolOutcome};
-            let calls = tx.open_table(TOOL_CALLS)?;
-            for entry in calls.range((turn.get(), 0, 0)..=(turn.get(), u32::MAX, u32::MAX))? {
-                let (key, value) = entry?;
-                let call =
-                    rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, value.value())?;
-                if call
-                    .admission()
-                    .is_some_and(|admission| admission.effect != ToolEffect::ReadOnly)
-                    && !call.outcome.as_ref().is_some_and(|outcome| {
-                        matches!(
-                            outcome.fact,
-                            ToolOutcome::NotApplied { .. } | ToolOutcome::NotInvoked { .. }
-                        )
-                    })
-                {
-                    return Ok(true);
-                }
-            }
-            Ok(false)
-        })?;
-        if may_have_applied_tool {
+        if self.step(|tx| retry_has_effects(tx, turn))? {
             return self.reject(Violation::InvalidValue(
                 "retry",
                 "this turn may have applied a tool effect; continue the conversation using its recorded evidence",
@@ -1227,6 +1221,58 @@ impl Batch {
             ));
         }
         let source = original.retry.as_ref().map_or(turn, |retry| retry.original);
+        let routed = self
+            .step(|tx| routed_assignment(tx, &spec, &original))?
+            .is_some();
+        if routed && self.job_lifecycle(conversation)?.reported.is_some() {
+            return self.reject(Violation::InvalidValue(
+                "recovery_finished",
+                "the plan has already received this step's result",
+            ));
+        }
+        let replacement = match (
+            self.step(|tx| routed_step_failure(tx, &spec, turn))?,
+            confirmation,
+        ) {
+            (Some(failure), None) => {
+                let targets =
+                    self.inspect(|tx| super::job_tools::recovery_targets(tx, &failure))?;
+                let Some(configuration) = targets.original else {
+                    return self.reject(Violation::InvalidValue(
+                        "recovery_target",
+                        "the original target no longer meets the plan requirements",
+                    ));
+                };
+                Some(configuration)
+            }
+            (Some(failure), Some(confirmation)) if by == Actor::User => {
+                let targets =
+                    self.inspect(|tx| super::job_tools::recovery_targets(tx, &failure))?;
+                let Some(alternate) = targets
+                    .alternate
+                    .filter(|target| target.confirmation == confirmation)
+                else {
+                    return self.reject(Violation::InvalidValue(
+                        "recovery_target_changed",
+                        "the alternate target changed; review it before approving",
+                    ));
+                };
+                Some(alternate.configuration)
+            }
+            (_, Some(_)) => {
+                return self.reject(Violation::InvalidValue(
+                    "recovery_finished",
+                    "the failed step no longer awaits recovery",
+                ));
+            }
+            (None, None) if !routed => None,
+            (None, None) => {
+                return self.reject(Violation::InvalidValue(
+                    "recovery_finished",
+                    "the failed step no longer awaits recovery",
+                ));
+            }
+        };
         if original.retry.is_some() {
             let root = self.mutable_job(source)?.ok_or_else(|| {
                 BatchError(Failure::Storage(StorageError::corrupted(
@@ -1299,7 +1345,7 @@ impl Batch {
             content: MutableJobContent::Generative {
                 text,
                 attachments,
-                configuration,
+                configuration: replacement.or(configuration),
             },
         };
         let id = self.create_job_as(
@@ -1324,6 +1370,27 @@ impl Batch {
             seq: 1,
             joined: false,
         })
+    }
+
+    pub(crate) fn finish_routed_failure(
+        &mut self,
+        conversation: JobId,
+        turn: JobId,
+    ) -> Result<JobAction, BatchError> {
+        let spec = self.require_mutable_conversation(conversation)?;
+        if self.group_head(conversation)? != Some(turn)
+            || self
+                .step(|tx| routed_step_failure(tx, &spec, turn))?
+                .is_none()
+        {
+            return self.reject(Violation::InvalidValue(
+                "recovery_finished",
+                "the failed step no longer awaits recovery",
+            ));
+        }
+        let action = self.close(conversation, Actor::User)?;
+        self.wake_scheduler();
+        Ok(action)
     }
 
     pub(super) fn child_turn_settled(
@@ -1726,6 +1793,153 @@ pub(super) fn turn_awaits_tool_decision(
     Ok(false)
 }
 
+fn retry_has_effects(tx: &impl TxRead, turn: JobId) -> Result<bool, StorageError> {
+    use crate::db::entities::{ToolEffect, ToolOutcome};
+    let calls = tx.table(TOOL_CALLS)?;
+    for entry in calls.range((turn.get(), 0, 0)..=(turn.get(), u32::MAX, u32::MAX))? {
+        let (key, value) = entry?;
+        let call = rows::decode_tool_evidence(rows::tool_call_ref(key.value())?, value.value())?;
+        if call
+            .admission()
+            .is_some_and(|admission| admission.effect != ToolEffect::ReadOnly)
+            && !call.outcome.as_ref().is_some_and(|outcome| {
+                matches!(
+                    outcome.fact,
+                    ToolOutcome::NotApplied { .. } | ToolOutcome::NotInvoked { .. }
+                )
+            })
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn routed_assignment(
+    tx: &impl TxRead,
+    spec: &JobSpec,
+    job: &MutableJob,
+) -> Result<Option<crate::db::entities::JobPlanRoute>, StorageError> {
+    let (Some(parent), Origin::Agent { call }) = (spec.parent_id, &spec.origin) else {
+        return Ok(None);
+    };
+    let source = job
+        .retry
+        .as_ref()
+        .map(|retry| required_turn(tx, retry.original))
+        .transpose()?;
+    let job = source.as_ref().unwrap_or(job);
+    if job.previous.is_some()
+        || job.submitted_by
+            != (Actor::Agent {
+                conversation: parent,
+            })
+    {
+        return Ok(None);
+    }
+    let table = tx.table(TOOL_CALLS)?;
+    let value = table
+        .get(rows::tool_call_key(*call))?
+        .ok_or_else(|| StorageError::corrupted("routed child origin is missing"))?;
+    let evidence = rows::decode_tool_evidence(*call, value.value())?;
+    if evidence.name != "job_plan" {
+        return Ok(None);
+    }
+    let crate::db::entities::ToolDecision::AwaitingAnswer(admission) = evidence.decision.fact
+    else {
+        return Ok(None);
+    };
+    let Some(JobToolCall::JobPlan { steps }) =
+        JobToolCall::parse("job_plan", admission.arguments.as_str())
+    else {
+        return Err(StorageError::corrupted(
+            "routed child origin does not parse",
+        ));
+    };
+    let index = call_siblings(tx, parent, spec.id, *call)?
+        .into_iter()
+        .position(|id| id == spec.id)
+        .ok_or_else(|| StorageError::corrupted("routed child missing from its plan"))?;
+    steps
+        .into_iter()
+        .nth(index)
+        .map(|step| step.route)
+        .ok_or_else(|| StorageError::corrupted("routed child has no corresponding plan step"))
+}
+
+pub(super) fn routed_step_failure(
+    tx: &impl TxRead,
+    spec: &JobSpec,
+    turn: JobId,
+) -> Result<Option<RoutedStepFailure>, StorageError> {
+    let (Some(parent), Origin::Agent { call }) = (spec.parent_id, &spec.origin) else {
+        return Ok(None);
+    };
+    let runtime = state::require(tx, spec.id)?;
+    if runtime.state.outcome.is_some()
+        || runtime.lifecycle.closing.is_some()
+        || runtime.lifecycle.reported.is_some()
+        || turn_head(tx, spec.id)? != Some(turn)
+        || !state::require(tx, turn)?
+            .state
+            .outcome
+            .is_some_and(|outcome| outcome.kind == OutcomeKind::Failed)
+    {
+        return Ok(None);
+    }
+    let outputs = tx.table(JOB_OUTPUTS)?;
+    let Some((key, value)) = outputs
+        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+        .next_back()
+        .transpose()?
+    else {
+        return Ok(None);
+    };
+    let result = rows::decode_output(key.value(), value.value())?;
+    if result.kind != OutputKind::Result
+        || !matches!(
+            result.code.as_deref(),
+            Some(
+                "provider_rejected"
+                    | "responses_terminal_failure"
+                    | "not_delivered"
+                    | "not_sent"
+                    | "build_failed"
+                    | "start_refused"
+                    | "executor_unavailable_before_start"
+            )
+        )
+    {
+        return Ok(None);
+    }
+    let job = required_turn(tx, turn)?;
+    if !matches!(job.frozen, Some(MutableFrozenConfiguration::Generative(_))) {
+        return Ok(None);
+    }
+    let Some(route) = routed_assignment(tx, spec, &job)? else {
+        return Ok(None);
+    };
+    if retry_has_effects(tx, turn)? || has_open_approvals(tx, spec.id)? {
+        return Ok(None);
+    }
+    for sibling in call_siblings(tx, parent, spec.id, *call)? {
+        if sibling == spec.id {
+            continue;
+        }
+        let lifecycle = state::require(tx, sibling)?.lifecycle;
+        if lifecycle
+            .after
+            .iter()
+            .any(|(prerequisite, _)| *prerequisite == spec.id)
+            && let Some(head) = turn_head(tx, sibling)?
+            && required_turn(tx, head)?.phase == crate::db::entities::MutableJobPhase::Executing
+        {
+            return Ok(None);
+        }
+    }
+    Ok(Some(RoutedStepFailure { job, result, route }))
+}
+
 fn child_notice_drop_reason(reason: &Violation) -> Option<ChildNoticeDrop> {
     match reason {
         Violation::InvalidValue("parent_notice_limit", _) => Some(ChildNoticeDrop::LimitReached),
@@ -1948,6 +2162,7 @@ pub(super) fn prerequisite_state_in_cached(
     };
     if has_open_approvals(tx, prerequisite)?
         || turn_awaits_tool_decision(tx, head)?
+        || routed_step_failure(tx, &row, head)?.is_some()
         || conversation_has_pending_children_cached(tx, prerequisite, 0, pending_children)?
     {
         return Ok(DependencyState::Waiting);
@@ -1972,7 +2187,11 @@ pub(super) fn has_user_turn(
         if unsettled_only && state::require(tx, id)?.state.outcome.is_some() {
             return Ok(false);
         }
-        if required_turn(tx, id)?.submitted_by == Actor::User {
+        let job = required_turn(tx, id)?;
+        if job.submitted_by == Actor::User
+            && (job.retry.is_none()
+                || routed_assignment(tx, &conversation_row(tx, conversation)?, &job)?.is_none())
+        {
             return Ok(true);
         }
     }
@@ -2083,6 +2302,9 @@ fn segment_waiting(
 ) -> Result<bool, StorageError> {
     let first = segment.first;
     let last = segment.head;
+    if routed_step_failure(tx, &conversation_row(tx, conversation)?, last)?.is_some() {
+        return Ok(true);
+    }
     if tx
         .table(OPEN_APPROVALS)?
         .range(

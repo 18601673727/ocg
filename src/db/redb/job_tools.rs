@@ -5,9 +5,9 @@ use crate::db::entities::{
 };
 use crate::db::entities::{
     AllocationToken, ConfigBody, ConfigKind, DispatchSelection, ExecutionConfiguration,
-    FrozenConfiguration, JobDependency, JobPlanRoute, JobPlanStep, JobSpec, JobToolCall,
-    ModelCapability, MutableJob, MutableJobContent, ReasoningEffort, ToolAdmission, ToolCallRef,
-    ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, Violation,
+    FrozenConfiguration, FrozenExecutionConfig, JobDependency, JobPlanRoute, JobPlanStep, JobSpec,
+    JobToolCall, ModelCapability, MutableJob, MutableJobContent, ReasoningEffort, ToolAdmission,
+    ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::rows::{ConfigRow, decode_project};
@@ -43,6 +43,25 @@ pub(super) struct RoutedPlan {
     pub(super) arguments: String,
     pub(super) confirmation: String,
     targets: Vec<(ExecutionConfiguration, Option<ProjectId>)>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryTargetKind {
+    Original,
+    Alternate,
+}
+
+pub(super) struct RecoveryTargets {
+    pub(super) original: Option<ExecutionConfiguration>,
+    pub(super) alternate: Option<RecoveryTarget>,
+}
+
+pub(super) struct RecoveryTarget {
+    pub(super) configuration: ExecutionConfiguration,
+    pub(super) confirmation: String,
+    pub(super) provider: String,
+    pub(super) model: String,
+    pub(super) effort: Option<String>,
 }
 
 fn selected_model_matches(selector: Option<&str>, id: ConfigId, name: &str) -> bool {
@@ -83,7 +102,8 @@ fn choose_plan_target(
     transports: &BTreeSet<LlmTransport>,
     current: ExecutionConfiguration,
     route: &JobPlanRoute,
-) -> Result<ExecutionConfiguration, BatchError> {
+    recovery: Option<(&FrozenExecutionConfig, RecoveryTargetKind)>,
+) -> Result<Option<ExecutionConfiguration>, BatchError> {
     let model_capabilities = route
         .model_capabilities
         .iter()
@@ -108,6 +128,9 @@ fn choose_plan_target(
         if !agent.capabilities.contains(&route.agent_capability)
             || agent.workspace_grant().is_some()
                 != (route.agent_capability == AgentCapability::Coding)
+            || recovery.is_some_and(|(failed, _)| {
+                failed.agent_ref.map(|reference| reference.id) != Some(row.id)
+            })
         {
             continue;
         }
@@ -141,6 +164,14 @@ fn choose_plan_target(
             {
                 continue;
             }
+            let same_provider = recovery
+                .is_some_and(|(failed, _)| failed.llm.provider.id.get() == provider.id.get());
+            if let Some((failed, kind)) = recovery
+                && (same_provider && model.id == failed.llm.model.id)
+                    != (kind == RecoveryTargetKind::Original)
+            {
+                continue;
+            }
             let candidate = ExecutionConfiguration {
                 agent_profile: Some(row.id.into()),
                 llm_profile: model.id.into(),
@@ -148,6 +179,7 @@ fn choose_plan_target(
             };
             let rank = (
                 effort.is_some() && model_body.reasoning_efforts.is_none(),
+                same_provider,
                 candidate.llm_profile != current.llm_profile,
                 candidate.agent_profile != current.agent_profile,
                 index,
@@ -168,8 +200,82 @@ fn choose_plan_target(
             }
         }
     }
-    best.map(|(_, configuration)| configuration).ok_or_else(|| {
-        Violation::InvalidValue("route", "no enabled Agent and Model satisfy the plan step").into()
+    Ok(best.map(|(_, configuration)| configuration))
+}
+
+fn plan_configs(tx: &impl TxRead) -> Result<BTreeMap<ConfigId, ConfigRow>, StorageError> {
+    let mut configs = BTreeMap::new();
+    for row in tx.table(CONFIGS)?.iter()? {
+        let (id, value) = row?;
+        let row = ConfigRow::decode_at(id.value(), value.value())?;
+        if row.archived_at.is_none() {
+            configs.insert(row.id, row);
+        }
+    }
+    Ok(configs)
+}
+
+pub(super) fn recovery_targets(
+    tx: &impl TxRead,
+    failure: &job_tree::RoutedStepFailure,
+) -> Result<RecoveryTargets, BatchError> {
+    use crate::db::entities::MutableFrozenConfiguration;
+    let MutableJobContent::Generative {
+        configuration: Some(current),
+        ..
+    } = failure.job.input.content
+    else {
+        return Err(StorageError::corrupted("routed step has no configured target").into());
+    };
+    let Some(MutableFrozenConfiguration::Generative(failed)) = &failure.job.frozen else {
+        return Err(StorageError::corrupted("routed step has no admitted target").into());
+    };
+    let configs = plan_configs(tx)?;
+    let transports = enabled_llm_transports(tx)?;
+    let choose = |kind| {
+        choose_plan_target(
+            tx,
+            &configs,
+            &transports,
+            current,
+            &failure.route,
+            Some((failed, kind)),
+        )
+    };
+    let original = choose(RecoveryTargetKind::Original)?;
+    let alternate = choose(RecoveryTargetKind::Alternate)?
+        .map(|configuration| -> Result<_, BatchError> {
+            let FrozenConfiguration::Generative(target) =
+                configs::freeze_configuration(tx, configuration)?
+            else {
+                return Err(StorageError::corrupted("recovery target is not generative").into());
+            };
+            let effort = target.llm.config.parameters.reasoning_effort;
+            let confirmation = ContentDigest::of(
+                json!([
+                    failure.job.id.to_string(),
+                    target.agent_ref,
+                    target.llm.model,
+                    target.llm.provider.id.to_string(),
+                    target.llm.provider.edit_seq,
+                    effort,
+                ])
+                .to_string()
+                .as_bytes(),
+            )
+            .to_string();
+            Ok(RecoveryTarget {
+                configuration,
+                confirmation,
+                provider: target.llm.provider.name,
+                model: target.llm.config.model,
+                effort,
+            })
+        })
+        .transpose()?;
+    Ok(RecoveryTargets {
+        original,
+        alternate,
     })
 }
 
@@ -186,19 +292,7 @@ pub(super) fn route_plan(
     else {
         return Err(Violation::InvalidValue("route", "the parent has no generative target").into());
     };
-    let mut configs = BTreeMap::new();
-    for row in tx
-        .table(CONFIGS)
-        .map_err(StorageError::from)?
-        .iter()
-        .map_err(StorageError::from)?
-    {
-        let (id, value) = row.map_err(StorageError::from)?;
-        let row = ConfigRow::decode_at(id.value(), value.value())?;
-        if row.archived_at.is_none() {
-            configs.insert(row.id, row);
-        }
-    }
+    let configs = plan_configs(tx)?;
     let transports = enabled_llm_transports(tx)?;
     let mut targets = Vec::with_capacity(steps.len());
     let mut proposed = Vec::with_capacity(steps.len());
@@ -218,7 +312,12 @@ pub(super) fn route_plan(
                     }
                 };
                 (
-                    choose_plan_target(tx, &configs, &transports, current, route)?,
+                    choose_plan_target(tx, &configs, &transports, current, route, None)?.ok_or(
+                        Violation::InvalidValue(
+                            "route",
+                            "no enabled Agent and Model satisfy the plan step",
+                        ),
+                    )?,
                     project,
                 )
             }

@@ -470,6 +470,69 @@ function PausedReportCard(props: {
   );
 }
 
+type RecoveryCard = Extract<ConversationCard, { kind: "routed_recovery" }>;
+type RecoveryAction = "retry" | "alternate" | "finish";
+
+function RoutedRecoveryCard(props: {
+  card: RecoveryCard;
+  disabled: boolean;
+  onAction: (action: RecoveryAction) => void;
+}) {
+  const i18n = useI18n();
+  return (
+    <div class="space-y-2 rounded-xl border border-border bg-card p-4 text-sm">
+      <p class="font-medium">{i18n.t("chat.card.recoverStep", { title: props.card.title })}</p>
+      <p class="break-words text-muted-foreground">{props.card.failure}</p>
+      <p class="text-muted-foreground">{i18n.t("chat.card.recoveryWaiting")}</p>
+      <Show when={props.card.alternate}>
+        {(target) => (
+          <p class="break-words text-muted-foreground">
+            {i18n.t("chat.card.recoveryTarget", {
+              target: [
+                target().provider,
+                target().model,
+                target().effort ?? i18n.t("chat.profileDefault"),
+              ].join(" · "),
+            })}
+          </p>
+        )}
+      </Show>
+      <div class="flex flex-wrap items-center gap-2">
+        <Show when={props.card.retry_original}>
+          <Button
+            type="button"
+            size="xs"
+            variant="outline"
+            disabled={props.disabled}
+            onClick={() => props.onAction("retry")}
+          >
+            {i18n.t("chat.card.retryOriginal")}
+          </Button>
+        </Show>
+        <Show when={props.card.alternate}>
+          <Button
+            type="button"
+            size="xs"
+            disabled={props.disabled}
+            onClick={() => props.onAction("alternate")}
+          >
+            {i18n.t("chat.card.approveRecoveryTarget")}
+          </Button>
+        </Show>
+        <Button
+          type="button"
+          size="xs"
+          variant="ghost"
+          disabled={props.disabled}
+          onClick={() => props.onAction("finish")}
+        >
+          {i18n.t("chat.card.returnFailure")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
 export function ConversationCardStrip(props: {
   turn?: string;
   conversationId?: string;
@@ -534,7 +597,10 @@ export function ConversationCardStrip(props: {
 
   async function act(
     card: ConversationCard,
-    decision?: { decision: "approve" | "reject" } | { answer: string },
+    decision?:
+      | { decision: "approve" | "reject" }
+      | { answer: string }
+      | { recovery: RecoveryAction },
   ) {
     if (!api || lock.current) return;
     lock.current = true;
@@ -542,8 +608,26 @@ export function ConversationCardStrip(props: {
     setPending(true);
     setError(null);
     try {
-      if (card.kind !== "paused") {
-        if (decision) {
+      if (card.kind === "routed_recovery" && decision && "recovery" in decision) {
+        switch (decision.recovery) {
+          case "retry":
+            await api.retryConversation(card.conversation, card.turn);
+            break;
+          case "alternate":
+            if (card.alternate)
+              await api.retryConversation(
+                card.conversation,
+                card.turn,
+                undefined,
+                card.alternate.confirmation,
+              );
+            break;
+          case "finish":
+            await api.closeConversation(card.conversation, undefined, card.turn);
+            break;
+        }
+      } else if (card.kind !== "paused" && card.kind !== "routed_recovery") {
+        if (decision && !("recovery" in decision)) {
           const res = await api.decideApproval(card.approval, decision);
           setCards((prev) =>
             prev.filter(
@@ -563,7 +647,10 @@ export function ConversationCardStrip(props: {
       }
       setRevision((value) => value + 1);
     } catch (cause) {
-      if (cause instanceof ApiError && cause.code === "plan_routes_changed")
+      if (
+        cause instanceof ApiError &&
+        ["plan_routes_changed", "recovery_target_changed", "recovery_finished"].includes(cause.code)
+      )
         setRevision((value) => value + 1);
       if (
         cause instanceof ApiError &&
@@ -634,7 +721,11 @@ export function ConversationCardStrip(props: {
         <For
           each={groupedCards().get(id)?.cards}
           keyed={(card) =>
-            card.kind === "paused" ? "paused:" + card.conversation : card.approval.join(":")
+            card.kind === "paused"
+              ? "paused:" + card.conversation
+              : card.kind === "routed_recovery"
+                ? "recovery:" + card.turn
+                : card.approval.join(":")
           }
         >
           {(card) => {
@@ -649,6 +740,15 @@ export function ConversationCardStrip(props: {
               <Switch>
                 <Match when={ofKind("paused")}>
                   {(paused) => <PausedReportCard card={paused()} onOpen={props.onOpen} />}
+                </Match>
+                <Match when={ofKind("routed_recovery")}>
+                  {(recovery) => (
+                    <RoutedRecoveryCard
+                      card={recovery()}
+                      disabled={pending()}
+                      onAction={(action) => void act(card(), { recovery: action })}
+                    />
+                  )}
                 </Match>
                 <Match when={ofKind("approval")}>
                   {(approval) => (

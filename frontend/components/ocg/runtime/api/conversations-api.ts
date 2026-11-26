@@ -253,11 +253,19 @@ export function createConversationsApi(send: Send, conversationListeners: Set<()
       return result;
     },
 
-    async retryConversation(conversation: string, turn: string, signal?: AbortSignal) {
+    async retryConversation(
+      conversation: string,
+      turn: string,
+      signal?: AbortSignal,
+      recoveryConfirmation?: string,
+    ) {
       jobIdentity(conversation);
       jobIdentity(turn);
       const answer = await send("POST", `/api/v1/conversations/${conversation}/retry`, {
-        body: { turn },
+        body: {
+          turn,
+          ...(recoveryConfirmation ? { recovery_confirmation: recoveryConfirmation } : {}),
+        },
         sign: true,
         signal,
       });
@@ -274,10 +282,11 @@ export function createConversationsApi(send: Send, conversationListeners: Set<()
       });
       return answer.input as Api.Stop;
     },
-    async closeConversation(conversation: string, signal?: AbortSignal) {
+    async closeConversation(conversation: string, signal?: AbortSignal, failedTurn?: string) {
       jobIdentity(conversation);
+      if (failedTurn) jobIdentity(failedTurn);
       const answer = await send("POST", `/api/v1/conversations/${conversation}/close`, {
-        body: {},
+        body: failedTurn ? { failed_turn: failedTurn } : {},
         sign: true,
         signal,
       });

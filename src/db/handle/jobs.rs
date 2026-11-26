@@ -539,6 +539,37 @@ impl DatabaseHandle {
         .await
     }
 
+    pub(crate) async fn retry_routed_target(
+        &self,
+        conversation: JobId,
+        turn: JobId,
+        confirmation: String,
+    ) -> Result<Appended, DatabaseError> {
+        self.write(
+            4096,
+            OperationKind::Retry,
+            (conversation, turn, confirmation),
+            |batch, (conversation, turn, confirmation)| {
+                batch.retry_with_target(conversation, turn, Actor::User, Some(&confirmation))
+            },
+        )
+        .await
+    }
+
+    pub(crate) async fn finish_routed_failure(
+        &self,
+        conversation: JobId,
+        turn: JobId,
+    ) -> Result<JobAction, DatabaseError> {
+        self.write(
+            4096,
+            OperationKind::Close,
+            (conversation, turn),
+            |batch, (conversation, turn)| batch.finish_routed_failure(conversation, turn),
+        )
+        .await
+    }
+
     pub async fn set_conversation(&self, root: JobId, edit: JobEdit) -> Result<(), DatabaseError> {
         self.write_sized(
             (root, edit),

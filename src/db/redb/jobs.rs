@@ -1572,6 +1572,17 @@ impl Batch {
                 "conversation has changed since Job creation",
             ));
         }
+        if job.retry.is_none()
+            && let Some(previous) = job.previous
+            && self
+                .step(|tx| super::job_tree::routed_step_failure(tx, &parent, previous))?
+                .is_some()
+        {
+            return self.reject(Violation::InvalidValue(
+                "step_recovery_pending",
+                "resolve this step's failure before sending another turn",
+            ));
+        }
         self.inspect(|tx| validate_mutable_input(tx, &job.input))?;
         if matches!(
             &job.input.content,

@@ -239,6 +239,12 @@ export const zh: Dictionary = {
   "chat.card.routedPlanNote":
     "核对自动选定的执行目标，一次批准整个计划。有依赖的任务会收到前置任务的结果。",
   "chat.card.routeCapabilities": "能力",
+  "chat.card.recoverStep": "{title} 需要恢复",
+  "chat.card.recoveryWaiting": "依赖此步骤的任务和最终汇总正在等待处理。",
+  "chat.card.recoveryTarget": "批准后将此步骤发送给 {target}。",
+  "chat.card.retryOriginal": "重试原目标",
+  "chat.card.approveRecoveryTarget": "批准改派",
+  "chat.card.returnFailure": "带失败结果继续",
   "chat.card.planNote": "此计划包含 {count} 个步骤。批准后将创建子任务，并在完成后汇总结果。",
   "chat.card.independentStep": "无前置依赖",
   "chat.card.rawRequest": "原始请求数据",
