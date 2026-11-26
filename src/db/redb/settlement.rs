@@ -324,6 +324,8 @@ impl Batch {
                     context_selection: crate::db::entities::MutableContextSelection::FullHistory,
                     summary_source: None,
                     frozen: Some(storable),
+                    child_results: Vec::new(),
+                    child_notice: None,
                 };
                 let req_tag = mutable_configuration_requirement(&wrapped);
                 batch.enqueue_mutable_job(&pred_job, req_tag, TurnMembership::NonTurn, false, true)
@@ -677,6 +679,8 @@ impl Batch {
             context_selection: MutableContextSelection::FullHistory,
             summary_source: None,
             frozen: Some(storable),
+            child_results: Vec::new(),
+            child_notice: None,
         };
         let req_tag = mutable_configuration_requirement(&wrapped);
         self.enqueue_mutable_job(&dec_job, req_tag, TurnMembership::Turn, false, true)?;

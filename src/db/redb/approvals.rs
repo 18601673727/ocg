@@ -21,7 +21,7 @@ use crate::db::redb::schema::{
     TOOL_CALLS, TOOL_STATS,
 };
 use ::redb::{Database, ReadTransaction, ReadableTable};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(super) fn continuation_submission(approval: ToolCallRef, step: &[u8]) -> Submission {
     let mut identity = b"ocg approval continuation ".to_vec();
@@ -893,6 +893,7 @@ pub(crate) fn read_cards(
     let mut cards = Vec::new();
     let mut pending = vec![root];
     let mut seen = BTreeSet::new();
+    let mut pending_children = BTreeMap::new();
     while let Some(conversation) = pending.pop() {
         if !seen.insert(conversation) || seen.len() > 65 {
             return Err(StorageError::corrupted(
@@ -911,7 +912,11 @@ pub(crate) fn read_cards(
         let (origin, project) = (row.origin, row.project);
         let parent = row.parent_id.map(|id| id.to_string());
         if origin != Origin::System {
-            let waiting = super::job_tree::waiting_child_reports(&rx, conversation)?;
+            let waiting = super::job_tree::waiting_child_reports_cached(
+                &rx,
+                conversation,
+                &mut pending_children,
+            )?;
             if !waiting.is_empty() {
                 cards.push(json!({"kind": "paused", "conversation": conversation.to_string(), "parent": parent, "waiting": waiting}));
             }

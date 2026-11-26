@@ -4,7 +4,7 @@ use super::catalog::{effective_context_policy, global_compaction_settings};
 use super::jobs::tool_evidence;
 use crate::db::entities::JobId;
 use crate::db::entities::{
-    Actor, ChildConversationEntry, ChildNotice, ChildNoticeKind, ChildResultReport, ContextState,
+    Actor, ChildConversationEntry, ChildNotice, ChildResultReport, ContextState,
     ContextWorkDetails, ContextWorkState, ConversationEntry, ConversationSearchMatch,
     ConversationSearchScope, ConversationsPage, JobLifecycle, JobLimits, JobSpec,
     MutableConversationPage, MutableConversationTurn, Origin, OutputKind, Recurrence,
@@ -13,9 +13,6 @@ use crate::db::entities::{ConfigId, ExecutionOperation, MutableJobPhase, Outcome
 use crate::db::redb::allocations::pools_offering_capability;
 use crate::db::redb::batch::{BatchError, Failure};
 use crate::db::redb::configs::ConfigurationResolver;
-use crate::db::redb::job_tree::{
-    CHILD_HELP_HEADER, CHILD_PROGRESS_HEADER, MAX_LIVE_CHILDREN, REPORT_HEADER,
-};
 use crate::db::redb::reads::execution_context::{SummarySourceError, verify_native_summary_in};
 use crate::db::redb::reads::jobs::{
     active_job_in, first_entry_text, mutable_job_details_in, mutable_job_record_in,
@@ -28,7 +25,7 @@ use crate::db::redb::schema::MAX_PAGE;
 use crate::db::redb::schema::{
     ATTACHMENTS, CHILD_GROUPS, CHILDREN, CONVERSATION_SEARCH, CONVERSATIONS, JOB_OUTPUTS,
     JOB_RUNTIME, JOBS, MESSAGES, META, OPEN_APPROVALS, POOL_ALLOCATIONS, PROJECTS, RECURRENCES,
-    REQUEST_EVENTS, TURNS,
+    REQUEST_EVENTS, TOOL_CALLS, TURNS,
 };
 use crate::db::redb::{StorageError, TxRead};
 use crate::db::redb::{allocations, indexes, rows, state};
@@ -151,138 +148,36 @@ fn child_notice(
     rx: &ReadTransaction,
     job: &crate::db::entities::MutableJob,
 ) -> Result<Option<ChildNotice>, StorageError> {
+    let Some(call) = job.child_notice else {
+        return Ok(None);
+    };
     let Actor::Agent { conversation } = job.submitted_by else {
-        return Ok(None);
+        return Err(StorageError::corrupted(
+            "child notice turn has non-Agent author",
+        ));
     };
-    let text = job.input.text();
-    let Some((header, _)) = text.split_once('\n') else {
-        return Ok(None);
-    };
-    let kind = match header {
-        CHILD_PROGRESS_HEADER => ChildNoticeKind::Progress,
-        CHILD_HELP_HEADER => ChildNoticeKind::Help,
-        _ => return Ok(None),
-    };
-    let Some((envelope, _)) = text.split_once("\n\n") else {
-        return Ok(None);
-    };
-    let Some(source) = read_conversation_row(rx, conversation)? else {
-        return Ok(None);
-    };
-    if source.parent_id != Some(job.parent_id) {
-        return Ok(None);
-    }
+    let record = rx
+        .open_table(TOOL_CALLS)?
+        .get(rows::tool_call_key(call))?
+        .ok_or_else(|| StorageError::corrupted("child notice tool call missing"))?;
+    let evidence = rows::decode_tool_evidence(call, record.value())?;
+    let kind = crate::db::redb::job_tree::pending_child_notice_kind(&evidence)?;
     let title = conversation_title(
         rx,
         conversation,
         &state::require(rx, conversation)?.lifecycle,
     )?;
+    let (envelope, _) = job
+        .input
+        .text()
+        .split_once("\n\n")
+        .ok_or_else(|| StorageError::corrupted("child notice turn missing body separator"))?;
     Ok(Some(ChildNotice {
         conversation,
         title,
         kind,
         text_start_utf16: (envelope.encode_utf16().count() + 2) as u32,
     }))
-}
-
-struct ParsedReportHeader {
-    conversation: JobId,
-    call: crate::db::entities::ToolCallRef,
-    title: String,
-    state: OutcomeKind,
-    title_matches_stored: bool,
-    state_matches_stored: bool,
-}
-
-fn parse_report_header(
-    rx: &ReadTransaction,
-    job: &crate::db::entities::MutableJob,
-    heading: &str,
-    origin: Option<crate::db::entities::ToolCallRef>,
-) -> Result<Option<ParsedReportHeader>, StorageError> {
-    let Some((raw_title, source)) = heading.rsplit_once("] conversation ") else {
-        return Ok(None);
-    };
-    let Some((id, outcome)) = source.split_once(": ") else {
-        return Ok(None);
-    };
-    let state = match outcome {
-        "completed" => OutcomeKind::Completed,
-        "failed" => OutcomeKind::Failed,
-        "cancelled" => OutcomeKind::Cancelled,
-        "unknown" => OutcomeKind::Unknown,
-        _ => return Ok(None),
-    };
-    let Some(conversation) = crate::db::entities::parse_entity_id(id).map(JobId::new) else {
-        return Ok(None);
-    };
-    let Some(child) = read_conversation_row(rx, conversation)? else {
-        return Ok(None);
-    };
-    let Origin::Agent { call } = child.origin else {
-        return Ok(None);
-    };
-    if child.parent_id != Some(job.parent_id)
-        || origin.is_some_and(|opening| opening != call)
-        || child.created_at > job.created_at
-    {
-        return Ok(None);
-    }
-    let runtime = state::require(rx, conversation)?;
-    let title_matches_stored = match &runtime.lifecycle.title {
-        Some(stored) => {
-            let truncated = &stored[..stored.floor_char_boundary(128)];
-            let normalized: String = truncated
-                .chars()
-                .map(|c| {
-                    if matches!(c, '\r' | '\n' | '\t')
-                        || crate::db::redb::jobs::invalid_input_character(c)
-                    {
-                        ' '
-                    } else {
-                        c
-                    }
-                })
-                .collect();
-            raw_title == normalized.trim() || raw_title == truncated
-        }
-        None => raw_title == id,
-    };
-    let state_matches_stored = runtime
-        .state
-        .outcome
-        .as_ref()
-        .is_some_and(|stored| stored.kind == state);
-    let title = if raw_title.is_empty() || raw_title == id {
-        conversation_title(rx, conversation, &runtime.lifecycle)?
-    } else {
-        raw_title.to_owned()
-    };
-    Ok(Some(ParsedReportHeader {
-        conversation,
-        call,
-        title,
-        state,
-        title_matches_stored,
-        state_matches_stored,
-    }))
-}
-
-fn is_report_fence(line: &str) -> bool {
-    if let Some(rest) = line.strip_prefix("~~~") {
-        if rest.is_empty() {
-            return true;
-        }
-        if rest.len() <= 13 && rest.bytes().all(|b| b == b'~') {
-            return true;
-        }
-        if let Some(digits) = rest.strip_prefix('-') {
-            return !digits.is_empty()
-                && digits.len() <= 10
-                && digits.bytes().all(|b| b.is_ascii_digit());
-        }
-    }
-    false
 }
 
 struct Utf16Cursor<'a> {
@@ -313,177 +208,28 @@ impl<'a> Utf16Cursor<'a> {
     }
 }
 
-fn parse_fenced_child_results(
-    rx: &ReadTransaction,
-    job: &crate::db::entities::MutableJob,
-    text: &str,
-    report: &str,
-) -> Result<Option<Vec<ChildResultReport>>, StorageError> {
-    if !report.starts_with("\n\n[") {
-        return Ok(None);
-    }
-    let Some((first_heading, after_first_heading)) = report[3..].split_once('\n') else {
-        return Ok(None);
-    };
-    let Some((fence, _)) = after_first_heading.split_once('\n') else {
-        return Ok(None);
-    };
-    if !is_report_fence(fence) {
-        return Ok(None);
-    }
-    let _ = first_heading;
-    let open_marker = format!("{fence}\n");
-    let close_marker = format!("\n{fence}");
-    let mut cursor = Utf16Cursor::new(text);
-    let mut pos = 0usize;
-    let mut origin = None;
-    let mut results: Vec<ChildResultReport> = Vec::new();
-    while pos < report.len() {
-        if results.len() == MAX_LIVE_CHILDREN || !report[pos..].starts_with("\n\n[") {
-            return Ok(None);
-        }
-        let heading_start = pos + 3;
-        let Some((heading, rest)) = report[heading_start..].split_once('\n') else {
-            return Ok(None);
-        };
-        let Some(parsed) = parse_report_header(rx, job, heading, origin)? else {
-            return Ok(None);
-        };
-        if results
-            .last()
-            .is_some_and(|previous| parsed.conversation <= previous.conversation)
-        {
-            return Ok(None);
-        }
-        if !rest.starts_with(&open_marker) {
-            return Ok(None);
-        }
-        let answer_start = heading_start + heading.len() + 1 + open_marker.len();
-        let Some(rel_end) = report[answer_start..].find(&close_marker) else {
-            return Ok(None);
-        };
-        let answer_end = answer_start + rel_end;
-        let next_pos = answer_end + close_marker.len();
-        if next_pos < report.len() && !report[next_pos..].starts_with("\n\n[") {
-            return Ok(None);
-        }
-        origin = Some(parsed.call);
-        results.push(ChildResultReport {
-            conversation: parsed.conversation,
-            title: parsed.title,
-            state: parsed.state,
-            answer_start_utf16: cursor.at(REPORT_HEADER.len() + answer_start),
-            answer_end_utf16: cursor.at(REPORT_HEADER.len() + answer_end),
-        });
-        pos = next_pos;
-    }
-    Ok((!results.is_empty()).then_some(results))
-}
-
 fn child_results(
     rx: &ReadTransaction,
     job: &crate::db::entities::MutableJob,
 ) -> Result<Vec<ChildResultReport>, StorageError> {
-    if job.submitted_by != Actor::Auto {
+    if job.child_results.is_empty() {
         return Ok(Vec::new());
     }
-    let text = job.input.text();
-    let Some(report) = text.strip_prefix(REPORT_HEADER) else {
-        return Ok(Vec::new());
-    };
-    if let Some(fenced) = parse_fenced_child_results(rx, job, text, report)? {
-        return Ok(fenced);
-    }
-    // Historical (unfenced) report fallback: preserve legacy report boundaries
-    // without overlapping header newlines or accepting out-of-order spoofs.
-    struct Candidate {
-        start: usize,
-        answer_start: usize,
-        parsed: ParsedReportHeader,
-    }
-    let mut candidates: Vec<Candidate> = Vec::new();
-    let mut origin = None;
-    for (start, _) in report.match_indices("\n\n[") {
-        let Some((heading, _)) = report[start + 3..].split_once('\n') else {
-            continue;
-        };
-        let Some(parsed) = parse_report_header(rx, job, heading, origin)? else {
-            continue;
-        };
-        if candidates.is_empty() {
-            if start != 0 {
-                return Ok(Vec::new());
-            }
-            origin = Some(parsed.call);
-        }
-        let answer_start = start + 3 + heading.len() + 1;
-        candidates.push(Candidate {
-            start,
-            answer_start,
-            parsed,
-        });
-    }
-    if candidates.is_empty() {
-        return Ok(Vec::new());
-    }
-    // Deduplicate repeated conversation IDs by keeping the best-matching header
-    // (preferring matches to stored title/outcome; if tied and after the first
-    // section, preferring the later occurrence when a prior answer quoted it).
-    let mut best_for_conv: std::collections::HashMap<JobId, usize> =
-        std::collections::HashMap::new();
-    for (idx, candidate) in candidates.iter().enumerate() {
-        let conv = candidate.parsed.conversation;
-        match best_for_conv.get(&conv).copied() {
-            None => {
-                best_for_conv.insert(conv, idx);
-            }
-            Some(existing_idx) => {
-                if existing_idx == 0 {
-                    // The anchored first section at offset 0 is always authoritative.
-                    continue;
-                }
-                let existing = &candidates[existing_idx].parsed;
-                let existing_score = u8::from(existing.title_matches_stored)
-                    + u8::from(existing.state_matches_stored);
-                let new_score = u8::from(candidate.parsed.title_matches_stored)
-                    + u8::from(candidate.parsed.state_matches_stored);
-                if new_score >= existing_score {
-                    best_for_conv.insert(conv, idx);
-                }
-            }
-        }
-    }
-    let mut cursor = Utf16Cursor::new(text);
-    let end = cursor.at(text.len());
-    let mut results: Vec<ChildResultReport> = Vec::new();
-    let mut min_next_start = 0usize;
-    for (idx, candidate) in candidates.into_iter().enumerate() {
-        if best_for_conv.get(&candidate.parsed.conversation).copied() != Some(idx) {
-            continue;
-        }
-        if candidate.start < min_next_start {
-            continue;
-        }
-        if results
-            .last()
-            .is_some_and(|previous| candidate.parsed.conversation <= previous.conversation)
-        {
-            continue;
-        }
-        if let Some(previous) = results.last_mut() {
-            previous.answer_end_utf16 = cursor.at(REPORT_HEADER.len() + candidate.start);
-        }
+    let mut cursor = Utf16Cursor::new(job.input.text());
+    let mut results = Vec::with_capacity(job.child_results.len());
+    for result in &job.child_results {
+        let title = conversation_title(
+            rx,
+            result.child,
+            &state::require(rx, result.child)?.lifecycle,
+        )?;
         results.push(ChildResultReport {
-            conversation: candidate.parsed.conversation,
-            title: candidate.parsed.title,
-            state: candidate.parsed.state,
-            answer_start_utf16: cursor.at(REPORT_HEADER.len() + candidate.answer_start),
-            answer_end_utf16: end,
+            conversation: result.child,
+            title,
+            state: result.outcome,
+            answer_start_utf16: cursor.at(result.answer_start as usize),
+            answer_end_utf16: cursor.at(result.answer_end as usize),
         });
-        min_next_start = candidate.answer_start;
-        if results.len() == MAX_LIVE_CHILDREN {
-            break;
-        }
     }
     Ok(results)
 }

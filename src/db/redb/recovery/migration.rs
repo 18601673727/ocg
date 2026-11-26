@@ -1,10 +1,11 @@
 use super::offline::{finalization_copy, verify_payloads, with_verified_rebuild_copy};
 use super::reserved::ReservedRefusal;
 use crate::db::entities::{
-    AWAITING_TOOL_DECISION, Actor, ChildNoticeDrop, ContentDigest, JobId, JobOutputId,
-    JobOutputRecord, JobSpec, MutableJob, MutableJobContent, MutableJobPhase,
-    NativeSummaryResultLink, Origin, OutcomeKind, OutputKind, Recurrence, RequestNumber,
-    SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome,
+    AWAITING_TOOL_DECISION, Actor, ChildNoticeDrop, ChildNoticeKind, ChildTurnResult,
+    ContentDigest, JobId, JobOutputId, JobOutputRecord, JobSpec, MutableJob, MutableJobContent,
+    MutableJobPhase, NativeSummaryResultLink, Origin, OutcomeKind, OutputKind, Recurrence,
+    RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord,
+    ToolOutcome,
 };
 use crate::db::redb::codec::{
     Code, Dec, Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME,
@@ -48,7 +49,7 @@ impl Versions {
     fn changes_body(self, tags: &[u8]) -> bool {
         match tags {
             [TAG_OUTPUT] => self.crosses(2),
-            [TAG_JOB] => self.crosses(3),
+            [TAG_JOB] => self.crosses(3) || self.crosses(7),
             [TAG_JOB_RUNTIME] => self.crosses(3) || self.crosses(5),
             _ => false,
         }
@@ -72,6 +73,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         (Some(3), Some(b"ocg-native-format-3")) => 3,
         (Some(4), Some(b"ocg-native-format-4")) => 4,
         (Some(5), Some(b"ocg-native-format-5")) => 5,
+        (Some(6), Some(b"ocg-native-format-6")) => 6,
         (Some(FORMAT_VERSION), Some(SCHEMA_FINGERPRINT)) => {
             return Err(ReservedRefusal::new(
                 "already_migrated",
@@ -81,11 +83,15 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         _ => {
             return Err(ReservedRefusal::new(
                 "unsupported_source",
-                "migration requires Format 1 through 5 with its matching schema fingerprint",
+                "migration requires Format 1 through 6 with its matching schema fingerprint",
             ));
         }
     };
-    check_migration_source_tables(source)?;
+    if from < 6 {
+        check_migration_source_tables(source)?;
+    } else {
+        check_required_tables(source)?;
+    }
     Ok(Versions {
         from,
         to: record_version_byte(),
@@ -774,15 +780,27 @@ fn source_caller(
     })
 }
 
-fn migrate_job(
+struct MigratedJobBase {
+    row: Vec<u8>,
+    author: Option<(Actor, &'static str)>,
+}
+
+fn migrate_job_base(
     versions: Versions,
     key: u128,
     bytes: &[u8],
     tx: &impl TxRead,
-    evidence: &AuthorEvidence,
+    evidence: Option<&AuthorEvidence>,
     source: &ReadTransaction,
-) -> Result<(Vec<u8>, Actor, &'static str), StorageError> {
+) -> Result<MigratedJobBase, StorageError> {
     let mut row = promote_record(versions, bytes, &[TAG_JOB])?;
+    if versions.crosses(7) {
+        // Append empty child_results (u32 0) and child_notice (None).
+        row.extend_from_slice(&[0, 0, 0, 0, 0]);
+    }
+    let Some(evidence) = evidence else {
+        return Ok(MigratedJobBase { row, author: None });
+    };
     let mut d = Dec::new(&row, TAG_JOB)?;
     d.u128()?;
     d.u128()?;
@@ -802,7 +820,10 @@ fn migrate_job(
         encoded.actor(&author);
         row.splice(offset..=offset, encoded.0);
     }
-    Ok((row, author, class))
+    Ok(MigratedJobBase {
+        row,
+        author: Some((author, class)),
+    })
 }
 
 fn migrate_runtime(versions: Versions, key: u128, bytes: &[u8]) -> Result<Vec<u8>, StorageError> {
@@ -818,19 +839,540 @@ fn migrate_runtime(versions: Versions, key: u128, bytes: &[u8]) -> Result<Vec<u8
     Ok(row)
 }
 
-fn migrate_turn_authors(
+fn migrate_turn_bases(
     versions: Versions,
     source: &ReadTransaction,
     tx: &WriteTransaction,
-    evidence: &AuthorEvidence,
+    evidence: Option<&AuthorEvidence>,
 ) -> Result<(), StorageError> {
     let mut jobs = tx.open_table(JOBS)?;
     for entry in source.open_table(JOBS)?.iter()? {
         let (k, v) = entry?;
-        let (row, _, _) = migrate_job(versions, k.value(), v.value(), tx, evidence, source)?;
-        jobs.insert(k.value(), row.as_slice())?;
+        let migrated = migrate_job_base(versions, k.value(), v.value(), tx, evidence, source)?;
+        jobs.insert(k.value(), migrated.row.as_slice())?;
     }
     Ok(())
+}
+
+struct ParsedReportHeader {
+    conversation: JobId,
+    call: ToolCallRef,
+    state: OutcomeKind,
+    title_matches_stored: bool,
+    state_matches_stored: bool,
+}
+
+struct ParsedChildResult {
+    conversation: JobId,
+    call: ToolCallRef,
+    state: OutcomeKind,
+    answer_start: u32,
+    answer_end: u32,
+}
+
+fn parse_report_header(
+    tx: &impl TxRead,
+    job: &MutableJob,
+    heading: &str,
+    origin: Option<ToolCallRef>,
+) -> Result<Option<ParsedReportHeader>, StorageError> {
+    let Some((raw_title, source)) = heading.rsplit_once("] conversation ") else {
+        return Ok(None);
+    };
+    let Some((id, outcome)) = source.split_once(": ") else {
+        return Ok(None);
+    };
+    let state = match outcome {
+        "completed" => OutcomeKind::Completed,
+        "failed" => OutcomeKind::Failed,
+        "cancelled" => OutcomeKind::Cancelled,
+        "unknown" => OutcomeKind::Unknown,
+        _ => return Ok(None),
+    };
+    let Some(conversation) = crate::db::entities::parse_entity_id(id).map(JobId::new) else {
+        return Ok(None);
+    };
+    let Some(child) = reads::jobs::read_conversation_row(tx, conversation)? else {
+        return Ok(None);
+    };
+    let Origin::Agent { call } = child.origin else {
+        return Ok(None);
+    };
+    if child.parent_id != Some(job.parent_id)
+        || origin.is_some_and(|opening| opening != call)
+        || child.created_at > job.created_at
+    {
+        return Ok(None);
+    }
+    let runtime = state::require(tx, conversation)?;
+    let title_matches_stored = match &runtime.lifecycle.title {
+        Some(stored) => {
+            let truncated = &stored[..stored.floor_char_boundary(128)];
+            let normalized: String = truncated
+                .chars()
+                .map(|c| {
+                    if matches!(c, '\r' | '\n' | '\t') || jobs::invalid_input_character(c) {
+                        ' '
+                    } else {
+                        c
+                    }
+                })
+                .collect();
+            raw_title == normalized.trim() || raw_title == truncated
+        }
+        None => raw_title == id,
+    };
+    let state_matches_stored = runtime
+        .state
+        .outcome
+        .as_ref()
+        .is_some_and(|stored| stored.kind == state);
+    Ok(Some(ParsedReportHeader {
+        conversation,
+        call,
+        state,
+        title_matches_stored,
+        state_matches_stored,
+    }))
+}
+
+fn is_report_fence(line: &str) -> bool {
+    if let Some(rest) = line.strip_prefix("~~~") {
+        if rest.is_empty() {
+            return true;
+        }
+        if rest.len() <= 13 && rest.bytes().all(|b| b == b'~') {
+            return true;
+        }
+        if let Some(digits) = rest.strip_prefix('-') {
+            return !digits.is_empty()
+                && digits.len() <= 10
+                && digits.bytes().all(|b| b.is_ascii_digit());
+        }
+    }
+    false
+}
+
+fn report_offset(byte_pos: usize) -> Result<u32, StorageError> {
+    u32::try_from(byte_pos)
+        .map_err(|_| StorageError::corrupted("child report byte offset overflow"))
+}
+
+fn parse_fenced_child_results(
+    tx: &impl TxRead,
+    job: &MutableJob,
+    report: &str,
+) -> Result<Option<Vec<ParsedChildResult>>, StorageError> {
+    if !report.starts_with("\n\n[") {
+        return Ok(None);
+    }
+    let Some((_, after_first_heading)) = report[3..].split_once('\n') else {
+        return Ok(None);
+    };
+    let Some((fence, _)) = after_first_heading.split_once('\n') else {
+        return Ok(None);
+    };
+    if !is_report_fence(fence) {
+        return Ok(None);
+    }
+    let open_marker = format!("{fence}\n");
+    let close_marker = format!("\n{fence}");
+    let mut pos = 0usize;
+    let mut origin = None;
+    let mut results: Vec<ParsedChildResult> = Vec::new();
+    while pos < report.len() {
+        if results.len() == job_tree::MAX_LIVE_CHILDREN || !report[pos..].starts_with("\n\n[") {
+            return Ok(None);
+        }
+        let heading_start = pos + 3;
+        let Some((heading, rest)) = report[heading_start..].split_once('\n') else {
+            return Ok(None);
+        };
+        let Some(parsed) = parse_report_header(tx, job, heading, origin)? else {
+            return Ok(None);
+        };
+        if results
+            .last()
+            .is_some_and(|previous| parsed.conversation <= previous.conversation)
+        {
+            return Ok(None);
+        }
+        if !rest.starts_with(&open_marker) {
+            return Ok(None);
+        }
+        let answer_start = heading_start + heading.len() + 1 + open_marker.len();
+        let Some(rel_end) = report[answer_start..].find(&close_marker) else {
+            return Ok(None);
+        };
+        let answer_end = answer_start + rel_end;
+        let next_pos = answer_end + close_marker.len();
+        if next_pos < report.len() && !report[next_pos..].starts_with("\n\n[") {
+            return Ok(None);
+        }
+        origin = Some(parsed.call);
+        results.push(ParsedChildResult {
+            conversation: parsed.conversation,
+            call: parsed.call,
+            state: parsed.state,
+            answer_start: report_offset(job_tree::REPORT_HEADER.len() + answer_start)?,
+            answer_end: report_offset(job_tree::REPORT_HEADER.len() + answer_end)?,
+        });
+        pos = next_pos;
+    }
+    Ok((!results.is_empty()).then_some(results))
+}
+
+fn parse_unfenced_child_results(
+    tx: &impl TxRead,
+    job: &MutableJob,
+    text: &str,
+    report: &str,
+) -> Result<Vec<ParsedChildResult>, StorageError> {
+    struct Candidate {
+        start: usize,
+        answer_start: usize,
+        parsed: ParsedReportHeader,
+    }
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut origin = None;
+    for (start, _) in report.match_indices("\n\n[") {
+        let Some((heading, _)) = report[start + 3..].split_once('\n') else {
+            continue;
+        };
+        let Some(parsed) = parse_report_header(tx, job, heading, origin)? else {
+            continue;
+        };
+        if candidates.is_empty() {
+            if start != 0 {
+                return Ok(Vec::new());
+            }
+            origin = Some(parsed.call);
+        }
+        let answer_start = start + 3 + heading.len() + 1;
+        candidates.push(Candidate {
+            start,
+            answer_start,
+            parsed,
+        });
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut best_for_conv: BTreeMap<JobId, usize> = BTreeMap::new();
+    for (idx, candidate) in candidates.iter().enumerate() {
+        let conv = candidate.parsed.conversation;
+        match best_for_conv.get(&conv).copied() {
+            None => {
+                best_for_conv.insert(conv, idx);
+            }
+            Some(existing_idx) => {
+                if existing_idx == 0 {
+                    continue;
+                }
+                let existing = &candidates[existing_idx].parsed;
+                let existing_score = u8::from(existing.title_matches_stored)
+                    + u8::from(existing.state_matches_stored);
+                let new_score = u8::from(candidate.parsed.title_matches_stored)
+                    + u8::from(candidate.parsed.state_matches_stored);
+                if new_score >= existing_score {
+                    best_for_conv.insert(conv, idx);
+                }
+            }
+        }
+    }
+    let end = report_offset(text.len())?;
+    let mut results: Vec<ParsedChildResult> = Vec::new();
+    let mut min_next_start = 0usize;
+    for (idx, candidate) in candidates.into_iter().enumerate() {
+        if best_for_conv.get(&candidate.parsed.conversation).copied() != Some(idx) {
+            continue;
+        }
+        if candidate.start < min_next_start {
+            continue;
+        }
+        if results
+            .last()
+            .is_some_and(|previous| candidate.parsed.conversation <= previous.conversation)
+        {
+            continue;
+        }
+        if let Some(previous) = results.last_mut() {
+            previous.answer_end = report_offset(job_tree::REPORT_HEADER.len() + candidate.start)?;
+        }
+        results.push(ParsedChildResult {
+            conversation: candidate.parsed.conversation,
+            call: candidate.parsed.call,
+            state: candidate.parsed.state,
+            answer_start: report_offset(job_tree::REPORT_HEADER.len() + candidate.answer_start)?,
+            answer_end: end,
+        });
+        min_next_start = candidate.answer_start;
+        if results.len() == job_tree::MAX_LIVE_CHILDREN {
+            break;
+        }
+    }
+    Ok(results)
+}
+
+fn child_segment_heads_before(
+    tx: &impl TxRead,
+    parent: JobId,
+    child: JobId,
+    before_turn: JobId,
+    seq0_submissions: &BTreeMap<JobId, SubmissionKey>,
+) -> Result<Vec<JobId>, StorageError> {
+    let recurrence = tx
+        .table(RECURRENCES)?
+        .get(child.get())?
+        .map(|row| Recurrence::decode(row.value()))
+        .transpose()?;
+    let max_n = recurrence.as_ref().map_or(0, |r| r.n);
+    let jobs = tx.table(JOBS)?;
+    let mut heads = Vec::new();
+    let mut current_head = None;
+    let mut in_segment = false;
+    let mut settled_non_planning = Vec::new();
+    for entry in tx
+        .table(TURNS)?
+        .range((child.get(), 0)..(child.get(), before_turn.get()))?
+    {
+        let id = JobId::new(entry?.0.value().1);
+        let row = jobs
+            .get(id.get())?
+            .ok_or_else(|| StorageError::corrupted("child turn missing during migration"))?;
+        let turn = jobs::decode_mutable_job(id.get(), row.value())?;
+        if reads::jobs::project_planning_target(tx, &turn)?.is_some() {
+            continue;
+        }
+        let settled = state::require(tx, id)?.state.outcome.is_some();
+        if settled {
+            settled_non_planning.push(id);
+        }
+        let is_recurrence_starter = turn.retry.is_none()
+            && turn.submitted_by == Actor::Auto
+            && recurrence.as_ref().is_some_and(|r| {
+                r.current_turn == id
+                    || r.previous_turn == Some(id)
+                    || (2..=max_n.min(u64::from(
+                        crate::db::entities::JobLimits::CEILING.max_iterations,
+                    )))
+                        .any(|n| {
+                            seq0_submissions.get(&id)
+                                == Some(
+                                    &settlement::recurrence_submission(
+                                        child.get(),
+                                        n,
+                                        b"recurrence-turn-create",
+                                    )
+                                    .key,
+                                )
+                        })
+            });
+        let is_agent_starter = turn.retry.is_none()
+            && turn.submitted_by
+                == (Actor::Agent {
+                    conversation: parent,
+                });
+        if is_agent_starter || is_recurrence_starter {
+            if let Some(prev) = current_head.take() {
+                heads.push(prev);
+            }
+            in_segment = true;
+            current_head = settled.then_some(id);
+        } else if turn.retry.is_none() && turn.submitted_by == Actor::User {
+            if let Some(prev) = current_head.take() {
+                heads.push(prev);
+            }
+            in_segment = false;
+        } else if in_segment {
+            current_head = settled.then_some(id);
+        }
+    }
+    if let Some(head) = current_head {
+        heads.push(head);
+    }
+    if heads.is_empty() {
+        heads = settled_non_planning;
+    }
+    Ok(heads)
+}
+
+fn resolve_report_heads(
+    tx: &impl TxRead,
+    job: &MutableJob,
+    parsed: &[ParsedChildResult],
+    seq0_submissions: &BTreeMap<JobId, SubmissionKey>,
+    claimed_heads: &mut BTreeMap<JobId, BTreeSet<JobId>>,
+) -> Result<Vec<ChildTurnResult>, StorageError> {
+    let mut results = Vec::with_capacity(parsed.len());
+    for item in parsed {
+        let all_heads = child_segment_heads_before(
+            tx,
+            job.parent_id,
+            item.conversation,
+            job.id,
+            seq0_submissions,
+        )?;
+        let unclaimed: Vec<JobId> = all_heads
+            .iter()
+            .copied()
+            .filter(|head| {
+                !claimed_heads
+                    .get(&item.conversation)
+                    .is_some_and(|used| used.contains(head))
+            })
+            .collect();
+        let candidates = if unclaimed.is_empty() {
+            &all_heads
+        } else {
+            &unclaimed
+        };
+        let head = if candidates.len() == 1 {
+            candidates[0]
+        } else if parsed.len() == 1
+            && let Some(&key) = seq0_submissions.get(&job.id)
+            && let Some(&matched) = candidates.iter().find(|&&head| {
+                job_tree::tool_submission(item.call, b"results create", head.get() as u32).key
+                    == key
+            })
+        {
+            matched
+        } else {
+            *candidates.first().ok_or_else(|| {
+                StorageError::corrupted("child report turn has no child head turn")
+            })?
+        };
+        claimed_heads
+            .entry(item.conversation)
+            .or_default()
+            .insert(head);
+        results.push(ChildTurnResult {
+            child: item.conversation,
+            head,
+            outcome: item.state,
+            answer_start: item.answer_start,
+            answer_end: item.answer_end,
+        });
+    }
+    Ok(results)
+}
+
+#[derive(Default, PartialEq, Eq)]
+struct LegacyChildTurns {
+    reports: BTreeMap<u128, Vec<ChildTurnResult>>,
+    notices: BTreeMap<u128, ToolCallRef>,
+}
+
+impl LegacyChildTurns {
+    fn read(tx: &impl TxRead) -> Result<Self, StorageError> {
+        let mut seq0_submissions = BTreeMap::new();
+        for entry in tx.table(SUBMISSIONS)?.iter()? {
+            let (key, value) = entry?;
+            let record = rows::decode_submission(key.value(), value.value())?;
+            if record.seq == 0 {
+                seq0_submissions.insert(record.job, record.key);
+            }
+        }
+        let submissions = tx.table(SUBMISSIONS)?;
+        let mut notice_calls = BTreeMap::new();
+        for entry in tx.table(TOOL_CALLS)?.iter()? {
+            let (key, value) = entry?;
+            let call = rows::tool_call_ref(key.value())?;
+            let tool = rows::decode_tool_evidence(call, value.value())?;
+            let kind = match tool.name.as_str() {
+                "job_report_progress" => ChildNoticeKind::Progress,
+                "job_ask_parent" => ChildNoticeKind::Help,
+                _ => continue,
+            };
+            let key = job_tree::tool_submission(call, b"child notice", 0).key;
+            if let Some(row) = submissions.get(key.as_bytes().as_slice())? {
+                let record = rows::decode_submission(key.as_bytes(), row.value())?;
+                notice_calls.insert(record.job.get(), (call, kind));
+            }
+        }
+        let mut turns = Self::default();
+        let mut claimed_heads = BTreeMap::new();
+        for entry in tx.table(JOBS)?.iter()? {
+            let (key, bytes) = entry?;
+            let id = key.value();
+            let job = jobs::decode_mutable_job(id, bytes.value())?;
+            if job.retry.is_some() || job.summary_source.is_some() {
+                continue;
+            }
+            if let Actor::Agent { conversation } = job.submitted_by {
+                let text = job.input.text();
+                if let Some((header, _)) = text.split_once('\n') {
+                    let header_kind = match header {
+                        job_tree::CHILD_PROGRESS_HEADER => Some(ChildNoticeKind::Progress),
+                        job_tree::CHILD_HELP_HEADER => Some(ChildNoticeKind::Help),
+                        _ => None,
+                    };
+                    if let Some(kind) = header_kind
+                        && text.split_once("\n\n").is_some()
+                        && let Some(source) = reads::jobs::read_conversation_row(tx, conversation)?
+                        && source.parent_id == Some(job.parent_id)
+                    {
+                        let Some(&(call, call_kind)) = notice_calls.get(&id) else {
+                            return Err(StorageError::corrupted(
+                                "child notice turn has no matching tool call submission",
+                            ));
+                        };
+                        if call_kind != kind {
+                            return Err(StorageError::corrupted(
+                                "child notice turn kind disagrees with tool call",
+                            ));
+                        }
+                        turns.notices.insert(id, call);
+                    }
+                }
+                continue;
+            }
+            if job.submitted_by != Actor::Auto {
+                continue;
+            }
+            let text = job.input.text();
+            let Some(report) = text.strip_prefix(job_tree::REPORT_HEADER) else {
+                continue;
+            };
+            let parsed = if let Some(fenced) = parse_fenced_child_results(tx, &job, report)? {
+                fenced
+            } else {
+                parse_unfenced_child_results(tx, &job, text, report)?
+            };
+            if parsed.is_empty() {
+                continue;
+            }
+            let results =
+                resolve_report_heads(tx, &job, &parsed, &seq0_submissions, &mut claimed_heads)?;
+            turns.reports.insert(id, results);
+        }
+        Ok(turns)
+    }
+
+    fn apply(&self, tx: &WriteTransaction) -> Result<(), StorageError> {
+        let mut jobs = tx.open_table(JOBS)?;
+        for (&id, results) in &self.reports {
+            let mut job = {
+                let row = jobs.get(id)?.ok_or_else(|| {
+                    StorageError::corrupted("child report turn missing during migration")
+                })?;
+                jobs::decode_mutable_job(id, row.value())?
+            };
+            job.child_results = results.clone();
+            jobs.insert(id, jobs::encode_mutable_job(&job).as_slice())?;
+        }
+        for (&id, &call) in &self.notices {
+            let mut job = {
+                let row = jobs.get(id)?.ok_or_else(|| {
+                    StorageError::corrupted("child notice turn missing during migration")
+                })?;
+                jobs::decode_mutable_job(id, row.value())?
+            };
+            job.child_notice = Some(call);
+            jobs.insert(id, jobs::encode_mutable_job(&job).as_slice())?;
+        }
+        Ok(())
+    }
 }
 
 fn promote_runtimes(
@@ -1026,32 +1568,44 @@ fn migrate_chain(
         }
     }
     let evidence = if versions.crosses(3) {
-        let evidence = AuthorEvidence::read(&tx)?;
-        migrate_turn_authors(versions, &source, &tx, &evidence)?;
-        Some(evidence)
+        Some(AuthorEvidence::read(&tx)?)
     } else {
         None
     };
+    migrate_turn_bases(versions, &source, &tx, evidence.as_ref())?;
     promote_runtimes(versions, &source, &tx)?;
     let changes = migrate_membership(&source, &tx)?;
     // Format 1 output conversion reads the final Job and runtime layouts.
     if versions.crosses(2) {
         migrate_outputs(versions, &source, &tx)?;
     }
-    let notices = LegacyNotices::read(&tx)?;
-    notices.apply(&tx)?;
+    let notices = if versions.crosses(6) {
+        let notices = LegacyNotices::read(&tx)?;
+        notices.apply(&tx)?;
+        Some(notices)
+    } else {
+        None
+    };
+    let child_turns = LegacyChildTurns::read(&tx)?;
+    child_turns.apply(&tx)?;
     tx.commit().map_err(StorageError::from)?;
 
     super::verify_reserved_residual(database)?;
     let result = database.begin_read().map_err(StorageError::from)?;
-    verify_record_headers(versions, &source, &result, &notices)?;
+    verify_record_headers(versions, &source, &result, notices.as_ref())?;
     verify_payloads(&result, directory)?;
+    if LegacyChildTurns::read(&result)? != child_turns {
+        return Err(ReservedRefusal::new(
+            "audit_failed",
+            "migration child turn metadata changed on re-evaluation",
+        ));
+    }
     let mut authors = BTreeMap::from([("user", 0u64), ("auto", 0), ("agent", 0)]);
     let mut classes = BTreeMap::new();
-    if let Some(evidence) = evidence {
-        verify_transformed(&source, &result, JOBS, |key, bytes| {
-            let (row, author, class) =
-                migrate_job(versions, key, bytes, &result, &evidence, &source)?;
+    verify_transformed(&source, &result, JOBS, |key, bytes| {
+        let migrated = migrate_job_base(versions, key, bytes, &result, evidence.as_ref(), &source)?;
+        let mut row = migrated.row;
+        if let Some((author, class)) = migrated.author {
             let name = match author {
                 Actor::User => "user",
                 Actor::Agent { .. } => "agent",
@@ -1060,9 +1614,18 @@ fn migrate_chain(
             };
             *authors.entry(name).or_default() += 1;
             *classes.entry(class).or_insert(0u64) += 1;
-            Ok(row)
-        })?;
-    }
+        }
+        if let Some(results) = child_turns.reports.get(&key) {
+            let mut job = jobs::decode_mutable_job(key, &row)?;
+            job.child_results = results.clone();
+            row = jobs::encode_mutable_job(&job);
+        } else if let Some(&call) = child_turns.notices.get(&key) {
+            let mut job = jobs::decode_mutable_job(key, &row)?;
+            job.child_notice = Some(call);
+            row = jobs::encode_mutable_job(&job);
+        }
+        Ok(row)
+    })?;
     let members = execution_membership(&result)?;
     verify_transformed(&source, &result, JOB_RUNTIME, |key, bytes| {
         let prior = migrate_runtime(versions, key, bytes)?;
@@ -1091,10 +1654,18 @@ fn migrate_chain(
         "kept_text_job_count": counts.kept_text_jobs.len(), "kept_text_jobs": counts.kept_text_jobs.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "jobs_changed": changes.jobs, "conversations_changed": changes.conversations,
         "closing_without_children": changes.closing, "kept_text_details": counts.kept_text_details});
-    if !notices.pending.is_empty() || !notices.dropped.is_empty() {
+    if let Some(notices) = &notices
+        && (!notices.pending.is_empty() || !notices.dropped.is_empty())
+    {
         plan["child_notices"] = json!({
             "queued": notices.pending.len(),
             "dropped": notices.dropped.len(),
+        });
+    }
+    if !child_turns.reports.is_empty() || !child_turns.notices.is_empty() {
+        plan["child_turns"] = json!({
+            "reports": child_turns.reports.len(),
+            "notices": child_turns.notices.len(),
         });
     }
     let encoded = serde_json::to_vec(&plan)

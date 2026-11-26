@@ -447,6 +447,7 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
     let conversations = tx.open_table(CONVERSATIONS)?;
     let turns = tx.open_table(TURNS)?;
     let retries = tx.open_table(RETRY_JOBS)?;
+    let tool_calls = tx.open_table(TOOL_CALLS)?;
     let mut agent_retries = std::collections::BTreeMap::<JobId, usize>::new();
     for entry in conversations.iter()? {
         let (key, value) = entry?;
@@ -515,6 +516,21 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
                 conversation.get(),
                 "submitting Agent conversation",
             )?;
+        }
+        for result in &job.child_results {
+            require_job_exists(
+                &conversations,
+                result.child.get(),
+                "child result conversation",
+            )?;
+            require_job_exists(&jobs, result.head.get(), "child result head turn")?;
+        }
+        if let Some(call) = job.child_notice {
+            let row = tool_calls.get(rows::tool_call_key(call))?.ok_or_else(|| {
+                StorageError::corrupted("child notice references missing tool call")
+            })?;
+            let evidence = rows::decode_tool_evidence(call, row.value())?;
+            job_tree::pending_child_notice_kind(&evidence)?;
         }
         if let Some(retry) = &job.retry {
             let original = jobs

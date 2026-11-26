@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const FORMAT_VERSION: u64 = 6; // Shared by database metadata and record headers.
+pub(super) const FORMAT_VERSION: u64 = 7; // Shared by database metadata and record headers.
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
-pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-format-6";
+pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-format-7";
 
 pub(super) const fn record_version_byte() -> u8 {
     const { assert!(FORMAT_VERSION <= u8::MAX as u64) };
@@ -76,12 +76,24 @@ macro_rules! tables {
             versions: recovery::migration::Versions,
             source: &ReadTransaction,
             result: &ReadTransaction,
-            notices: &recovery::migration::LegacyNotices,
+            notices: Option<&recovery::migration::LegacyNotices>,
         ) -> Result<(), recovery::reserved::ReservedRefusal> {
             macro_rules! verify {
                 (META) => { recovery::migration::verify_metadata(versions, source, result)? };
-                (TOOL_CALLS, $tags:expr) => { notices.verify_calls(versions, source, result)? };
-                (PENDING_CHILD_NOTICES) => { notices.verify_queue(result)? };
+                (TOOL_CALLS, $tags:expr) => {
+                    if let Some(notices) = notices {
+                        notices.verify_calls(versions, source, result)?;
+                    } else {
+                        recovery::migration::verify_tagged(versions, source, result, TOOL_CALLS, $tags)?;
+                    }
+                };
+                (PENDING_CHILD_NOTICES) => {
+                    if let Some(notices) = notices {
+                        notices.verify_queue(result)?;
+                    } else {
+                        recovery::audit::verify_identical_table(source, result, PENDING_CHILD_NOTICES)?;
+                    }
+                };
                 ($definition:ident, $tags:expr) => {
                     recovery::migration::verify_tagged(versions, source, result, $definition, $tags)?
                 };

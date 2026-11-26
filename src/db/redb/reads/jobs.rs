@@ -461,8 +461,14 @@ fn dependency_state(
     rx: &ReadTransaction,
     dependency: JobId,
     condition: DependencyCondition,
+    pending_children: &mut BTreeMap<JobId, bool>,
 ) -> Result<DependencyState, StorageError> {
-    super::super::job_tree::prerequisite_state_in(rx, dependency, condition)
+    super::super::job_tree::prerequisite_state_in_cached(
+        rx,
+        dependency,
+        condition,
+        pending_children,
+    )
 }
 
 fn cap_title(title: &str) -> String {
@@ -500,6 +506,7 @@ fn tree_node(
     rx: &ReadTransaction,
     row: &TreeRow,
     names: &mut BTreeMap<ConfigId, Option<String>>,
+    pending_children: &mut BTreeMap<JobId, bool>,
 ) -> Result<TreeNode, StorageError> {
     let (parent_id, created_at, facts, agent) = match row {
         TreeRow::Conversation(row) => {
@@ -529,7 +536,7 @@ fn tree_node(
                 depends_on.push((
                     *dependency,
                     *condition,
-                    dependency_state(rx, *dependency, *condition)?,
+                    dependency_state(rx, *dependency, *condition, pending_children)?,
                 ));
             }
             (
@@ -629,13 +636,19 @@ pub(crate) fn read_job_tree(
     };
     let ancestors = read_ancestors(&rx, root)?;
     let mut names: BTreeMap<ConfigId, Option<String>> = BTreeMap::new();
-    let mut nodes = vec![tree_node(&rx, &root_row, &mut names)?];
+    let mut pending_children: BTreeMap<JobId, bool> = BTreeMap::new();
+    let mut nodes = vec![tree_node(
+        &rx,
+        &root_row,
+        &mut names,
+        &mut pending_children,
+    )?];
     let page = child_page(&rx, root, after, limit.min(TREE_PAGE_MAX))?;
     let mut level = Vec::new();
     for child in page.listed {
         let row = tree_row(&rx, child)?
             .ok_or_else(|| StorageError::corrupted(format!("{child} has no job row")))?;
-        nodes.push(tree_node(&rx, &row, &mut names)?);
+        nodes.push(tree_node(&rx, &row, &mut names, &mut pending_children)?);
         level.push(nodes.len() - 1);
     }
     nodes[0].children = Some(level.clone());
@@ -653,7 +666,7 @@ pub(crate) fn read_job_tree(
             for child in page.listed {
                 let row = tree_row(&rx, child)?
                     .ok_or_else(|| StorageError::corrupted(format!("{child} has no job row")))?;
-                nodes.push(tree_node(&rx, &row, &mut names)?);
+                nodes.push(tree_node(&rx, &row, &mut names, &mut pending_children)?);
                 children.push(nodes.len() - 1);
             }
             nodes[index].children = Some(children.clone());

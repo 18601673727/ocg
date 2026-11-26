@@ -152,6 +152,15 @@ pub struct JobRetry {
     pub original: JobId,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChildTurnResult {
+    pub child: JobId,
+    pub head: JobId,
+    pub outcome: super::OutcomeKind,
+    pub answer_start: u32,
+    pub answer_end: u32,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct MutableJob {
     pub id: JobId,
@@ -168,6 +177,8 @@ pub struct MutableJob {
     pub context_selection: MutableContextSelection,
     pub summary_source: Option<super::ContentDigest>,
     pub frozen: Option<MutableFrozenConfiguration>,
+    pub child_results: Vec<ChildTurnResult>,
+    pub child_notice: Option<super::ToolCallRef>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

@@ -515,6 +515,8 @@ impl Batch {
                             context_selection: MutableContextSelection::FullHistory,
                             summary_source: None,
                             frozen: Some(MutableFrozenConfiguration::Generative(frozen.clone())),
+                            child_results: Vec::new(),
+                            child_notice: None,
                         };
                         batch.insert_native_summary_job(&chunk_job, &frozen, 0, true)?;
                         batch.insert(
@@ -562,6 +564,8 @@ impl Batch {
                 context_selection: MutableContextSelection::FullHistory,
                 summary_source: Some(source_digest),
                 frozen: Some(MutableFrozenConfiguration::Generative(frozen.clone())),
+                child_results: Vec::new(),
+                child_notice: None,
             };
             batch.insert_native_summary_job(
                 &producer_job,

@@ -4,11 +4,11 @@ use crate::db::entities::{
     JobState, Origin, OutcomeKind, OutputKind, ProjectId, RecordRef, Recurrence, SubmissionKey,
 };
 use crate::db::entities::{
-    AllocationPhase, AllocationToken, ChildNoticeDrop, ChildNoticeKind, ComposerContextId,
-    DependencyState, ExecutionConfiguration, JobAction, JobClosing, JobLifecycle, JobQueuePriority,
-    JobToolCall, MutableFrozenConfiguration, MutableJob, MutableJobContent, MutableJobInput,
-    NativeStopRequest, OutcomeCause, OutcomeRecord, RequestFingerprint, Submission, ToolCallRef,
-    ToolEvidenceRecord, Violation,
+    AllocationPhase, AllocationToken, ChildNoticeDrop, ChildNoticeKind, ChildTurnResult,
+    ComposerContextId, DependencyState, ExecutionConfiguration, JobAction, JobClosing,
+    JobLifecycle, JobQueuePriority, JobToolCall, MutableFrozenConfiguration, MutableJob,
+    MutableJobContent, MutableJobInput, NativeStopRequest, OutcomeCause, OutcomeRecord,
+    RequestFingerprint, Submission, ToolCallRef, ToolEvidenceRecord, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::schema::{
@@ -18,6 +18,7 @@ use crate::db::redb::schema::{
 use crate::db::redb::{rows, state};
 use ::redb::ReadableTable;
 use reads::jobs::{read_conversation_row, turn_head};
+use std::collections::BTreeMap;
 use std::ops::ControlFlow;
 
 #[derive(Default)]
@@ -105,7 +106,7 @@ enum ReportTurn {
     Permanent(Violation),
     WaitForConfiguration,
     InvalidInput(Violation),
-    Post(MutableJobInput),
+    Post(MutableJobInput, Vec<ChildTurnResult>),
 }
 
 struct ChildReport {
@@ -269,8 +270,31 @@ impl Batch {
         submit: Submission,
         by: Actor,
     ) -> Result<JobId, BatchError> {
+        self.host_turn_with_child_data(conversation, input, create, submit, by, Vec::new(), None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn host_turn_with_child_data(
+        &mut self,
+        conversation: JobId,
+        input: MutableJobInput,
+        create: Submission,
+        submit: Submission,
+        by: Actor,
+        child_results: Vec<ChildTurnResult>,
+        child_notice: Option<ToolCallRef>,
+    ) -> Result<JobId, BatchError> {
         let context = ComposerContextId::new(self.next_id()?);
-        let id = self.create_job_as(context, input, create, Some(conversation), None, by)?;
+        let id = self.create_job_with_child_data(
+            context,
+            input,
+            create,
+            Some(conversation),
+            None,
+            by,
+            child_results,
+            child_notice,
+        )?;
         self.submit_mutable_job(id, 1, submit)?;
         self.wake_scheduler();
         Ok(id)
@@ -346,7 +370,7 @@ impl Batch {
         call: ToolCallRef,
         input: MutableJobInput,
     ) -> Result<JobId, BatchError> {
-        self.host_turn(
+        self.host_turn_with_child_data(
             parent,
             input,
             tool_submission(call, b"child notice", 0),
@@ -354,6 +378,8 @@ impl Batch {
             Actor::Agent {
                 conversation: child,
             },
+            Vec::new(),
+            Some(call),
         )
     }
 
@@ -1434,19 +1460,21 @@ impl Batch {
             ReportTurn::AtLimit
             | ReportTurn::WaitForConfiguration
             | ReportTurn::InvalidInput(_) => return Ok(0),
-            ReportTurn::Post(input) => {
+            ReportTurn::Post(input, child_results) => {
                 if self.step(|tx| has_current_draft(tx, parent))? {
                     return Ok(0);
                 }
                 let marker = results
                     .iter()
                     .fold(0u32, |marker, r| marker ^ r.head.get() as u32);
-                self.host_turn(
+                self.host_turn_with_child_data(
                     parent,
                     input,
                     tool_submission(call, b"results create", marker),
                     tool_submission(call, b"results submit", marker),
                     Actor::Auto,
+                    child_results,
+                    None,
                 )?;
                 let mut lifecycle = self.job_lifecycle(parent)?;
                 lifecycle.loop_count = lifecycle.loop_count.saturating_add(1);
@@ -1477,7 +1505,11 @@ impl Batch {
         parent: JobId,
         child: JobId,
     ) -> Result<usize, BatchError> {
-        let Some(report) = self.step(|tx| collect_child_report(tx, parent, child))? else {
+        let Some(report) = self.step(|tx| {
+            let mut pending_children = BTreeMap::new();
+            collect_child_report(tx, parent, child, &mut pending_children)
+        })?
+        else {
             return Ok(0);
         };
         if let ReportTurn::InvalidInput(reason) = &report.turn {
@@ -1498,7 +1530,10 @@ impl Batch {
         if self.end_impossible_dependents(parent, child)? {
             count += 1;
         }
-        count += match self.step(|tx| collect_child_report(tx, parent, child))? {
+        count += match self.step(|tx| {
+            let mut pending_children = BTreeMap::new();
+            collect_child_report(tx, parent, child, &mut pending_children)
+        })? {
             Some(report) => self.return_child_results(report)?,
             None => 0,
         };
@@ -1814,6 +1849,7 @@ fn child_has_pending_work(
     parent: JobId,
     child: &JobSpec,
     depth: u8,
+    pending_children: &mut BTreeMap<JobId, bool>,
 ) -> Result<bool, StorageError> {
     if depth > crate::db::entities::MAX_JOB_DEPTH {
         return Err(StorageError::corrupted(
@@ -1833,7 +1869,7 @@ fn child_has_pending_work(
     if has_active_agent_turn(tx, parent, child.id)? {
         return Ok(true);
     }
-    conversation_has_pending_children(tx, child.id, depth + 1)
+    conversation_has_pending_children_cached(tx, child.id, depth + 1, pending_children)
 }
 
 fn conversation_has_pending_children(
@@ -1841,27 +1877,56 @@ fn conversation_has_pending_children(
     conversation: JobId,
     depth: u8,
 ) -> Result<bool, StorageError> {
+    let mut pending_children = BTreeMap::new();
+    conversation_has_pending_children_cached(tx, conversation, depth, &mut pending_children)
+}
+
+fn conversation_has_pending_children_cached(
+    tx: &impl TxRead,
+    conversation: JobId,
+    depth: u8,
+    pending_children: &mut BTreeMap<JobId, bool>,
+) -> Result<bool, StorageError> {
     if depth > crate::db::entities::MAX_JOB_DEPTH {
         return Err(StorageError::corrupted(
             "conversation ancestry exceeds the hard depth limit",
         ));
     }
+    if let Some(&pending) = pending_children.get(&conversation) {
+        return Ok(pending);
+    }
+    let mut pending = false;
     for entry in tx
         .table(LIVE_CHILDREN)?
         .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
     {
         let child = conversation_row(tx, JobId::new(entry?.0.value().1))?;
-        if child_has_pending_work(tx, conversation, &child, depth)? {
-            return Ok(true);
+        if child_has_pending_work(tx, conversation, &child, depth, pending_children)? {
+            pending = true;
+            break;
         }
     }
-    Ok(!unreported_calls(tx, conversation, None)?.0.is_empty())
+    if !pending {
+        pending = !unreported_calls(tx, conversation, None)?.0.is_empty();
+    }
+    pending_children.insert(conversation, pending);
+    Ok(pending)
 }
 
 pub(super) fn prerequisite_state_in(
     tx: &impl TxRead,
     prerequisite: JobId,
     condition: DependencyCondition,
+) -> Result<DependencyState, StorageError> {
+    let mut pending_children = BTreeMap::new();
+    prerequisite_state_in_cached(tx, prerequisite, condition, &mut pending_children)
+}
+
+pub(super) fn prerequisite_state_in_cached(
+    tx: &impl TxRead,
+    prerequisite: JobId,
+    condition: DependencyCondition,
+    pending_children: &mut BTreeMap<JobId, bool>,
 ) -> Result<DependencyState, StorageError> {
     let Some(row) = read_conversation_row(tx, prerequisite)? else {
         let outcome = state::read(tx, prerequisite)?.and_then(|s| s.state.outcome);
@@ -1882,7 +1947,7 @@ pub(super) fn prerequisite_state_in(
     };
     if has_open_approvals(tx, prerequisite)?
         || turn_awaits_tool_decision(tx, head)?
-        || conversation_has_pending_children(tx, prerequisite, 0)?
+        || conversation_has_pending_children_cached(tx, prerequisite, 0, pending_children)?
     {
         return Ok(DependencyState::Waiting);
     }
@@ -2013,6 +2078,7 @@ fn segment_waiting(
     tx: &impl TxRead,
     conversation: JobId,
     segment: &ReportSegment,
+    pending_children: &mut BTreeMap<JobId, bool>,
 ) -> Result<bool, StorageError> {
     let first = segment.first;
     let last = segment.head;
@@ -2033,20 +2099,13 @@ fn segment_waiting(
     {
         return Ok(true);
     }
-    conversation_has_pending_children(tx, conversation, 0)
+    conversation_has_pending_children_cached(tx, conversation, 0, pending_children)
 }
 
 // A report must not move the head on which an unsubmitted user message is based.
 pub(super) fn has_current_draft(tx: &impl TxRead, parent: JobId) -> Result<bool, StorageError> {
     let head = turn_head(tx, parent)?;
     has_draft(tx, parent, |draft| draft.previous == head)
-}
-
-fn is_child_notice(text: &str) -> bool {
-    matches!(
-        text.lines().next(),
-        Some(CHILD_PROGRESS_HEADER | CHILD_HELP_HEADER)
-    )
 }
 
 fn child_notice_message(
@@ -2087,7 +2146,7 @@ fn child_notice_capacity(tx: &impl TxRead, spec: &JobSpec) -> Result<usize, Stor
         match turn.submitted_by {
             Actor::User => break,
             Actor::Agent { conversation } if Some(conversation) == spec.parent_id => break,
-            Actor::Agent { .. } if is_child_notice(turn.input.text()) => remaining -= 1,
+            Actor::Agent { .. } if turn.child_notice.is_some() => remaining -= 1,
             Actor::Agent { .. } | Actor::Auto | Actor::Loop => {}
         }
     }
@@ -2151,7 +2210,9 @@ fn pending_child_notices(
         .collect()
 }
 
-fn pending_child_notice_kind(record: &ToolEvidenceRecord) -> Result<ChildNoticeKind, StorageError> {
+pub(super) fn pending_child_notice_kind(
+    record: &ToolEvidenceRecord,
+) -> Result<ChildNoticeKind, StorageError> {
     match record.name.as_str() {
         "job_report_progress" => Ok(ChildNoticeKind::Progress),
         "job_ask_parent" => Ok(ChildNoticeKind::Help),
@@ -2233,13 +2294,14 @@ fn unreported_calls(
     Ok((children, last.filter(|_| count == MAX_CHILD_SCAN)))
 }
 
-pub(super) fn waiting_child_reports(
+pub(super) fn waiting_child_reports_cached(
     tx: &impl TxRead,
     parent: JobId,
+    pending_children: &mut BTreeMap<JobId, bool>,
 ) -> Result<Vec<JobId>, StorageError> {
     let mut waiting = Vec::new();
     for child in unreported_calls(tx, parent, None)?.0 {
-        let Some(report) = collect_child_report(tx, parent, child)? else {
+        let Some(report) = collect_child_report(tx, parent, child, pending_children)? else {
             continue;
         };
         if matches!(report.turn, ReportTurn::AtLimit) {
@@ -2253,6 +2315,7 @@ fn collect_child_report(
     tx: &impl TxRead,
     parent: JobId,
     child: JobId,
+    pending_children: &mut BTreeMap<JobId, bool>,
 ) -> Result<Option<ChildReport>, StorageError> {
     let Origin::Agent { call } = conversation_row(tx, child)?.origin else {
         return Ok(None);
@@ -2265,7 +2328,7 @@ fn collect_child_report(
         let head = segment.head;
         let child_runtime = state::require(tx, child)?;
         let lifecycle = child_runtime.lifecycle;
-        if segment_waiting(tx, child, &segment)? {
+        if segment_waiting(tx, child, &segment, pending_children)? {
             return Ok(None);
         }
         if lifecycle.reported.is_none_or(|reported| reported < head) {
@@ -2316,7 +2379,10 @@ fn report_fence(answers: &[String]) -> String {
     format!("~~~-{}", answers.len())
 }
 
-fn child_report_text(tx: &impl TxRead, results: &[ChildResult]) -> Result<String, StorageError> {
+fn child_report_text(
+    tx: &impl TxRead,
+    results: &[ChildResult],
+) -> Result<(String, Vec<ChildTurnResult>), StorageError> {
     let mut text = String::from(REPORT_HEADER);
     let mut available = jobs::MAX_INPUT_BYTES.saturating_sub(text.len());
     let mut prepared = Vec::with_capacity(results.len());
@@ -2372,9 +2438,12 @@ fn child_report_text(tx: &impl TxRead, results: &[ChildResult]) -> Result<String
             available.saturating_sub(header.len() + footer.len() + pointer.len().min(answer.len()));
         sections.push((header, answer, pointer));
     }
-    for (header, answer, pointer) in sections {
+    let mut stored_results = Vec::with_capacity(sections.len());
+    for ((header, answer, pointer), result) in sections.into_iter().zip(results) {
         text.push_str(&header);
         available += pointer.len().min(answer.len());
+        let answer_start = u32::try_from(text.len())
+            .map_err(|_| StorageError::corrupted("child report offset overflow"))?;
         if answer.len() <= available {
             text.push_str(&answer);
             available -= answer.len();
@@ -2384,9 +2453,18 @@ fn child_report_text(tx: &impl TxRead, results: &[ChildResult]) -> Result<String
             text.push_str(&pointer);
             available = available.saturating_sub(end + pointer.len());
         }
+        let answer_end = u32::try_from(text.len())
+            .map_err(|_| StorageError::corrupted("child report offset overflow"))?;
         text.push_str(&footer);
+        stored_results.push(ChildTurnResult {
+            child: result.child,
+            head: result.head,
+            outcome: result.outcome,
+            answer_start,
+            answer_end,
+        });
     }
-    Ok(text)
+    Ok((text, stored_results))
 }
 
 fn conversation_row(tx: &impl TxRead, id: JobId) -> Result<JobSpec, StorageError> {
@@ -2430,7 +2508,8 @@ fn child_report_turn(
         Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::Permanent(reason)),
         Err(BatchError(Failure::Storage(error))) => return Err(error),
     }
-    let input = host_input(child_report_text(tx, results)?, configuration, priority);
+    let (text, stored_results) = child_report_text(tx, results)?;
+    let input = host_input(text, configuration, priority);
     match jobs::validate_mutable_input(tx, &input) {
         Ok(()) => {}
         Err(BatchError(Failure::Rejected(reason))) => return Ok(ReportTurn::InvalidInput(reason)),
@@ -2446,7 +2525,7 @@ fn child_report_turn(
     {
         return Ok(ReportTurn::Permanent(reason));
     }
-    Ok(ReportTurn::Post(input))
+    Ok(ReportTurn::Post(input, stored_results))
 }
 
 pub(crate) fn read_child_report_page(
@@ -2458,6 +2537,7 @@ pub(crate) fn read_child_report_page(
     let groups = tx.open_table(CHILD_GROUPS)?;
     let mut next = after;
     let mut scanned = 0;
+    let mut pending_children = BTreeMap::new();
     for entry in groups
         .range((after.map_or(Unbounded, Excluded), Unbounded))?
         .take(MAX_CHILD_SCAN)
@@ -2485,16 +2565,16 @@ pub(crate) fn read_child_report_page(
         {
             continue;
         }
-        if let Some(report) = collect_child_report(&tx, parent, child)? {
+        if let Some(report) = collect_child_report(&tx, parent, child, &mut pending_children)? {
             match report.turn {
-                ReportTurn::Post(_) if has_current_draft(&tx, parent)? => {
+                ReportTurn::Post(_, _) if has_current_draft(&tx, parent)? => {
                     next = Some((parent.get(), u128::MAX))
                 }
                 ReportTurn::AtLimit | ReportTurn::WaitForConfiguration => {
                     next = Some((parent.get(), u128::MAX))
                 }
                 ReportTurn::InvalidInput(_) => {}
-                ReportTurn::Skip | ReportTurn::Permanent(_) | ReportTurn::Post(_) => {
+                ReportTurn::Skip | ReportTurn::Permanent(_) | ReportTurn::Post(_, _) => {
                     // Re-read the parent head and loop count after each settlement.
                     return Ok(ChildReportPage {
                         next,

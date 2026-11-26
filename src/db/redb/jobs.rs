@@ -6,7 +6,7 @@ use crate::db::entities::{
     RecordRef, Recurrence, RecurrenceHalt, RecurrencePhase, SubmissionRecord, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Commit, Failure, Probe};
-use crate::db::redb::codec::{Dec, DecodeResult, Enc, TAG_JOB};
+use crate::db::redb::codec::{Code, Dec, DecodeResult, Enc, TAG_JOB};
 use crate::db::redb::reservations::mutable_configuration_requirement;
 use crate::db::redb::rows::encode_submission;
 use crate::db::redb::schema::{
@@ -79,6 +79,15 @@ pub(super) fn encode_mutable_job(job: &crate::db::entities::MutableJob) -> Vec<u
             e.u8(*byte);
         }
     });
+    e.u32(job.child_results.len() as u32);
+    for result in &job.child_results {
+        e.u128(result.child.get());
+        e.u128(result.head.get());
+        e.u8(result.outcome.code());
+        e.u32(result.answer_start);
+        e.u32(result.answer_end);
+    }
+    e.opt(job.child_notice.as_ref(), |e, call| e.call_ref(call));
     e.0
 }
 
@@ -352,7 +361,68 @@ pub(super) fn decode_mutable_job(
             d.take_array()?,
         ))
     })?;
+    let result_count = d.u32()? as usize;
+    if result_count > crate::db::redb::job_tree::MAX_LIVE_CHILDREN {
+        return Err(StorageError::corrupted("too many child results on Job"));
+    }
+    let mut child_results = Vec::with_capacity(result_count);
+    for _ in 0..result_count {
+        child_results.push(crate::db::entities::ChildTurnResult {
+            child: JobId::new(d.u128()?),
+            head: JobId::new(d.u128()?),
+            outcome: d.code(OutcomeKind::from_code)?,
+            answer_start: d.u32()?,
+            answer_end: d.u32()?,
+        });
+    }
+    let child_notice = d.opt(Dec::call_ref)?;
     d.end()?;
+    if !child_results.is_empty() {
+        let crate::db::entities::MutableJobContent::Generative { text, .. } = &input.content else {
+            return Err(StorageError::corrupted(
+                "non-generative Job has child results",
+            ));
+        };
+        if submitted_by != Actor::Auto || retry.is_some() || summary_source.is_some() {
+            return Err(StorageError::corrupted(
+                "invalid Job provenance for child results",
+            ));
+        }
+        let mut prev_child = None;
+        let mut prev_end = 0usize;
+        for result in &child_results {
+            let start = result.answer_start as usize;
+            let end = result.answer_end as usize;
+            if result.child.get() == 0
+                || result.head.get() == 0
+                || prev_child.is_some_and(|prev| result.child <= prev)
+                || start < prev_end
+                || start > end
+                || end > text.len()
+                || !text.is_char_boundary(start)
+                || !text.is_char_boundary(end)
+            {
+                return Err(StorageError::corrupted("invalid child result range on Job"));
+            }
+            prev_child = Some(result.child);
+            prev_end = end;
+        }
+    }
+    if let Some(call) = child_notice
+        && (!child_results.is_empty()
+            || !matches!(submitted_by, Actor::Agent { .. })
+            || retry.is_some()
+            || summary_source.is_some()
+            || call.job.get() == 0
+            || !matches!(
+                input.content,
+                crate::db::entities::MutableJobContent::Generative { .. }
+            ))
+    {
+        return Err(StorageError::corrupted(
+            "invalid Job provenance for child notice",
+        ));
+    }
     if previous.is_some_and(|previous| previous >= id)
         || retry
             .as_ref()
@@ -452,6 +522,8 @@ pub(super) fn decode_mutable_job(
         context_selection,
         summary_source,
         frozen,
+        child_results,
+        child_notice,
     })
 }
 
@@ -680,6 +752,11 @@ impl Batch {
                 .is_some_and(|old| old.submitted_by != job.submitted_by)
         {
             return self.corrupted("invalid change of Job author".into());
+        }
+        if previous.as_ref().is_some_and(|old| {
+            old.child_results != job.child_results || old.child_notice != job.child_notice
+        }) {
+            return self.corrupted("invalid change of Job child metadata".into());
         }
         self.record_job_phase(job.id, previous.as_ref().map(|row| row.phase), job.phase)?;
         self.record_mutable_input_revision(
@@ -927,11 +1004,35 @@ impl Batch {
     pub(crate) fn create_job_as(
         &mut self,
         context: crate::db::entities::ComposerContextId,
+        input: crate::db::entities::MutableJobInput,
+        submission: crate::db::entities::Submission,
+        conversation: Option<JobId>,
+        project: Option<ProjectId>,
+        by: Actor,
+    ) -> Result<JobId, BatchError> {
+        self.create_job_with_child_data(
+            context,
+            input,
+            submission,
+            conversation,
+            project,
+            by,
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_job_with_child_data(
+        &mut self,
+        context: crate::db::entities::ComposerContextId,
         mut input: crate::db::entities::MutableJobInput,
         submission: crate::db::entities::Submission,
         conversation: Option<JobId>,
         project: Option<ProjectId>,
         by: Actor,
+        child_results: Vec<crate::db::entities::ChildTurnResult>,
+        child_notice: Option<crate::db::entities::ToolCallRef>,
     ) -> Result<JobId, BatchError> {
         use crate::db::entities::{MutableJob, MutableJobPhase};
         self.require_allocation_durability()?;
@@ -1008,6 +1109,8 @@ impl Batch {
             context_selection: crate::db::entities::MutableContextSelection::FullHistory,
             summary_source: None,
             frozen: None,
+            child_results,
+            child_notice,
         };
         self.store_mutable_job(&job)?;
         self.put_job_state(id, &JobState::new(id))?;
@@ -1637,6 +1740,8 @@ impl Batch {
             context_selection: MutableContextSelection::FullHistory,
             summary_source: None,
             frozen: Some(storable),
+            child_results: Vec::new(),
+            child_notice: None,
         };
         let req_tag = mutable_configuration_requirement(&FrozenConfiguration::Decision(frozen));
         self.enqueue_mutable_job(&job, req_tag, TurnMembership::Turn, false, true)?;
