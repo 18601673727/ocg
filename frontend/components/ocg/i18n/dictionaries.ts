@@ -266,6 +266,9 @@ export const en = {
   "chat.card.answerPlaceholder": "Your answer",
   "chat.card.approval": "Approval requested",
   "chat.card.plan": "Task execution plan",
+  "chat.card.routedPlanNote":
+    "Review the automatically selected targets and approve the plan once. Dependent tasks receive the results of their prerequisites.",
+  "chat.card.routeCapabilities": "Capabilities",
   "chat.card.planNote":
     "This plan has {count} steps. Approval will create child tasks and a final synthesis.",
   "chat.card.independentStep": "No prerequisite steps",

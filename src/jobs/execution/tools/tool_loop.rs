@@ -144,12 +144,17 @@ pub(crate) const ASK_USER_TOOL_NAME: &str = "ask_user";
 
 pub(crate) const REQUEST_COMMAND_TOOL_NAME: &str = "workspace_request_command";
 
-fn needs_decision(name: &str) -> Option<fn(ToolAdmission) -> ToolDecision> {
+fn needs_decision(name: &str, arguments: &str) -> Option<fn(ToolAdmission) -> ToolDecision> {
     match name {
         ASK_USER_TOOL_NAME | "job_dispatch" | "job_ask_parent" => {
             Some(ToolDecision::AwaitingAnswer)
         }
         REQUEST_COMMAND_TOOL_NAME | "job_assign" => Some(ToolDecision::AwaitingApproval),
+        "job_plan"
+            if JobToolCall::parse(name, arguments).is_some_and(|call| call.routes_plan()) =>
+        {
+            Some(ToolDecision::AwaitingAnswer)
+        }
         _ => None,
     }
 }
@@ -256,7 +261,7 @@ pub(crate) async fn answer_calls(
     // Keep read-only results when a user decision may pause the Turn before the next request.
     let retain_results = calls.iter().zip(&prepared).any(|(call, dispatch)| {
         dispatch.is_ok()
-            && needs_decision(&call.name).is_some()
+            && needs_decision(&call.name, &call.arguments).is_some()
             && (tools.decider || call.name == "job_ask_parent")
     });
     let limits = &tools.limits;
@@ -301,12 +306,12 @@ pub(crate) async fn answer_calls(
             arguments: ToolPayload::new(call.arguments.clone()),
             authorization: AuthorizationBasis::RegistryGrant,
         };
-        if let Some(awaiting_decision) = needs_decision(&call.name) {
+        if let Some(awaiting_decision) = needs_decision(&call.name, &call.arguments) {
             if tools.decider || call.name == "job_ask_parent" {
                 match record_decision(site, call, awaiting_decision(decided)).await {
                     Ok(()) => awaiting.push(index),
                     Err(ToolLoopStop::AdmissionRefused { violation, .. })
-                        if call.name == "job_ask_parent" =>
+                        if matches!(call.name.as_str(), "job_ask_parent" | "job_plan") =>
                     {
                         let refusal = InvalidToolCall::at(
                             ToolCallRefusal::Unauthorized,

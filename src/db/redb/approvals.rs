@@ -544,6 +544,11 @@ impl Batch {
             self.require_planning_decision_satisfied(call)?;
         }
         let conversation = self.turn_conversation(call.job)?;
+        if name == "job_plan"
+            && let ToolDecision::AwaitingAnswer(admission) = &decision
+        {
+            self.check_routed_plan(call, admission.arguments.as_str())?;
+        }
         if name == "job_ask_parent"
             && let ToolDecision::AwaitingAnswer(admission) = &decision
         {
@@ -909,9 +914,9 @@ pub(crate) fn read_cards(
         if conversation == root {
             super::state::require(&rx, root)?;
         }
-        let (origin, project) = (row.origin, row.project);
+        let (origin, project) = (&row.origin, row.project);
         let parent = row.parent_id.map(|id| id.to_string());
-        if origin != Origin::System {
+        if *origin != Origin::System {
             let waiting = super::job_tree::waiting_child_reports_cached(
                 &rx,
                 conversation,
@@ -954,6 +959,30 @@ pub(crate) fn read_cards(
                 if call.name == "job_dispatch" {
                     card["kind"] = json!("dispatch");
                     card["arguments"] = json!(arguments);
+                } else if call.name == "job_plan"
+                    && matches!(call.decision.fact, ToolDecision::AwaitingAnswer(_))
+                {
+                    let Some(crate::db::entities::JobToolCall::JobPlan { steps }) =
+                        crate::db::entities::JobToolCall::parse("job_plan", arguments)
+                    else {
+                        return Err(StorageError::corrupted("routed plan arguments are invalid"));
+                    };
+                    let job = super::jobs::mutable_job_in(&rx, call.call.job)?
+                        .ok_or_else(|| StorageError::corrupted("routed plan Job is missing"))?;
+                    card["kind"] = json!("routed_plan");
+                    match super::job_tools::route_plan(&rx, &job, &row, &steps) {
+                        Ok(plan) => {
+                            card["arguments"] = json!(plan.arguments);
+                            card["confirmation"] = json!(plan.confirmation);
+                            card["routing_error"] = json!(null);
+                        }
+                        Err(BatchError(Failure::Rejected(error))) => {
+                            card["arguments"] = json!(arguments);
+                            card["confirmation"] = json!(null);
+                            card["routing_error"] = json!(error.to_string());
+                        }
+                        Err(BatchError(Failure::Storage(error))) => return Err(error),
+                    }
                 } else if matches!(
                     call.decision.fact,
                     crate::db::entities::ToolDecision::AwaitingAnswer(_)

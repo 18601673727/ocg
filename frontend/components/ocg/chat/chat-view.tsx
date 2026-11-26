@@ -542,7 +542,7 @@ export function ConversationCardStrip(props: {
     setPending(true);
     setError(null);
     try {
-      if (card.kind === "approval" || card.kind === "question" || card.kind === "dispatch") {
+      if (card.kind !== "paused") {
         if (decision) {
           const res = await api.decideApproval(card.approval, decision);
           setCards((prev) =>
@@ -550,7 +550,6 @@ export function ConversationCardStrip(props: {
               (c) =>
                 !(
                   c.kind === card.kind &&
-                  (c.kind === "approval" || c.kind === "question" || c.kind === "dispatch") &&
                   c.approval[0] === card.approval[0] &&
                   c.approval[1] === card.approval[1] &&
                   c.approval[2] === card.approval[2]
@@ -564,6 +563,8 @@ export function ConversationCardStrip(props: {
       }
       setRevision((value) => value + 1);
     } catch (cause) {
+      if (cause instanceof ApiError && cause.code === "plan_routes_changed")
+        setRevision((value) => value + 1);
       if (
         cause instanceof ApiError &&
         (cause.code === "approval_decided" || cause.code === "approval_not_found")
@@ -669,6 +670,26 @@ export function ConversationCardStrip(props: {
                       disabled={pending()}
                       answer={(text) => void act(card(), { answer: text })}
                       dismiss={reject}
+                    />
+                  )}
+                </Match>
+                <Match when={ofKind("routed_plan")}>
+                  {(plan) => (
+                    <ApprovalRequest
+                      tool={plan().tool}
+                      arguments={plan().arguments}
+                      routed
+                      routingError={plan().routing_error}
+                      disabled={pending()}
+                      onApprove={
+                        plan().confirmation
+                          ? () => {
+                              const answer = plan().confirmation;
+                              if (answer) void act(plan(), { answer });
+                            }
+                          : undefined
+                      }
+                      onReject={reject}
                     />
                   )}
                 </Match>

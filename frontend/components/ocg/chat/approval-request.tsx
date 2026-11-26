@@ -17,8 +17,10 @@ export function ApprovalRequest(props: {
   tool: string;
   arguments: string;
   assessment?: ApprovalAssessment;
+  routed?: boolean;
+  routingError?: string | null;
   disabled: boolean;
-  onApprove: () => void;
+  onApprove?: () => void;
   onReject: () => void;
 }) {
   const i18n = useI18n();
@@ -26,17 +28,21 @@ export function ApprovalRequest(props: {
     new Intl.NumberFormat(i18n.locale, { style: "percent", maximumFractionDigits: 2 }).format(
       value,
     );
-  let args: Record<string, unknown> = {};
-  let formatted = props.arguments;
-  try {
-    const value: unknown = JSON.parse(props.arguments);
-    formatted = JSON.stringify(value, null, 2);
-    if (value && typeof value === "object" && !Array.isArray(value))
-      args = Object.fromEntries(Object.entries(value));
-  } catch {}
+  const parsed = createMemo(() => {
+    let args: Record<string, unknown> = {};
+    let formatted = props.arguments;
+    try {
+      const value: unknown = JSON.parse(props.arguments);
+      formatted = JSON.stringify(value, null, 2);
+      if (value && typeof value === "object" && !Array.isArray(value))
+        args = Object.fromEntries(Object.entries(value));
+    } catch {}
+    return { args, formatted };
+  });
+  const planSteps = () => parsed().args.steps;
   const steps = createMemo(() =>
-    props.tool === "job_plan" && Array.isArray(args.steps)
-      ? args.steps.map((value: unknown, index) => {
+    props.tool === "job_plan" && Array.isArray(planSteps())
+      ? (planSteps() as unknown[]).map((value, index) => {
           if (
             !value ||
             typeof value !== "object" ||
@@ -61,6 +67,26 @@ export function ApprovalRequest(props: {
             dependencies: value.depends_on,
             agent: "agent" in value && typeof value.agent === "string" ? value.agent : null,
             model: "model" in value && typeof value.model === "string" ? value.model : null,
+            provider:
+              "provider" in value && typeof value.provider === "string" ? value.provider : null,
+            agentCapabilities:
+              "agent_capabilities" in value && Array.isArray(value.agent_capabilities)
+                ? value.agent_capabilities.filter(
+                    (item): item is "chat" | "coding" | "decision" =>
+                      item === "chat" || item === "coding" || item === "decision",
+                  )
+                : [],
+            modelCapabilities:
+              "model_capabilities" in value && Array.isArray(value.model_capabilities)
+                ? value.model_capabilities.filter(
+                    (item): item is string => typeof item === "string",
+                  )
+                : [],
+            effort:
+              "reasoning_effort" in value && typeof value.reasoning_effort === "string"
+                ? value.reasoning_effort
+                : null,
+            project: "project" in value && typeof value.project === "string" ? value.project : null,
           };
         })
       : null,
@@ -69,8 +95,9 @@ export function ApprovalRequest(props: {
     const current = steps();
     return current?.length && current.every((step) => step !== null) ? current : null;
   });
-  const target = createMemo(() =>
-    props.tool === "workspace_run_command" && typeof args.command === "string"
+  const target = createMemo(() => {
+    const { args } = parsed();
+    return props.tool === "workspace_run_command" && typeof args.command === "string"
       ? args.command
       : props.tool === "workspace_request_command" &&
           Array.isArray(args.argv) &&
@@ -78,15 +105,18 @@ export function ApprovalRequest(props: {
         ? args.argv.join(" ")
         : props.tool === "workspace_write_file" && typeof args.path === "string"
           ? args.path
-          : null,
-  );
-  const note = createMemo(() =>
-    props.tool === "job_plan" && Array.isArray(args.steps)
-      ? i18n.t("chat.card.planNote", { count: args.steps.length })
-      : props.tool === "workspace_request_command"
-        ? i18n.t("chat.card.commandGrantNote")
-        : i18n.t("chat.card.review"),
-  );
+          : null;
+  });
+  const note = createMemo(() => {
+    const args = planSteps();
+    return props.routed
+      ? i18n.t("chat.card.routedPlanNote")
+      : props.tool === "job_plan" && Array.isArray(args)
+        ? i18n.t("chat.card.planNote", { count: args.length })
+        : props.tool === "workspace_request_command"
+          ? i18n.t("chat.card.commandGrantNote")
+          : i18n.t("chat.card.review");
+  });
   return (
     <ApprovalCard
       state="request"
@@ -101,6 +131,11 @@ export function ApprovalRequest(props: {
       onAllowOnce={props.onApprove}
       onDeny={props.onReject}
     >
+      {props.routingError && (
+        <p role="alert" class="text-destructive">
+          {props.routingError}
+        </p>
+      )}
       <Show when={plan()}>
         {(currentPlan) => (
           <ol class="space-y-3 py-1" aria-label={i18n.t("chat.card.plan")}>
@@ -146,6 +181,43 @@ export function ApprovalRequest(props: {
                             <dd class="inline break-all">{step.model}</dd>
                           </div>
                         )}
+                        {step.provider && (
+                          <div>
+                            <dt class="inline font-medium">{i18n.t("chat.provider")}: </dt>
+                            <dd class="inline break-words">{step.provider}</dd>
+                          </div>
+                        )}
+                        {step.provider && (
+                          <div>
+                            <dt class="inline font-medium">{i18n.t("chat.effort")}: </dt>
+                            <dd class="inline">{step.effort ?? i18n.t("chat.profileDefault")}</dd>
+                          </div>
+                        )}
+                        {step.provider && (
+                          <div>
+                            <dt class="inline font-medium">{i18n.t("chat.project")}: </dt>
+                            <dd class="inline break-words">
+                              {step.project ?? i18n.t("chat.pureConversation")}
+                            </dd>
+                          </div>
+                        )}
+                        {step.agentCapabilities.length > 0 && (
+                          <div>
+                            <dt class="inline font-medium">
+                              {i18n.t("chat.card.routeCapabilities")}:{" "}
+                            </dt>
+                            <dd class="inline">
+                              {[
+                                ...step.agentCapabilities.map((capability) =>
+                                  i18n.t(`settings.agent.capability.${capability}`),
+                                ),
+                                ...step.modelCapabilities.filter(
+                                  (capability) => capability !== "chat",
+                                ),
+                              ].join(" / ")}
+                            </dd>
+                          </div>
+                        )}
                       </dl>
                     )}
                   </div>
@@ -184,18 +256,20 @@ export function ApprovalRequest(props: {
           </p>
         </div>
       )}
-      <details class="rounded-lg border border-border">
-        <summary class="cursor-pointer px-3 py-2 text-muted-foreground">
-          {i18n.t("chat.card.rawRequest")}
-        </summary>
-        <div class="space-y-2 border-t border-border p-3">
-          <p class="text-muted-foreground">{i18n.t("chat.card.originalDetails")}</p>
-          <p class="font-mono">{props.tool}</p>
-          <pre class="ocg-subtle-scrollbar max-h-64 max-w-full overflow-auto overscroll-contain rounded-md bg-muted/50 p-3 font-mono text-xs whitespace-pre-wrap break-all">
-            {formatted}
-          </pre>
-        </div>
-      </details>
+      {!props.routed && (
+        <details class="rounded-lg border border-border">
+          <summary class="cursor-pointer px-3 py-2 text-muted-foreground">
+            {i18n.t("chat.card.rawRequest")}
+          </summary>
+          <div class="space-y-2 border-t border-border p-3">
+            <p class="text-muted-foreground">{i18n.t("chat.card.originalDetails")}</p>
+            <p class="font-mono">{props.tool}</p>
+            <pre class="ocg-subtle-scrollbar max-h-64 max-w-full overflow-auto overscroll-contain rounded-md bg-muted/50 p-3 font-mono text-xs whitespace-pre-wrap break-all">
+              {parsed().formatted}
+            </pre>
+          </div>
+        </details>
+      )}
     </ApprovalCard>
   );
 }

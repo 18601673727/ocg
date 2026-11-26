@@ -47,9 +47,24 @@ fn job_tools() -> Result<Vec<JobTool>, ToolRegistryError> {
     let mut specs = vec![
         (
             "job_plan",
-            json!({"steps":{"type":"array","minItems":1,"maxItems":6,"items":{"type":"object","additionalProperties":false,"properties":{"title":{"type":"string","minLength":1,"maxLength":120},"objective":{"type":"string","minLength":1,"maxLength":2000},"depends_on":{"type":"array","maxItems":5,"uniqueItems":true,"items":{"type":"integer","minimum":0,"maximum":5}}},"required":["title","objective","depends_on"]}}}),
+            json!({"steps":{"type":"array","minItems":1,"maxItems":6,"items":{
+                "type":"object","additionalProperties":false,
+                "properties":{
+                    "title":{"type":"string","minLength":1,"maxLength":120},
+                    "objective":{"type":"string","minLength":1,"maxLength":2000},
+                    "depends_on":{"type":"array","maxItems":5,"uniqueItems":true,"items":{"type":"integer","minimum":0,"maximum":5}},
+                    "route":{"type":"object","additionalProperties":false,"properties":{
+                        "agent_capability":{"type":"string","enum":["chat","coding"]},
+                        "model_capabilities":{"type":"array","maxItems":4,"uniqueItems":true,"items":{"type":"string","enum":["chat","tools","vision","reasoning"]}},
+                        "provider":{"type":"string","minLength":1,"maxLength":256,"description":"Required configured Provider name or ID. Omit to match any suitable Provider."},
+                        "model":{"type":"string","minLength":1,"maxLength":256,"description":"Required wire model name or Model Profile ID. Omit to match any suitable Model."},
+                        "reasoning_effort":{"type":"string","enum":["none","minimal","low","medium","high","xhigh","max"]}
+                    },"required":["agent_capability"]}
+                },
+                "required":["title","objective","depends_on"]
+            }}}),
             vec!["steps"],
-            "Submit a bounded execution plan. Each step names its prerequisites in depends_on as zero-based indices of earlier steps. Use [] for independent work, which may run concurrently when capacity permits. A dependent step waits for its prerequisites to settle. One local step continues directly in the current Job without creating a child conversation. For several steps, the host opens one child conversation per step with this Agent's own permissions and, once every step has settled, adds their results to this conversation as a message. Use one precise scope per step. Read-only discovery may precede a plan, but side-effecting work must not. A Project policy may require a plan before workspace_run_command even for a read-only shell command. A plan cannot be made by one of its own steps.",
+            "Submit a bounded execution plan before any side-effecting work. Each step lists zero-based indices of earlier prerequisites. Independent steps may run concurrently. A dependent step waits for prerequisite results. To select a suitable target automatically for a step, set route with agent_capability (chat without Workspace access, or coding within the current Project), any required model capabilities, and only the Provider or Model constraints the task needs. Choose reasoning_effort for the step when appropriate, such as low for a simple task, medium for several reasoning steps, or high for a complex analysis. Omit effort when relying on the Model profile default. If any step specifies route, the host selects targets and asks the user to confirm the entire plan once. A step without route inherits this Job's target. One unrouted step continues locally. The host returns the child results together after all steps settle. Use one precise scope per step. A plan cannot be made by one of its own steps.",
         ),
         (
             "job_limits",
@@ -61,7 +76,7 @@ fn job_tools() -> Result<Vec<JobTool>, ToolRegistryError> {
             "job_agents",
             json!({"after":profile,"limit":{"type":"integer","minimum":1,"maximum":20}}),
             vec![],
-            "List Agent profiles with their instructions summary and model capabilities. Dispatch targets are selected by the user when a dispatch request is made. Follow next_after when has_more is true.",
+            "List Agent profiles with their instructions summary and default Model, Provider, capabilities and advertised reasoning efforts. Use this to discover exact names before submitting a routed job_plan. Follow next_after when has_more is true.",
         ),
         (
             "job_workers",
@@ -149,7 +164,7 @@ fn job_tools() -> Result<Vec<JobTool>, ToolRegistryError> {
         let version = if USER_DECIDED.contains(&name) {
             2
         } else if name == "job_plan" {
-            7
+            8
         } else {
             1
         };

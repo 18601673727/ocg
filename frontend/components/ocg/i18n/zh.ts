@@ -236,6 +236,9 @@ export const zh: Dictionary = {
   "chat.card.answerPlaceholder": "您的回答",
   "chat.card.approval": "请求批准",
   "chat.card.plan": "任务执行计划",
+  "chat.card.routedPlanNote":
+    "核对自动选定的执行目标，一次批准整个计划。有依赖的任务会收到前置任务的结果。",
+  "chat.card.routeCapabilities": "能力",
   "chat.card.planNote": "此计划包含 {count} 个步骤。批准后将创建子任务，并在完成后汇总结果。",
   "chat.card.independentStep": "无前置依赖",
   "chat.card.rawRequest": "原始请求数据",

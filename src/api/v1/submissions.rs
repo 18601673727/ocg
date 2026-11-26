@@ -433,6 +433,15 @@ pub(crate) enum CardView {
         tool: String,
         arguments: String,
     },
+    RoutedPlan {
+        conversation: String,
+        parent: Option<String>,
+        approval: (String, u32, u32),
+        tool: String,
+        arguments: String,
+        confirmation: Option<String>,
+        routing_error: Option<String>,
+    },
     Approval {
         conversation: String,
         parent: Option<String>,

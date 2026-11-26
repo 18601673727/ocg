@@ -778,9 +778,25 @@ pub struct JobPlanStep {
     pub title: String,
     pub objective: String,
     pub depends_on: Vec<usize>,
+    pub route: Option<JobPlanRoute>,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JobPlanRoute {
+    pub agent_capability: super::AgentCapability,
+    #[serde(default)]
+    pub model_capabilities: Vec<String>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 impl JobToolCall {
+    pub(crate) fn routes_plan(&self) -> bool {
+        matches!(self, Self::JobPlan { steps } if steps.iter().any(|step| step.route.is_some()))
+    }
+
     pub(crate) fn parse(name: &str, arguments: &str) -> Option<Self> {
         let arguments: serde_json::Value = serde_json::from_str(arguments).ok()?;
         serde_json::from_value(serde_json::json!({"name": name, "arguments": arguments})).ok()
@@ -821,7 +837,7 @@ impl JobToolCall {
 
     pub(crate) fn handler_version(&self) -> String {
         let version = match self {
-            Self::JobPlan { .. } => 7,
+            Self::JobPlan { .. } => 8,
             Self::JobDispatch { .. } | Self::JobAssign { .. } => 2,
             Self::JobLimits { .. }
             | Self::JobAgents { .. }

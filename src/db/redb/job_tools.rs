@@ -1,17 +1,21 @@
 use crate::db::entities::{
-    Actor, ApprovalDecision, ConfigId, ContentDigest, DependencyCondition, DependencyState, JobId,
-    JobLimits, Origin, ProfileId, ProjectId,
+    Actor, AgentCapability, ApprovalDecision, ConfigId, ContentDigest, DependencyCondition,
+    DependencyState, ExecutionOperation, JobId, JobLimits, LlmTransport, Origin, ProfileId,
+    ProjectId,
 };
 use crate::db::entities::{
     AllocationToken, ConfigBody, ConfigKind, DispatchSelection, ExecutionConfiguration,
-    JobDependency, JobToolCall, ModelCapability, MutableJob, ReasoningEffort, ToolAdmission,
-    ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, Violation,
+    FrozenConfiguration, JobDependency, JobPlanRoute, JobPlanStep, JobSpec, JobToolCall,
+    ModelCapability, MutableJob, MutableJobContent, ReasoningEffort, ToolAdmission, ToolCallRef,
+    ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, Violation,
 };
-use crate::db::redb::batch::{Batch, BatchError};
-use crate::db::redb::job_tree;
-use crate::db::redb::schema::RECURRENCES;
+use crate::db::redb::batch::{Batch, BatchError, Failure};
+use crate::db::redb::rows::{ConfigRow, decode_project};
+use crate::db::redb::schema::{CONFIGS, EXECUTORS, POOLS, PROJECTS, RECURRENCES};
+use crate::db::redb::{StorageError, TxRead, allocations, configs, job_tree};
+use ::redb::ReadableTable;
 use serde_json::{Value, json};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) struct JobToolApplied {
     pub(crate) value: Value,
@@ -34,6 +38,255 @@ const MAX_STEP_TITLE_CHARS: usize = 120;
 const MAX_STEP_OBJECTIVE_CHARS: usize = 2000;
 const MAX_SELECTED_PROJECTS: usize = 16;
 const MAX_INSTRUCTION_SUMMARY_CHARS: usize = 256;
+
+pub(super) struct RoutedPlan {
+    pub(super) arguments: String,
+    pub(super) confirmation: String,
+    targets: Vec<(ExecutionConfiguration, Option<ProjectId>)>,
+}
+
+fn selected_model_matches(selector: Option<&str>, id: ConfigId, name: &str) -> bool {
+    selector.is_none_or(|value| {
+        value.eq_ignore_ascii_case(name)
+            || crate::db::entities::parse_entity_id(value) == Some(id.get())
+    })
+}
+
+fn enabled_llm_transports(tx: &impl TxRead) -> Result<BTreeSet<LlmTransport>, StorageError> {
+    let pools = tx.table(POOLS)?;
+    let executors = tx.table(EXECUTORS)?;
+    let mut transports = BTreeSet::new();
+    for entry in executors.iter()? {
+        let (key, value) = entry?;
+        let executor = allocations::decode_allocation_executor(key.value(), value.value())?;
+        if !executor.enabled || executor.archived {
+            continue;
+        }
+        let pool = pools
+            .get(executor.pool.get())?
+            .ok_or_else(|| StorageError::corrupted("Executor references a missing Pool"))?;
+        let pool = allocations::decode_allocation_pool(executor.pool.get(), pool.value())?;
+        if pool.enabled && !pool.archived {
+            transports.extend(executor.capabilities.iter().filter_map(|&(op, transport)| {
+                (op == ExecutionOperation::LlmRequest)
+                    .then_some(transport)
+                    .flatten()
+            }));
+        }
+    }
+    Ok(transports)
+}
+
+fn choose_plan_target(
+    tx: &impl TxRead,
+    configs: &BTreeMap<ConfigId, ConfigRow>,
+    transports: &BTreeSet<LlmTransport>,
+    current: ExecutionConfiguration,
+    route: &JobPlanRoute,
+) -> Result<ExecutionConfiguration, BatchError> {
+    let model_capabilities = route
+        .model_capabilities
+        .iter()
+        .map(|value| ModelCapability::parse(value))
+        .collect::<Option<BTreeSet<_>>>()
+        .ok_or(Violation::InvalidValue("route", "unknown model capability"))?;
+    let effort = route
+        .reasoning_effort
+        .as_deref()
+        .map(|value| {
+            ReasoningEffort::parse(value).ok_or(Violation::InvalidValue(
+                "reasoning_effort",
+                "invalid plan effort",
+            ))
+        })
+        .transpose()?;
+    let mut best = None;
+    for row in configs.values() {
+        let ConfigBody::Agent(agent) = &row.body else {
+            continue;
+        };
+        if !agent.capabilities.contains(&route.agent_capability)
+            || agent.workspace_grant().is_some()
+                != (route.agent_capability == AgentCapability::Coding)
+        {
+            continue;
+        }
+        for (index, id) in agent.models.iter().enumerate() {
+            let Some(model) = configs.get(id).filter(|row| row.model_enabled) else {
+                continue;
+            };
+            let ConfigBody::Model(model_body) = &model.body else {
+                continue;
+            };
+            let Some(provider) = configs.get(&model_body.connection_id) else {
+                continue;
+            };
+            let ConfigBody::Connection(connection) = &provider.body else {
+                continue;
+            };
+            if !transports.contains(&connection.protocol)
+                || !agent.supports_model(&model.body)
+                || !model_capabilities.is_subset(&model_body.declared_capabilities)
+                || !selected_model_matches(route.model.as_deref(), model.id, &model_body.model)
+                || !selected_model_matches(route.provider.as_deref(), provider.id, &provider.name)
+                || effort.is_some_and(|effort| {
+                    connection.protocol == LlmTransport::AnthropicMessages
+                        || !model_body
+                            .declared_capabilities
+                            .contains(&ModelCapability::Reasoning)
+                        || model_body.reasoning_efforts.as_ref().is_some_and(|values| {
+                            !values.iter().any(|value| value == effort.as_str())
+                        })
+                })
+            {
+                continue;
+            }
+            let candidate = ExecutionConfiguration {
+                agent_profile: Some(row.id.into()),
+                llm_profile: model.id.into(),
+                reasoning_effort: effort,
+            };
+            let rank = (
+                effort.is_some() && model_body.reasoning_efforts.is_none(),
+                candidate.llm_profile != current.llm_profile,
+                candidate.agent_profile != current.agent_profile,
+                index,
+                row.id,
+                *id,
+            );
+            if best.as_ref().is_some_and(|(previous, _)| *previous <= rank) {
+                continue;
+            }
+            match configs::freeze_configuration(tx, candidate) {
+                Ok(FrozenConfiguration::Generative(config))
+                    if config.native_execution_refusal().is_none() =>
+                {
+                    best = Some((rank, candidate));
+                }
+                Ok(_) | Err(BatchError(Failure::Rejected(_))) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    best.map(|(_, configuration)| configuration).ok_or_else(|| {
+        Violation::InvalidValue("route", "no enabled Agent and Model satisfy the plan step").into()
+    })
+}
+
+pub(super) fn route_plan(
+    tx: &impl TxRead,
+    job: &MutableJob,
+    spec: &JobSpec,
+    steps: &[JobPlanStep],
+) -> Result<RoutedPlan, BatchError> {
+    let MutableJobContent::Generative {
+        configuration: Some(current),
+        ..
+    } = job.input.content
+    else {
+        return Err(Violation::InvalidValue("route", "the parent has no generative target").into());
+    };
+    let mut configs = BTreeMap::new();
+    for row in tx
+        .table(CONFIGS)
+        .map_err(StorageError::from)?
+        .iter()
+        .map_err(StorageError::from)?
+    {
+        let (id, value) = row.map_err(StorageError::from)?;
+        let row = ConfigRow::decode_at(id.value(), value.value())?;
+        if row.archived_at.is_none() {
+            configs.insert(row.id, row);
+        }
+    }
+    let transports = enabled_llm_transports(tx)?;
+    let mut targets = Vec::with_capacity(steps.len());
+    let mut proposed = Vec::with_capacity(steps.len());
+    let mut revisions = Vec::with_capacity(steps.len());
+    for step in steps {
+        let (configuration, project) = match &step.route {
+            Some(route) => {
+                let project = match route.agent_capability {
+                    AgentCapability::Chat => None,
+                    AgentCapability::Coding => {
+                        Some(spec.project.ok_or(Violation::ProjectRequired)?)
+                    }
+                    AgentCapability::Decision => {
+                        return Err(
+                            Violation::InvalidValue("route", "expected chat or coding").into()
+                        );
+                    }
+                };
+                (
+                    choose_plan_target(tx, &configs, &transports, current, route)?,
+                    project,
+                )
+            }
+            None => (current, spec.project),
+        };
+        let FrozenConfiguration::Generative(frozen) =
+            configs::freeze_configuration(tx, configuration)?
+        else {
+            return Err(
+                Violation::InvalidValue("route", "the plan target is not generative").into(),
+            );
+        };
+        let Some(agent) = frozen.agent_ref.and_then(|id| configs.get(&id.id)) else {
+            return Err(Violation::InvalidValue("route", "the plan target has no Agent").into());
+        };
+        let Some(model) = configs.get(&frozen.llm.model.id) else {
+            return Err(Violation::InvalidValue("route", "the plan target has no Model").into());
+        };
+        let project = project
+            .map(|id| {
+                let table = tx.table(PROJECTS).map_err(StorageError::from)?;
+                let bytes = table
+                    .get(id.get())
+                    .map_err(StorageError::from)?
+                    .ok_or_else(|| StorageError::corrupted("plan Project is missing"))?;
+                decode_project(id.get(), bytes.value())
+            })
+            .transpose()?;
+        proposed.push(json!({
+            "title": step.title,
+            "objective": step.objective,
+            "depends_on": step.depends_on,
+            "provider": frozen.llm.provider.name,
+            "model": frozen.llm.config.model,
+            "agent": agent.name,
+            "agent_capabilities": frozen.agent.as_ref().map(|agent| &agent.capabilities),
+            "model_capabilities": frozen.llm.config.declared_capabilities.iter().map(|capability| capability.as_str()).collect::<Vec<_>>(),
+            "reasoning_effort": frozen.llm.config.parameters.reasoning_effort,
+            "project": project.as_ref().map(|p| &p.name),
+        }));
+        revisions.push(json!([
+            [agent.id.to_string(), agent.edit_seq],
+            [model.id.to_string(), model.edit_seq],
+            [
+                frozen.llm.provider.id.to_string(),
+                frozen.llm.provider.edit_seq
+            ],
+            project.as_ref().map(|p| (
+                p.id.to_string(),
+                p.updated_at.as_unix_micros(),
+                p.decision_revision
+            )),
+        ]));
+        targets.push((configuration, project.map(|p| p.id)));
+    }
+    let arguments = json!({"steps": proposed}).to_string();
+    let confirmation = ContentDigest::of(
+        json!([job.id.to_string(), arguments, revisions])
+            .to_string()
+            .as_bytes(),
+    )
+    .to_string();
+    Ok(RoutedPlan {
+        targets,
+        arguments,
+        confirmation,
+    })
+}
 
 impl Batch {
     fn job_tool_id(&mut self, text: &str) -> Result<u128, BatchError> {
@@ -90,7 +343,26 @@ impl Batch {
         }
         let caller = job.parent_id;
         let applied = match tool {
-            JobToolCall::JobPlan { steps } => self.job_plan(&job, call, steps)?,
+            JobToolCall::JobPlan { steps } => {
+                let spec = self.check_job_plan(&job, call, &steps)?;
+                if steps.iter().any(|step| step.route.is_some()) {
+                    return self.reject(Violation::InvalidValue(
+                        "task_plan",
+                        "a routed plan requires user confirmation",
+                    ));
+                }
+                if steps.len() == 1 {
+                    JobToolApplied::of(json!({
+                        "steps": [],
+                        "continuation": job.id.to_string(),
+                        "next": "one local step: continue directly in this Job",
+                    }))
+                } else {
+                    let (configuration, _) = self.conversation_configuration(spec.id)?;
+                    let targets = vec![(configuration, spec.project); steps.len()];
+                    JobToolApplied::of(self.launch_job_plan(&job, call, steps, targets)?)
+                }
+            }
             JobToolCall::JobLimits {
                 conversation,
                 max_depth,
@@ -294,12 +566,12 @@ impl Batch {
         }))
     }
 
-    fn job_plan(
+    fn check_job_plan(
         &mut self,
         job: &MutableJob,
         call: ToolCallRef,
-        steps: Vec<crate::db::entities::JobPlanStep>,
-    ) -> Result<JobToolApplied, BatchError> {
+        steps: &[JobPlanStep],
+    ) -> Result<JobSpec, BatchError> {
         if !(1..=MAX_PLAN_STEPS).contains(&steps.len())
             || steps.iter().any(|step| {
                 step.title.trim().is_empty()
@@ -365,23 +637,22 @@ impl Batch {
                 "the steps of a plan cannot create another plan",
             ));
         }
-        if steps.len() == 1 {
-            return Ok(JobToolApplied::of(json!({
-                "steps": [],
-                "continuation": job.id.to_string(),
-                "next": "one local step: continue directly in this Job",
-            })));
-        }
-        let (configuration, priority) = self.conversation_configuration(conversation)?;
-        let (agent, project) = (spec.agent, spec.project);
-        let agent = agent.or_else(|| {
-            configuration
-                .agent_profile
-                .map(|id| ConfigId::new(id.get()))
-        });
+        Ok(spec)
+    }
+
+    fn launch_job_plan(
+        &mut self,
+        job: &MutableJob,
+        call: ToolCallRef,
+        steps: Vec<JobPlanStep>,
+        targets: Vec<(ExecutionConfiguration, Option<ProjectId>)>,
+    ) -> Result<Value, BatchError> {
+        let conversation = job.parent_id;
+        let priority = job.input.priority;
         let mut opened: Vec<JobId> = Vec::new();
         let mut receipts = Vec::new();
-        for (index, step) in steps.into_iter().enumerate() {
+        for (index, (step, (configuration, project))) in steps.into_iter().zip(targets).enumerate()
+        {
             let after = step
                 .depends_on
                 .iter()
@@ -394,8 +665,14 @@ impl Batch {
                     "dependency has not been allocated",
                 ));
             }
-            let child =
-                self.open_child_conversation(conversation, call, agent, project, false, after)?;
+            let child = self.open_child_conversation(
+                conversation,
+                call,
+                configuration.agent_profile.map(Into::into),
+                project,
+                false,
+                after,
+            )?;
             let mut lifecycle = self.job_lifecycle(child)?;
             lifecycle.title = Some(step.title);
             self.put_job_lifecycle(child, &lifecycle)?;
@@ -410,10 +687,34 @@ impl Batch {
             opened.push(child);
             receipts.push(json!({"conversation": child.to_string(), "turn": turn.to_string()}));
         }
-        Ok(JobToolApplied::of(json!({
+        Ok(json!({
             "steps": receipts,
             "next": "the host adds a message to this conversation with every step's result once all have settled; end your turn now",
-        })))
+        }))
+    }
+
+    pub(super) fn check_routed_plan(
+        &mut self,
+        call: ToolCallRef,
+        arguments: &str,
+    ) -> Result<(), BatchError> {
+        let Some(JobToolCall::JobPlan { steps }) = JobToolCall::parse("job_plan", arguments) else {
+            return self.reject(Violation::InvalidValue(
+                "task_plan",
+                "invalid plan arguments",
+            ));
+        };
+        let Some(job) = self.mutable_job(call.job)? else {
+            return self.corrupted("a routed plan was proposed by a non-native Job".into());
+        };
+        if !steps.iter().any(|step| step.route.is_some())
+            || !self.frozen_agent_manages_jobs(&job)?
+        {
+            return self.reject(Violation::InvalidValue("task_plan", "invalid routed plan"));
+        }
+        let spec = self.check_job_plan(&job, call, &steps)?;
+        self.inspect(|tx| route_plan(tx, &job, &spec, &steps))?;
+        Ok(())
     }
 
     fn awaiting_job_call(
@@ -446,6 +747,23 @@ impl Batch {
             return Ok(None);
         };
         match (call, decision) {
+            (JobToolCall::JobPlan { steps }, ApprovalDecision::Answered { text }) => {
+                let Some(job) = self.mutable_job(approval.job)? else {
+                    return self.corrupted("a routed plan was proposed by a non-native Job".into());
+                };
+                let spec = self.require_mutable_conversation(conversation)?;
+                let plan = self.inspect(|tx| route_plan(tx, &job, &spec, &steps))?;
+                if plan.confirmation != *text {
+                    return self.reject(Violation::InvalidValue(
+                        "plan_routes_changed",
+                        "the routing proposal changed; review the current targets",
+                    ));
+                }
+                let dispatched = self.launch_job_plan(&job, approval, steps, plan.targets)?;
+                Ok(Some(format!(
+                    "I confirmed the routed plan. The host started the child tasks: {dispatched}. Wait for their automatic results before announcing completion."
+                )))
+            }
             (
                 JobToolCall::JobDispatch {
                     objective,
@@ -722,14 +1040,20 @@ impl Batch {
                 Some(model) => {
                     let record = self.require_config(model)?;
                     match record.body {
-                        ConfigBody::Model(body) => json!({
-                            "profile": ProfileId::new(model.get()).to_string(),
-                            "name": record.name,
-                            "model": body.model,
-                            "declared_capabilities": body.declared_capabilities.iter().map(|capability| capability.as_str()).collect::<Vec<_>>(),
-                            "enabled": record.model_enabled,
-                            "archived": record.archived_at.is_some(),
-                        }),
+                        ConfigBody::Model(body) => {
+                            let provider = self.require_config(body.connection_id)?;
+                            json!({
+                                "profile": ProfileId::new(model.get()).to_string(),
+                                "name": record.name,
+                                "model": body.model,
+                                "provider": provider.name,
+                                "provider_id": provider.id.to_string(),
+                                "reasoning_efforts": body.reasoning_efforts,
+                                "declared_capabilities": body.declared_capabilities.iter().map(|capability| capability.as_str()).collect::<Vec<_>>(),
+                                "enabled": record.model_enabled,
+                                "archived": record.archived_at.is_some(),
+                            })
+                        }
                         ConfigBody::DecisionModel(body) => json!({
                             "profile": ProfileId::new(model.get()).to_string(),
                             "name": record.name,
