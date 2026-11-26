@@ -74,7 +74,7 @@ pub(super) struct Shared {
     pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
     pub(super) database_directory: PathBuf,
     pub(super) admission: RwLock<Admission>,
-    pub(super) update_paused: AtomicBool,
+    pub(super) update_pauses: AtomicUsize,
     pub(super) database: RwLock<Option<Opened>>,
     pub(super) staging: RwLock<()>,
     pub(super) epoch: AtomicU64,
@@ -106,6 +106,10 @@ pub(super) fn flush_staged(_shared: &Shared, database: &Database) -> Result<u64,
 }
 
 impl Shared {
+    pub(super) fn is_update_paused(&self) -> bool {
+        self.update_pauses.load(Ordering::SeqCst) > 0
+    }
+
     pub(super) fn note_read_error(&self, error: &StorageError) {
         if error.kind == StorageErrorKind::Corrupted {
             self.needs_full_verification.store(true, Ordering::SeqCst);

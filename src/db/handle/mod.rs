@@ -33,8 +33,12 @@ pub(crate) struct UpdatePause(Arc<Shared>);
 
 impl Drop for UpdatePause {
     fn drop(&mut self) {
-        self.0.update_paused.store(false, Ordering::SeqCst);
-        self.0.scheduler_wake.publish();
+        if self.0.update_pauses.fetch_sub(1, Ordering::SeqCst) == 1
+            && matches!(self.0.admission(), Admission::Open)
+            && !self.0.released.load(Ordering::SeqCst)
+        {
+            self.0.scheduler_wake.publish();
+        }
     }
 }
 
@@ -176,7 +180,7 @@ impl DatabaseHandle {
             .admission
             .write()
             .unwrap_or_else(PoisonError::into_inner);
-        self.check_write_admission(&admission)?;
+        admitted(&admission)?;
         let opened = database.as_ref().ok_or(DatabaseError::ReadsClosed)?;
         let counts = redb::queue_counts(&opened.database, true).map_err(|error| {
             self.shared.note_read_error(&error);
@@ -189,6 +193,7 @@ impl DatabaseHandle {
             || counts.held != 0
             || !self.sender.is_empty()
             || !self.maintenance_sender.is_empty()
+            || !self.shared.attachment_slots.0.is_full()
             || self.shared.in_flight_maintenance.load(Ordering::SeqCst) != 0
             || self.shared.in_flight_commands.load(Ordering::SeqCst) != 0
         {
@@ -197,13 +202,17 @@ impl DatabaseHandle {
         if crate::workspace::process::groups_tracked() {
             return Ok(None);
         }
-        self.shared.update_paused.store(true, Ordering::SeqCst);
+        self.shared.update_pauses.fetch_add(1, Ordering::SeqCst);
         Ok(Some(UpdatePause(self.shared.clone())))
+    }
+
+    pub fn accepting_commands(&self) -> bool {
+        matches!(self.shared.admission(), Admission::Open) && !self.shared.is_update_paused()
     }
 
     fn check_write_admission(&self, admission: &Admission) -> Result<(), DatabaseError> {
         admitted(admission)?;
-        if self.shared.update_paused.load(Ordering::SeqCst) {
+        if self.shared.is_update_paused() {
             return Err(DatabaseError::ShuttingDown);
         }
         Ok(())
@@ -423,7 +432,7 @@ impl DatabaseHandle {
                 .admission
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            if self.shared.update_paused.load(Ordering::SeqCst) {
+            if self.shared.is_update_paused() {
                 return Err(MaintenanceError::ShuttingDown);
             }
             admission.check_maintenance()?;

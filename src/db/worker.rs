@@ -262,7 +262,7 @@ impl DatabaseWorker {
                     scheduler_subscription: std::sync::Mutex::new(Some(scheduler_subscription)),
                     database_directory: directory.to_path_buf(),
                     admission: RwLock::new(Admission::Open),
-                    update_paused: AtomicBool::new(false),
+                    update_pauses: AtomicUsize::new(0),
                     database: RwLock::new(Some(Opened { database, epoch })),
                     staging: RwLock::new(()),
                     epoch: AtomicU64::new(epoch),
@@ -520,7 +520,7 @@ impl WriteWorker {
                 }
             }
             Maintenance::CompactStorage(reply) => {
-                let result = if self.shared.update_paused.load(Ordering::SeqCst) {
+                let result = if self.shared.is_update_paused() {
                     Err(MaintenanceError::ShuttingDown)
                 } else {
                     self.compact_storage()
@@ -532,7 +532,7 @@ impl WriteWorker {
 
     fn admit(&mut self, envelope: Envelope, space_checked: bool) -> Option<Envelope> {
         let operation = envelope.operation;
-        if self.shared.update_paused.load(Ordering::SeqCst) {
+        if self.shared.is_update_paused() {
             let Envelope {
                 command, in_flight, ..
             } = envelope;
@@ -625,7 +625,7 @@ impl WriteWorker {
         // A failed aggregate estimate must leave protection and individual refusals
         // to the original per-command admission path.
         let space_checked = group.len() > 1
-            && !shared.update_paused.load(Ordering::SeqCst)
+            && !shared.is_update_paused()
             && shared.protection.status().lock.is_none()
             && disk::check_space(
                 ProtectedArea::Database,
@@ -774,6 +774,7 @@ impl WriteWorker {
     fn publish_scheduling_change(&self) {
         if self.storage_failure.is_none()
             && !self.shared.released.load(Ordering::SeqCst)
+            && !self.shared.is_update_paused()
             && self.shared.protection.status().lock.is_none()
         {
             self.shared.scheduler_wake.publish();

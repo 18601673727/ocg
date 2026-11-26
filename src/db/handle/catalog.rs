@@ -6,7 +6,6 @@ use crate::db::entities::{
 use crate::db::entities::{AttachmentId, ConfigId, ProjectId};
 use crate::db::errors::{CommandOutcome, DatabaseError};
 use crate::db::mutations::PublishedAttachment;
-use crate::db::shared::admitted;
 use crate::db::worker::DatabaseHandle;
 use crate::db::{entities, mutations, redb};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -406,7 +405,7 @@ impl DatabaseHandle {
         attachment: Attachment,
     ) -> Result<AttachmentId, AttachmentError> {
         mutations::check_new_attachment(&attachment).map_err(DatabaseError::Rejected)?;
-        admitted(
+        self.check_write_admission(
             &self
                 .shared
                 .admission
@@ -546,10 +545,7 @@ impl DatabaseHandle {
                 .admission
                 .read()
                 .unwrap_or_else(PoisonError::into_inner);
-            admitted(&admission)?;
-            if self.shared.update_paused.load(Ordering::SeqCst) {
-                return Err(DatabaseError::ShuttingDown);
-            }
+            self.check_write_admission(&admission)?;
         }
         let shared = self.shared.clone();
         ntex::rt::spawn_blocking(move || shared.ensure_credential_key())

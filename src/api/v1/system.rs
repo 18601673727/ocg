@@ -142,7 +142,7 @@ pub(super) async fn health(
         host: "running".to_owned(),
         database: DatabaseHealthView {
             status: status.to_owned(),
-            accepting_commands: status == "open",
+            accepting_commands: database.accepting_commands(),
             readable,
             database_bytes,
             available_bytes,

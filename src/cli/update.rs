@@ -355,9 +355,10 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
         let dir = std::env::temp_dir().join(format!("ocg-update-{}", uuid::Uuid::now_v7()));
         DirBuilder::new().mode(0o700).create(&dir)?;
         let result = run_installer(&dir, &install.prefix, &download);
-        let cleanup = fs::remove_dir_all(&dir);
+        if let Err(error) = fs::remove_dir_all(&dir) {
+            eprintln!("warning: failed to remove temporary update directory: {error}");
+        }
         let (status, message) = result?;
-        cleanup?;
         if !status.success() {
             if let Some(progress) = state.as_mut() {
                 progress.message = message;
@@ -368,20 +369,33 @@ pub(super) fn run(args: Vec<String>) -> Result<()> {
     })();
     if let Some(progress) = state.as_mut() {
         match &result {
-            Ok(Some(0)) => progress.phase = Phase::Succeeded,
+            Ok(Some(0)) => {
+                progress.phase = Phase::Succeeded;
+                progress.running_jobs = None;
+            }
             Ok(Some(_)) => {
                 progress.phase = Phase::Failed;
                 if progress.message.is_none() {
                     progress.message = Some("installer failed".to_owned());
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                if matches!(progress.phase, Phase::Waiting) {
+                    progress.phase = Phase::Succeeded;
+                    progress.running_jobs = None;
+                }
+            }
             Err(error) => {
                 progress.phase = Phase::Failed;
                 progress.message = Some(error.to_string());
             }
         }
-        update::write_state(&install.prefix, progress)?;
+        if let Err(error) = update::write_state(&install.prefix, progress) {
+            if matches!(&result, Ok(Some(0)) | Ok(None)) {
+                return Err(error.into());
+            }
+            eprintln!("warning: failed to write update state: {error}");
+        }
     }
     match result? {
         Some(code) if code != 0 => std::process::exit(code),
@@ -421,15 +435,39 @@ fn run_collecting(mut command: Command) -> Result<(ExitStatus, Option<String>)> 
     let stderr = child.stderr.take().ok_or("installer stderr unavailable")?;
     let mut message = None;
     let mut fallback = None;
-    for line in BufReader::new(stderr).lines() {
-        let line = line?;
-        writeln!(std::io::stderr().lock(), "{line}")?;
-        if line.starts_with("Update to ") || line.starts_with("OCG did not") {
-            message = Some(line);
-        } else if line.starts_with("OCG failed:") || (fallback.is_none() && !line.trim().is_empty())
-        {
-            fallback = Some(line);
+    let mut reader = BufReader::new(stderr);
+    let mut line_buf = Vec::new();
+    let mut read_error = None;
+    loop {
+        line_buf.clear();
+        match reader.read_until(b'\n', &mut line_buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                while matches!(line_buf.last(), Some(b'\n' | b'\r')) {
+                    line_buf.pop();
+                }
+                let line = String::from_utf8_lossy(&line_buf).into_owned();
+                let _ = writeln!(std::io::stderr().lock(), "{line}");
+                if line.starts_with("Update to ") || line.starts_with("OCG did not") {
+                    message = Some(line);
+                } else if line.starts_with("OCG failed:")
+                    || (fallback.is_none() && !line.trim().is_empty())
+                {
+                    fallback = Some(line);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => {
+                read_error = Some(error);
+                break;
+            }
         }
     }
-    Ok((child.wait()?, message.or(fallback)))
+    let status = child.wait()?;
+    if let Some(error) = read_error
+        && status.success()
+    {
+        return Err(error.into());
+    }
+    Ok((status, message.or(fallback)))
 }

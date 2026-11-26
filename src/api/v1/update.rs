@@ -148,15 +148,43 @@ pub(super) async fn post(database: &DatabaseHandle, body: &[u8]) -> Result<Reply
             started_at: update::now_ms(),
         };
         let result_state = state.clone();
-        let mut child = ntex::rt::spawn_blocking(move || launch(state))
+        let watch_state = state.clone();
+        let (prefix, mut child) = ntex::rt::spawn_blocking(move || launch(state))
             .await
             .map_err(|_| INTERNAL)??;
         ntex::rt::spawn(async move {
-            match ntex::rt::spawn_blocking(move || child.wait()).await {
-                Ok(Ok(status)) if status.success() => {}
-                Ok(Ok(status)) => log::warn!("updater process exited with {status}"),
-                Ok(Err(error)) => log::warn!("failed to wait for updater process: {error}"),
-                Err(error) => log::warn!("updater wait task failed: {error:?}"),
+            let failure = match ntex::rt::spawn_blocking(move || child.wait()).await {
+                Ok(Ok(status)) if status.success() => None,
+                Ok(Ok(status)) => {
+                    log::warn!("updater process exited with {status}");
+                    Some(format!("updater process exited with {status}"))
+                }
+                Ok(Err(error)) => {
+                    log::warn!("failed to wait for updater process: {error}");
+                    Some(format!("failed to wait for updater process: {error}"))
+                }
+                Err(error) => {
+                    log::warn!("updater wait task failed: {error:?}");
+                    Some("updater wait task failed".to_owned())
+                }
+            };
+            if let Some(message) = failure {
+                let _ = ntex::rt::spawn_blocking(move || {
+                    let Ok(_lock) = update::lock(&prefix) else {
+                        return;
+                    };
+                    if let Some(mut current) = update::read_state(&prefix)
+                        && current.started_at == watch_state.started_at
+                        && matches!(current.phase, Phase::Waiting | Phase::Installing)
+                    {
+                        current.phase = Phase::Failed;
+                        current.message = Some(message);
+                        if let Err(error) = update::write_state(&prefix, &current) {
+                            log::warn!("failed to persist failed update state: {error}");
+                        }
+                    }
+                })
+                .await;
             }
         });
         Ok(Reply::new(
@@ -168,8 +196,10 @@ pub(super) async fn post(database: &DatabaseHandle, body: &[u8]) -> Result<Reply
 
 #[cfg(unix)]
 async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
+    use crate::db::{DatabaseError, DatabaseStatus};
     use crate::host::update;
     use std::time::Instant;
+    let watch_database = database.clone();
     let database = database.clone();
     let paused = ntex::rt::spawn_blocking(move || {
         let install = update::install().map_err(|_| CONFLICT)?;
@@ -187,7 +217,12 @@ async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
                     Instant::now() + Duration::from_secs(600),
                 )
             })
-            .map_err(|_| INTERNAL)
+            .map_err(|error| match error {
+                DatabaseError::DiskProtected(_)
+                | DatabaseError::ShuttingDown
+                | DatabaseError::ReadsClosed => CONFLICT,
+                _ => INTERNAL,
+            })
     })
     .await
     .map_err(|_| INTERNAL)??;
@@ -197,6 +232,9 @@ async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
         ntex::rt::spawn(async move {
             let _pause = pause;
             loop {
+                if watch_database.status() != DatabaseStatus::Open {
+                    break;
+                }
                 if Instant::now() >= deadline {
                     log::warn!(
                         "update pause ended after 10 minutes; writes and Jobs are open again while the update runs."
@@ -218,7 +256,9 @@ async fn prepare(database: &DatabaseHandle) -> Result<Reply, Refusal> {
 }
 
 #[cfg(unix)]
-fn launch(mut state: crate::host::update::State) -> Result<std::process::Child, Refusal> {
+fn launch(
+    mut state: crate::host::update::State,
+) -> Result<(std::path::PathBuf, std::process::Child), Refusal> {
     use crate::host::update::{self, Phase};
     use std::os::unix::fs::OpenOptionsExt;
     use std::process::{Command, Stdio};
@@ -292,5 +332,5 @@ fn launch(mut state: crate::host::update::State) -> Result<std::process::Child, 
         INTERNAL
     });
     drop(lock);
-    child
+    child.map(|child| (install.prefix, child))
 }
