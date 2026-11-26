@@ -1,19 +1,22 @@
 use super::offline::{finalization_copy, verify_payloads, with_verified_rebuild_copy};
 use super::reserved::ReservedRefusal;
 use crate::db::entities::{
-    Actor, ContentDigest, JobId, JobOutputId, JobOutputRecord, JobSpec, MutableJob,
-    MutableJobContent, MutableJobPhase, NativeSummaryResultLink, Origin, OutcomeKind, OutputKind,
-    Recurrence, RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef,
+    AWAITING_TOOL_DECISION, Actor, ChildNoticeDrop, ContentDigest, JobId, JobOutputId,
+    JobOutputRecord, JobSpec, MutableJob, MutableJobContent, MutableJobPhase,
+    NativeSummaryResultLink, Origin, OutcomeKind, OutputKind, Recurrence, RequestNumber,
+    SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord, ToolOutcome,
 };
 use crate::db::redb::codec::{
-    Code, Dec, Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME, TAG_OUTPUT,
+    Code, Dec, Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME,
+    TAG_OUTPUT, TAG_TOOL_CALL,
 };
 use crate::db::redb::execution::TAG_EXECUTION_EVENT;
 use crate::db::redb::schema::{
     APPROVALS, CONVERSATIONS, DATABASE_FORMAT_KEY, FORMAT_VERSION, JOB_OUTPUTS, JOB_RUNTIME, JOBS,
-    MESSAGES, META, POOL_ALLOCATIONS, RECURRENCES, REQUEST_EVENTS, SCHEMA_FINGERPRINT,
-    SCHEMA_FINGERPRINT_KEY, SUBMISSIONS, TOOL_CALLS, TURNS, check_required_tables,
-    record_version_byte, rewrite_record_headers, verify_identical_database, verify_record_headers,
+    MESSAGES, META, OPEN_APPROVALS, PENDING_CHILD_NOTICES, POOL_ALLOCATIONS, RECURRENCES,
+    REQUEST_EVENTS, SCHEMA_FINGERPRINT, SCHEMA_FINGERPRINT_KEY, SUBMISSIONS, TOOL_CALLS, TURNS,
+    check_migration_source_tables, check_required_tables, record_version_byte,
+    rewrite_record_headers, verify_identical_database, verify_record_headers,
 };
 use crate::db::redb::{
     StorageError, TxRead, allocations, approvals, job_tree, jobs, observations, reads, rows,
@@ -24,7 +27,11 @@ use ::redb::{
     TableHandle, WriteTransaction,
 };
 use serde_json::{Value as Json, json};
-use std::{collections::BTreeMap, fs::File, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    path::Path,
+};
 
 #[derive(Clone, Copy)]
 pub(in crate::db::redb) struct Versions {
@@ -64,12 +71,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         (Some(2), Some(b"ocg-native-format-2")) => 2,
         (Some(3), Some(b"ocg-native-format-3")) => 3,
         (Some(4), Some(b"ocg-native-format-4")) => 4,
-        (Some(5), Some(b"ocg-native-format-5")) => {
-            return Err(ReservedRefusal::new(
-                "unsupported_source",
-                format!("no migration from Format 5 to Format {FORMAT_VERSION} is available"),
-            ));
-        }
+        (Some(5), Some(b"ocg-native-format-5")) => 5,
         (Some(FORMAT_VERSION), Some(SCHEMA_FINGERPRINT)) => {
             return Err(ReservedRefusal::new(
                 "already_migrated",
@@ -79,11 +81,11 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         _ => {
             return Err(ReservedRefusal::new(
                 "unsupported_source",
-                "migration requires Format 1, 2, 3 or 4 with its matching schema fingerprint",
+                "migration requires Format 1 through 5 with its matching schema fingerprint",
             ));
         }
     };
-    check_required_tables(source)?;
+    check_migration_source_tables(source)?;
     Ok(Versions {
         from,
         to: record_version_byte(),
@@ -106,8 +108,11 @@ fn promote_header(versions: Versions, bytes: &mut [u8], tags: &[u8]) -> Result<(
 fn promote_record(versions: Versions, bytes: &[u8], tags: &[u8]) -> Result<Vec<u8>, StorageError> {
     let mut row = bytes.to_vec();
     promote_header(versions, &mut row, tags)?;
-    if versions.crosses(4) && row[0] == crate::db::redb::codec::TAG_TOOL_CALL {
+    if versions.crosses(4) && row[0] == TAG_TOOL_CALL {
         row.push(0); // Historical commands have no recorded process identity.
+    }
+    if versions.crosses(6) && row[0] == TAG_TOOL_CALL {
+        row.push(0);
     }
     if row[0] == TAG_EXECUTION_EVENT {
         let mut d = Dec::payload(&row[2..]);
@@ -219,6 +224,161 @@ pub(in crate::db::redb) fn verify_metadata(
     verify_transformed(source, result, META, |k, v| {
         promote_metadata(versions, k, v)
     })
+}
+
+#[derive(Default)]
+pub(in crate::db::redb) struct LegacyNotices {
+    pending: BTreeSet<(u128, u128, u32, u32)>,
+    dropped: BTreeMap<ToolCallRef, ChildNoticeDrop>,
+}
+
+impl LegacyNotices {
+    fn read(tx: &WriteTransaction) -> Result<Self, StorageError> {
+        let mut notices = Self::default();
+        let calls = tx.open_table(TOOL_CALLS)?;
+        let approvals = tx.open_table(OPEN_APPROVALS)?;
+        let outputs = tx.open_table(JOB_OUTPUTS)?;
+        let submissions = tx.open_table(SUBMISSIONS)?;
+        for entry in calls.iter()? {
+            let (key, value) = entry?;
+            let call = rows::tool_call_ref(key.value())?;
+            let tool = rows::decode_tool_evidence(call, value.value())?;
+            let progress = match tool.name.as_str() {
+                "job_report_progress" if legacy_progress_deferred(&tool) => true,
+                "job_ask_parent"
+                    if matches!(tool.decision.fact, ToolDecision::AwaitingAnswer(_)) =>
+                {
+                    false
+                }
+                _ => continue,
+            };
+            let posted = job_tree::tool_submission(call, b"child notice", 1).key;
+            if submissions.get(posted.as_bytes().as_slice())?.is_some() {
+                continue;
+            }
+            let turn = jobs::mutable_job_in(tx, call.job)?
+                .ok_or_else(|| StorageError::corrupted("child notice has no Job"))?;
+            if !progress
+                && (approvals
+                    .get(approvals::open_key(turn.parent_id, call))?
+                    .is_none()
+                    || !legacy_child_is_awaiting(&outputs, call.job)?)
+            {
+                continue;
+            }
+            let child = legacy_notice_conversation(tx, turn.parent_id)?;
+            let parent = child
+                .parent_id
+                .ok_or_else(|| StorageError::corrupted("child notice has no parent"))?;
+            if progress && state::require(tx, call.job)?.state.outcome.is_some() {
+                notices
+                    .dropped
+                    .insert(call, ChildNoticeDrop::ChildTurnSettled);
+            } else if jobs::require_open_turn_parent(
+                &legacy_notice_conversation(tx, parent)?,
+                &state::require(tx, parent)?,
+            )
+            .is_err()
+            {
+                notices.dropped.insert(call, ChildNoticeDrop::ParentClosed);
+            } else {
+                notices.pending.insert(approvals::open_key(parent, call));
+            }
+        }
+        Ok(notices)
+    }
+
+    fn apply(&self, tx: &WriteTransaction) -> Result<(), StorageError> {
+        let mut pending = tx.open_table(PENDING_CHILD_NOTICES)?;
+        for key in &self.pending {
+            pending.insert(*key, ())?;
+        }
+        let mut calls = tx.open_table(TOOL_CALLS)?;
+        for (&call, &reason) in &self.dropped {
+            let key = rows::tool_call_key(call);
+            let mut record = {
+                let row = calls.get(key)?.ok_or_else(|| {
+                    StorageError::corrupted("dropped child notice has no tool call")
+                })?;
+                rows::decode_tool_evidence(call, row.value())?
+            };
+            record.child_notice_drop = Some(reason);
+            calls.insert(key, rows::encode_tool_evidence(&record).as_slice())?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::db::redb) fn verify_queue(
+        &self,
+        result: &ReadTransaction,
+    ) -> Result<(), StorageError> {
+        let table = result.open_table(PENDING_CHILD_NOTICES)?;
+        let mut found = table.iter()?;
+        for expected in &self.pending {
+            if found.next().transpose()?.map(|(key, _)| key.value()) != Some(*expected) {
+                return Err(StorageError::corrupted(
+                    "migration changed a pending child notice",
+                ));
+            }
+        }
+        if found.next().transpose()?.is_some() {
+            return Err(StorageError::corrupted(
+                "migration added unexpected pending child notices",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(in crate::db::redb) fn verify_calls(
+        &self,
+        versions: Versions,
+        source: &ReadTransaction,
+        result: &ReadTransaction,
+    ) -> Result<(), StorageError> {
+        verify_transformed(source, result, TOOL_CALLS, |key, bytes| {
+            let promoted = promote_record(versions, bytes, &[TAG_TOOL_CALL])?;
+            let call = rows::tool_call_ref(key)?;
+            let Some(&reason) = self.dropped.get(&call) else {
+                return Ok(promoted);
+            };
+            let mut record = rows::decode_tool_evidence(call, &promoted)?;
+            record.child_notice_drop = Some(reason);
+            Ok(rows::encode_tool_evidence(&record))
+        })
+    }
+}
+
+fn legacy_progress_deferred(tool: &ToolEvidenceRecord) -> bool {
+    let Some(ToolOutcome::Completed { result }) =
+        tool.outcome.as_ref().map(|outcome| &outcome.fact)
+    else {
+        return false;
+    };
+    serde_json::from_str::<Json>(result.as_str())
+        .ok()
+        .and_then(|result| result.get("deferred")?.as_bool())
+        == Some(true)
+}
+
+fn legacy_child_is_awaiting(
+    outputs: &impl ReadableTable<(u128, u32), &'static [u8]>,
+    turn: JobId,
+) -> Result<bool, StorageError> {
+    let id = turn.get();
+    let Some((key, row)) = outputs
+        .range((id, 0)..=(id, u32::MAX))?
+        .next_back()
+        .transpose()?
+    else {
+        return Ok(false);
+    };
+    let output = rows::decode_output(key.value(), row.value())?;
+    Ok(output.kind == OutputKind::Result && output.code.as_deref() == Some(AWAITING_TOOL_DECISION))
+}
+
+fn legacy_notice_conversation(tx: &impl TxRead, id: JobId) -> Result<JobSpec, StorageError> {
+    reads::jobs::read_conversation_row(tx, id)?
+        .ok_or_else(|| StorageError::corrupted("child notice conversation is missing"))
 }
 
 fn old_output(
@@ -846,6 +1006,8 @@ fn migrate_chain(
             "the source contains persistent redb savepoints",
         ));
     }
+    tx.open_table(PENDING_CHILD_NOTICES)
+        .map_err(StorageError::from)?;
     rewrite_record_headers(versions, &source, &tx)?;
     {
         let mut meta = tx.open_table(META).map_err(StorageError::from)?;
@@ -876,11 +1038,13 @@ fn migrate_chain(
     if versions.crosses(2) {
         migrate_outputs(versions, &source, &tx)?;
     }
+    let notices = LegacyNotices::read(&tx)?;
+    notices.apply(&tx)?;
     tx.commit().map_err(StorageError::from)?;
 
     super::verify_reserved_residual(database)?;
     let result = database.begin_read().map_err(StorageError::from)?;
-    verify_record_headers(versions, &source, &result)?;
+    verify_record_headers(versions, &source, &result, &notices)?;
     verify_payloads(&result, directory)?;
     let mut authors = BTreeMap::from([("user", 0u64), ("auto", 0), ("agent", 0)]);
     let mut classes = BTreeMap::new();
@@ -921,12 +1085,18 @@ fn migrate_chain(
     } else {
         0
     };
-    let plan = json!({"command_groups_not_recorded": historical_calls, "kind": "storage-migration", "source_sha256": sha, "source_format": versions.from,
+    let mut plan = json!({"command_groups_not_recorded": historical_calls, "kind": "storage-migration", "source_sha256": sha, "source_format": versions.from,
         "target_format": versions.to, "submitted_by": authors, "creation_classes": classes,
         "converted_summary_links": counts.converted_summary_links, "retained_summary_links": counts.retained_summary_links,
         "kept_text_job_count": counts.kept_text_jobs.len(), "kept_text_jobs": counts.kept_text_jobs.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "jobs_changed": changes.jobs, "conversations_changed": changes.conversations,
         "closing_without_children": changes.closing, "kept_text_details": counts.kept_text_details});
+    if !notices.pending.is_empty() || !notices.dropped.is_empty() {
+        plan["child_notices"] = json!({
+            "queued": notices.pending.len(),
+            "dropped": notices.dropped.len(),
+        });
+    }
     let encoded = serde_json::to_vec(&plan)
         .map_err(|e| ReservedRefusal::new("invalid_plan", e.to_string()))?;
     Ok(json!({"plan": plan, "plan_digest": ContentDigest::of(&encoded).to_string()}))

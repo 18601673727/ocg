@@ -45,6 +45,15 @@ macro_rules! tables {
             Ok(())
         }
 
+        #[cfg(unix)]
+        pub(super) fn check_migration_source_tables(tx: &ReadTransaction) -> Result<(), StorageError> {
+            use ::redb::TableHandle;
+            let expected: Vec<_> = [$($($table,)*)*].into_iter()
+                .filter(|name| *name != PENDING_CHILD_NOTICES.name())
+                .collect();
+            check_layout(tx, &expected)
+        }
+
         pub(super) fn check_record_headers(tx: &ReadTransaction) -> Result<(), StorageError> {
             $($($(
                 for entry in tx.open_table($name)?.iter()? {
@@ -63,9 +72,16 @@ macro_rules! tables {
         }
 
         #[cfg(unix)]
-        pub(super) fn verify_record_headers(versions: recovery::migration::Versions, source: &ReadTransaction, result: &ReadTransaction) -> Result<(), recovery::reserved::ReservedRefusal> {
+        pub(super) fn verify_record_headers(
+            versions: recovery::migration::Versions,
+            source: &ReadTransaction,
+            result: &ReadTransaction,
+            notices: &recovery::migration::LegacyNotices,
+        ) -> Result<(), recovery::reserved::ReservedRefusal> {
             macro_rules! verify {
                 (META) => { recovery::migration::verify_metadata(versions, source, result)? };
+                (TOOL_CALLS, $tags:expr) => { notices.verify_calls(versions, source, result)? };
+                (PENDING_CHILD_NOTICES) => { notices.verify_queue(result)? };
                 ($definition:ident, $tags:expr) => {
                     recovery::migration::verify_tagged(versions, source, result, $definition, $tags)?
                 };
