@@ -1214,6 +1214,7 @@ fn resolve_report_heads(
     parsed: &[ParsedChildResult],
     seq0_submissions: &BTreeMap<JobId, SubmissionKey>,
     claimed_heads: &mut BTreeMap<JobId, BTreeSet<JobId>>,
+    heads_guessed_turns: &mut Vec<JobId>,
 ) -> Result<Vec<ChildTurnResult>, StorageError> {
     let mut results = Vec::with_capacity(parsed.len());
     for item in parsed {
@@ -1249,9 +1250,11 @@ fn resolve_report_heads(
         {
             matched
         } else {
-            *candidates.first().ok_or_else(|| {
+            let &head = candidates.first().ok_or_else(|| {
                 StorageError::corrupted("child report turn has no child head turn")
-            })?
+            })?;
+            heads_guessed_turns.push(job.id);
+            head
         };
         claimed_heads
             .entry(item.conversation)
@@ -1272,6 +1275,7 @@ fn resolve_report_heads(
 struct LegacyChildTurns {
     reports: BTreeMap<u128, Vec<ChildTurnResult>>,
     notices: BTreeMap<u128, ToolCallRef>,
+    heads_guessed_turns: Vec<JobId>,
 }
 
 impl LegacyChildTurns {
@@ -1378,8 +1382,14 @@ impl LegacyChildTurns {
             if parsed.is_empty() {
                 continue;
             }
-            let results =
-                resolve_report_heads(tx, &job, &parsed, &seq0_submissions, &mut claimed_heads)?;
+            let results = resolve_report_heads(
+                tx,
+                &job,
+                &parsed,
+                &seq0_submissions,
+                &mut claimed_heads,
+                &mut turns.heads_guessed_turns,
+            )?;
             turns.reports.insert(id, results);
         }
         Ok(turns)
@@ -1702,6 +1712,8 @@ fn migrate_chain(
         plan["child_turns"] = json!({
             "reports": child_turns.reports.len(),
             "notices": child_turns.notices.len(),
+            "heads_guessed": child_turns.heads_guessed_turns.len(),
+            "heads_guessed_turns": child_turns.heads_guessed_turns.iter().map(ToString::to_string).collect::<Vec<_>>(),
         });
     }
     let encoded = serde_json::to_vec(&plan)
