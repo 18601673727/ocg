@@ -295,12 +295,17 @@ impl DatabaseHandle {
         revision: u64,
     ) -> Result<(), DatabaseError> {
         self.write(
-            8192,
+            64 * 1024,
             OperationKind::StopTurn,
             (context, id, revision),
             |batch, (context, id, revision)| {
                 batch.require_mutable_job_context(context, id)?;
-                batch.discard_unsubmitted_job(id, revision)
+                let parent = batch.mutable_job(id)?.map(|job| job.parent_id);
+                batch.discard_unsubmitted_job(id, revision)?;
+                if let Some(parent) = parent {
+                    batch.flush_child_reports(parent)?;
+                }
+                Ok(())
             },
         )
         .await

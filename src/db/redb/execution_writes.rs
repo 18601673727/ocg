@@ -955,15 +955,28 @@ impl Batch {
     ) -> Result<(), BatchError> {
         self.require_development_write_for(proof, None)?;
         let token = proof.token();
-        if let Some(failure) = failure
-            && failure.job == token.job
-            && failure.observation.status_code.is_some()
-            && failure.observation.failure.is_some()
-            && self
-                .development_usage_prefix(token.job, failure.request)?
-                .is_some()
-        {
-            self.record_development_provider_failure(token.job, failure)?;
+        if let Some(failure) = failure {
+            let valid = failure.job == token.job
+                && failure.observation.status_code.is_some()
+                && failure.observation.failure.is_some()
+                && self
+                    .development_usage_prefix(token.job, failure.request)?
+                    .and_then(|prefix| prefix.checked_add(1))
+                    .is_some()
+                && self
+                    .mutable_job(token.job)?
+                    .is_some_and(|row| row.frozen.is_some());
+            if valid {
+                self.record_development_provider_failure(token.job, failure)?;
+            } else {
+                log::debug!(
+                    "skipping optional provider failure evidence for uncertain Job {}",
+                    token.job
+                );
+            }
+        }
+        if let Some(job) = self.mutable_job(token.job)? {
+            self.void_job_approvals(job.parent_id, token.job, crate::db::entities::Actor::Auto)?;
         }
         self.transition_pool_allocation(
             token,
@@ -1257,7 +1270,7 @@ impl Batch {
                 "required evidence or output sequence is invalid",
             ));
         }
-        let awaiting_answer = kind == OutcomeKind::Completed
+        let awaiting_decision = kind == OutcomeKind::Completed
             && result.code.as_deref() == Some(crate::db::entities::AWAITING_TOOL_DECISION);
         let (seq, id) = self.settle_mutable_outcome(token, job, kind, result)?;
         self.transition_pool_allocation(
@@ -1267,7 +1280,11 @@ impl Batch {
         )?;
         self.settle_summary_membership(job)?;
         self.settle_standalone_decision(job)?;
-        self.settle_child_help(job.parent_id, job.id, awaiting_answer)?;
+        if awaiting_decision {
+            self.settle_child_help(job.parent_id, job.id)?;
+        } else {
+            self.void_job_approvals(job.parent_id, job.id, crate::db::entities::Actor::Auto)?;
+        }
         self.freed_capacity = true;
         self.probe = Some(Probe::Outcome(token.job));
         if kind == OutcomeKind::Completed

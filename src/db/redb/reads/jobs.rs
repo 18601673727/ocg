@@ -6,7 +6,6 @@ use crate::db::entities::{
     MutableJobContent, MutableJobDetails, MutableJobPhase, MutableJobRecord, NativeJobItem, Origin,
     OutputKind, ProjectId, Recurrence, RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
 };
-use crate::db::redb::batch::Batch;
 use crate::db::redb::reads::conversations::{conversation_summary, conversation_tip};
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::{ConfigRow, decode_output, decode_tool_evidence, tool_call_ref};
@@ -463,22 +462,7 @@ fn dependency_state(
     dependency: JobId,
     condition: DependencyCondition,
 ) -> Result<DependencyState, StorageError> {
-    let target = match read_conversation_row(rx, dependency)? {
-        Some(row) if !row.is_chunk_group() => match turn_head(rx, dependency)? {
-            Some(head) => head,
-            None => return Ok(DependencyState::Waiting),
-        },
-        Some(_) | None => dependency,
-    };
-    let state = rx
-        .open_table(JOB_RUNTIME)?
-        .get(target.get())?
-        .map(|bytes| state::decode_state(target.get(), bytes.value()))
-        .transpose()?;
-    Ok(Batch::dependency_outcome_state(
-        state.as_ref().and_then(|state| state.outcome.as_ref()),
-        condition,
-    ))
+    super::super::job_tree::prerequisite_state_in(rx, dependency, condition)
 }
 
 fn cap_title(title: &str) -> String {

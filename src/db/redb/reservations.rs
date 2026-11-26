@@ -1041,6 +1041,9 @@ impl Batch {
             });
             self.put_job_state(job, &state)?;
         }
+        if let Some(row) = self.mutable_job(job)? {
+            self.void_job_approvals(row.parent_id, job, crate::db::entities::Actor::Auto)?;
+        }
         if let Some(proof) = proof {
             return self.release_with_proof(allocation, proof);
         }
@@ -1180,6 +1183,11 @@ impl Batch {
                 ));
             }
         }
+        self.void_job_approvals(
+            job.parent_id,
+            action.token.job,
+            crate::db::entities::Actor::Auto,
+        )?;
         self.release_with_proof(allocation, action.proof)
     }
 

@@ -513,14 +513,17 @@ impl DatabaseHandle {
                 proof.token.job,
                 (proof, expected_seq, finalization),
                 |(_, _, finalization)| {
-                    let bytes = finalization_bytes(finalization);
-                    if finalization.result().code.as_deref()
-                        == Some(entities::AWAITING_TOOL_DECISION)
-                    {
-                        bytes.saturating_add(1024 * 1024)
+                    let notice = matches!(
+                        finalization,
+                        JobFinalization::Completed(result)
+                            if result.code.as_deref()
+                                == Some(entities::AWAITING_TOOL_DECISION)
+                    );
+                    finalization_bytes(finalization).saturating_add(if notice {
+                        1024 * 1024
                     } else {
-                        bytes
-                    }
+                        0
+                    })
                 },
                 OperationKind::FinalizeJob,
                 |batch, (proof, expected_seq, finalization)| {

@@ -4,11 +4,11 @@ use crate::db::entities::{
     JobState, Origin, OutcomeKind, OutputKind, ProjectId, RecordRef, Recurrence, SubmissionKey,
 };
 use crate::db::entities::{
-    AllocationPhase, AllocationToken, ApprovalDecision, ChildNoticeDrop, ChildNoticeKind,
-    ComposerContextId, DependencyState, ExecutionConfiguration, JobAction, JobClosing,
-    JobLifecycle, JobQueuePriority, JobToolCall, MutableFrozenConfiguration, MutableJob,
-    MutableJobContent, MutableJobInput, NativeStopRequest, OutcomeCause, OutcomeRecord,
-    RequestFingerprint, Submission, ToolCallRef, ToolEvidenceRecord, Violation,
+    AllocationPhase, AllocationToken, ChildNoticeDrop, ChildNoticeKind, ComposerContextId,
+    DependencyState, ExecutionConfiguration, JobAction, JobClosing, JobLifecycle, JobQueuePriority,
+    JobToolCall, MutableFrozenConfiguration, MutableJob, MutableJobContent, MutableJobInput,
+    NativeStopRequest, OutcomeCause, OutcomeRecord, RequestFingerprint, Submission, ToolCallRef,
+    ToolEvidenceRecord, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::schema::{
@@ -361,7 +361,7 @@ impl Batch {
         &mut self,
         parent: JobId,
         notice: PendingChildNotice,
-    ) -> Result<(), BatchError> {
+    ) -> Result<bool, BatchError> {
         let PendingChildNotice {
             child,
             call,
@@ -375,23 +375,19 @@ impl Batch {
             Ok((_, Some(input))) => {
                 self.deliver_child_notice(parent, child, call, input)?;
                 self.remove(PENDING_CHILD_NOTICES, approvals::open_key(parent, call))?;
+                Ok(true)
             }
-            Ok((_, None)) => {}
-            Err(BatchError(Failure::Rejected(Violation::InvalidValue(
-                "parent_notice_limit",
-                _,
-            )))) => {
-                self.drop_pending_child_notice(parent, call, ChildNoticeDrop::LimitReached)?;
-            }
-            Err(BatchError(Failure::Rejected(Violation::ParentClosed(_)))) => {
-                self.drop_pending_child_notice(parent, call, ChildNoticeDrop::ParentClosed)?;
-            }
+            Ok((_, None)) => Ok(false),
             Err(BatchError(Failure::Rejected(reason))) => {
+                if let Some(reason) = child_notice_drop_reason(&reason) {
+                    self.drop_pending_child_notice(parent, call, reason)?;
+                    return Ok(true);
+                }
                 log::debug!("pending child notice {call} is waiting for delivery: {reason}");
+                Ok(false)
             }
-            Err(error @ BatchError(Failure::Storage(_))) => return Err(error),
+            Err(error @ BatchError(Failure::Storage(_))) => Err(error),
         }
-        Ok(())
     }
 
     pub(super) fn drop_pending_child_notice(
@@ -422,24 +418,20 @@ impl Batch {
         &mut self,
         child: JobId,
         turn: JobId,
-        awaiting_answer: bool,
     ) -> Result<(), BatchError> {
-        if let Some((call, text)) = self.step(|tx| approvals::open_child_help(tx, child, turn))? {
-            if !awaiting_answer {
-                self.put_approval(call, ApprovalDecision::Voided, Actor::Auto)?;
-                self.remove(OPEN_APPROVALS, approvals::open_key(child, call))?;
-            } else if let Some(parent) = self.require_mutable_conversation(child)?.parent_id {
-                self.insert(PENDING_CHILD_NOTICES, approvals::open_key(parent, call), ())?;
-                self.retry_child_notice(
-                    parent,
-                    PendingChildNotice {
-                        child,
-                        call,
-                        kind: ChildNoticeKind::Help,
-                        text,
-                    },
-                )?;
-            }
+        if let Some((call, text)) = self.step(|tx| approvals::open_child_help(tx, child, turn))?
+            && let Some(parent) = self.require_mutable_conversation(child)?.parent_id
+        {
+            self.insert(PENDING_CHILD_NOTICES, approvals::open_key(parent, call), ())?;
+            self.retry_child_notice(
+                parent,
+                PendingChildNotice {
+                    child,
+                    call,
+                    kind: ChildNoticeKind::Help,
+                    text,
+                },
+            )?;
         }
         Ok(())
     }
@@ -528,6 +520,17 @@ impl Batch {
                 return Ok(());
             }
         }
+    }
+
+    fn retry_pending_child_help(
+        &mut self,
+        parent: JobId,
+        child: JobId,
+    ) -> Result<usize, BatchError> {
+        let Some(notice) = self.step(|tx| pending_child_help(tx, parent, child))? else {
+            return Ok(0);
+        };
+        Ok(usize::from(self.retry_child_notice(parent, notice)?))
     }
 
     fn require_room_for_child(&mut self, parent: JobId) -> Result<(), BatchError> {
@@ -630,22 +633,7 @@ impl Batch {
         prerequisite: JobId,
         condition: DependencyCondition,
     ) -> Result<DependencyState, BatchError> {
-        if self
-            .require_mutable_conversation(prerequisite)?
-            .is_chunk_group()
-        {
-            return Ok(Batch::dependency_outcome_state(
-                self.require_job_state(prerequisite)?.outcome.as_ref(),
-                condition,
-            ));
-        }
-        let Some(head) = self.group_head(prerequisite)? else {
-            return Ok(DependencyState::Waiting);
-        };
-        Ok(Batch::dependency_outcome_state(
-            self.require_job_state(head)?.outcome.as_ref(),
-            condition,
-        ))
+        self.step(|tx| prerequisite_state_in(tx, prerequisite, condition))
     }
 
     pub(crate) fn mutable_job_blocked(&mut self, job: &MutableJob) -> Result<bool, BatchError> {
@@ -772,13 +760,13 @@ impl Batch {
         for current in &subtree {
             let mut lifecycle = self.job_lifecycle(*current)?;
             if lifecycle.closing.is_none() {
+                let voided = self.void_approvals(*current, by.clone())?;
                 lifecycle.closing = Some(JobClosing {
                     at: self.now,
                     by: by.clone(),
-                    running: false,
+                    running: voided > 0,
                 });
                 self.put_job_lifecycle(*current, &lifecycle)?;
-                self.void_approvals(*current, by.clone())?;
             }
         }
         let mut running = Vec::new();
@@ -802,6 +790,7 @@ impl Batch {
                 && self.require_job_state(current)?.outcome.is_some()
                 && let Some(parent) = self.require_mutable_conversation(current)?.parent_id
             {
+                self.end_impossible_dependents(parent, current)?;
                 self.report_settled_child(parent, current)?;
             }
         }
@@ -833,12 +822,16 @@ impl Batch {
             return Ok(false);
         }
         let head = self.head_turn(conversation)?;
-        let answered = match head {
-            Some(head) => self.require_job_state(head.id)?.outcome,
-            None => None,
+        let (answered, awaiting) = match head {
+            Some(head) => (
+                self.require_job_state(head.id)?.outcome,
+                self.step(|tx| turn_awaits_tool_decision(tx, head.id))?,
+            ),
+            None => (None, false),
         };
         let kept = answered.filter(|outcome| {
             !closing.running
+                && !awaiting
                 && outcome.kind == OutcomeKind::Completed
                 && outcome.cause != Some(OutcomeCause::Closed)
         });
@@ -1360,6 +1353,8 @@ impl Batch {
             || !self.live_children(conversation)?.is_empty()
             || !self.unsettled_non_turn_jobs(conversation)?.is_empty()
             || self.step(|tx| has_open_approvals(tx, conversation))?
+            || self.step(|tx| turn_awaits_tool_decision(tx, head))?
+            || self.step(|tx| conversation_has_pending_children(tx, conversation, 0))?
         {
             return Ok(false);
         }
@@ -1434,6 +1429,7 @@ impl Batch {
             results,
             turn,
         } = report;
+        let mut posted = false;
         match turn {
             ReportTurn::AtLimit
             | ReportTurn::WaitForConfiguration
@@ -1455,6 +1451,7 @@ impl Batch {
                 let mut lifecycle = self.job_lifecycle(parent)?;
                 lifecycle.loop_count = lifecycle.loop_count.saturating_add(1);
                 self.put_job_lifecycle(parent, &lifecycle)?;
+                posted = true;
             }
             ReportTurn::Permanent(reason) => {
                 log::warn!("child results for parent {parent} remain on the child cards: {reason}")
@@ -1465,6 +1462,12 @@ impl Batch {
             let mut lifecycle = self.job_lifecycle(result.child)?;
             lifecycle.reported = Some(result.head);
             self.put_job_lifecycle(result.child, &lifecycle)?;
+        }
+        if !posted && let Some(grandparent) = self.require_mutable_conversation(parent)?.parent_id {
+            self.auto_close_if_done(parent)?;
+            self.end_impossible_dependents(grandparent, parent)?;
+            self.report_settled_child(grandparent, parent)?;
+            self.wake_scheduler();
         }
         Ok(results.len())
     }
@@ -1488,13 +1491,24 @@ impl Batch {
         parent: JobId,
         child: JobId,
     ) -> Result<usize, BatchError> {
-        match self.step(|tx| collect_child_report(tx, parent, child))? {
-            Some(report) => self.return_child_results(report),
-            None => Ok(0),
+        let mut count = self.retry_pending_child_help(parent, child)?;
+        if self.job_lifecycle(child)?.closing.is_none() && self.auto_close_if_done(child)? {
+            count += 1;
         }
+        if self.end_impossible_dependents(parent, child)? {
+            count += 1;
+        }
+        count += match self.step(|tx| collect_child_report(tx, parent, child))? {
+            Some(report) => self.return_child_results(report)?,
+            None => 0,
+        };
+        Ok(count)
     }
 
     pub(crate) fn flush_child_reports(&mut self, parent: JobId) -> Result<(), BatchError> {
+        for child in self.live_children(parent)? {
+            self.retry_pending_child_help(parent, child)?;
+        }
         let mut before = None;
         loop {
             let (children, next) = self.step(|tx| unreported_calls(tx, parent, before))?;
@@ -1658,6 +1672,226 @@ fn has_open_approvals(tx: &impl TxRead, conversation: JobId) -> Result<bool, Sto
         .is_some())
 }
 
+pub(super) fn turn_awaits_tool_decision(
+    tx: &impl TxRead,
+    turn: JobId,
+) -> Result<bool, StorageError> {
+    let outputs = tx.table(JOB_OUTPUTS)?;
+    for entry in outputs
+        .range((turn.get(), 0)..=(turn.get(), u32::MAX))?
+        .rev()
+    {
+        let (key, value) = entry?;
+        if rows::output_kind(value.value())? == OutputKind::Result {
+            let output = rows::decode_output(key.value(), value.value())?;
+            return Ok(output.code.as_deref() == Some(crate::db::entities::AWAITING_TOOL_DECISION));
+        }
+    }
+    Ok(false)
+}
+
+fn child_notice_drop_reason(reason: &Violation) -> Option<ChildNoticeDrop> {
+    match reason {
+        Violation::InvalidValue("parent_notice_limit", _) => Some(ChildNoticeDrop::LimitReached),
+        Violation::ParentClosed(_) => Some(ChildNoticeDrop::ParentClosed),
+        _ => None,
+    }
+}
+
+fn pending_child_help(
+    tx: &impl TxRead,
+    parent: JobId,
+    child: JobId,
+) -> Result<Option<PendingChildNotice>, StorageError> {
+    let calls = tx.table(TOOL_CALLS)?;
+    let pending = tx.table(PENDING_CHILD_NOTICES)?;
+    for entry in tx
+        .table(OPEN_APPROVALS)?
+        .range((child.get(), 0, 0, 0)..=(child.get(), u128::MAX, u32::MAX, u32::MAX))?
+    {
+        let (key, value) = entry?;
+        if value.value() != 0 {
+            return Err(StorageError::corrupted("invalid open approval index entry"));
+        }
+        let (_, turn, request, index) = key.value();
+        let call = rows::tool_call_ref((turn, request, index))?;
+        if pending.get(approvals::open_key(parent, call))?.is_some() {
+            let row = calls
+                .get(rows::tool_call_key(call))?
+                .ok_or_else(|| StorageError::corrupted("pending help notice has no tool call"))?;
+            let record = rows::decode_tool_evidence(call, row.value())?;
+            if pending_child_notice_kind(&record)? != ChildNoticeKind::Help {
+                return Err(StorageError::corrupted(
+                    "pending help notice is not a help request",
+                ));
+            }
+            return Ok(Some(PendingChildNotice {
+                child,
+                call,
+                kind: ChildNoticeKind::Help,
+                text: stored_notice_text(&record)?,
+            }));
+        }
+    }
+    Ok(None)
+}
+
+fn pending_child_help_can_settle(
+    tx: &impl TxRead,
+    parent: JobId,
+    child: JobId,
+) -> Result<bool, StorageError> {
+    let Some(notice) = pending_child_help(tx, parent, child)? else {
+        return Ok(false);
+    };
+    let message = child_notice_message(child, notice.call, &notice.text, notice.kind);
+    match prepare_child_notice_in(tx, parent, message) {
+        Ok(input) => Ok(input.is_some()),
+        Err(BatchError(Failure::Rejected(reason))) => {
+            Ok(child_notice_drop_reason(&reason).is_some())
+        }
+        Err(BatchError(Failure::Storage(error))) => Err(error),
+    }
+}
+
+fn has_active_agent_turn(
+    tx: &impl TxRead,
+    parent: JobId,
+    child: JobId,
+) -> Result<bool, StorageError> {
+    let recurrence = tx
+        .table(RECURRENCES)?
+        .get(child.get())?
+        .map(|row| Recurrence::decode(row.value()))
+        .transpose()?;
+    let mut head = None;
+    let mut first = None;
+    for entry in tx
+        .table(TURNS)?
+        .range((child.get(), 0)..=(child.get(), u128::MAX))?
+        .rev()
+    {
+        let id = JobId::new(entry?.0.value().1);
+        let job = required_turn(tx, id)?;
+        if reads::jobs::project_planning_target(tx, &job)?.is_some() {
+            continue;
+        }
+        head.get_or_insert(id);
+        if job.retry.is_some() {
+            continue;
+        }
+        if recurrence
+            .as_ref()
+            .is_some_and(|r| r.current_turn == id || r.previous_turn == Some(id))
+            || job.submitted_by
+                == (Actor::Agent {
+                    conversation: parent,
+                })
+        {
+            first = Some(id);
+            break;
+        }
+        if job.submitted_by == Actor::User {
+            return Ok(false);
+        }
+    }
+    let Some((first, head)) = first.zip(head) else {
+        return Ok(false);
+    };
+    if state::require(tx, head)?.state.outcome.is_none() || turn_awaits_tool_decision(tx, head)? {
+        return Ok(true);
+    }
+    Ok(tx
+        .table(OPEN_APPROVALS)?
+        .range((child.get(), first.get(), 0, 0)..=(child.get(), head.get(), u32::MAX, u32::MAX))?
+        .next()
+        .transpose()?
+        .is_some())
+}
+
+fn child_has_pending_work(
+    tx: &impl TxRead,
+    parent: JobId,
+    child: &JobSpec,
+    depth: u8,
+) -> Result<bool, StorageError> {
+    if depth > crate::db::entities::MAX_JOB_DEPTH {
+        return Err(StorageError::corrupted(
+            "conversation ancestry exceeds the hard depth limit",
+        ));
+    }
+    if !matches!(child.origin, Origin::Agent { .. }) || child.is_chunk_group() {
+        return Ok(false);
+    }
+    let runtime = state::require(tx, child.id)?;
+    if report_segment(tx, parent, child.id, runtime.lifecycle.reported)?.is_some() {
+        return Ok(true);
+    }
+    if runtime.state.outcome.is_some() {
+        return Ok(false);
+    }
+    if has_active_agent_turn(tx, parent, child.id)? {
+        return Ok(true);
+    }
+    conversation_has_pending_children(tx, child.id, depth + 1)
+}
+
+fn conversation_has_pending_children(
+    tx: &impl TxRead,
+    conversation: JobId,
+    depth: u8,
+) -> Result<bool, StorageError> {
+    if depth > crate::db::entities::MAX_JOB_DEPTH {
+        return Err(StorageError::corrupted(
+            "conversation ancestry exceeds the hard depth limit",
+        ));
+    }
+    for entry in tx
+        .table(LIVE_CHILDREN)?
+        .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
+    {
+        let child = conversation_row(tx, JobId::new(entry?.0.value().1))?;
+        if child_has_pending_work(tx, conversation, &child, depth)? {
+            return Ok(true);
+        }
+    }
+    Ok(!unreported_calls(tx, conversation, None)?.0.is_empty())
+}
+
+pub(super) fn prerequisite_state_in(
+    tx: &impl TxRead,
+    prerequisite: JobId,
+    condition: DependencyCondition,
+) -> Result<DependencyState, StorageError> {
+    let Some(row) = read_conversation_row(tx, prerequisite)? else {
+        let outcome = state::read(tx, prerequisite)?.and_then(|s| s.state.outcome);
+        return Ok(Batch::dependency_outcome_state(outcome.as_ref(), condition));
+    };
+    let conv_outcome = state::read(tx, prerequisite)?.and_then(|s| s.state.outcome);
+    if row.is_chunk_group() || conv_outcome.is_some() {
+        return Ok(Batch::dependency_outcome_state(
+            conv_outcome.as_ref(),
+            condition,
+        ));
+    }
+    let Some(head) = turn_head(tx, prerequisite)? else {
+        return Ok(DependencyState::Waiting);
+    };
+    let Some(head_outcome) = state::read(tx, head)?.and_then(|s| s.state.outcome) else {
+        return Ok(DependencyState::Waiting);
+    };
+    if has_open_approvals(tx, prerequisite)?
+        || turn_awaits_tool_decision(tx, head)?
+        || conversation_has_pending_children(tx, prerequisite, 0)?
+    {
+        return Ok(DependencyState::Waiting);
+    }
+    Ok(Batch::dependency_outcome_state(
+        Some(&head_outcome),
+        condition,
+    ))
+}
+
 pub(super) fn has_user_turn(
     tx: &impl TxRead,
     conversation: JobId,
@@ -1705,7 +1939,10 @@ fn idle_worker(tx: &impl TxRead, caller: JobId, row: &JobSpec) -> Result<bool, S
     }
     // unsettled_turns is the suffix ending at the head. A settled head has no such suffix.
     match turn_head(tx, row.id)? {
-        Some(head) => Ok(state::require(tx, head)?.state.outcome.is_some()),
+        Some(head) => Ok(state::require(tx, head)?.state.outcome.is_some()
+            && !turn_awaits_tool_decision(tx, head)?
+            && !conversation_has_pending_children(tx, row.id, 0)?
+            && report_segment(tx, caller, row.id, runtime.lifecycle.reported)?.is_none()),
         None => Ok(false),
     }
 }
@@ -1791,19 +2028,12 @@ fn segment_waiting(
     {
         return Ok(true);
     }
-    for entry in tx
-        .table(LIVE_CHILDREN)?
-        .range((conversation.get(), 0)..=(conversation.get(), u128::MAX))?
+    if state::require(tx, conversation)?.state.outcome.is_none()
+        && turn_awaits_tool_decision(tx, last)?
     {
-        let child = conversation_row(tx, JobId::new(entry?.0.value().1))?;
-        if let Origin::Agent { call } = child.origin
-            && (first..=last).contains(&call.job)
-            && !idle_worker(tx, conversation, &child)?
-        {
-            return Ok(true);
-        }
+        return Ok(true);
     }
-    Ok(false)
+    conversation_has_pending_children(tx, conversation, 0)
 }
 
 // A report must not move the head on which an unsubmitted user message is based.
@@ -2033,19 +2263,26 @@ fn collect_child_report(
             return Ok(None);
         };
         let head = segment.head;
-        let lifecycle = state::require(tx, child)?.lifecycle;
+        let child_runtime = state::require(tx, child)?;
+        let lifecycle = child_runtime.lifecycle;
         if segment_waiting(tx, child, &segment)? {
             return Ok(None);
         }
         if lifecycle.reported.is_none_or(|reported| reported < head) {
-            let outcome = state::require(tx, head)?
+            let head_outcome = state::require(tx, head)?
                 .state
                 .outcome
                 .ok_or_else(|| StorageError::corrupted("reportable turn has no outcome"))?;
+            let outcome = match child_runtime.state.outcome {
+                Some(conv_outcome) if head_outcome.kind == OutcomeKind::Completed => {
+                    conv_outcome.kind
+                }
+                _ => head_outcome.kind,
+            };
             results.push(ChildResult {
                 child,
                 head,
-                outcome: outcome.kind,
+                outcome,
                 title: lifecycle.title.unwrap_or_else(|| child.to_string()),
             });
         }
@@ -2062,21 +2299,48 @@ fn collect_child_report(
     }))
 }
 
+fn report_fence(answers: &[String]) -> String {
+    let unused = |candidate: &str| !answers.iter().any(|answer| answer.contains(candidate));
+    for length in 3..=16 {
+        let candidate = "~".repeat(length);
+        if unused(&candidate) {
+            return candidate;
+        }
+    }
+    for n in 1u32..=65_537 {
+        let candidate = format!("~~~-{n}");
+        if unused(&candidate) {
+            return candidate;
+        }
+    }
+    format!("~~~-{}", answers.len())
+}
+
 fn child_report_text(tx: &impl TxRead, results: &[ChildResult]) -> Result<String, StorageError> {
     let mut text = String::from(REPORT_HEADER);
-    let mut available = jobs::MAX_INPUT_BYTES - text.len();
-    let mut sections = Vec::new();
+    let mut available = jobs::MAX_INPUT_BYTES.saturating_sub(text.len());
+    let mut prepared = Vec::with_capacity(results.len());
+    let mut answers = Vec::with_capacity(results.len());
     for result in results {
         let child = result.child;
         let title = &result.title[..result.title.floor_char_boundary(REPORT_TITLE_BYTES)];
-        let title = title.replace(jobs::invalid_input_character, " ");
+        let title: String = title
+            .chars()
+            .map(|c| {
+                if matches!(c, '\r' | '\n' | '\t') || jobs::invalid_input_character(c) {
+                    ' '
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let title = title.trim().to_owned();
         let status = match result.outcome {
             OutcomeKind::Completed => "completed",
             OutcomeKind::Failed => "failed",
             OutcomeKind::Cancelled => "cancelled",
             OutcomeKind::Unknown => "unknown",
         };
-        let header = format!("\n\n[{title}] conversation {child}: {status}\n");
         let pointer = format!("\nFull answer in child conversation {child}.");
         let body = if result.outcome == OutcomeKind::Unknown {
             reads::jobs::unknown_execution_note(tx, result.head)?
@@ -2094,9 +2358,18 @@ fn child_report_text(tx: &impl TxRead, results: &[ChildResult]) -> Result<String
                 }
             })
             .collect();
+        answers.push(answer);
+        prepared.push((title, child, status, pointer));
+    }
+    let fence = report_fence(&answers);
+    let footer = format!("\n{fence}");
+    let mut sections = Vec::with_capacity(prepared.len());
+    for ((title, child, status, pointer), answer) in prepared.into_iter().zip(answers) {
+        let header = format!("\n\n[{title}] conversation {child}: {status}\n{fence}\n");
         // At most MAX_LIVE_CHILDREN were opened by the call. Reserve every
-        // header plus enough for either the full answer or its pointer.
-        available -= header.len() + pointer.len().min(answer.len());
+        // header, fence and enough for either the full answer or its pointer.
+        available =
+            available.saturating_sub(header.len() + footer.len() + pointer.len().min(answer.len()));
         sections.push((header, answer, pointer));
     }
     for (header, answer, pointer) in sections {
@@ -2106,11 +2379,12 @@ fn child_report_text(tx: &impl TxRead, results: &[ChildResult]) -> Result<String
             text.push_str(&answer);
             available -= answer.len();
         } else {
-            let end = answer.floor_char_boundary(available - pointer.len());
+            let end = answer.floor_char_boundary(available.saturating_sub(pointer.len()));
             text.push_str(&answer[..end]);
             text.push_str(&pointer);
-            available -= end + pointer.len();
+            available = available.saturating_sub(end + pointer.len());
         }
+        text.push_str(&footer);
     }
     Ok(text)
 }
@@ -2195,6 +2469,12 @@ pub(crate) fn read_child_report_page(
         }
         next = Some(key);
         let (parent, child) = (JobId::new(key.0), JobId::new(key.1));
+        if pending_child_help_can_settle(&tx, parent, child)? {
+            return Ok(ChildReportPage {
+                next,
+                candidate: Some((parent, child)),
+            });
+        }
         if report_segment(
             &tx,
             parent,

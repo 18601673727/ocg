@@ -164,12 +164,6 @@ impl Batch {
                 "expected between 1 and 2000 characters",
             ));
         }
-        if self.step(|tx| super::job_tree::has_current_draft(tx, child))? {
-            return self.reject(Violation::InvalidValue(
-                "child",
-                "the child has an unsent draft; retry after it is sent or discarded",
-            ));
-        }
         self.decide_as(
             approval,
             ApprovalDecision::Answered {
@@ -210,11 +204,25 @@ impl Batch {
             }
         };
         let conversation = self.turn_conversation(approval.job)?;
-        if self.require_job_state(approval.job)?.outcome.is_none() {
-            return self.reject(Violation::InvalidValue(
-                "approval_not_ready",
-                "the Job that asked has not ended",
-            ));
+        match self.require_job_state(approval.job)?.outcome {
+            None => {
+                return self.reject(Violation::InvalidValue(
+                    "approval_not_ready",
+                    "the Job that asked has not ended",
+                ));
+            }
+            Some(outcome)
+                if outcome.kind != OutcomeKind::Completed
+                    || !self.step(|tx| {
+                        super::job_tree::turn_awaits_tool_decision(tx, approval.job)
+                    })? =>
+            {
+                return self.reject(Violation::InvalidValue(
+                    "approval_decided",
+                    "the Job that asked is not awaiting a tool decision",
+                ));
+            }
+            Some(_) => {}
         }
         let key = open_key(conversation, approval);
         if !self.step(|tx| {
@@ -238,6 +246,14 @@ impl Batch {
             return self.reject(Violation::InvalidValue(
                 "conversation_closing",
                 "decisions cannot continue a closing conversation",
+            ));
+        }
+        if call.name == "job_ask_parent"
+            && self.step(|tx| super::job_tree::has_current_draft(tx, conversation))?
+        {
+            return self.reject(Violation::InvalidValue(
+                "child",
+                "the child has an unsent draft; retry after it is sent or discarded",
             ));
         }
         let approved_command = if decision == ApprovalDecision::Approved {
@@ -452,11 +468,31 @@ impl Batch {
         &mut self,
         conversation: JobId,
         by: Actor,
-    ) -> Result<(), BatchError> {
+    ) -> Result<usize, BatchError> {
+        self.void_approvals_in(conversation, None, by)
+    }
+
+    pub(crate) fn void_job_approvals(
+        &mut self,
+        conversation: JobId,
+        turn: JobId,
+        by: Actor,
+    ) -> Result<usize, BatchError> {
+        self.void_approvals_in(conversation, Some(turn), by)
+    }
+
+    fn void_approvals_in(
+        &mut self,
+        conversation: JobId,
+        turn: Option<JobId>,
+        by: Actor,
+    ) -> Result<usize, BatchError> {
         let calls = self.step(|tx| {
             let mut calls = Vec::new();
+            let start = turn.map_or(0, JobId::get);
+            let end = turn.map_or(u128::MAX, JobId::get);
             for entry in tx.open_table(OPEN_APPROVALS)?.range(
-                (conversation.get(), 0, 0, 0)..=(conversation.get(), u128::MAX, u32::MAX, u32::MAX),
+                (conversation.get(), start, 0, 0)..=(conversation.get(), end, u32::MAX, u32::MAX),
             )? {
                 let (key, value) = entry?;
                 if value.value() != 0 {
@@ -467,6 +503,10 @@ impl Batch {
             }
             Ok(calls)
         })?;
+        let count = calls.len();
+        if count == 0 {
+            return Ok(0);
+        }
         let parent = self.require_mutable_conversation(conversation)?.parent_id;
         for call in calls {
             if let Some(parent) = parent {
@@ -475,7 +515,7 @@ impl Batch {
             self.put_approval(call, ApprovalDecision::Voided, by.clone())?;
             self.remove(OPEN_APPROVALS, open_key(conversation, call))?;
         }
-        Ok(())
+        Ok(count)
     }
 }
 
@@ -739,7 +779,7 @@ impl Batch {
     }
 }
 
-fn question(arguments: &str) -> String {
+pub(super) fn question(arguments: &str) -> String {
     serde_json::from_str::<serde_json::Value>(arguments)
         .ok()
         .and_then(|v| {
@@ -883,6 +923,9 @@ pub(crate) fn read_cards(
                     return Err(StorageError::corrupted("invalid open approval index entry"));
                 }
                 let (_, turn, request, index) = key.value();
+                if read_state(&rx, JobId::new(turn))?.outcome.is_none() {
+                    continue;
+                }
                 let call = tool_call_ref((turn, request, index))?;
                 let table = rx.open_table(TOOL_CALLS)?;
                 let bytes = table
