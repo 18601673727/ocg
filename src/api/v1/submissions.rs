@@ -980,6 +980,7 @@ pub(super) async fn action(
 }
 fn action_error(error: DatabaseError) -> Refusal {
     match error {
+        DatabaseError::Rejected(Violation::ProjectRequired) => PROJECT_REQUIRED,
         DatabaseError::Rejected(reason @ Violation::SummarySourceCorrupt { .. }) => Refusal::new(
             StatusCode::CONFLICT,
             "summary_source_corrupt",

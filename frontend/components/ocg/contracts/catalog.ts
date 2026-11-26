@@ -43,6 +43,18 @@ export type ProfilesSnapshot = Omit<
 export type LlmProfile = ProfilesSnapshot["llm_profiles"][number];
 export type ManagedAgentProfile = ProfilesSnapshot["agent_profiles"][number];
 
+const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+export function reasoningEffortOptions(model?: {
+  reasoning_efforts: string[] | null;
+  declared_capabilities: Capability[];
+}) {
+  return (
+    model?.reasoning_efforts ??
+    (model?.declared_capabilities.includes("reasoning") ? WIRE_EFFORTS : [])
+  );
+}
+
 export function projectAgentProfiles(page: Api.AgentProfiles): AgentProfiles {
   return {
     ...page,

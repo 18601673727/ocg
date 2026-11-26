@@ -155,6 +155,7 @@ pub(crate) struct DevelopmentExecutionContext {
     pub adopted_summary: Option<VerifiedNativeSummary>,
     pub covered_inputs: Vec<DevelopmentRetainedInput>,
     pub history: Vec<DevelopmentContextTurn>,
+    pub prerequisite_results: Option<String>,
 }
 
 impl DevelopmentExecutionContext {

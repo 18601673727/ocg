@@ -3,11 +3,21 @@ import { OptionList } from "@/components/ocg/chat/ui/option-list";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectItem } from "@/components/ui/select";
-import type { ProfilesSnapshot, Project } from "../contracts";
+import {
+  type LlmProfile,
+  type ProfilesSnapshot,
+  type Project,
+  reasoningEffortOptions,
+} from "../contracts";
 import { useI18n } from "../i18n";
 import type { ApiClient } from "../runtime/api-client";
 
-type Selection = { agent: string | null; model: string; projects: string[] };
+type Selection = {
+  agent: string;
+  model: string;
+  projects: string[];
+  reasoning_effort: string | null;
+};
 
 export function DispatchSelectionCard(props: {
   client: ApiClient;
@@ -22,6 +32,7 @@ export function DispatchSelectionCard(props: {
   } | null>(null);
   const [target, setTarget] = createSignal("");
   const [modelId, setModelId] = createSignal("");
+  const [effort, setEffort] = createSignal("");
   const [projects, setProjects] = createSignal<string[]>([]);
   const [error, setError] = createSignal<string | null>(null);
   const [revision, setRevision] = createSignal(0);
@@ -92,6 +103,17 @@ export function DispatchSelectionCard(props: {
   const model = createMemo(() =>
     modelId() ? choices().find((model) => model!.id === modelId()) : choices()[0],
   );
+  const efforts = createMemo(() => {
+    const selected = model();
+    return selected?.protocol !== "anthropic_messages" &&
+      selected?.declared_capabilities.includes("reasoning")
+      ? reasoningEffortOptions(selected)
+      : [];
+  });
+  const defaultEffort = createMemo(() => {
+    const value = model()?.parameters.reasoning_effort;
+    return value ? `${i18n.t("chat.profileDefault")} (${value})` : i18n.t("chat.profileDefault");
+  });
   const needsProject = createMemo(() => Boolean(agent()?.capabilities.includes("coding")));
   const validProjects = createMemo(() =>
     projects().filter((id) => catalog()?.projects.some((project) => project.id === id)),
@@ -100,16 +122,30 @@ export function DispatchSelectionCard(props: {
     !props.disabled &&
     Boolean(agent() && model()) &&
     (!needsProject() || validProjects().length > 0);
+  function modelLabel(profile: LlmProfile) {
+    const provider = catalog()?.profiles.providers.find(({ profile_ids }) =>
+      profile_ids.includes(profile.id),
+    );
+    const modelName =
+      profile.name === profile.model ? profile.model : `${profile.name} · ${profile.model}`;
+    const label = provider ? `${modelName} · ${provider.name}` : modelName;
+    return agent()?.llm_targets[0] === profile.id
+      ? `${label} (${i18n.t("settings.agent.defaultModel")})`
+      : label;
+  }
   return (
     <form
       class="flex flex-col gap-3 text-sm"
       onSubmit={(event) => {
         event.preventDefault();
-        if (!canDispatch()) return;
+        const selectedAgent = agent();
+        const selectedModel = model();
+        if (!canDispatch() || !selectedAgent || !selectedModel) return;
         props.onSelect({
-          agent: agent()?.id ?? null,
-          model: model()!.id,
+          agent: selectedAgent.id,
+          model: selectedModel.id,
           projects: validProjects(),
+          reasoning_effort: efforts().includes(effort()) ? effort() : null,
         });
       }}
     >
@@ -166,6 +202,7 @@ export function DispatchSelectionCard(props: {
             if (next === null) return;
             setTarget(next);
             setModelId("");
+            setEffort("");
           }}
           class="min-h-10 w-full rounded-md border-border bg-background px-2"
         >
@@ -196,26 +233,41 @@ export function DispatchSelectionCard(props: {
           <Select
             value={model()!.id}
             items={choices().map((model) => ({
-              value: model!.id,
-              label: `${model!.name} · ${model!.model}${
-                agent()?.llm_targets[0] === model!.id
-                  ? ` (${i18n.t("settings.agent.defaultModel")})`
-                  : ""
-              }`,
+              value: model.id,
+              label: modelLabel(model),
             }))}
             disabled={props.disabled}
             onValueChange={(next) => {
-              if (next !== null) setModelId(next);
+              if (next === null) return;
+              setModelId(next);
+              setEffort("");
             }}
             class="min-h-10 w-full rounded-md border-border bg-background px-2"
           >
             {choices().map((model) => (
-              <SelectItem value={model!.id}>
-                {model!.name} · {model!.model}
-                {agent()?.llm_targets[0] === model!.id
-                  ? ` (${i18n.t("settings.agent.defaultModel")})`
-                  : ""}
-              </SelectItem>
+              <SelectItem value={model.id}>{modelLabel(model)}</SelectItem>
+            ))}
+          </Select>
+        </label>
+      )}
+      {model() && (
+        <label class="flex flex-col gap-1">
+          {i18n.t("chat.effort")}
+          <Select
+            value={efforts().includes(effort()) ? effort() : ""}
+            items={[
+              { value: "", label: defaultEffort() },
+              ...efforts().map((value) => ({ value, label: value })),
+            ]}
+            disabled={props.disabled || !efforts().length}
+            onValueChange={(next) => {
+              if (next !== null) setEffort(next);
+            }}
+            class="min-h-10 w-full rounded-md border-border bg-background px-2"
+          >
+            <SelectItem value="">{defaultEffort()}</SelectItem>
+            {efforts().map((value) => (
+              <SelectItem value={value}>{value}</SelectItem>
             ))}
           </Select>
         </label>

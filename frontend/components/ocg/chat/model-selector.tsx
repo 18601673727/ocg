@@ -1,6 +1,11 @@
 import { createEffect, createMemo, createSignal } from "solid-js";
 import { type Ref } from "@/lib/ui-state";
-import type { AgentProfile, ChatModelSelection, Project } from "../contracts";
+import {
+  type AgentProfile,
+  type ChatModelSelection,
+  type Project,
+  reasoningEffortOptions,
+} from "../contracts";
 import { useI18n } from "../i18n";
 import { useOcgRuntime, useOcgRuntimeSnapshot } from "../runtime/runtime-context";
 import { settingsPath } from "../settings/settings-sections";
@@ -11,8 +16,6 @@ function targetLabel(target: { name: string; model: string }): string {
   if (!name || name === target.model) return target.model;
   return `${target.model} (${name})`;
 }
-
-const WIRE_EFFORTS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 type Catalog = { agents: AgentProfile[]; projects: Project[] };
 
@@ -113,11 +116,7 @@ export function ModelSelector(props: {
   const llmId = createMemo(() => llm()?.id);
   const supportsImages = createMemo(() => llm()?.declared_capabilities.includes("vision") ?? false);
   const model = createMemo(() => llm()?.model);
-  const efforts = createMemo(
-    () =>
-      llm()?.reasoning_efforts ??
-      (llm()?.declared_capabilities.includes("reasoning") ? WIRE_EFFORTS : []),
-  );
+  const efforts = createMemo(() => reasoningEffortOptions(llm()));
   const effort = createMemo(() =>
     props.selection?.llmProfile === llmId() &&
     props.selection?.effort &&

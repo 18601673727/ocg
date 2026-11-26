@@ -915,12 +915,27 @@ fn development_candidate_in(
     let mut history = Vec::new();
     let mut previous = record.job.previous;
     let outputs = rx.open_table(JOB_OUTPUTS)?;
+    let after = &conversation_lifecycle.after;
+    let prerequisite_results = if record.job.summary_source.is_none()
+        && !conversation.is_chunk_group()
+        && !after.is_empty()
+    {
+        Some(
+            super::super::job_tree::prerequisite_results(rx, &conversation, after)?
+                .ok_or_else(|| context_unavailable("execution prerequisite is not satisfied"))?,
+        )
+    } else {
+        None
+    };
     let mut output_bytes = 0usize;
     let mut selected_bytes = record.job.input.text().len().saturating_add(
         requirements
             .prompt_bytes(&configuration, project.as_ref(), adopted_summary.as_ref())
             .map_err(|_| StorageError::corrupted("invalid project context"))?,
     );
+    if let Some(results) = &prerequisite_results {
+        selected_bytes = selected_bytes.saturating_add(results.len() + 2);
+    }
     let mut image_count = attachments.len();
     while let Some(id) = previous {
         let is_covered = covered.contains(&id);
@@ -1128,6 +1143,7 @@ fn development_candidate_in(
             adopted_summary,
             covered_inputs,
             history,
+            prerequisite_results,
         },
     ))
 }

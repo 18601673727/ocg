@@ -264,7 +264,7 @@ export const zh: Dictionary = {
   "chat.dispatch.submit": "派发 Job",
   "chat.dispatch.recurrence": "每 {seconds} 秒重复执行一次。",
   "chat.dispatch.keepOpen": "任务结束后保留此 worker，以接收后续任务。",
-  "chat.dispatch.dependencies": "需等待 {count} 个前置 Job。",
+  "chat.dispatch.dependencies": "等待 {count} 个前置 Job，并将结果发送给所选模型。",
   "chat.card.question": "向您提问",
 
   "chat.children": "子对话",

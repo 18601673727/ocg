@@ -762,6 +762,7 @@ pub struct DispatchSelection {
     pub agent: Option<String>,
     pub model: String,
     pub projects: Vec<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone, Debug, serde::Deserialize)]

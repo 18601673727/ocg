@@ -1,11 +1,11 @@
 use crate::db::entities::{
-    Actor, ApprovalDecision, ConfigId, ContentDigest, DependencyCondition, JobId, JobLimits,
-    Origin, ProfileId, ProjectId,
+    Actor, ApprovalDecision, ConfigId, ContentDigest, DependencyCondition, DependencyState, JobId,
+    JobLimits, Origin, ProfileId, ProjectId,
 };
 use crate::db::entities::{
     AllocationToken, ConfigBody, ConfigKind, DispatchSelection, ExecutionConfiguration,
-    JobDependency, JobToolCall, MutableJob, ToolAdmission, ToolCallRef, ToolDecision, ToolEffect,
-    ToolEvidenceRecord, ToolOutcome, ToolPayload, Violation,
+    JobDependency, JobToolCall, ModelCapability, MutableJob, ReasoningEffort, ToolAdmission,
+    ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError};
 use crate::db::redb::job_tree;
@@ -511,7 +511,7 @@ impl Batch {
         every_seconds: Option<u32>,
         depends_on: Vec<JobDependency>,
     ) -> Result<String, BatchError> {
-        self.validate_dispatch_selection(selection)?;
+        let configuration = self.dispatch_configuration(selection)?;
         if objective.trim().is_empty() {
             return self.reject(Violation::InvalidValue("objective", "must not be empty"));
         }
@@ -523,12 +523,7 @@ impl Batch {
                 "interval must be between 60 and 2592000 seconds",
             ));
         }
-        let agent = selection
-            .agent
-            .as_deref()
-            .map(|id| self.job_tool_id(id).map(ConfigId::new))
-            .transpose()?;
-        let model = ConfigId::new(self.job_tool_id(&selection.model)?);
+        let agent = configuration.agent_profile.map(Into::into);
         let projects = if selection.projects.is_empty() {
             vec![None]
         } else {
@@ -562,6 +557,12 @@ impl Batch {
                     ));
                 }
             };
+            if self.prerequisite_state(id, condition)? == DependencyState::Impossible {
+                return self.reject(Violation::InvalidValue(
+                    "depends_on",
+                    "a prerequisite already ended unsuccessfully and cannot meet the success condition",
+                ));
+            }
             after.push((id, condition));
         }
         after.sort_by_key(|(id, _)| *id);
@@ -573,11 +574,6 @@ impl Batch {
         }
         let Some(asked) = self.mutable_job(approval.job)? else {
             return self.corrupted("the Job that asked is not native".into());
-        };
-        let configuration = ExecutionConfiguration {
-            reasoning_effort: None,
-            agent_profile: agent.map(Into::into),
-            llm_profile: model.into(),
         };
         let mut lines = Vec::new();
         for (index, project) in projects.into_iter().enumerate() {
@@ -617,10 +613,10 @@ impl Batch {
         ))
     }
 
-    pub(crate) fn validate_dispatch_selection(
+    fn dispatch_configuration(
         &mut self,
         selection: &DispatchSelection,
-    ) -> Result<(), BatchError> {
+    ) -> Result<ExecutionConfiguration, BatchError> {
         if selection.projects.len() > MAX_SELECTED_PROJECTS {
             return self.reject(Violation::InvalidValue(
                 "projects",
@@ -641,8 +637,8 @@ impl Batch {
                 "select an Agent that lists this Model",
             ));
         };
-        let agent = ConfigId::new(self.job_tool_id(agent)?);
-        let config = self.require_config_kind(agent, ConfigKind::Agent)?;
+        let agent_id = ConfigId::new(self.job_tool_id(agent)?);
+        let config = self.require_config_kind(agent_id, ConfigKind::Agent)?;
         let ConfigBody::Agent(agent) = config.body else {
             return self.corrupted("invalid dispatch Agent".into());
         };
@@ -658,6 +654,29 @@ impl Batch {
         if agent.workspace_grant().is_some() && selection.projects.is_empty() {
             return self.reject(Violation::ProjectRequired);
         }
+        let reasoning_effort = if let Some(value) = &selection.reasoning_effort {
+            let ConfigBody::Model(body) = &record.body else {
+                return self.corrupted("invalid dispatch model".into());
+            };
+            let Some(effort) = ReasoningEffort::parse(value) else {
+                return self.reject(Violation::InvalidValue(
+                    "reasoning_effort",
+                    "invalid effort",
+                ));
+            };
+            if !body
+                .declared_capabilities
+                .contains(&ModelCapability::Reasoning)
+            {
+                return self.reject(Violation::InvalidValue(
+                    "reasoning_effort",
+                    "the selected model has no reasoning capability",
+                ));
+            }
+            Some(effort)
+        } else {
+            None
+        };
         let mut projects = BTreeSet::new();
         for project in &selection.projects {
             let project = ProjectId::new(self.job_tool_id(project)?);
@@ -669,7 +688,11 @@ impl Batch {
             }
             self.require_project(project)?;
         }
-        Ok(())
+        Ok(ExecutionConfiguration {
+            reasoning_effort,
+            agent_profile: Some(agent_id.into()),
+            llm_profile: model.into(),
+        })
     }
 
     fn job_agent_catalog(

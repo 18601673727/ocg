@@ -298,7 +298,8 @@ export const en = {
   "chat.dispatch.submit": "Dispatch Jobs",
   "chat.dispatch.recurrence": "Repeats every {seconds} seconds.",
   "chat.dispatch.keepOpen": "The worker stays open after this task for further assignments.",
-  "chat.dispatch.dependencies": "Waits for {count} prerequisite Job(s).",
+  "chat.dispatch.dependencies":
+    "Waits for {count} prerequisite Job(s) and sends their results to the selected model.",
   "chat.card.question": "Question for you",
 
   "chat.children": "Child conversations",
