@@ -64,6 +64,12 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         (Some(2), Some(b"ocg-native-format-2")) => 2,
         (Some(3), Some(b"ocg-native-format-3")) => 3,
         (Some(4), Some(b"ocg-native-format-4")) => 4,
+        (Some(5), Some(b"ocg-native-format-5")) => {
+            return Err(ReservedRefusal::new(
+                "unsupported_source",
+                format!("no migration from Format 5 to Format {FORMAT_VERSION} is available"),
+            ));
+        }
         (Some(FORMAT_VERSION), Some(SCHEMA_FINGERPRINT)) => {
             return Err(ReservedRefusal::new(
                 "already_migrated",

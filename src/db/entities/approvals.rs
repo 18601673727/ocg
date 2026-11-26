@@ -256,6 +256,32 @@ pub struct ToolEvidenceRecord {
     pub decision: Recorded<ToolDecision>,
     pub outcome: Option<Recorded<ToolOutcome>>,
     pub reconciliation: Option<Recorded<ToolReconciliation>>,
+    pub child_notice_drop: Option<ChildNoticeDrop>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildNoticeDrop {
+    LimitReached,
+    ParentClosed,
+    ChildTurnSettled,
+    RequestResolved,
+}
+
+impl ChildNoticeDrop {
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Self::LimitReached => {
+                "Notice dropped because the parent reached its child notice limit."
+            }
+            Self::ParentClosed => "Notice dropped because the parent conversation closed.",
+            Self::ChildTurnSettled => {
+                "Progress notice dropped because the child turn ended before delivery."
+            }
+            Self::RequestResolved => {
+                "Help notice dropped because the request was resolved before delivery."
+            }
+        }
+    }
 }
 
 impl ToolEvidenceRecord {

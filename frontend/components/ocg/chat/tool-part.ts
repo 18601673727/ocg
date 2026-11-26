@@ -30,15 +30,18 @@ export function presentToolCall(
     call.decision !== "awaiting_approval" &&
     call.decision !== "awaiting_answer";
   const failed =
+    Boolean(call.child_notice_drop) ||
     refused ||
     call.outcome_kind === "not_applied" ||
     call.outcome_kind === "not_invoked" ||
     call.outcome_kind === "uncertain";
-  const result = refused
-    ? `${t("transcript.outcome.refused")}: ${call.decision}`
-    : call.outcome_kind && call.outcome_kind !== "completed_elided"
-      ? (call.result ?? call.outcome_kind)
-      : undefined;
+  const result =
+    call.child_notice_drop ??
+    (refused
+      ? `${t("transcript.outcome.refused")}: ${call.decision}`
+      : call.outcome_kind && call.outcome_kind !== "completed_elided"
+        ? (call.result ?? call.outcome_kind)
+        : undefined);
   return {
     toolCallId: call.tool_call_id,
     toolName: call.name,

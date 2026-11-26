@@ -1,11 +1,11 @@
 use super::StorageError;
 use crate::db::entities::{
     Actor, AgentCapability, AgentConfig, AttachmentOrigin, AuthorizationBasis, ChatFinishReason,
-    CleanupKind, ConfigId, ConfigRef, DependencyCondition, EffectConclusion, ExecutionOperation,
-    FrozenExecutionConfig, FrozenLlmConfig, JobId, LlmConfig, LlmParameters, LlmProviderId,
-    LlmTransport, ModelCapability, NormalizedUsage, OutcomeKind, OutputKind, ProviderFailure,
-    ProviderSnapshot, RecurrenceHalt, RequestNumber, StopProof, Timestamp, ToolCallRefusal,
-    ToolEffect, UncertainCause, WithheldReason,
+    ChildNoticeDrop, CleanupKind, ConfigId, ConfigRef, DependencyCondition, EffectConclusion,
+    ExecutionOperation, FrozenExecutionConfig, FrozenLlmConfig, JobId, LlmConfig, LlmParameters,
+    LlmProviderId, LlmTransport, ModelCapability, NormalizedUsage, OutcomeKind, OutputKind,
+    ProviderFailure, ProviderSnapshot, RecurrenceHalt, RequestNumber, StopProof, Timestamp,
+    ToolCallRefusal, ToolEffect, UncertainCause, WithheldReason,
 };
 use crate::db::entities::{
     CommandOwner, CommandStatus, CompactionMode, CompactionPolicy, CompactionPreset, ConfigKind,
@@ -650,6 +650,10 @@ codes!(ToolCallRefusal {
     ToolCallRefusal::MissingSchema = 7, ToolCallRefusal::UnsupportedSchema = 8, ToolCallRefusal::InvalidArguments = 9, ToolCallRefusal::NoDecider = 10,
 });
 codes!(ToolEffect { ToolEffect::ReadOnly = 1, ToolEffect::Idempotent = 2, ToolEffect::NonIdempotent = 3 });
+codes!(ChildNoticeDrop {
+    ChildNoticeDrop::LimitReached = 1, ChildNoticeDrop::ParentClosed = 2,
+    ChildNoticeDrop::ChildTurnSettled = 3, ChildNoticeDrop::RequestResolved = 4,
+});
 codes!(AuthorizationBasis { AuthorizationBasis::RegistryGrant = 1 });
 codes!(WithheldReason { WithheldReason::Unserializable = 2 });
 codes!(UncertainCause { UncertainCause::TimedOut = 1, UncertainCause::Cancelled = 2, UncertainCause::HandlerReported = 3 });

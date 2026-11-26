@@ -1716,6 +1716,13 @@ impl Batch {
             return self.corrupted("Job state has a different identity".into());
         }
         let previous = self.step(|tx| state::read(tx, job))?;
+        if state.outcome.is_some()
+            && previous
+                .as_ref()
+                .is_some_and(|row| row.state.outcome.is_none())
+        {
+            self.expire_child_progress(job)?;
+        }
         self.record_job_state(previous.as_ref().map(|row| &row.state), state)?;
         let mut row = previous.unwrap_or_else(|| JobRuntime::new(job));
         row.state = state.clone();
@@ -1828,6 +1835,11 @@ impl Batch {
             }
             state::write(tx, &runtime)
         })?;
+        if (previous.closing.is_none() && row.closing.is_some())
+            || (previous.hidden_at.is_none() && row.hidden_at.is_some())
+        {
+            self.drop_notices_to_closed_parent(root)?;
+        }
         if (row.closing.is_some() || row.hidden_at.is_some())
             && let Some(mut rec) = self.get(RECURRENCES, root.get(), Recurrence::decode)?
             && !matches!(rec.phase, RecurrencePhase::Halted { .. })

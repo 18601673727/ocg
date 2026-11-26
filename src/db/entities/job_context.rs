@@ -688,6 +688,7 @@ pub(crate) struct ChildNotice {
     pub text_start_utf16: u32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildNoticeKind {
     Progress,
     Help,

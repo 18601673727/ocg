@@ -3,14 +3,14 @@ use std::collections::BTreeSet;
 use super::StorageError;
 use crate::db::entities::{
     AttachmentCleanup, AttachmentId, AttachmentOrigin, AttachmentRecord, AuthorizationBasis,
-    CleanupKind, CommandOwner, CommandStatus, ConfigBody, ConfigId, ConfigKind, ConnectionConfig,
-    ContentDigest, EffectConclusion, JobId, JobOutputId, JobOutputRecord, LlmParameters,
-    LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason, ProjectCommand,
-    ProjectDecisionConfig, ProjectId, ProjectRecord, Recorded, Recurrence, RecurrenceHalt,
-    RecurrencePhase, RequestEventRecord, RequestFingerprint, RequestNumber, RequestPayload,
-    SubmissionKey, SubmissionRecord, Timestamp, ToolAdmission, ToolCallRef, ToolDecision,
-    ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation, UncertainCause,
-    UsageFinality, WithheldReason,
+    ChildNoticeDrop, CleanupKind, CommandOwner, CommandStatus, ConfigBody, ConfigId, ConfigKind,
+    ConnectionConfig, ContentDigest, EffectConclusion, JobId, JobOutputId, JobOutputRecord,
+    LlmParameters, LlmTransport, Measurements, ModelCapability, ModelConfig, NotInvokedReason,
+    ProjectCommand, ProjectDecisionConfig, ProjectId, ProjectRecord, Recorded, Recurrence,
+    RecurrenceHalt, RecurrencePhase, RequestEventRecord, RequestFingerprint, RequestNumber,
+    RequestPayload, SubmissionKey, SubmissionRecord, Timestamp, ToolAdmission, ToolCallRef,
+    ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, ToolReconciliation,
+    UncertainCause, UsageFinality, WithheldReason,
 };
 use crate::db::entities::{
     ChatFinishReason, CredentialSecret, JobSpec, Origin, OutputKind, RequestEligibility,
@@ -580,6 +580,9 @@ pub(super) fn encode_tool_evidence(record: &ToolEvidenceRecord) -> Vec<u8> {
         e.u64(group.sentinel_inode);
         e.opt(group.pid_namespace.as_ref(), |e, ns| e.u64(*ns));
     });
+    e.opt(record.child_notice_drop.as_ref(), |e, drop| {
+        e.u8(drop.code())
+    });
     e.0
 }
 
@@ -674,6 +677,7 @@ pub(super) fn decode_tool_evidence(
             "a recorded command group requires a spawning admission",
         ));
     }
+    let child_notice_drop = d.opt(|d| d.code(ChildNoticeDrop::from_code))?;
     d.end()?;
     Ok(ToolEvidenceRecord {
         group,
@@ -687,6 +691,7 @@ pub(super) fn decode_tool_evidence(
         },
         outcome,
         reconciliation,
+        child_notice_drop,
     })
 }
 

@@ -6,9 +6,9 @@ use std::collections::BTreeSet;
 pub(crate) const DATABASE_FILE_NAME: &str = "ocg.redb";
 pub(crate) const CREDENTIAL_KEY_FILE_NAME: &str = "ocg.key";
 pub(super) const DATABASE_FORMAT_KEY: &str = "database_format";
-pub(super) const FORMAT_VERSION: u64 = 5; // Shared by database metadata and record headers.
+pub(super) const FORMAT_VERSION: u64 = 6; // Shared by database metadata and record headers.
 pub(super) const SCHEMA_FINGERPRINT_KEY: &str = "schema_fingerprint";
-pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-format-5";
+pub(super) const SCHEMA_FINGERPRINT: &[u8] = b"ocg-native-format-6";
 
 pub(super) const fn record_version_byte() -> u8 {
     const { assert!(FORMAT_VERSION <= u8::MAX as u64) };
@@ -142,6 +142,7 @@ tables! {
         JOB_EVENTS: (u128, u64) => &[u8] = "job_event" tags [55];
         REQUEST_EVENTS: (u128, u32, u32) => &[u8] = "request_event" tags [8];
         TOOL_CALLS: (u128, u32, u32) => &[u8] = "tool_call" tags [7];
+        PENDING_CHILD_NOTICES: (u128, u128, u32, u32) => () = "pending_child_notice";
     }
     metadata {
         META: &str => &[u8] = "meta";

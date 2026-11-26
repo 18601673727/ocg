@@ -1,8 +1,8 @@
 use super::codec::TAG_APPROVAL;
 use super::{StorageError, TxRead, approvals};
 use crate::db::entities::{
-    AWAITING_TOOL_DECISION, Actor, Appended, ApprovalDecision, ApprovalRecord, ChildNoticeKind,
-    JobId, Origin, OutcomeKind, OutputKind, ToolCallRefusal, ToolEffect, ToolEvidenceRecord,
+    Actor, Appended, ApprovalDecision, ApprovalRecord, ChildNoticeDrop, ChildNoticeKind, JobId,
+    Origin, OutcomeKind, ToolCallRefusal, ToolEffect, ToolEvidenceRecord,
 };
 use crate::db::entities::{
     ExecutionEventKind, MessageBody, Recorded, ToolCallRef, ToolDecision, ToolOutcome, Violation,
@@ -254,6 +254,11 @@ impl Batch {
                 None => continuation_text(&call.name, &decision),
             },
         };
+        if call.name == "job_ask_parent"
+            && let Some(parent) = self.require_mutable_conversation(conversation)?.parent_id
+        {
+            self.drop_pending_child_notice(parent, approval, ChildNoticeDrop::RequestResolved)?;
+        }
         self.put_approval(approval, decision, by)?;
         self.step(|tx| {
             tx.open_table(OPEN_APPROVALS)?.remove(key)?;
@@ -462,7 +467,11 @@ impl Batch {
             }
             Ok(calls)
         })?;
+        let parent = self.require_mutable_conversation(conversation)?.parent_id;
         for call in calls {
+            if let Some(parent) = parent {
+                self.drop_pending_child_notice(parent, call, ChildNoticeDrop::RequestResolved)?;
+            }
             self.put_approval(call, ApprovalDecision::Voided, by.clone())?;
             self.remove(OPEN_APPROVALS, open_key(conversation, call))?;
         }
@@ -600,6 +609,7 @@ impl Batch {
             },
             outcome: None,
             reconciliation: None,
+            child_notice_drop: None,
         };
         self.step(|tx| {
             tx.open_table(TOOL_CALLS)?
@@ -743,16 +753,11 @@ fn question(arguments: &str) -> String {
 pub(super) fn open_child_help(
     tx: &impl TxRead,
     child: JobId,
-    turn: Option<JobId>,
+    turn: JobId,
 ) -> Result<Option<(ToolCallRef, String)>, StorageError> {
     let calls = tx.table(TOOL_CALLS)?;
-    let start = (child.get(), turn.map_or(0, JobId::get), 0, 0);
-    let end = (
-        child.get(),
-        turn.map_or(u128::MAX, JobId::get),
-        u32::MAX,
-        u32::MAX,
-    );
+    let start = (child.get(), turn.get(), 0, 0);
+    let end = (child.get(), turn.get(), u32::MAX, u32::MAX);
     for entry in tx.table(OPEN_APPROVALS)?.range(start..=end)? {
         let (_, job, request, index) = entry?.0.value();
         let call = tool_call_ref((job, request, index))?;
@@ -769,20 +774,6 @@ pub(super) fn open_child_help(
         return Ok(Some((call, question(admission.arguments.as_str()))));
     }
     Ok(None)
-}
-
-pub(super) fn child_help_is_awaiting(tx: &impl TxRead, turn: JobId) -> Result<bool, StorageError> {
-    let job = turn.get();
-    let outputs = tx.table(JOB_OUTPUTS)?;
-    let Some((key, row)) = outputs
-        .range((job, 0)..=(job, u32::MAX))?
-        .next_back()
-        .transpose()?
-    else {
-        return Ok(false);
-    };
-    let output = decode_output(key.value(), row.value())?;
-    Ok(output.kind == OutputKind::Result && output.code.as_deref() == Some(AWAITING_TOOL_DECISION))
 }
 
 fn approval_assessment(

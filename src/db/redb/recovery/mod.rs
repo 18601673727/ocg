@@ -155,13 +155,8 @@ pub(super) fn check_identity(
             .map_err(|_| unsupported_format("database format marker is malformed"))?,
     };
     if (1..FORMAT_VERSION).contains(&found) {
-        let action = if cfg!(unix) {
-            "run ocg migrate <data-directory> --dry-run"
-        } else {
-            "use the Unix-only ocg migrate command"
-        };
         return Err(unsupported_format(&format!(
-            "database format {found} requires offline migration: {action}"
+            "database format {found} is not supported; no migration to format {FORMAT_VERSION} is available"
         )));
     }
     if found != FORMAT_VERSION {

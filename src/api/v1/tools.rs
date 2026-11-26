@@ -22,6 +22,9 @@ pub(crate) struct ToolCallView {
     result_cut: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
+    child_notice_drop: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
     duration_ms: Option<u64>,
 }
 
@@ -150,6 +153,7 @@ fn tool_view_with_limit(record: &ToolEvidenceRecord, limit: usize) -> ToolCallVi
         arguments_cut,
         result,
         result_cut,
+        child_notice_drop: record.child_notice_drop.map(|reason| reason.message()),
         duration_ms: record.outcome.as_ref().and_then(|outcome| {
             outcome
                 .at

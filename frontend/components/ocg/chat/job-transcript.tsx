@@ -282,7 +282,8 @@ function TurnToolCalls(props: {
           props.tools.map((tool) => {
             const key = `${tool.request}:${tool.index}`;
             const summary = argumentSummary(tool.name, tool.arguments);
-            const outcome = outcomeLabel(tool.outcome_kind, tool.decision, props.isLive);
+            const kind = tool.child_notice_drop ? "not_applied" : tool.outcome_kind;
+            const outcome = outcomeLabel(kind, tool.decision, props.isLive);
             const isCompleted = outcome === "completed";
             const isRunning = outcome === "running";
             const isUncertain =
@@ -322,7 +323,7 @@ function TurnToolCalls(props: {
                         "border border-border bg-muted text-muted-foreground",
                     )}
                   >
-                    {outcomeText(i18n.t, tool.outcome_kind, tool.decision, props.isLive)}
+                    {outcomeText(i18n.t, kind, tool.decision, props.isLive)}
                   </span>
                 </summary>
                 {expanded()[key] && (
@@ -332,6 +333,9 @@ function TurnToolCalls(props: {
                         {i18n.t("transcript.decision", { decision: tool.decision })}
                       </div>
                     ) : null}
+                    {tool.child_notice_drop && (
+                      <div class="font-sans text-xs text-destructive">{tool.child_notice_drop}</div>
+                    )}
                     <WorkspaceTool call={tool} jobId={props.jobId} client={props.client}>
                       <div>
                         <div class="mb-1 flex items-center justify-between font-sans text-[11px] text-muted-foreground">
