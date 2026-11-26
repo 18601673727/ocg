@@ -1127,20 +1127,31 @@ fn child_segment_heads_before(
         .map(|row| Recurrence::decode(row.value()))
         .transpose()?;
     let max_n = recurrence.as_ref().map_or(0, |r| r.n);
-    let jobs = tx.table(JOBS)?;
+    let turn_ids = {
+        let turns = tx.table(TURNS)?;
+        turns
+            .range((child.get(), 0)..(child.get(), before_turn.get()))?
+            .map(|entry| Ok(JobId::new(entry?.0.value().1)))
+            .collect::<Result<Vec<_>, StorageError>>()?
+    };
+    let child_turns = {
+        let jobs = tx.table(JOBS)?;
+        turn_ids
+            .into_iter()
+            .map(|id| {
+                let row = jobs.get(id.get())?.ok_or_else(|| {
+                    StorageError::corrupted("child turn missing during migration")
+                })?;
+                jobs::decode_mutable_job(id.get(), row.value())
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?
+    };
     let mut heads = Vec::new();
     let mut current_head = None;
     let mut in_segment = false;
     let mut settled_non_planning = Vec::new();
-    for entry in tx
-        .table(TURNS)?
-        .range((child.get(), 0)..(child.get(), before_turn.get()))?
-    {
-        let id = JobId::new(entry?.0.value().1);
-        let row = jobs
-            .get(id.get())?
-            .ok_or_else(|| StorageError::corrupted("child turn missing during migration"))?;
-        let turn = jobs::decode_mutable_job(id.get(), row.value())?;
+    for turn in child_turns {
+        let id = turn.id;
         if reads::jobs::project_planning_target(tx, &turn)?.is_some() {
             continue;
         }
@@ -1273,32 +1284,57 @@ impl LegacyChildTurns {
                 seq0_submissions.insert(record.job, record.key);
             }
         }
-        let submissions = tx.table(SUBMISSIONS)?;
         let mut notice_calls = BTreeMap::new();
-        for entry in tx.table(TOOL_CALLS)?.iter()? {
-            let (key, value) = entry?;
-            let call = rows::tool_call_ref(key.value())?;
-            let tool = rows::decode_tool_evidence(call, value.value())?;
-            let kind = match tool.name.as_str() {
-                "job_report_progress" => ChildNoticeKind::Progress,
-                "job_ask_parent" => ChildNoticeKind::Help,
-                _ => continue,
-            };
-            let key = job_tree::tool_submission(call, b"child notice", 0).key;
-            if let Some(row) = submissions.get(key.as_bytes().as_slice())? {
-                let record = rows::decode_submission(key.as_bytes(), row.value())?;
-                notice_calls.insert(record.job.get(), (call, kind));
+        {
+            let submissions = tx.table(SUBMISSIONS)?;
+            for entry in tx.table(TOOL_CALLS)?.iter()? {
+                let (key, value) = entry?;
+                let call = rows::tool_call_ref(key.value())?;
+                let tool = rows::decode_tool_evidence(call, value.value())?;
+                let kind = match tool.name.as_str() {
+                    "job_report_progress" => ChildNoticeKind::Progress,
+                    "job_ask_parent" => ChildNoticeKind::Help,
+                    _ => continue,
+                };
+                let key = job_tree::tool_submission(call, b"child notice", 0).key;
+                if let Some(row) = submissions.get(key.as_bytes().as_slice())? {
+                    let record = rows::decode_submission(key.as_bytes(), row.value())?;
+                    notice_calls.insert(record.job.get(), (call, kind));
+                }
             }
         }
+        let candidates = {
+            let jobs = tx.table(JOBS)?;
+            let mut candidates = Vec::new();
+            for entry in jobs.iter()? {
+                let (key, bytes) = entry?;
+                let job = jobs::decode_mutable_job(key.value(), bytes.value())?;
+                if job.retry.is_some() || job.summary_source.is_some() {
+                    continue;
+                }
+                let is_candidate = match job.submitted_by {
+                    Actor::Agent { .. } => {
+                        matches!(
+                            job.input.text().split_once('\n'),
+                            Some((
+                                job_tree::CHILD_PROGRESS_HEADER | job_tree::CHILD_HELP_HEADER,
+                                _
+                            ))
+                        )
+                    }
+                    Actor::Auto => job.input.text().starts_with(job_tree::REPORT_HEADER),
+                    Actor::User | Actor::Loop => false,
+                };
+                if is_candidate {
+                    candidates.push(job);
+                }
+            }
+            candidates
+        };
         let mut turns = Self::default();
         let mut claimed_heads = BTreeMap::new();
-        for entry in tx.table(JOBS)?.iter()? {
-            let (key, bytes) = entry?;
-            let id = key.value();
-            let job = jobs::decode_mutable_job(id, bytes.value())?;
-            if job.retry.is_some() || job.summary_source.is_some() {
-                continue;
-            }
+        for job in candidates {
+            let id = job.id.get();
             if let Actor::Agent { conversation } = job.submitted_by {
                 let text = job.input.text();
                 if let Some((header, _)) = text.split_once('\n') {
