@@ -486,6 +486,7 @@ fn unchanged(file: &File, before: &std::fs::Metadata, read: u64) -> Result<(), R
     let after = file.metadata().map_err(|_| Refusal::Unreadable)?;
     let state = |metadata: &std::fs::Metadata| {
         (
+            metadata.nlink(),
             metadata.len(),
             metadata.mtime(),
             metadata.mtime_nsec(),

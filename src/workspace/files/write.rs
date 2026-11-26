@@ -453,7 +453,13 @@ fn delete(
     if initial_stat.st_size > MAX_DELETE_BYTES as i64 {
         return Err(Refusal::FileTooLargeForDelete.into());
     }
-    let file = open_within(&directory, name, Step::File, MAX_DELETE_BYTES)?;
+    let file =
+        open_within(&directory, name, Step::File, MAX_DELETE_BYTES).map_err(
+            |refusal| match refusal {
+                PathRefusal::TooLarge { .. } => Failure::Refused(Refusal::FileTooLargeForDelete),
+                other => other.into(),
+            },
+        )?;
     let before = rustix::fs::fstat(&file).map_err(|_| PathRefusal::Unreadable)?;
     if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile {
         return Err(PathRefusal::NotRegularFile.into());
@@ -464,7 +470,10 @@ fn delete(
     if before.st_size > MAX_DELETE_BYTES as i64 {
         return Err(Refusal::FileTooLargeForDelete.into());
     }
-    let current_bytes = read_bytes(&file, MAX_DELETE_BYTES)?;
+    let current_bytes = read_bytes(&file, MAX_DELETE_BYTES).map_err(|refusal| match refusal {
+        PathRefusal::TooLarge { .. } => Failure::Refused(Refusal::FileTooLargeForDelete),
+        other => other.into(),
+    })?;
     let read = rustix::fs::fstat(&file).map_err(|_| PathRefusal::Unreadable)?;
     if version(&before) != version(&read) {
         return Err(PathRefusal::Changed.into());
@@ -476,15 +485,19 @@ fn delete(
     if current != expected {
         return Err(Refusal::Mismatch.into());
     }
+    let open_after = rustix::fs::fstat(&file).map_err(|_| Refusal::Changed)?;
     let after = rustix::fs::statat(&directory, name, AtFlags::SYMLINK_NOFOLLOW)
         .map_err(|_| Refusal::Changed)?;
-    if version(&read) != version(&after) {
+    if version(&read) != version(&open_after) || version(&read) != version(&after) {
         return Err(Refusal::Changed.into());
     }
     if stop.requested() {
         return Err(Refusal::Stopped.into());
     }
-    rustix::fs::unlinkat(&directory, name, AtFlags::empty()).map_err(|_| Refusal::NotDeleted)?;
+    rustix::fs::unlinkat(&directory, name, AtFlags::empty()).map_err(|errno| match errno {
+        Errno::NOENT => Refusal::Changed,
+        _ => Refusal::NotDeleted,
+    })?;
     directory
         .sync_all()
         .map_err(|_| Uncertainty::DeleteNotDurable.into())
@@ -496,6 +509,8 @@ fn version(stat: &Stat) -> impl PartialEq + use<> {
         stat.st_ino,
         stat.st_nlink,
         stat.st_mode,
+        stat.st_uid,
+        stat.st_gid,
         stat.st_size,
         stat.st_mtime,
         stat.st_mtime_nsec,
