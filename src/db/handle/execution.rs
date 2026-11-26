@@ -5,9 +5,9 @@ use crate::db::commands::{
 };
 use crate::db::entities::JobId;
 use crate::db::entities::{
-    AppendedOutput, JobFinalization, JobOutput, Metrics, OperationKind, ProviderAnswer,
-    ProviderRequestRecord, RequestNumber, ToolCallRef, ToolEvidence, ToolEvidenceRecord,
-    ToolOutcome, Violation,
+    AppendedOutput, ChildHelpStatus, JobFinalization, JobOutput, Metrics, OperationKind,
+    ProviderAnswer, ProviderRequestRecord, RequestNumber, ToolCallRef, ToolEvidence,
+    ToolEvidenceRecord, ToolOutcome, Violation,
 };
 use crate::db::errors::DatabaseError;
 use crate::db::handoff::{
@@ -64,6 +64,18 @@ impl DatabaseHandle {
     ) -> Result<Vec<ToolEvidenceRecord>, DatabaseError> {
         self.read(move |database| redb::read_tool_evidence(database, job, after, limit))
             .await
+    }
+
+    pub(crate) async fn tool_evidence_with_child_help(
+        &self,
+        job: JobId,
+        after: Option<(RequestNumber, u32)>,
+        limit: usize,
+    ) -> Result<Vec<(ToolEvidenceRecord, Option<ChildHelpStatus>)>, DatabaseError> {
+        self.read(move |database| {
+            redb::read_tool_evidence_with_child_help(database, job, after, limit)
+        })
+        .await
     }
 
     pub(crate) async fn development_trial_job(

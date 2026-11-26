@@ -1116,6 +1116,7 @@ export const zh: Dictionary = {
   "transcript.outcome.refused": "已拒绝",
   "transcript.outcome.awaitingApproval": "等待批准",
   "transcript.outcome.awaitingAnswer": "等待回答",
+  "transcript.outcome.answered": "已答复",
   "app.closeNavigation": "关闭导航",
   "app.retryLoading": "重试加载",
   "app.loadingConversation": "正在加载对话…",

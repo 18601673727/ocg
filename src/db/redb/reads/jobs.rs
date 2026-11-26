@@ -1,11 +1,12 @@
 use crate::db::derived::ActivityProjection;
-use crate::db::entities::{ConfigBody, ConfigId, DependencyState, OutcomeKind, ToolCallRef};
 use crate::db::entities::{
-    DependencyCondition, ExecutionEventKind, JobId, JobLifecycle, JobOutputId, JobOutputRecord,
-    JobSearchPage, JobSpec, JobState, JobTree, JobUsage, MutableConfiguration, MutableJob,
-    MutableJobContent, MutableJobDetails, MutableJobPhase, MutableJobRecord, NativeJobItem, Origin,
-    OutputKind, ProjectId, Recurrence, RequestNumber, ToolEvidenceRecord, TreeFacts, TreeNode,
+    ApprovalDecision, ApprovalRecord, ChildHelpStatus, DependencyCondition, ExecutionEventKind,
+    JobId, JobLifecycle, JobOutputId, JobOutputRecord, JobSearchPage, JobSpec, JobState, JobTree,
+    JobUsage, MutableConfiguration, MutableJob, MutableJobContent, MutableJobDetails,
+    MutableJobPhase, MutableJobRecord, NativeJobItem, Origin, OutputKind, ProjectId, Recurrence,
+    RequestNumber, ToolDecision, ToolEvidenceRecord, TreeFacts, TreeNode,
 };
+use crate::db::entities::{ConfigBody, ConfigId, DependencyState, OutcomeKind, ToolCallRef};
 use crate::db::redb::reads::conversations::{conversation_summary, conversation_tip};
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::{ConfigRow, decode_output, decode_tool_evidence, tool_call_ref};
@@ -844,6 +845,44 @@ pub(crate) fn read_tool_evidence(
     limit: usize,
 ) -> Result<Vec<ToolEvidenceRecord>, StorageError> {
     tool_evidence(&read(database)?, job, after, limit)
+}
+
+pub(crate) fn read_tool_evidence_with_child_help(
+    database: &Database,
+    job: JobId,
+    after: Option<(RequestNumber, u32)>,
+    limit: usize,
+) -> Result<Vec<(ToolEvidenceRecord, Option<ChildHelpStatus>)>, StorageError> {
+    let rx = read(database)?;
+    let approvals = rx.open_table(APPROVALS)?;
+    tool_evidence(&rx, job, after, limit)?
+        .into_iter()
+        .map(|record| {
+            let status = if record.name == "job_ask_parent"
+                && matches!(record.decision.fact, ToolDecision::AwaitingAnswer(_))
+            {
+                let approval = approvals
+                    .get(rows::tool_call_key(record.call))?
+                    .map(|bytes| ApprovalRecord::decode(bytes.value()))
+                    .transpose()?;
+                Some(match approval.map(|record| record.decision) {
+                    None => ChildHelpStatus::Pending,
+                    Some(ApprovalDecision::Answered { .. }) => ChildHelpStatus::Answered,
+                    Some(ApprovalDecision::Rejected | ApprovalDecision::Voided) => {
+                        ChildHelpStatus::Dismissed
+                    }
+                    Some(ApprovalDecision::Approved) => {
+                        return Err(StorageError::corrupted(
+                            "child help approved without an answer",
+                        ));
+                    }
+                })
+            } else {
+                None
+            };
+            Ok((record, status))
+        })
+        .collect()
 }
 
 pub(crate) fn unknown_execution_note(

@@ -42,18 +42,24 @@ export function presentToolCall(
       : call.outcome_kind && call.outcome_kind !== "completed_elided"
         ? (call.result ?? call.outcome_kind)
         : undefined);
+  let status: ToolCallMessagePartStatus = { type: "running" };
+  if (call.child_help_status === "answered") {
+    status = { type: "complete" };
+  } else if (failed) {
+    status = { type: "incomplete", reason: "error" };
+  } else if (call.child_help_status === "dismissed") {
+    status = { type: "incomplete", reason: "cancelled" };
+  } else if (call.outcome_kind) {
+    status = { type: "complete" };
+  } else if (call.decision === "awaiting_approval" || call.decision === "awaiting_answer") {
+    status = { type: "requires-action" };
+  }
   return {
     toolCallId: call.tool_call_id,
     toolName: call.name,
     argsText: call.arguments ?? "{}",
     result,
-    status: failed
-      ? { type: "incomplete", reason: "error" }
-      : call.outcome_kind
-        ? { type: "complete" }
-        : call.decision === "awaiting_approval" || call.decision === "awaiting_answer"
-          ? { type: "requires-action" }
-          : { type: "running" },
+    status,
     durationMs: call.duration_ms,
     truncated: call.arguments_cut || call.result_cut,
     call,

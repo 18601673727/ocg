@@ -13,6 +13,7 @@ import type {
   ToolCallMessagePartComponent,
   ToolCallMessagePartStatus,
 } from "@/components/ocg/chat/tool-part";
+import { useI18n } from "@/components/ocg/i18n";
 import {
   bindElementRef,
   type CSSProperties,
@@ -172,9 +173,17 @@ function ToolFallbackTrigger(
     durationMs?: number;
     summary?: string;
     status?: ToolCallMessagePartStatus;
+    statusLabel?: string;
   },
 ) {
-  const [, props] = splitProps(viewProps, ["toolName", "summary", "status", "class", "durationMs"]);
+  const [, props] = splitProps(viewProps, [
+    "toolName",
+    "summary",
+    "status",
+    "statusLabel",
+    "class",
+    "durationMs",
+  ]);
 
   const statusType = createMemo(() => viewProps.status?.type ?? "complete");
   const isRunning = createMemo(() => statusType() === "running");
@@ -220,7 +229,7 @@ function ToolFallbackTrigger(
           isRunning() && "shimmer motion-reduce:animate-none",
         )}
       >
-        {label()}: <b class="font-medium">{viewProps.toolName}</b>
+        {viewProps.statusLabel ?? label()}: <b class="font-medium">{viewProps.toolName}</b>
       </span>
       {viewProps.summary ? (
         <span
@@ -400,6 +409,7 @@ function ToolFallbackError(
 }
 
 const ToolFallbackImpl: ToolCallMessagePartComponent = (props) => {
+  const { t } = useI18n();
   const isCancelled = createMemo(
     () => props.status?.type === "incomplete" && props.status.reason === "cancelled",
   );
@@ -410,6 +420,11 @@ const ToolFallbackImpl: ToolCallMessagePartComponent = (props) => {
         toolName={props.toolName}
         summary={toolArgumentSummary(props.toolName, props.argsText)}
         status={props.status}
+        statusLabel={
+          props.call?.child_help_status === "answered"
+            ? t("transcript.outcome.answered")
+            : undefined
+        }
       />
       <ToolFallbackContent>
         <ToolFallbackError status={props.status} />

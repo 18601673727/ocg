@@ -115,6 +115,14 @@ pub struct ApprovalRecord {
     pub at: Timestamp,
 }
 
+#[derive(Clone, Copy, serde::Serialize, ts_rs::TS)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ChildHelpStatus {
+    Pending,
+    Answered,
+    Dismissed,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolAdmission {
     pub handler_version: String,

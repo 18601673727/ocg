@@ -583,8 +583,11 @@ impl Batch {
         if !occupancy_valid {
             return Err(stale());
         }
+        let mut current_lifecycle = self.job_lifecycle(job.parent_id)?;
+        // A display title can change while the execution is being prepared.
+        current_lifecycle.title.clone_from(&lifecycle.title);
         if self.require_mutable_conversation(job.parent_id)? != *conversation
-            || self.job_lifecycle(job.parent_id)? != *lifecycle
+            || current_lifecycle != *lifecycle
         {
             return Err(stale());
         }

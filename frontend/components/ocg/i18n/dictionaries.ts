@@ -1198,6 +1198,7 @@ export const en = {
   "transcript.outcome.refused": "Refused",
   "transcript.outcome.awaitingApproval": "Awaiting approval",
   "transcript.outcome.awaitingAnswer": "Awaiting answer",
+  "transcript.outcome.answered": "Answered",
   "app.closeNavigation": "Close navigation",
   "app.retryLoading": "Retry loading",
   "app.loadingConversation": "Loading conversation…",

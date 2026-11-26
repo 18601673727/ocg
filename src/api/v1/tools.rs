@@ -4,6 +4,7 @@ use super::{
     RequestNumber, Shared, ToolDecision, ToolEvidenceRecord, ToolOutcome, ToolOutcomeKind,
     UncertainCause, Value, WithheldReason, dashboard, routing,
 };
+use crate::db::entities::ChildHelpStatus;
 
 pub(super) const MAX_EXPOSED_TOOL_STRING_BYTES: usize = 2 * 1024;
 
@@ -23,6 +24,9 @@ pub(crate) struct ToolCallView {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     child_notice_drop: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    child_help_status: Option<ChildHelpStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     duration_ms: Option<u64>,
@@ -84,11 +88,11 @@ pub(super) fn tools_query(query: &str) -> Result<(Option<(RequestNumber, u32)>, 
     Ok((after, limit.unwrap_or(50)))
 }
 
-fn tool_view(record: &ToolEvidenceRecord) -> ToolCallView {
-    tool_view_with_limit(record, MAX_EXPOSED_TOOL_STRING_BYTES)
-}
-
-fn tool_view_with_limit(record: &ToolEvidenceRecord, limit: usize) -> ToolCallView {
+fn tool_view(
+    record: &ToolEvidenceRecord,
+    child_help_status: Option<ChildHelpStatus>,
+    limit: usize,
+) -> ToolCallView {
     let cut = |text: &str| {
         if limit == MAX_EXPOSED_TOOL_STRING_BYTES {
             let (text, cut) = cut_tool_string(text);
@@ -154,6 +158,7 @@ fn tool_view_with_limit(record: &ToolEvidenceRecord, limit: usize) -> ToolCallVi
         result,
         result_cut,
         child_notice_drop: record.child_notice_drop.map(|reason| reason.message()),
+        child_help_status,
         duration_ms: record.outcome.as_ref().and_then(|outcome| {
             outcome
                 .at
@@ -176,17 +181,20 @@ pub(super) async fn tool(
         .checked_sub(1)
         .map(|index| (request, index))
         .or_else(|| RequestNumber::new(request.get() - 1).map(|previous| (previous, u32::MAX)));
-    let records = shared.database.tool_evidence(job, after, 1).await?;
-    let record = records
+    let records = shared
+        .database
+        .tool_evidence_with_child_help(job, after, 1)
+        .await?;
+    let (record, child_help_status) = records
         .first()
-        .filter(|record| record.call.request == request && record.call.index == index)
+        .filter(|(record, _)| record.call.request == request && record.call.index == index)
         .ok_or(NOT_FOUND)?;
     dashboard::bounded(
         shared,
         envelope(serde_json::json!(ToolsView {
             job: job.to_string(),
             after: None,
-            tools: vec![tool_view_with_limit(record, usize::MAX)],
+            tools: vec![tool_view(record, *child_help_status, usize::MAX)],
             next_after: None,
             has_more: false,
         })),
@@ -201,7 +209,9 @@ pub(super) async fn tools(
 ) -> Result<Value, Refusal> {
     let database = &shared.database;
     super::outputs::require_output_job(database, job).await?;
-    let records = database.tool_evidence(job, after, limit + 1).await?;
+    let records = database
+        .tool_evidence_with_child_help(job, after, limit + 1)
+        .await?;
     let after_cursor = after.map(|(req, idx)| format!("{}:{}", req.get(), idx));
     let envelope = |page: Vec<ToolCallView>, next: Option<(RequestNumber, u32)>, more: bool| {
         envelope(serde_json::json!(ToolsView {
@@ -217,8 +227,8 @@ pub(super) async fn tools(
     let mut page = Vec::new();
     let mut next = None;
     let mut more = records.len() > limit;
-    for record in records.iter().take(limit) {
-        let tool = tool_view(record);
+    for (record, child_help_status) in records.iter().take(limit) {
+        let tool = tool_view(record, *child_help_status, MAX_EXPOSED_TOOL_STRING_BYTES);
         let cost = dashboard::serialized_len(&tool)? + 1;
         if size + cost > shared.response_bytes {
             if page.is_empty() {

@@ -282,7 +282,13 @@ function TurnToolCalls(props: {
           props.tools.map((tool) => {
             const key = `${tool.request}:${tool.index}`;
             const summary = argumentSummary(tool.name, tool.arguments);
-            const kind = tool.child_notice_drop ? "not_applied" : tool.outcome_kind;
+            const answered = tool.child_help_status === "answered";
+            const dismissed = tool.child_help_status === "dismissed";
+            const kind = answered
+              ? "completed"
+              : tool.child_notice_drop || dismissed
+                ? "not_applied"
+                : tool.outcome_kind;
             const outcome = outcomeLabel(kind, tool.decision, props.isLive);
             const isCompleted = outcome === "completed";
             const isRunning = outcome === "running";
@@ -323,12 +329,14 @@ function TurnToolCalls(props: {
                         "border border-border bg-muted text-muted-foreground",
                     )}
                   >
-                    {outcomeText(i18n.t, kind, tool.decision, props.isLive)}
+                    {answered
+                      ? i18n.t("transcript.outcome.answered")
+                      : outcomeText(i18n.t, kind, tool.decision, props.isLive)}
                   </span>
                 </summary>
                 {expanded()[key] && (
                   <div class="mt-2 space-y-2 border-t border-border pt-2 font-mono text-xs">
-                    {tool.decision !== "admitted" ? (
+                    {tool.decision !== "admitted" && !answered && !dismissed ? (
                       <div class="font-sans text-xs text-destructive">
                         {i18n.t("transcript.decision", { decision: tool.decision })}
                       </div>

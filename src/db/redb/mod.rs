@@ -54,6 +54,7 @@ pub(crate) use reads::execution_context::{read_development_execution_context, re
 pub(crate) use reads::jobs::{
     read_job_search, read_job_tree, read_latest_output, read_mutable_job_details, read_native_job,
     read_output_job_is_decision, read_outputs, read_outputs_with_pieces, read_tool_evidence,
+    read_tool_evidence_with_child_help,
 };
 pub(crate) use reads::usage::{
     read_tool_stats, read_usage_buckets, read_usage_retries, read_usage_summary,

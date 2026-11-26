@@ -17,6 +17,10 @@ type StreamEntry = {
   stop: () => void;
 };
 
+function awaitsChildHelp(turn: Turn): boolean {
+  return turn.tools.some((tool) => tool.child_help_status === "pending");
+}
+
 export class TurnStreams {
   private readonly streams = new Map<string, StreamEntry>();
   private unsubscribeWatchCatalog?: () => void;
@@ -75,7 +79,7 @@ export class TurnStreams {
     const { api, signal } = this.reader;
     const turn = this.turns.get(jobId);
     if (!turn || this.streams.has(jobId) || signal.aborted) return;
-    if (!needsWatch(turn)) return;
+    if (!needsWatch(turn) && !awaitsChildHelp(turn)) return;
     const entry: StreamEntry = {
       subscription: null,
       catalogChanged: (pages) => {
@@ -162,6 +166,7 @@ export class TurnStreams {
                 previous: turn.responses,
                 settled:
                   readReplies &&
+                  !awaitsChildHelp(turn) &&
                   details.settlement.state !== "unsettled" &&
                   details.settlement.state !== "unknown",
                 readReplies,
@@ -274,7 +279,7 @@ export class TurnStreams {
             (readReplies || turn.outputs.firstSeq > 1));
         if (!evidenceCurrent) {
           queued = true;
-        } else if (!active && !continuationRetry) {
+        } else if (!active && !awaitsChildHelp(turn) && !continuationRetry) {
           finish();
         }
       } catch (error) {
@@ -361,7 +366,7 @@ export class TurnStreams {
       });
     };
     // Queued turns share the catalog subscription until they have output to stream.
-    if (turn.details?.mutable_phase !== "queued") connect();
+    if (needsWatch(turn) && turn.details?.mutable_phase !== "queued") connect();
     this.subscribeWatchCatalog();
     void tick();
   }

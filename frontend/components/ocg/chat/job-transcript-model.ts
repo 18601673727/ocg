@@ -409,6 +409,7 @@ function providerMessages(
       calls.some(
         (call) =>
           !call.outcome_kind &&
+          (!call.child_help_status || call.child_help_status === "pending") &&
           (call.decision === "awaiting_approval" || call.decision === "awaiting_answer"),
       );
     const running =

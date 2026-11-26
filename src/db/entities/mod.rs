@@ -15,6 +15,7 @@ mod scheduling;
 mod statistics;
 mod usage;
 
+pub(crate) use approvals::ChildHelpStatus;
 pub use approvals::{
     ApprovalDecision, ApprovalRecord, AuthorizationBasis, ChildNoticeDrop, CommandGroup,
     EffectConclusion, MAX_FUNCTION_NAME_BYTES, MAX_HANDLER_VERSION_BYTES,
