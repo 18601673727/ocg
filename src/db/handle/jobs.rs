@@ -276,6 +276,7 @@ impl DatabaseHandle {
                     }
                     None => batch.submit_mutable_job(id, revision, submission),
                 }?;
+                batch.flush_child_notices(job.parent_id)?;
                 batch.flush_child_reports(job.parent_id)?;
                 batch.read_mutable_job(id)?.ok_or_else(|| {
                     redb::BatchError(redb::Failure::Storage(redb::StorageError::corrupted(

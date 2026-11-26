@@ -1257,6 +1257,8 @@ impl Batch {
                 "required evidence or output sequence is invalid",
             ));
         }
+        let awaiting_answer = kind == OutcomeKind::Completed
+            && result.code.as_deref() == Some(crate::db::entities::AWAITING_TOOL_DECISION);
         let (seq, id) = self.settle_mutable_outcome(token, job, kind, result)?;
         self.transition_pool_allocation(
             token,
@@ -1265,6 +1267,7 @@ impl Batch {
         )?;
         self.settle_summary_membership(job)?;
         self.settle_standalone_decision(job)?;
+        self.settle_child_help(job.parent_id, job.id, awaiting_answer)?;
         self.freed_capacity = true;
         self.probe = Some(Probe::Outcome(token.job));
         if kind == OutcomeKind::Completed

@@ -1235,6 +1235,7 @@ impl Batch {
         self.put_job_state(id, &state)?;
         self.release_draft_context(&job)?;
         self.settle_native_dependents(id, OutcomeKind::Cancelled)?;
+        self.flush_child_notices(job.parent_id)?;
         self.probe = Some(Probe::Outcome(id));
         Ok(())
     }

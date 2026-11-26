@@ -1,8 +1,8 @@
 use super::codec::TAG_APPROVAL;
-use super::{StorageError, approvals};
+use super::{StorageError, TxRead, approvals};
 use crate::db::entities::{
-    Actor, Appended, ApprovalDecision, ApprovalRecord, JobId, Origin, OutcomeKind, ToolCallRefusal,
-    ToolEffect, ToolEvidenceRecord,
+    AWAITING_TOOL_DECISION, Actor, Appended, ApprovalDecision, ApprovalRecord, ChildNoticeKind,
+    JobId, Origin, OutcomeKind, OutputKind, ToolCallRefusal, ToolEffect, ToolEvidenceRecord,
 };
 use crate::db::entities::{
     ExecutionEventKind, MessageBody, Recorded, ToolCallRef, ToolDecision, ToolOutcome, Violation,
@@ -495,7 +495,7 @@ impl Batch {
             self.require_planning_decision_satisfied(call)?;
         }
         let conversation = self.turn_conversation(call.job)?;
-        let help = if name == "job_ask_parent"
+        if name == "job_ask_parent"
             && let ToolDecision::AwaitingAnswer(admission) = &decision
         {
             let Some(job) = self.mutable_job(call.job)? else {
@@ -530,10 +530,13 @@ impl Batch {
                     "this child already has an unanswered help request",
                 ));
             }
-            Some(question(admission.arguments.as_str()))
-        } else {
-            None
-        };
+            self.prepare_child_notice(
+                conversation,
+                call,
+                &question(admission.arguments.as_str()),
+                ChildNoticeKind::Help,
+            )?;
+        }
         if !self.request_observed(call.job, call.request)? {
             return self.reject(Violation::RequestNotObserved {
                 job: call.job,
@@ -625,9 +628,6 @@ impl Batch {
                 self.put_approval(call, ApprovalDecision::Voided, closing.by)?;
             } else {
                 self.insert(OPEN_APPROVALS, approvals::open_key(conversation, call), 0)?;
-                if let Some(question) = help {
-                    self.post_child_notice(conversation, call, &question, true)?;
-                }
             }
         }
         self.probe = Some(Probe::ToolCall(call));
@@ -738,6 +738,51 @@ fn question(arguments: &str) -> String {
                 .map(str::to_owned)
         })
         .unwrap_or_default()
+}
+
+pub(super) fn open_child_help(
+    tx: &impl TxRead,
+    child: JobId,
+    turn: Option<JobId>,
+) -> Result<Option<(ToolCallRef, String)>, StorageError> {
+    let calls = tx.table(TOOL_CALLS)?;
+    let start = (child.get(), turn.map_or(0, JobId::get), 0, 0);
+    let end = (
+        child.get(),
+        turn.map_or(u128::MAX, JobId::get),
+        u32::MAX,
+        u32::MAX,
+    );
+    for entry in tx.table(OPEN_APPROVALS)?.range(start..=end)? {
+        let (_, job, request, index) = entry?.0.value();
+        let call = tool_call_ref((job, request, index))?;
+        let record = calls
+            .get(tool_call_key(call))?
+            .ok_or_else(|| StorageError::corrupted("awaiting call missing"))?;
+        let evidence = decode_tool_evidence(call, record.value())?;
+        if evidence.name != "job_ask_parent" {
+            continue;
+        }
+        let ToolDecision::AwaitingAnswer(admission) = evidence.decision.fact else {
+            continue;
+        };
+        return Ok(Some((call, question(admission.arguments.as_str()))));
+    }
+    Ok(None)
+}
+
+pub(super) fn child_help_is_awaiting(tx: &impl TxRead, turn: JobId) -> Result<bool, StorageError> {
+    let job = turn.get();
+    let outputs = tx.table(JOB_OUTPUTS)?;
+    let Some((key, row)) = outputs
+        .range((job, 0)..=(job, u32::MAX))?
+        .next_back()
+        .transpose()?
+    else {
+        return Ok(false);
+    };
+    let output = decode_output(key.value(), row.value())?;
+    Ok(output.kind == OutputKind::Result && output.code.as_deref() == Some(AWAITING_TOOL_DECISION))
 }
 
 fn approval_assessment(

@@ -1,18 +1,19 @@
-use super::{StorageError, TxRead, jobs, reads};
+use super::{StorageError, TxRead, approvals, jobs, reads};
 use crate::db::entities::{
     Actor, Appended, ConfigId, ContentDigest, DependencyCondition, JobId, JobLimits, JobSpec,
     JobState, Origin, OutcomeKind, OutputKind, ProjectId, RecordRef, Recurrence, SubmissionKey,
 };
 use crate::db::entities::{
-    AllocationPhase, AllocationToken, ComposerContextId, DependencyState, ExecutionConfiguration,
-    JobAction, JobClosing, JobLifecycle, JobQueuePriority, MutableFrozenConfiguration, MutableJob,
-    MutableJobContent, MutableJobInput, NativeStopRequest, OutcomeCause, OutcomeRecord,
-    RequestFingerprint, Submission, ToolCallRef, Violation,
+    AllocationPhase, AllocationToken, ApprovalDecision, ChildNoticeKind, ComposerContextId,
+    DependencyState, ExecutionConfiguration, JobAction, JobClosing, JobLifecycle, JobQueuePriority,
+    JobToolCall, MutableFrozenConfiguration, MutableJob, MutableJobContent, MutableJobInput,
+    NativeStopRequest, OutcomeCause, OutcomeRecord, RequestFingerprint, Submission, ToolCallRef,
+    ToolOutcome, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::schema::{
     CHILD_GROUPS, CHILDREN, CONVERSATIONS, DRAFT_CONTEXTS, JOB_OUTPUTS, JOBS, LIVE_CHILDREN,
-    OPEN_APPROVALS, RECURRENCES, RETRY_JOBS, TOOL_CALLS, TURNS,
+    OPEN_APPROVALS, RECURRENCES, RETRY_JOBS, SUBMISSIONS, TOOL_CALLS, TURNS,
 };
 use crate::db::redb::{rows, state};
 use ::redb::ReadableTable;
@@ -89,6 +90,13 @@ struct ChildResult {
     head: JobId,
     outcome: OutcomeKind,
     title: String,
+}
+
+struct PendingChildNotice {
+    child: JobId,
+    call: ToolCallRef,
+    kind: ChildNoticeKind,
+    text: String,
 }
 
 enum ReportTurn {
@@ -288,13 +296,13 @@ impl Batch {
         )
     }
 
-    pub(super) fn post_child_notice(
+    pub(super) fn prepare_child_notice(
         &mut self,
         child: JobId,
         call: ToolCallRef,
         text: &str,
-        help: bool,
-    ) -> Result<(JobId, JobId), BatchError> {
+        kind: ChildNoticeKind,
+    ) -> Result<(JobId, Option<MutableJobInput>), BatchError> {
         let child_row = self.require_mutable_conversation(child)?;
         let Some(parent) = child_row.parent_id else {
             return self.reject(Violation::InvalidValue(
@@ -309,67 +317,93 @@ impl Batch {
                 "expected between 1 and 2000 characters",
             ));
         }
-        if self.step(|tx| has_current_draft(tx, parent))? {
-            return self.reject(Violation::InvalidValue(
-                "parent",
-                "the parent has an unsent draft; retry after it is sent or discarded",
-            ));
+        let message = child_notice_message(child, call, text, kind);
+        let input = self.inspect(|tx| prepare_child_notice_in(tx, parent, message))?;
+        Ok((parent, input))
+    }
+
+    pub(super) fn post_child_notice(
+        &mut self,
+        child: JobId,
+        call: ToolCallRef,
+        text: &str,
+    ) -> Result<(JobId, Option<JobId>), BatchError> {
+        let (parent, input) =
+            self.prepare_child_notice(child, call, text, ChildNoticeKind::Progress)?;
+        let turn = input
+            .map(|input| self.deliver_child_notice(parent, child, call, input))
+            .transpose()?;
+        Ok((parent, turn))
+    }
+
+    fn deliver_child_notice(
+        &mut self,
+        parent: JobId,
+        child: JobId,
+        call: ToolCallRef,
+        input: MutableJobInput,
+    ) -> Result<JobId, BatchError> {
+        self.host_turn(
+            parent,
+            input,
+            tool_submission(call, b"child notice", 0),
+            tool_submission(call, b"child notice", 1),
+            Actor::Agent {
+                conversation: child,
+            },
+        )
+    }
+
+    fn retry_child_notice(&mut self, notice: PendingChildNotice) -> Result<(), BatchError> {
+        let PendingChildNotice {
+            child,
+            call,
+            kind,
+            text,
+        } = notice;
+        match self.prepare_child_notice(child, call, &text, kind) {
+            Ok((parent, Some(input))) => {
+                self.deliver_child_notice(parent, child, call, input)?;
+            }
+            Ok((_, None)) => {}
+            Err(BatchError(Failure::Rejected(reason))) => {
+                log::debug!("pending child notice {call} could not be delivered: {reason}");
+            }
+            Err(error @ BatchError(Failure::Storage(_))) => return Err(error),
         }
-        let (limits, _) = self.group_limits(parent)?;
-        let parent_row = self.require_mutable_conversation(parent)?;
-        let mut previous = self.group_head(parent)?;
-        let mut count = 0;
-        // Interim updates have their own allowance. They do not spend final-report turns.
-        for _ in 0..=u8::MAX {
-            let Some(id) = previous else { break };
-            let Some(turn) = self.mutable_job(id)? else {
-                return self.corrupted("missing turn in parent history".into());
-            };
-            previous = turn.previous;
-            match turn.submitted_by {
-                Actor::User => {
-                    previous = None;
-                    break;
-                }
-                Actor::Agent { conversation } if Some(conversation) == parent_row.parent_id => {
-                    previous = None;
-                    break;
-                }
-                Actor::Agent { .. } => {
-                    if is_child_notice(turn.input.text()) {
-                        count += 1;
-                        if count >= limits.max_auto_turns {
-                            break;
-                        }
-                    }
-                }
-                Actor::Auto | Actor::Loop => {}
+        Ok(())
+    }
+
+    pub(super) fn settle_child_help(
+        &mut self,
+        child: JobId,
+        turn: JobId,
+        awaiting_answer: bool,
+    ) -> Result<(), BatchError> {
+        if let Some((call, text)) =
+            self.step(|tx| approvals::open_child_help(tx, child, Some(turn)))?
+        {
+            if !awaiting_answer {
+                self.put_approval(call, ApprovalDecision::Voided, Actor::Auto)?;
+                self.remove(OPEN_APPROVALS, approvals::open_key(child, call))?;
+            } else if !self.step(|tx| child_notice_delivered(tx, call))? {
+                self.retry_child_notice(PendingChildNotice {
+                    child,
+                    call,
+                    kind: ChildNoticeKind::Help,
+                    text,
+                })?;
             }
         }
-        if count >= limits.max_auto_turns || previous.is_some() {
-            return self.reject(Violation::InvalidValue(
-                "parent_notice_limit",
-                "the parent has reached its automatic limit for interim child notices",
-            ));
+        Ok(())
+    }
+
+    pub(crate) fn flush_child_notices(&mut self, parent: JobId) -> Result<(), BatchError> {
+        let notices = self.step(|tx| pending_child_notices(tx, parent))?;
+        for notice in notices {
+            self.retry_child_notice(notice)?;
         }
-        let heading = if help {
-            CHILD_HELP_HEADER
-        } else {
-            CHILD_PROGRESS_HEADER
-        };
-        let instruction = if help {
-            format!(
-                "The direct child is paused. If you can supply the requested input, call job_answer_child with turn {}, request {}, index {} and your answer. Otherwise ask the user. The child's final result will follow separately.",
-                call.job,
-                call.request.get(),
-                call.index,
-            )
-        } else {
-            "This is an interim update. The work is still in progress; wait for its separate final result.".to_owned()
-        };
-        let message = format!("{heading}\nFrom direct child {child}. {instruction}\n\n{text}");
-        let turn = self.agent_turn(parent, message, call, b"child notice", child)?;
-        Ok((parent, turn))
+        Ok(())
     }
 
     fn require_room_for_child(&mut self, parent: JobId) -> Result<(), BatchError> {
@@ -1659,6 +1693,173 @@ fn is_child_notice(text: &str) -> bool {
         text.lines().next(),
         Some(CHILD_PROGRESS_HEADER | CHILD_HELP_HEADER)
     )
+}
+
+fn child_notice_message(
+    child: JobId,
+    call: ToolCallRef,
+    text: &str,
+    kind: ChildNoticeKind,
+) -> String {
+    let (heading, instruction) = match kind {
+        ChildNoticeKind::Help => (
+            CHILD_HELP_HEADER,
+            format!(
+                "The direct child is paused. If you can supply the requested input, call job_answer_child with turn {}, request {}, index {} and your answer. Otherwise ask the user. The child's final result will follow separately.",
+                call.job, call.request.get(), call.index,
+            ),
+        ),
+        ChildNoticeKind::Progress => (
+            CHILD_PROGRESS_HEADER,
+            "This is an interim update. The work is still in progress; wait for its separate final result.".to_owned(),
+        ),
+    };
+    format!("{heading}\nFrom direct child {child}. {instruction}\n\n{text}")
+}
+
+fn child_notice_capacity(tx: &impl TxRead, spec: &JobSpec) -> Result<usize, StorageError> {
+    let (limits, _) = reads::conversations::conversation_limits(tx, spec.id)?
+        .ok_or_else(|| StorageError::corrupted("child notice ancestor is missing"))?;
+    let mut remaining = usize::from(limits.max_auto_turns);
+    let mut previous = turn_head(tx, spec.id)?;
+    // Interim updates have their own allowance. They do not spend final-report turns.
+    for _ in 0..MAX_CHILD_SCAN {
+        let Some(id) = previous else { break };
+        if remaining == 0 {
+            break;
+        }
+        let turn = required_turn(tx, id)?;
+        previous = turn.previous;
+        match turn.submitted_by {
+            Actor::User => break,
+            Actor::Agent { conversation } if Some(conversation) == spec.parent_id => break,
+            Actor::Agent { .. } if is_child_notice(turn.input.text()) => remaining -= 1,
+            Actor::Agent { .. } | Actor::Auto | Actor::Loop => {}
+        }
+    }
+    Ok(remaining)
+}
+
+fn prepare_child_notice_in(
+    tx: &impl TxRead,
+    parent: JobId,
+    message: String,
+) -> Result<Option<MutableJobInput>, BatchError> {
+    let spec = conversation_row(tx, parent)?;
+    jobs::require_open_turn_parent(&spec, &state::require(tx, parent)?)?;
+    let previous = turn_head(tx, parent)?;
+    let head = previous.map(|id| required_turn(tx, id)).transpose()?;
+    let (configuration, priority) = head_configuration(head)?;
+    let input = host_input(message, configuration, priority);
+    jobs::validate_mutable_input(tx, &input)?;
+    if has_current_draft(tx, parent)? {
+        return Ok(None);
+    }
+    if child_notice_capacity(tx, &spec)? == 0 {
+        return Err(Violation::InvalidValue(
+            "parent_notice_limit",
+            "the parent has reached its automatic limit for interim child notices",
+        )
+        .into());
+    }
+    jobs::require_generative_history(tx, parent, previous, None)?;
+    let frozen = jobs::generative_execution(tx, &input)?;
+    jobs::require_conversation_agent(&spec, frozen.agent_ref.map(|reference| reference.id))?;
+    Ok(Some(input))
+}
+
+fn child_notice_delivered(tx: &impl TxRead, call: ToolCallRef) -> Result<bool, StorageError> {
+    let submission = tool_submission(call, b"child notice", 1);
+    Ok(tx
+        .table(SUBMISSIONS)?
+        .get(submission.key.as_bytes().as_slice())?
+        .is_some())
+}
+
+fn pending_child_notices(
+    tx: &impl TxRead,
+    parent: JobId,
+) -> Result<Vec<PendingChildNotice>, StorageError> {
+    let mut notices = Vec::new();
+    let children = tx.table(CHILD_GROUPS)?;
+    let child_range = (parent.get(), 0)..=(parent.get(), u128::MAX);
+    if children
+        .range(child_range.clone())?
+        .next()
+        .transpose()?
+        .is_none()
+        || has_current_draft(tx, parent)?
+    {
+        return Ok(notices);
+    }
+    let capacity = child_notice_capacity(tx, &conversation_row(tx, parent)?)?;
+    if capacity == 0 {
+        return Ok(notices);
+    }
+    for entry in tx.table(LIVE_CHILDREN)?.range(child_range.clone())? {
+        let child = JobId::new(entry?.0.value().1);
+        if let Some((call, text)) = approvals::open_child_help(tx, child, None)?
+            && !child_notice_delivered(tx, call)?
+            && approvals::child_help_is_awaiting(tx, call.job)?
+        {
+            notices.push(PendingChildNotice {
+                child,
+                call,
+                kind: ChildNoticeKind::Help,
+                text,
+            });
+            if notices.len() == capacity {
+                return Ok(notices);
+            }
+        }
+    }
+    let turns = tx.table(TURNS)?;
+    let calls = tx.table(TOOL_CALLS)?;
+    for entry in children.range(child_range)? {
+        let child = JobId::new(entry?.0.value().1);
+        for turn in turns.range((child.get(), 0)..=(child.get(), u128::MAX))? {
+            let turn = turn?.0.value().1;
+            for entry in calls.range((turn, 0, 0)..=(turn, u32::MAX, u32::MAX))? {
+                let (key, value) = entry?;
+                let call = rows::tool_call_ref(key.value())?;
+                let record = rows::decode_tool_evidence(call, value.value())?;
+                if record.name != "job_report_progress" {
+                    continue;
+                }
+                let Some(ToolOutcome::Completed { result }) =
+                    record.outcome.as_ref().map(|outcome| &outcome.fact)
+                else {
+                    continue;
+                };
+                let deferred = serde_json::from_str::<serde_json::Value>(result.as_str())
+                    .ok()
+                    .and_then(|value| value.get("deferred")?.as_bool())
+                    == Some(true);
+                if !deferred || child_notice_delivered(tx, call)? {
+                    continue;
+                }
+                let Some(JobToolCall::JobReportProgress { text }) =
+                    record.admission().and_then(|admission| {
+                        JobToolCall::parse(&record.name, admission.arguments.as_str())
+                    })
+                else {
+                    return Err(StorageError::corrupted(
+                        "deferred progress call missing its text",
+                    ));
+                };
+                notices.push(PendingChildNotice {
+                    child,
+                    call,
+                    kind: ChildNoticeKind::Progress,
+                    text,
+                });
+                if notices.len() == capacity {
+                    return Ok(notices);
+                }
+            }
+        }
+    }
+    Ok(notices)
 }
 
 fn has_draft(

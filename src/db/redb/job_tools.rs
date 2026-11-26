@@ -122,8 +122,11 @@ impl Batch {
                 )
             }
             JobToolCall::JobReportProgress { text } => {
-                let (parent, turn) = self.post_child_notice(caller, call, &text, false)?;
-                JobToolApplied::of(json!({"parent": parent.to_string(), "turn": turn.to_string()}))
+                let (parent, turn) = self.post_child_notice(caller, call, &text)?;
+                JobToolApplied::of(match turn {
+                    Some(turn) => json!({"parent": parent.to_string(), "turn": turn.to_string()}),
+                    None => json!({"parent": parent.to_string(), "deferred": true}),
+                })
             }
             JobToolCall::JobAnswerChild {
                 turn,

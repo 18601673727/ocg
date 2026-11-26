@@ -512,7 +512,16 @@ impl DatabaseHandle {
             .write_output(
                 proof.token.job,
                 (proof, expected_seq, finalization),
-                |(_, _, finalization)| finalization_bytes(finalization),
+                |(_, _, finalization)| {
+                    let bytes = finalization_bytes(finalization);
+                    if finalization.result().code.as_deref()
+                        == Some(entities::AWAITING_TOOL_DECISION)
+                    {
+                        bytes.saturating_add(1024 * 1024)
+                    } else {
+                        bytes
+                    }
+                },
                 OperationKind::FinalizeJob,
                 |batch, (proof, expected_seq, finalization)| {
                     batch.finalize_development_job(&proof, expected_seq, finalization)
@@ -882,16 +891,7 @@ impl DatabaseHandle {
                         Some(admission) => identity
                             .saturating_add(byte_count(admission.handler_version.len()))
                             .saturating_add(byte_count(admission.parameters.len()))
-                            .saturating_add(byte_count(admission.arguments.len()))
-                            .saturating_add(if evidence.name == "job_ask_parent" {
-                                search_index_bytes(admission.arguments.as_str())
-                                    .saturating_add(
-                                        byte_count(admission.arguments.len()).saturating_mul(6),
-                                    )
-                                    .saturating_add(64 * 1024)
-                            } else {
-                                0
-                            }),
+                            .saturating_add(byte_count(admission.arguments.len())),
                     }
                 },
                 OperationKind::RecordToolDecision,
