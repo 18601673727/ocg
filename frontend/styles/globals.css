@@ -281,6 +281,9 @@
 }
 
 .dark .hljs-keyword,
+.dark .hljs-meta .hljs-keyword,
+.dark .hljs-template-tag,
+.dark .hljs-variable.language_,
 .dark .hljs-selector-tag,
 .dark .hljs-literal,
 .dark .hljs-type {
@@ -288,13 +291,17 @@
 }
 
 .dark .hljs-string,
+.dark .hljs-meta .hljs-string,
 .dark .hljs-doctag,
 .dark .hljs-regexp,
-.dark .hljs-addition {
+.dark .hljs-code,
+.dark .hljs-formula {
   color: #a5d6ff;
 }
 
 .dark .hljs-number,
+.dark .hljs-meta,
+.dark .hljs-operator,
 .dark .hljs-symbol,
 .dark .hljs-bullet,
 .dark .hljs-link {
@@ -324,12 +331,19 @@
   color: #7ee787;
 }
 
-.dark .hljs-deletion {
-  color: #ffdcd7;
+.dark .hljs-addition {
+  color: #aff5b4;
+  background-color: #033a16;
 }
 
-.dark .hljs-emphasis {
-  font-style: italic;
+.dark .hljs-deletion {
+  color: #ffdcd7;
+  background-color: #67060c;
+}
+
+.dark .hljs-emphasis,
+.dark .hljs-strong {
+  color: inherit;
 }
 
 .dark .hljs-strong {

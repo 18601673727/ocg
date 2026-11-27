@@ -515,7 +515,7 @@ function UserMessage() {
         <div class="group/user-message relative col-start-2 min-w-0 max-w-full justify-self-end">
           <MarkdownBody
             content={message().content}
-            class="bg-muted text-foreground rounded-(--composer-radius) px-4 py-2 wrap-break-word"
+            class="bg-muted text-foreground rounded-(--composer-radius) px-4 py-2 wrap-break-word [&>:first-child]:mt-0 [&>:last-child]:mb-0"
           />
           <div class="pointer-events-none absolute start-0 top-1/2 -translate-x-full -translate-y-1/2 pe-2 opacity-0 transition-opacity group-hover/user-message:pointer-events-auto group-hover/user-message:opacity-100 group-focus-within/user-message:pointer-events-auto group-focus-within/user-message:opacity-100 motion-reduce:transition-none rtl:translate-x-full">
             <MessageActions />
