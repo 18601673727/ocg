@@ -850,11 +850,11 @@ export const zh: Dictionary = {
   "settings.theme.dark": "深色",
   "settings.theme.label": "主题",
   "settings.theme.desc": "选择浅色或深色外观。",
-  "settings.accent.label": "强调色",
+  "settings.accent.label": "主题色",
   "settings.accent.ochre": "赭石",
   "settings.accent.slate": "石板灰",
   "settings.accent.teal": "青绿",
-  "settings.accent.desc": "预设的技术强调色；不接受任意 CSS。",
+  "settings.accent.desc": "应用于背景、侧边栏和控件。",
   "settings.language.label": "语言",
   "settings.language.desc": "此浏览器的界面语言，存储在本地；后端内容不变。",
 

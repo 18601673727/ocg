@@ -917,11 +917,11 @@ export const en = {
   "settings.theme.dark": "Dark",
   "settings.theme.label": "Theme",
   "settings.theme.desc": "Choose light or dark appearance.",
-  "settings.accent.label": "Accent",
+  "settings.accent.label": "Theme color",
   "settings.accent.ochre": "Ochre",
   "settings.accent.slate": "Slate",
   "settings.accent.teal": "Teal",
-  "settings.accent.desc": "A predefined technical accent; arbitrary CSS is not accepted.",
+  "settings.accent.desc": "Applies to backgrounds, the sidebar, and controls.",
   "settings.language.label": "Language",
   "settings.language.desc":
     "Interface language for this browser. Stored locally; backend content is unchanged.",
