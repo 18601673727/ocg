@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use ntex::client::Client;
-use ntex::http::{Uri, header};
+use ntex::http::header;
+use ntex::url::Url as Uri;
 
 use crate::api::v1::{PORT_VARIABLE, TOKEN_VARIABLE};
 use crate::network::http;

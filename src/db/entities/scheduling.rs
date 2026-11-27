@@ -347,7 +347,7 @@ impl ApprovedEndpoint {
                 "the endpoint must be 1..=2048 visible ASCII characters",
             ));
         }
-        let uri: ntex::http::Uri = text
+        let uri: ntex::url::Url = text
             .parse()
             .map_err(|_| invalid("the endpoint is not a valid URL"))?;
         if uri.scheme_str() != Some("https") {
@@ -375,7 +375,7 @@ impl ApprovedEndpoint {
         if port == 0 {
             return Err(invalid("the port must not be 0"));
         }
-        let path = uri.path().trim_end_matches('/');
+        let path = uri.path().as_str().trim_end_matches('/');
         let path = path.strip_suffix("/chat/completions").unwrap_or(path);
         if [
             "/responses",

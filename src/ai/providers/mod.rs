@@ -69,8 +69,8 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
     Ok(url)
 }
 
-pub(crate) fn provider_uri(url: &str) -> Option<ntex::http::Uri> {
-    let uri = url.parse::<ntex::http::Uri>().ok()?;
+pub(crate) fn provider_uri(url: &str) -> Option<ntex::url::Url> {
+    let uri = url.parse::<ntex::url::Url>().ok()?;
     let supported_scheme = uri.scheme_str() == Some("https")
         || (uri.scheme_str() == Some("http")
             && matches!(
@@ -163,7 +163,7 @@ pub(super) async fn send(
     };
     let client = provider_client_for(&config.destination, &endpoint).await?;
     let session = stream
-        .then(|| endpoint.parse::<ntex::http::Uri>().ok())
+        .then(|| endpoint.parse::<ntex::url::Url>().ok())
         .flatten()
         .filter(|uri| {
             uri.host()
@@ -228,6 +228,6 @@ pub(super) async fn send(
         facts: None,
         finished: false,
     })?
-    .map_err(observe::classify_client_error)?;
+    .map_err(|error| observe::classify_client_error(error.into_error()))?;
     Ok((response, started, redactor))
 }

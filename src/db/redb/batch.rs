@@ -247,7 +247,7 @@ pub(crate) enum CompactFailure {
 }
 
 pub(crate) fn compact(database: &mut Database) -> Result<bool, CompactFailure> {
-    match database.compact() {
+    match database.compact(::redb::CompactionMode::Balanced) {
         Ok(moved) => Ok(moved),
         Err(::redb::CompactionError::TransactionInProgress) => {
             Err(CompactFailure::TransactionInProgress)

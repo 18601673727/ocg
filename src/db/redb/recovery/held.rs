@@ -551,9 +551,10 @@ fn audit_held_recovery(
     let mut release_time = None;
     for action in &plan.actions {
         let job = action.token.job;
-        let allocation_row = tx
+        let allocations_table = tx
             .open_table(POOL_ALLOCATIONS)
-            .map_err(StorageError::from)?
+            .map_err(StorageError::from)?;
+        let allocation_row = allocations_table
             .get(job.get())
             .map_err(StorageError::from)?
             .ok_or_else(|| {
@@ -561,9 +562,8 @@ fn audit_held_recovery(
             })?;
         let allocation = allocations::decode_pool_allocation(job.get(), allocation_row.value())?;
         drop(allocation_row);
-        let state_row = tx
-            .open_table(JOB_RUNTIME)
-            .map_err(StorageError::from)?
+        let runtime_table = tx.open_table(JOB_RUNTIME).map_err(StorageError::from)?;
+        let state_row = runtime_table
             .get(job.get())
             .map_err(StorageError::from)?
             .ok_or_else(|| {

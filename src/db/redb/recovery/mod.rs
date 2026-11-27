@@ -101,7 +101,9 @@ pub(crate) fn open(directory: &Path) -> Result<OpenedFile, StorageError> {
     }
     let mut builder = Database::builder();
     builder.set_cache_size(CACHE_BYTES);
-    let database = builder.create_file(file).map_err(StorageError::from)?;
+    let database = builder
+        .create_with_backend(::redb::backends::FileBackend::new(file))
+        .map_err(StorageError::from)?;
     let epoch = initialize(&database, fresh)?;
     Ok(OpenedFile { database, epoch })
 }
@@ -1166,7 +1168,8 @@ fn resolved_unknown_ownership(
     else {
         return Ok(false);
     };
-    let Some(row) = tx.open_table(POOL_ALLOCATIONS)?.get(state.job_id.get())? else {
+    let allocations_table = tx.open_table(POOL_ALLOCATIONS)?;
+    let Some(row) = allocations_table.get(state.job_id.get())? else {
         return Ok(false);
     };
     let allocation = allocations::decode_pool_allocation(state.job_id.get(), row.value())?;
@@ -1515,7 +1518,8 @@ fn preflight(
                 file.metadata().map_err(io_storage_error)?.len(),
                 "database changed during preflight copy",
             )?;
-            let database = Database::builder().create_file(copy)?;
+            let database = Database::builder()
+                .create_with_backend(::redb::backends::FileBackend::new(copy))?;
             validate_preflight(&database).map(|_| Verification::Full)
         }
         Err(error) => Err(error.into()),
@@ -1697,10 +1701,7 @@ pub(crate) fn reclaim_pending(
                 std::ops::Bound::Excluded(after.as_slice())
             });
             let mut page = Vec::new();
-            for entry in queue
-                .range::<&[u8]>((start, std::ops::Bound::Unbounded))?
-                .take(256)
-            {
+            for entry in queue.range((start, std::ops::Bound::Unbounded))?.take(256) {
                 let (key, value) = entry?;
                 let digest: [u8; 32] = key
                     .value()

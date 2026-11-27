@@ -212,7 +212,7 @@ fn content_type(file: &Path) -> Option<&'static str> {
 }
 
 pub(super) fn response(asset: Asset) -> HttpResponse {
-    HttpResponse::build(StatusCode::OK)
+    HttpResponse::builder(StatusCode::OK)
         .header(header::CONTENT_TYPE, asset.content_type)
         .header(
             header::CACHE_CONTROL,

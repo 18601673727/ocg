@@ -870,10 +870,9 @@ mod tests {
 
     #[ntex::test]
     async fn sse_assembles_signed_blocks_tool_arguments_and_usage_only_after_message_stop() {
-        let server = web::test::server(async || {
+        let server = web::test::server(async |_| {
             App::new().service(web::resource("/{case}/messages").route(web::post().to(messages)))
-        })
-        .await;
+        });
         let result = exchange(server.url("/complete"))
             .await
             .unwrap()

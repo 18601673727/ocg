@@ -396,7 +396,8 @@ fn event_at_parts(
     request: u32,
     seq: u32,
 ) -> Result<Option<RequestEventRecord>, StorageError> {
-    let Some(bytes) = rx.open_table(REQUEST_EVENTS)?.get((job, request, seq))? else {
+    let events = rx.open_table(REQUEST_EVENTS)?;
+    let Some(bytes) = events.get((job, request, seq))? else {
         return Ok(None);
     };
     let request = RequestNumber::new(request)

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ntex::http::Uri;
+use ntex::url::Url as Uri;
 use regex::Regex;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -94,17 +94,15 @@ fn redirect_url(current: &Uri, location: &str) -> Result<Uri, ToolFailure> {
         return parse_url(&format!("{scheme}:{location}"));
     }
     let path = if location.is_empty() {
-        current
-            .path_and_query()
-            .map_or("/", |value| value.as_str())
-            .to_owned()
+        current.path_and_query().as_str().to_owned()
     } else if location.starts_with('?') {
-        format!("{}{location}", current.path())
+        format!("{}{location}", current.path().as_str())
     } else if location.starts_with('/') {
         location.to_owned()
     } else {
         let directory = current
             .path()
+            .as_str()
             .rsplit_once('/')
             .map_or("", |(directory, _)| directory);
         format!("{directory}/{location}")
@@ -494,4 +492,21 @@ pub(crate) fn register(registry: &ToolRegistry) -> Result<(), ToolRegistryError>
         registry.authorize(name)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_url, redirect_url};
+
+    #[test]
+    fn url_and_redirect_validation_rejects_credentials() {
+        assert!(parse_url("https://user:password@example.com/path").is_err());
+        assert!(parse_url("file:///tmp/example").is_err());
+        let current = parse_url("https://example.com/a/b?old=1").unwrap();
+        assert_eq!(
+            redirect_url(&current, "../c?new=2").unwrap().as_str(),
+            "https://example.com/c?new=2"
+        );
+        assert!(redirect_url(&current, "//user:password@example.com/").is_err());
+    }
 }

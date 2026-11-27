@@ -51,7 +51,8 @@ fn with_offline_database<T>(
     } else {
         let source = std::fs::File::open(&path).map_err(io_storage_error)?;
         let copy = verification_copy(&source, bytes, "database changed during inspection copy")?;
-        let mut database = Database::builder().create_file(copy)?;
+        let mut database =
+            Database::builder().create_with_backend(::redb::backends::FileBackend::new(copy))?;
         inspect(OfflineAccess::Copy(&mut database))?
     };
     Ok((result, bytes))
@@ -113,15 +114,16 @@ pub(super) fn with_database_copy<T>(
     body: impl FnOnce(&mut Database) -> Result<T, ReservedRefusal>,
 ) -> Result<T, ReservedRefusal> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut database = match builder.create_file(file) {
-            Err(::redb::DatabaseError::RepairAborted) => {
-                return Err(ReservedRefusal::new(
-                    "page_integrity",
-                    "the offline copy requires redb repair",
-                ));
-            }
-            result => result?,
-        };
+        let mut database =
+            match builder.create_with_backend(::redb::backends::FileBackend::new(file)) {
+                Err(::redb::DatabaseError::RepairAborted) => {
+                    return Err(ReservedRefusal::new(
+                        "page_integrity",
+                        "the offline copy requires redb repair",
+                    ));
+                }
+                result => result?,
+            };
         body(&mut database)
     }))
     .unwrap_or_else(|_| {
@@ -523,7 +525,8 @@ pub(crate) fn verify_publication(
     )?;
 
     let guarded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut database = Database::builder().create_file(copy)?;
+        let mut database =
+            Database::builder().create_with_backend(::redb::backends::FileBackend::new(copy))?;
         let logical = if recovered {
             logical_report(recovery::verify_recovered(&database))
         } else {

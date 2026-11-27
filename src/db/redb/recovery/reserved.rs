@@ -19,7 +19,7 @@ use crate::db::redb::schema::{
 use crate::db::redb::state::JobRuntime;
 use crate::db::redb::{StorageError, StorageErrorKind, allocations, reads};
 use crate::host::identity::{current_boot_id, current_host_id};
-use ::redb::ReadableDatabase;
+use ::redb::{ReadableDatabase, ReadableTable};
 
 #[derive(Debug)]
 pub(crate) struct ReservedRefusal {
@@ -410,9 +410,10 @@ pub(crate) fn verify_reserved_publication_delta(
             let source_record = reads::jobs::mutable_job_record_in(&source_tx, job)?
                 .ok_or_else(|| audit_delta("the rollback source Job vanished"))?;
             let parent = source_record.job.parent_id;
-            let parent_row = source_tx
+            let parents = source_tx
                 .open_table(CONVERSATIONS)
-                .map_err(StorageError::from)?
+                .map_err(StorageError::from)?;
+            let parent_row = parents
                 .get(parent.get())
                 .map_err(StorageError::from)?
                 .ok_or_else(|| audit_delta("the rollback parent Group vanished"))?;
@@ -425,18 +426,20 @@ pub(crate) fn verify_reserved_publication_delta(
                 &std::collections::BTreeSet::from([job.get()]),
                 Some((parent, standalone)),
             )?;
-            let source_allocation_row = source_tx
+            let source_allocations = source_tx
                 .open_table(POOL_ALLOCATIONS)
-                .map_err(StorageError::from)?
+                .map_err(StorageError::from)?;
+            let source_allocation_row = source_allocations
                 .get(job.get())
                 .map_err(StorageError::from)?
                 .ok_or_else(|| audit_delta("the rollback source Allocation vanished"))?;
             let source_allocation =
                 allocations::decode_pool_allocation(job.get(), source_allocation_row.value())?;
             drop(source_allocation_row);
-            let source_state_row = source_tx
+            let source_states = source_tx
                 .open_table(JOB_RUNTIME)
-                .map_err(StorageError::from)?
+                .map_err(StorageError::from)?;
+            let source_state_row = source_states
                 .get(job.get())
                 .map_err(StorageError::from)?
                 .ok_or_else(|| audit_delta("the rollback source Job state vanished"))?;
@@ -444,9 +447,10 @@ pub(crate) fn verify_reserved_publication_delta(
             drop(source_state_row);
 
             let tx = database.begin_read().map_err(StorageError::from)?;
-            let row = tx
+            let allocations_table = tx
                 .open_table(POOL_ALLOCATIONS)
-                .map_err(StorageError::from)?
+                .map_err(StorageError::from)?;
+            let row = allocations_table
                 .get(job.get())
                 .map_err(StorageError::from)?
                 .ok_or_else(|| {
@@ -454,9 +458,8 @@ pub(crate) fn verify_reserved_publication_delta(
                 })?;
             let released = allocations::decode_pool_allocation(job.get(), row.value())?;
             drop(row);
-            let state_row = tx
-                .open_table(JOB_RUNTIME)
-                .map_err(StorageError::from)?
+            let states = tx.open_table(JOB_RUNTIME).map_err(StorageError::from)?;
+            let state_row = states
                 .get(job.get())
                 .map_err(StorageError::from)?
                 .ok_or_else(|| audit_delta("the published Job state vanished"))?;

@@ -421,7 +421,7 @@ mod tests {
     use std::num::NonZeroU32;
     use std::path::PathBuf;
 
-    use ::redb::ReadableDatabase;
+    use ::redb::{ReadableDatabase, ReadableTable};
     use uuid::Uuid;
 
     use super::INJECT_CONFIRMED_ANSWER_REJECTION;
@@ -665,14 +665,17 @@ mod tests {
         // Verify complete transaction rollback and preserved capacity ownership.
         let raw = ::redb::Database::open(database_file(&temp.0)).expect("open raw redb");
         let tx = raw.begin_read().expect("begin read");
-        let allocation_row = tx
+        let allocations_table = tx
             .open_table(POOL_ALLOCATIONS)
-            .expect("open POOL_ALLOCATIONS")
+            .expect("open POOL_ALLOCATIONS");
+        let allocation_row = allocations_table
             .get(job_id.get())
             .expect("read allocation")
             .expect("allocation still exists");
         let allocation = allocations::decode_pool_allocation(job_id.get(), allocation_row.value())
             .expect("decode allocation");
+        drop(allocation_row);
+        drop(allocations_table);
         assert!(
             allocation.holds_capacity(),
             "capacity ownership must remain intact after rollback"
@@ -702,9 +705,10 @@ mod tests {
         // Clearing fault injection allows startup to settle the confirmed answer cleanly.
         let recovered = open(&temp.0).expect("startup succeeds once fault is cleared");
         let tx = recovered.database.begin_read().expect("begin read");
-        let settled_allocation = tx
+        let allocations_table = tx
             .open_table(POOL_ALLOCATIONS)
-            .expect("open POOL_ALLOCATIONS")
+            .expect("open POOL_ALLOCATIONS");
+        let settled_allocation = allocations_table
             .get(job_id.get())
             .expect("read allocation")
             .expect("allocation row exists");

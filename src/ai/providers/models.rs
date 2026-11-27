@@ -57,8 +57,9 @@ pub(crate) async fn list_models(
                 }
                 let body = match response.body().limit(1024 * 1024).await {
                     Ok(body) => body.to_vec(),
-                    Err(ntex::http::error::PayloadError::Overflow)
-                        if (200..300).contains(&status) =>
+                    Err(error)
+                        if matches!(**error, ntex::http::error::PayloadError::Overflow)
+                            && (200..300).contains(&status) =>
                     {
                         return Err(ModelListError::NotListed);
                     }

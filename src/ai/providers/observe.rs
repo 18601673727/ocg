@@ -308,7 +308,6 @@ pub(crate) fn classify_client_error(error: ClientError) -> ProviderExecutionErro
         | ClientError::Response(_)
         | ClientError::Http(_)
         | ClientError::H2(_)
-        | ClientError::TunnelNotSupported
         | ClientError::Error(_) => ProviderExecutionError::Unknown {
             message,
             facts: None,

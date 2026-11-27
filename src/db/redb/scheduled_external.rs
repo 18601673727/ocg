@@ -377,14 +377,13 @@ pub(crate) fn read_scheduled_external_binding_with_policy(
     StorageError,
 > {
     let rx = read(database)?;
-    let Some(row) = rx.open_table(SCHEDULED_EXTERNAL_BINDING)?.get(job.get())? else {
+    let bindings = rx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
+    let Some(row) = bindings.get(job.get())? else {
         return Ok(None);
     };
     let binding = decode_scheduled_external_binding(job.get(), row.value())?;
-    let Some(policy_row) = rx
-        .open_table(SCHEDULED_EXTERNAL_POLICY)?
-        .get(binding.policy.get())?
-    else {
+    let policies = rx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
+    let Some(policy_row) = policies.get(binding.policy.get())? else {
         return Err(StorageError::corrupted(
             "a scheduled external binding names a missing policy",
         ));

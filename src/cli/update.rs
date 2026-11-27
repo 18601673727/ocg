@@ -9,7 +9,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use ntex::client::error::{ClientError, ConnectError};
-use ntex::client::{Client, Connector};
+use ntex::client::{Client, ClientConfig};
 use ntex::http::header;
 use ntex::time::Millis;
 
@@ -27,13 +27,10 @@ async fn write_progress(prefix: &Path, state: &State) -> Result<()> {
 }
 
 async fn wait_jobs(install: &Install, state: &mut State) -> Result<()> {
-    let client = Client::builder()
-        .connector::<()>(Connector::default())
-        .response_timeout(Millis(2_000))
-        .response_payload_timeout(Millis(2_000))
-        .build(ntex::SharedCfg::new("update-health"))
-        .await;
-    let client = client.map_err(|error| format!("health client failed: {error}"))?;
+    let config = ClientConfig::new()
+        .set_response_timeout(Millis(2_000))
+        .set_response_payload_timeout(Millis(2_000));
+    let client = Client::builder().build(ntex::SharedCfg::new("update-health").add(config));
     let auth = http::authorization(&install.token)?;
     let url = format!("http://127.0.0.1:{}/api/v1/health", install.port);
     let prepare_url = format!("http://127.0.0.1:{}/api/v1/update", install.port);
@@ -49,8 +46,7 @@ async fn wait_jobs(install: &Install, state: &mut State) -> Result<()> {
             .await
         {
             Ok(response) => response,
-            Err(ClientError::Connect(ConnectError::Disconnected(Some(error))))
-                if error.kind() == std::io::ErrorKind::ConnectionRefused =>
+            Err(error) if matches!(&*error, ClientError::Connect(ConnectError::Disconnected(Some(error))) if error.kind() == std::io::ErrorKind::ConnectionRefused) =>
             {
                 println!("OCG is not running; updating now");
                 return Ok(());

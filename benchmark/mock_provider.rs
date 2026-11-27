@@ -139,33 +139,36 @@ impl MockProvider {
         let streaming = Arc::clone(&gate);
         let workers = std::thread::available_parallelism().map_or(4, |value| value.get());
 
-        let server = HttpServer::new(async move || {
+        let server = HttpServer::new(async move |_| {
             let config = config.clone();
             let served = served.clone();
             let streaming = streaming.clone();
             App::new().default_service(web::to(async move |body: web::types::Json<Value>| {
                 if config.fail_requests {
                     served.requests.fetch_add(1, Ordering::Relaxed);
-                    return Ok::<_, ntex::web::Error>(HttpResponse::InternalServerError().json(
+                    return Ok::<_, ntex::web::WebError>(HttpResponse::InternalServerError().json(
                         &json!({"error": {"message": "benchmark-injected provider failure"}}),
                     ));
                 }
-                let plan =
-                    answer(&body, &config, &served).map_err(ntex::web::error::ErrorBadRequest)?;
+                let plan = answer(&body, &config, &served).map_err(|error| {
+                    ntex::web::WebError::from_err(ntex::web::error::ErrorBadRequest(error))
+                })?;
                 if let Some(job_key) = &plan.wait_for {
                     let receiver = streaming.receiver(job_key);
                     ntex::time::timeout(config.gate_timeout, receiver.recv_async())
                         .await
                         .map_err(|_| {
-                            ntex::web::error::ErrorRequestTimeout(
+                            ntex::web::WebError::from_err(ntex::web::error::ErrorRequestTimeout(
                                 "downstream subscription was not established",
-                            )
+                            ))
                         })?
                         .map_err(|error| {
-                            ntex::web::error::ErrorInternalServerError(error.to_string())
+                            ntex::web::WebError::from_err(
+                                ntex::web::error::ErrorInternalServerError(error.to_string()),
+                            )
                         })?;
                 }
-                Ok::<_, ntex::web::Error>(
+                Ok::<_, ntex::web::WebError>(
                     HttpResponse::Ok()
                         .content_type("text/event-stream")
                         .streaming(ProviderBody::new(
@@ -179,7 +182,7 @@ impl MockProvider {
         })
         .workers(workers)
         .disable_signals()
-        .listen(listener)?
+        .listen(listener, ntex::SharedCfg::default())?
         .run();
 
         let finished = ntex::rt::spawn(server.clone());

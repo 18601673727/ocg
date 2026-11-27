@@ -236,7 +236,7 @@ fn json_response(status: StatusCode, body: &Value) -> HttpResponse {
 }
 
 fn json_bytes_response(status: StatusCode, body: Vec<u8>) -> HttpResponse {
-    HttpResponse::build(status)
+    HttpResponse::builder(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
@@ -270,9 +270,10 @@ pub(super) fn bounded_json(body: &Value, limit: usize) -> Result<Vec<u8>, Refusa
 }
 
 pub(super) async fn answer(
+    shared: &web::AppState<Arc<Shared>>,
+    _: (),
     request: HttpRequest,
     payload: web::types::Payload,
-    shared: web::types::State<Arc<Shared>>,
 ) -> HttpResponse {
     match admit(
         &request,
@@ -298,12 +299,12 @@ pub(super) async fn answer(
             body_limit: limit,
         })) => match authorize(&caller, route) {
             Ok(Route::Events { job, after_seq }) => {
-                events::open(&shared, request.io().cloned(), job, after_seq)
+                events::open(shared, request.io().cloned(), job, after_seq)
                     .await
                     .unwrap_or_else(|refusal| refusal.response())
             }
             Ok(Route::Subscription(topic)) => {
-                subscriptions::open(&shared, request.io().cloned(), topic)
+                subscriptions::open(shared, request.io().cloned(), topic)
                     .unwrap_or_else(|refusal| refusal.response())
             }
             Ok(Route::AttachmentContent(attachment)) => {
@@ -316,7 +317,7 @@ pub(super) async fn answer(
                 &caller,
                 &request,
                 LimitedBody { payload, limit },
-                &shared,
+                shared,
             )
             .await
             {

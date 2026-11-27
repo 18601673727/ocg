@@ -181,7 +181,7 @@ pub(super) async fn content(
         .await
         .map_err(attachment_refusal)?;
     let image = ImageInput::new(mime, content.bytes).map_err(|_| ATTACHMENT_UNAVAILABLE)?;
-    let mut response = HttpResponse::build(StatusCode::OK)
+    let mut response = HttpResponse::builder(StatusCode::OK)
         .header(header::CACHE_CONTROL, "private, no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(header::CONTENT_DISPOSITION, "inline")

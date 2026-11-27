@@ -173,7 +173,7 @@ where
 {
     let polled = Rc::new(Cell::new(now));
     let watched = io.map(|io| watch(io, polled.clone(), stall));
-    HttpResponse::build(StatusCode::OK)
+    HttpResponse::builder(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream; charset=utf-8")
         .header(header::CACHE_CONTROL, "no-store")
         .header(header::X_CONTENT_TYPE_OPTIONS, "nosniff")

@@ -79,28 +79,30 @@ impl ApiServer {
             closing: AtomicBool::new(false),
         });
         let kept = shared.clone();
-        let server = HttpServer::new(async move || {
-            App::new()
-                .state(shared.clone())
-                .default_service(web::to(answer))
-        })
+        let server = HttpServer::with_config(
+            async move || Ok(web::AppState::new(shared.clone())),
+            async move |_| App::new().default_service(web::to_with_state(answer)),
+        )
         .workers(1)
-        .maxconn(64)
+        .max_connections(64)
         .backlog(64)
-        .shutdown_timeout(STOP_TIMEOUT)
-        .config(
-            SharedCfg::new("OCG-API").add(IoConfig::new()).add(
-                HttpServiceConfig::new()
-                    .set_max_headers(MAX_HEADERS)
-                    .set_max_buf_size(16 * 1024),
-            ),
-        );
+        .graceful_shutdown_timeout(STOP_TIMEOUT);
         let server = if ntex::rt::System::current().signals() {
             server
         } else {
             server.disable_signals()
         };
-        let server = server.listen(listener).map_err(StartError::Serve)?.run();
+        let server = server
+            .listen(
+                listener,
+                SharedCfg::new("OCG-API").add(IoConfig::new()).add(
+                    HttpServiceConfig::new()
+                        .set_max_headers(MAX_HEADERS as u16)
+                        .set_max_buf_size(16 * 1024),
+                ),
+            )
+            .map_err(StartError::Serve)?
+            .run();
         let finished = ntex::rt::spawn(server.clone());
         Ok(Self {
             address,

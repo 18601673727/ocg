@@ -1,21 +1,18 @@
-use std::cell::{OnceCell, RefCell};
-use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
-use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use ntex::client::{Client, Connector};
+use ntex::client::{Client, ClientBuilder, ClientConfig};
 use ntex::connect::{Connect, ConnectError, Connector as TcpConnector};
-use ntex::http::Uri;
 use ntex::http::header::HeaderValue;
 use ntex::io::{Io, IoBoxed};
-use ntex::service::apply_fn_factory;
+use ntex::service::apply_fn;
 use ntex::time::{Millis, Seconds};
+use ntex::url::Url as Uri;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LoopbackProxy(std::net::SocketAddr);
@@ -49,38 +46,13 @@ pub(crate) fn authorization(credential: &str) -> Result<HeaderValue, HttpError> 
     Ok(value)
 }
 
-#[derive(PartialEq, Eq)]
-struct ApprovedDestination {
-    host: String,
-    port: u16,
-    proxy: SocketAddr,
-}
-
-#[derive(Default)]
-struct ProviderClients {
-    http: OnceCell<Client>,
-    https: OnceCell<Client>,
-    approved: RefCell<VecDeque<(ApprovedDestination, Client)>>,
-}
-
-fn worker_clients() -> Rc<ProviderClients> {
-    ntex::rt::Arbiter::get_value(Rc::<ProviderClients>::default)
-}
-
 pub(crate) async fn standard_client(uri: &Uri) -> Result<Client, HttpError> {
-    let plain = uri.scheme_str() == Some("http");
-    let clients = worker_clients();
-    let cache = if plain { &clients.http } else { &clients.https };
-    if let Some(client) = cache.get() {
-        return Ok(client.clone());
-    }
-    let connector = if plain {
-        Connector::default()
+    let builder = if uri.scheme_str() == Some("http") {
+        Client::builder()
     } else {
         connector()?
     };
-    let client = provider_client(connector, "provider").await?;
-    Ok(cache.get_or_init(|| client).clone())
+    provider_client(builder, "provider").await
 }
 
 pub(crate) async fn approved_client(
@@ -88,92 +60,53 @@ pub(crate) async fn approved_client(
     port: u16,
     proxy: SocketAddr,
 ) -> Result<Client, HttpError> {
-    const LIMIT: usize = 16;
-    let key = ApprovedDestination {
-        host: bare_host(host),
-        port,
-        proxy,
-    };
-    let clients = worker_clients();
-    let cached = || {
-        clients
-            .approved
-            .borrow()
-            .iter()
-            .find(|(destination, _)| destination == &key)
-            .map(|(_, client)| client.clone())
-    };
-    if let Some(client) = cached() {
-        return Ok(client);
-    }
-    let client = provider_client(
-        approved_connector(&key.host, port, proxy)?,
-        "provider-approved",
-    )
-    .await?;
-    if let Some(existing) = cached() {
-        return Ok(existing);
-    }
-    let mut cache = clients.approved.borrow_mut();
-    if cache.len() == LIMIT {
-        cache.pop_front();
-    }
-    cache.push_back((key, client.clone()));
-    Ok(client)
+    provider_client(approved_connector(host, port, proxy)?, "provider-approved").await
 }
 
-async fn provider_client(connector: Connector, name: &'static str) -> Result<Client, HttpError> {
-    Client::builder()
-        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-        // Job admission controls concurrency. A shared connector must not impose
-        // ntex's default eight-request ceiling across independent Providers.
-        // A positive limit also lets ntex wake waiters for a connecting authority.
-        .connector::<()>(connector.limit(usize::MAX))
-        .disable_redirects()
-        .disable_timeout()
-        .response_payload_timeout(Millis::ZERO)
-        .build(
-            ntex::SharedCfg::new(name)
-                .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
-        )
-        .await
+async fn provider_client(builder: ClientBuilder, name: &'static str) -> Result<Client, HttpError> {
+    let config = ClientConfig::new()
+        .set_header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
         .map_err(|_| HttpError {
-            message: "provider HTTP client could not be initialized".to_owned(),
-        })
+            message: "invalid user agent".to_owned(),
+        })?
+        .set_h1_connection_limit(0)
+        .set_h2_connection_limit(0)
+        .disable_timeout()
+        .set_response_payload_timeout(Millis::ZERO);
+    Ok(builder.build(
+        ntex::SharedCfg::new(name)
+            .add(config)
+            .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
+    ))
 }
 
 pub(crate) async fn release_client() -> Result<Client, HttpError> {
-    Client::builder()
-        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-        .connector::<()>(connector()?)
-        .disable_redirects()
-        .response_timeout(Millis(30_000))
-        .response_payload_timeout(Millis(30_000))
-        .build(ntex::SharedCfg::new("release"))
-        .await
+    let config = ClientConfig::new()
+        .set_header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
         .map_err(|_| HttpError {
-            message: "release HTTP client could not be initialized".to_owned(),
-        })
+            message: "invalid user agent".to_owned(),
+        })?
+        .set_response_timeout(Millis(30_000))
+        .set_response_payload_timeout(Millis(30_000));
+    Ok(connector()?.build(ntex::SharedCfg::new("release").add(config)))
 }
 
 pub(crate) async fn web_client(
     timeout: Duration,
     non_public: Arc<AtomicBool>,
 ) -> Result<Client, HttpError> {
-    Client::builder()
-        .header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
-        .connector::<()>(web_connector(non_public)?)
-        .disable_redirects()
-        .response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
-        .response_payload_timeout(Millis::ZERO)
-        .build(
-            ntex::SharedCfg::new("web")
-                .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
-        )
-        .await
+    let config = ClientConfig::new()
+        .set_header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
         .map_err(|_| HttpError {
-            message: "web HTTP client could not be initialized".to_owned(),
-        })
+            message: "invalid user agent".to_owned(),
+        })?
+        .set_response_timeout(Millis(timeout.as_millis().min(u128::from(u32::MAX)) as u32))
+        .set_response_payload_timeout(Millis::ZERO);
+    Ok(web_connector(non_public)?.build(
+        ntex::SharedCfg::new("web")
+            .add(config)
+            .add(ntex_h2::ServiceConfig::new().set_ping_timeout(Seconds::ZERO)),
+    ))
 }
 
 struct Proxy {
@@ -435,7 +368,7 @@ async fn open_proxy_io(
     Ok((io, host))
 }
 
-fn connector() -> Result<Connector, HttpError> {
+fn connector() -> Result<ClientBuilder, HttpError> {
     let proxy = PROXY
         .get_or_init(load)
         .as_ref()
@@ -443,57 +376,75 @@ fn connector() -> Result<Connector, HttpError> {
             message: message.clone(),
         })?;
     let Some(proxy) = proxy else {
-        return Ok(Connector::default()
+        return Ok(Client::builder()
             .secure_connector(ntex::connect::rustls::TlsConnector::from(tunnel_tls())));
     };
     let tls = tunnel_tls();
-    Ok(Connector::default()
-        .connector(apply_fn_factory(
+    Ok(Client::builder()
+        .connector(apply_fn(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                open_proxy_io(proxy, request, 80, |req| service.call(req))
-                    .await
-                    .map(|(io, _)| io)
+                open_proxy_io(proxy, request, 80, |req| async {
+                    service.call(req).await.map_err(|error| error.into_error())
+                })
+                .await
+                .map(|(io, _)| io)
+                .map_err(ntex::Error::from_err)
             },
         ))
-        .secure_connector(apply_fn_factory(
+        .secure_connector(apply_fn(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                let (io, host) =
-                    open_proxy_io(proxy, request, 443, |req| service.call(req)).await?;
-                wrap_tls(io, &host, tls.clone()).await
+                let result: Result<IoBoxed, ConnectError> = async {
+                    let (io, host) = open_proxy_io(proxy, request, 443, |req| async {
+                        service.call(req).await.map_err(|error| error.into_error())
+                    })
+                    .await?;
+                    wrap_tls(io, &host, tls.clone()).await
+                }
+                .await;
+                result.map_err(ntex::Error::from_err)
             },
         )))
 }
 
-fn approved_connector(host: &str, port: u16, proxy: SocketAddr) -> Result<Connector, HttpError> {
+fn approved_connector(
+    host: &str,
+    port: u16,
+    proxy: SocketAddr,
+) -> Result<ClientBuilder, HttpError> {
     let tls = tunnel_tls();
     let approved = Arc::new((bare_host(host), port));
     let addr = proxy;
     let proxy: Uri = format!("http://{addr}").parse().map_err(|_| HttpError {
         message: "the trusted proxy address is not usable".to_owned(),
     })?;
-    Ok(Connector::default()
-        .connector(apply_fn_factory(
+    Ok(Client::builder()
+        .connector(apply_fn(
             TcpConnector::<Uri>::new(),
             async move |_request: Connect<Uri>, _service| {
-                Err::<Io, ConnectError>(ConnectError::InvalidInput)
+                Err::<Io, _>(ntex::Error::from_err(ConnectError::InvalidInput))
             },
         ))
-        .secure_connector(apply_fn_factory(
+        .secure_connector(apply_fn(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                let target = request.get_ref().clone();
-                let host = target.host().ok_or(ConnectError::InvalidInput)?;
-                let port = target.port_u16().unwrap_or(443);
-                if bare_host(host) != approved.0 || port != approved.1 {
-                    return Err(ConnectError::InvalidInput);
+                let result: Result<IoBoxed, ConnectError> = async {
+                    let target = request.get_ref().clone();
+                    let host = target.host().ok_or(ConnectError::InvalidInput)?;
+                    let port = target.port_u16().unwrap_or(443);
+                    if bare_host(host) != approved.0 || port != approved.1 {
+                        return Err(ConnectError::InvalidInput);
+                    }
+                    let io = service
+                        .call(Connect::new(proxy.clone()).set_addrs(vec![addr]))
+                        .await
+                        .map_err(|error| error.into_error())?;
+                    connect_tunnel_with_timeout(&io, host, port, None, TUNNEL_TIMEOUT).await?;
+                    wrap_tls(io, host, tls.clone()).await
                 }
-                let io = service
-                    .call(Connect::new(proxy.clone()).set_addrs(vec![addr]))
-                    .await?;
-                connect_tunnel_with_timeout(&io, host, port, None, TUNNEL_TIMEOUT).await?;
-                wrap_tls(io, host, tls.clone()).await
+                .await;
+                result.map_err(ntex::Error::from_err)
             },
         )))
 }
@@ -528,7 +479,7 @@ async fn open_web_io(
     Ok((io, host))
 }
 
-fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, HttpError> {
+fn web_connector(non_public: Arc<AtomicBool>) -> Result<ClientBuilder, HttpError> {
     let proxy = PROXY
         .get_or_init(load)
         .as_ref()
@@ -537,25 +488,31 @@ fn web_connector(non_public: Arc<AtomicBool>) -> Result<Connector, HttpError> {
         })?;
     let tls = tunnel_tls();
     let http_non_public = non_public.clone();
-    Ok(Connector::default()
-        .connector(apply_fn_factory(
+    Ok(Client::builder()
+        .connector(apply_fn(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                open_web_io(proxy.as_ref(), request, 80, &http_non_public, |req| {
-                    service.call(req)
+                open_web_io(proxy.as_ref(), request, 80, &http_non_public, |req| async {
+                    service.call(req).await.map_err(|error| error.into_error())
                 })
                 .await
                 .map(|(io, _)| io)
+                .map_err(ntex::Error::from_err)
             },
         ))
-        .secure_connector(apply_fn_factory(
+        .secure_connector(apply_fn(
             TcpConnector::<Uri>::new(),
             async move |request: Connect<Uri>, service| {
-                let (io, host) = open_web_io(proxy.as_ref(), request, 443, &non_public, |req| {
-                    service.call(req)
-                })
-                .await?;
-                wrap_tls(io, &host, tls.clone()).await
+                let result: Result<IoBoxed, ConnectError> = async {
+                    let (io, host) =
+                        open_web_io(proxy.as_ref(), request, 443, &non_public, |req| async {
+                            service.call(req).await.map_err(|error| error.into_error())
+                        })
+                        .await?;
+                    wrap_tls(io, &host, tls.clone()).await
+                }
+                .await;
+                result.map_err(ntex::Error::from_err)
             },
         )))
 }
@@ -764,7 +721,7 @@ async fn connect_tunnel(
     authorization: Option<&HeaderValue>,
 ) -> io::Result<()> {
     let authority = format!("{host}:{port}");
-    io.with_write_buf(|buffer| {
+    io.with_write_src(|buffer| {
         buffer.extend_from_slice(
             format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n").as_bytes(),
         );
@@ -779,7 +736,7 @@ async fn connect_tunnel(
     let mut head = Vec::new();
     while head.len() < 16 * 1024 {
         let mut byte = [0];
-        io.read(&mut byte).await?;
+        io.read_exact(&mut byte).await?;
         head.push(byte[0]);
         if head.ends_with(b"\r\n\r\n") {
             let status = std::str::from_utf8(&head).ok().and_then(|head| {
@@ -797,4 +754,75 @@ async fn connect_tunnel(
     Err(io::Error::other(
         "provider proxy CONNECT response exceeded its limit",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    #[ntex::test]
+    async fn proxy_connect_preserves_bytes_after_response_headers() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\nnext")
+                .unwrap();
+            request
+        });
+        let stream = ntex::rt::spawn_blocking(move || TcpStream::connect(address))
+            .await
+            .unwrap()
+            .unwrap();
+        let io =
+            ntex::rt::from_tcp_stream(stream, ntex::SharedCfg::new("test-proxy").into()).unwrap();
+        let authorization = HeaderValue::from_static("Basic dXNlcjpwYXNz");
+        connect_tunnel(&io, "example.com", 443, Some(&authorization))
+            .await
+            .unwrap();
+        let mut next = [0; 4];
+        io.read_exact(&mut next).await.unwrap();
+        assert_eq!(&next, b"next");
+        let request = ntex::rt::spawn_blocking(move || server.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(request, b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n");
+    }
+
+    #[ntex::test]
+    async fn web_client_rejects_loopback_before_connecting() {
+        let non_public = Arc::new(AtomicBool::new(false));
+        let client = web_client(Duration::from_secs(2), non_public.clone())
+            .await
+            .unwrap();
+        assert!(client.get("http://127.0.0.1:1/").send().await.is_err());
+        assert!(non_public.load(Ordering::SeqCst));
+    }
+
+    #[ntex::test]
+    async fn approved_client_rejects_plain_http() {
+        let client = approved_client("example.com", 443, "127.0.0.1:1".parse().unwrap())
+            .await
+            .unwrap();
+        assert!(client.get("http://example.com/").send().await.is_err());
+    }
+
+    #[test]
+    fn proxy_and_host_validation_remain_strict() {
+        assert!(Proxy::parse("http://user:pass@127.0.0.1:8080", "localhost").is_ok());
+        assert!(Proxy::parse("https://127.0.0.1:8080", "").is_err());
+        assert!(Proxy::parse("http://127.0.0.1:8080/path", "").is_err());
+        assert!(is_non_public_host_literal("127.0.0.1"));
+        assert!(is_non_public_host_literal("[::1]"));
+    }
 }

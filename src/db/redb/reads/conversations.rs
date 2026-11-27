@@ -29,7 +29,7 @@ use crate::db::redb::schema::{
 };
 use crate::db::redb::{StorageError, TxRead};
 use crate::db::redb::{allocations, indexes, rows, state};
-use ::redb::{Database, ReadOnlyTable, ReadTransaction};
+use ::redb::{Database, ReadOnlyTable, ReadTransaction, ReadableTable};
 use std::collections::BTreeSet;
 
 pub(crate) fn read_mutable_conversation_turn_page(
@@ -156,8 +156,8 @@ fn child_notice(
             "child notice turn has non-Agent author",
         ));
     };
-    let record = rx
-        .open_table(TOOL_CALLS)?
+    let calls = rx.open_table(TOOL_CALLS)?;
+    let record = calls
         .get(rows::tool_call_key(call))?
         .ok_or_else(|| StorageError::corrupted("child notice tool call missing"))?;
     let evidence = rows::decode_tool_evidence(call, record.value())?;
@@ -974,12 +974,10 @@ pub(crate) fn read_context_state(
             continue;
         };
         let state = read_state(&rx, child_id)?;
-        let manifest_bytes = rx
-            .open_table(MESSAGES)?
-            .get(source.as_bytes().as_slice())?
-            .ok_or_else(|| {
-                StorageError::corrupted(format!("summary manifest for {child_id} is missing"))
-            })?;
+        let messages = rx.open_table(MESSAGES)?;
+        let manifest_bytes = messages.get(source.as_bytes().as_slice())?.ok_or_else(|| {
+            StorageError::corrupted(format!("summary manifest for {child_id} is missing"))
+        })?;
         let manifest = serde_json::from_slice::<crate::db::entities::NativeSummaryManifest>(
             manifest_bytes.value(),
         )
