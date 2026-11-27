@@ -678,6 +678,16 @@ pub(super) fn decode_mutable_input_revision(
     Ok(input)
 }
 
+/// Result of [`Batch::capture_prerequisite_context`].
+pub(super) enum PrerequisiteCapture {
+    /// The conversation has no uncaptured prerequisite context.
+    NotRequired,
+    /// The prerequisites are not yet satisfied; nothing was written.
+    Pending,
+    /// The context was written onto the original assignment.
+    Captured { assignment: JobId, context: String },
+}
+
 pub(super) enum TurnMembership {
     Turn,
     NonTurn,
@@ -840,6 +850,53 @@ impl Batch {
             }
         }
         self.insert(JOBS, job.id.get(), encode_mutable_job(job).as_slice())
+    }
+
+    /// Captures the prerequisite results onto a conversation's original
+    /// assignment, the only row that owns them. This is the single runtime
+    /// write of the field: it reads the authoritative assignment, refuses once
+    /// any Generative turn has started without the context, never replaces an
+    /// existing context, and changes no other field. Callers must commit it in
+    /// the same batch as the first eligible reservation.
+    pub(super) fn capture_prerequisite_context(
+        &mut self,
+        conversation: JobId,
+    ) -> Result<PrerequisiteCapture, BatchError> {
+        let spec = self.require_mutable_conversation(conversation)?;
+        let Some(mut assignment) =
+            self.step(|tx| super::job_tree::prerequisite_assignment(tx, &spec))?
+        else {
+            return Ok(PrerequisiteCapture::NotRequired);
+        };
+        if assignment.prerequisite_context.is_some() {
+            return Ok(PrerequisiteCapture::NotRequired);
+        }
+        if self
+            .step(|tx| super::job_tree::prerequisite_admissions(tx, &assignment))?
+            .first_started
+            .is_some()
+        {
+            return self.reject(Violation::InvalidValue(
+                "prerequisite_context",
+                super::job_tree::PREREQUISITE_CONTEXT_LOST,
+            ));
+        }
+        let lifecycle = self.job_lifecycle(conversation)?;
+        let Some(context) =
+            self.step(|tx| super::job_tree::prerequisite_results(tx, &spec, &lifecycle.after))?
+        else {
+            return Ok(PrerequisiteCapture::Pending);
+        };
+        assignment.prerequisite_context = Some(context.clone());
+        self.insert(
+            JOBS,
+            assignment.id.get(),
+            encode_mutable_job(&assignment).as_slice(),
+        )?;
+        Ok(PrerequisiteCapture::Captured {
+            assignment: assignment.id,
+            context,
+        })
     }
 
     pub(super) fn record_mutable_submission(

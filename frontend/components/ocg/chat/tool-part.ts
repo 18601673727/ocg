@@ -9,7 +9,7 @@ export type ToolCallMessagePartStatus =
 export type ToolCallPart = {
   toolCallId: string;
   toolName: string;
-  argsText: string;
+  argsText: string | null;
   result?: unknown;
   status: ToolCallMessagePartStatus;
   durationMs?: number;
@@ -57,7 +57,7 @@ export function presentToolCall(
   return {
     toolCallId: call.tool_call_id,
     toolName: call.name,
-    argsText: call.arguments ?? "{}",
+    argsText: call.arguments,
     result,
     status,
     durationMs: call.duration_ms,

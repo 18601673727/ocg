@@ -116,7 +116,8 @@ function ToolFallbackDuration(viewProps: ElementProps<"span"> & { durationMs?: n
   );
 }
 
-export function toolArgumentSummary(toolName: string, argsText: string): string {
+export function toolArgumentSummary(toolName: string, argsText: string | null): string {
+  if (argsText === null) return "";
   try {
     const args: unknown = JSON.parse(argsText);
     if (!args || typeof args !== "object") return "";
@@ -292,7 +293,7 @@ function ToolFallbackContent(viewProps: ElementProps<typeof CollapsibleContent>)
 
 function ToolFallbackArgs(
   viewProps: ElementProps<"div"> & {
-    argsText?: string;
+    argsText?: string | null;
   },
 ) {
   const [, props] = splitProps(viewProps, ["argsText", "class"]);

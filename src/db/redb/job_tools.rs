@@ -1204,11 +1204,16 @@ impl Batch {
             }
             self.require_project(project)?;
         }
-        Ok(ExecutionConfiguration {
+        let configuration = ExecutionConfiguration {
             reasoning_effort,
             agent_profile: Some(agent_id.into()),
             llm_profile: model.into(),
-        })
+        };
+        // Refuse the selection with the same rules the child submission
+        // applies, before the answer records the approval. Submission freezes
+        // again in this transaction and stays authoritative.
+        self.inspect(|tx| configs::freeze_configuration(tx, configuration))?;
+        Ok(configuration)
     }
 
     fn job_agent_catalog(

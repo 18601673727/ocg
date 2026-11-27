@@ -19,7 +19,7 @@ use crate::db::redb::allocations::{
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure, Probe};
 use crate::db::redb::codec::{Code, encode_scheduled_external_binding};
-use crate::db::redb::jobs::{decode_mutable_job, encode_mutable_job, mutable_priority};
+use crate::db::redb::jobs::{decode_mutable_job, mutable_priority};
 use crate::db::redb::reads::read;
 use crate::db::redb::rows::{decode_attachment, decode_output};
 use crate::db::redb::schema::{
@@ -354,26 +354,19 @@ impl Batch {
             {
                 continue;
             }
-            let mut persist_job = job.context_selection != stored_selection;
+            let persist_job = job.context_selection != stored_selection;
             if !summary_work && matches!(&frozen, FrozenConfiguration::Generative(_)) {
-                let spec = self.require_mutable_conversation(job.parent_id)?;
-                if let Some(mut assignment) =
-                    self.step(|tx| super::job_tree::prerequisite_assignment(tx, &spec))?
-                    && assignment.prerequisite_context.is_none()
-                {
-                    let lifecycle = self.job_lifecycle(job.parent_id)?;
-                    let Some(context) = self.step(|tx| {
-                        super::job_tree::prerequisite_results(tx, &spec, &lifecycle.after)
-                    })?
-                    else {
-                        continue;
-                    };
-                    if assignment.id == job.id {
-                        job.prerequisite_context = Some(context);
-                        persist_job = true;
-                    } else {
-                        assignment.prerequisite_context = Some(context);
-                        self.insert(JOBS, assignment.id.get(), &encode_mutable_job(&assignment))?;
+                use super::jobs::PrerequisiteCapture;
+                match self.capture_prerequisite_context(job.parent_id)? {
+                    PrerequisiteCapture::NotRequired => {}
+                    PrerequisiteCapture::Pending => continue,
+                    PrerequisiteCapture::Captured {
+                        assignment,
+                        context,
+                    } => {
+                        if assignment == job.id {
+                            job.prerequisite_context = Some(context);
+                        }
                     }
                 }
             }
@@ -459,11 +452,10 @@ impl Batch {
             stop_proof: None,
         };
         self.put_pool_allocation(&allocation, previous)?;
+        if persist_job {
+            self.store_mutable_job(row)?;
+        }
         self.step(|tx| {
-            if persist_job {
-                tx.open_table(JOBS)?
-                    .insert(row.id.get(), encode_mutable_job(row).as_slice())?;
-            }
             tx.open_table(MUTABLE_READY)?.remove(ready_key)?;
             tx.open_table(PENDING)?.remove(row.id.get())?;
             let mut bindings = tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;

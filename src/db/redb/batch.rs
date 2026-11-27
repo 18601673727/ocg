@@ -274,6 +274,10 @@ pub(super) fn finish_abort<T>(tx: WriteTransaction, failure: Failure) -> BatchOu
 }
 
 impl Batch {
+    pub(crate) fn has_execution_events(&self) -> bool {
+        self.execution_transaction.is_some()
+    }
+
     pub(super) fn new(tx: WriteTransaction, epoch: u64) -> Self {
         Self {
             tx,

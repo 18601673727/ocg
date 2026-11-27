@@ -15,8 +15,8 @@ pub(crate) fn authorize_development_candidate(
         ))
     };
     match resolved {
-        DevelopmentResolvedCandidate::Decision(context) => {
-            if context.conversation.parent_id.is_some() || offer.is_some() {
+        DevelopmentResolvedCandidate::Decision(_) => {
+            if offer.is_some() {
                 return Err(unavailable());
             }
         }

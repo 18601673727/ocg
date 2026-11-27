@@ -1988,8 +1988,16 @@ pub(super) fn routed_step_recovery(
         .code
         .as_deref()
         .and_then(crate::db::entities::UnstartedCause::routed_recovery);
+    let unstarted_failure = [
+        crate::db::entities::UnstartedCause::StartRefused,
+        crate::db::entities::UnstartedCause::ExecutorUnavailable,
+        crate::db::entities::UnstartedCause::HostShutdown,
+    ]
+    .into_iter()
+    .any(|cause| result.code.as_deref() == Some(cause.code()));
     if result.kind != OutputKind::Result
         || (prestart.is_none()
+            && !unstarted_failure
             && !matches!(
                 result.code.as_deref(),
                 Some(
@@ -1998,10 +2006,7 @@ pub(super) fn routed_step_recovery(
                         | "not_delivered"
                         | "not_sent"
                         | "build_failed"
-                        | "start_refused"
-                        | "executor_unavailable_before_start"
                         | "host_shutdown"
-                        | "host_shutdown_before_start"
                 )
             ))
     {

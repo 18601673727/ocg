@@ -771,13 +771,6 @@ fn development_candidate_in(
     if conversation_lifecycle.on_hold.is_some() || conversation_lifecycle.closing.is_some() {
         return Err(context_unavailable("conversation is not eligible"));
     }
-    if super::super::job_tree::prerequisite_assignment(rx, &conversation)?
-        .is_some_and(|assignment| assignment.prerequisite_context.is_none())
-    {
-        return Err(context_unavailable(
-            super::super::job_tree::PREREQUISITE_CONTEXT_LOST,
-        ));
-    }
     let project = record
         .project
         .map(|id| {
@@ -817,6 +810,19 @@ fn development_candidate_in(
     else {
         return Err(context_unavailable("Job operation is unsupported"));
     };
+    // Decisions read only their own request. Generative work, including a
+    // Summary of the assignment, embeds the original prerequisite results.
+    if super::super::job_tree::prerequisite_assignment(rx, &conversation)?
+        .is_some_and(|assignment| assignment.prerequisite_context.is_none())
+    {
+        return Err(context_unavailable(
+            if super::super::job_tree::prerequisite_context_lost(rx, &conversation)? {
+                super::super::job_tree::PREREQUISITE_CONTEXT_LOST
+            } else {
+                "prerequisite results have not been captured"
+            },
+        ));
+    }
     let plan_step = match conversation.origin {
         Origin::Agent { call } => tool_call_name(rx, call)?.as_deref() == Some("job_plan"),
         Origin::User | Origin::System => false,

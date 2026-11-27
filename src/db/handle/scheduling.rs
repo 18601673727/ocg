@@ -156,16 +156,11 @@ impl DatabaseHandle {
                             |batch| {
                                 let result =
                                     batch.reserve_next_development_job(request, eligible)?;
-                                Ok(
-                                    if matches!(
-                                        result,
-                                        entities::DevelopmentReservation::Reserved(_)
-                                    ) {
-                                        Continue(result)
-                                    } else {
-                                        Break(result)
-                                    },
-                                )
+                                Ok(if batch.has_execution_events() {
+                                    Continue(result)
+                                } else {
+                                    Break(result)
+                                })
                             },
                         );
                         settle(
