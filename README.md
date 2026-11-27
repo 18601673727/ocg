@@ -117,26 +117,28 @@ Then open the local URL above.
 
 Keep the OCG data directory separate from project workspaces. The [data layout](src/system/data_directory.rs) places `ocg.redb` and `credentials.json` in the data root, with logs in `ocg_logs/` and attachments in `ocg_attachments/`.
 
-> **Storage:** This release uses database **Format 5**. `ocg migrate <data-directory> --dry-run | --apply <plan-digest> | --finalize` converts Format 1-4 databases offline (Unix only). Databases from 0.5.x releases (formats 16-18) and unmarked databases are not supported; start those with a new data directory. `ocg verify <data-directory>` checks an existing database without modifying it; the installer runs this check before switching versions and stops if it fails.
+> **Storage:** This release uses database **Format 9**. `ocg migrate <data-directory> --dry-run | --apply <plan-digest> | --finalize` converts Format 1-8 databases offline (Unix only). Databases from 0.5.x releases (formats 16-18) and unmarked databases are not supported; start those with a new data directory. `ocg verify <data-directory>` checks an existing database without modifying it; the installer runs this check before switching versions and stops if it fails.
 
 ## Performance
 
-Current: 2026-11-25, OCG 0.6.1, commit [`7f69932`](https://github.com/18601673727/ocg/commit/7f69932127b0e6b2e41b23b494974014187a1e0d). Last: 2026-11-25, commit [`0c4bdd5`](https://github.com/18601673727/ocg/commit/0c4bdd585a9320ca5700e00fe6eea7c6151ee503). Both ran on the same 2-core ARM64 Linux machine (11.66 GiB RAM, ext4, optimized build). The current run used a clean install of the published 0.6.1 binary. Each job makes 3 mock model requests and 2 real tool calls. 8 concurrent clients, 1,000 jobs, 1,000 workspace files. Values are medians of 3 trials, except startup with 10 trials; latency is p50 / p95. Deltas use the previously published rounded values.
+Current: 2026-11-28, OCG 0.6.2 source at commit [`a215de2`](https://github.com/18601673727/ocg/commit/a215de2a9db11e4f3c10c6f5d7e8bc24ad2eb44e). Last: 2026-11-25, OCG 0.6.1 release binary at commit [`7f69932`](https://github.com/18601673727/ocg/commit/7f69932127b0e6b2e41b23b494974014187a1e0d). Both ran on the same 2-core ARM64 Linux machine (11.66 GiB RAM, ext4, optimized build). The current run used a clean Git archive built with Rust 1.99.1. Each job makes 3 mock model requests and 2 real tool calls. The workload uses 8 concurrent clients, 1,000 jobs, and 1,000 workspace files. Values are medians of 3 trials, except startup with 10 trials; latency is p50 / p95.
 
-| Metric | Last | Current | Delta |
-| --- | ---: | ---: | ---: |
-| Startup | 36.1 ms | 36.3 ms | +0.5% |
-| Memory, idle | 17.8 MiB | 18.1 MiB | +1.8% |
-| Memory, under load | 70.3 MiB | 70.1 MiB | −0.3% |
-| Job admission | 25.6 / 31.7 ms | 25.5 / 31.5 ms | −0.3% / −0.6% |
-| Job throughput | 33.0 jobs/s | 32.8 jobs/s | −0.5% |
-| Job completion | 243 / 276 ms | 245 / 277 ms | +0.6% / +0.5% |
-| Streaming delivery | 17.2 / 27.6 ms | 17.5 / 28.2 ms | +1.5% / +2.2% |
-| History read | 3.7 / 9.5 ms | 3.7 / 10.0 ms | −0.3% / +4.9% |
-| Workspace search | 0.026 / 0.282 ms | 0.025 / 0.267 ms | −3.8% / −5.3% |
-| Database per job | 47.1 KiB | 62.6 KiB | +33.0% |
+| Metric | Last | Current |
+| --- | ---: | ---: |
+| Startup | 36.3 ms | 36.0 ms |
+| Memory, idle | 18.1 MiB | 18.1 MiB |
+| Memory, under load | 70.1 MiB | 71.2 MiB |
+| Job admission | 25.5 / 31.5 ms | 24.8 / 30.9 ms |
+| Job throughput | 32.8 jobs/s | 33.3 jobs/s |
+| Job completion | 245 / 277 ms | 241 / 275 ms |
+| Streaming delivery | 17.5 / 28.2 ms | 17.1 / 27.7 ms |
+| History read | 3.7 / 10.0 ms | 3.5 / 9.2 ms |
+| Workspace search | 0.025 / 0.267 ms | 0.024 / 0.255 ms |
+| Database per job | 62.6 KiB | 47.1 KiB |
 
-All runs finished with no failed, rejected, timed-out or unfinished operations. Database growth varied across the three current trials, at 41.9–62.9 KiB per job. The provider is a local mock, so model latency is not included.
+All 73 current measurements succeeded. Database growth ranged from 47.1 to 65.7 KiB per job across the three current trials. The provider is a local mock, so model latency is not included. The current run's evidence is at `chuncheon:/srv/ocg-backend-bench-a215de2/results/`; the combined JSONL SHA-256 is `1d9915fbc49f03da52cbcd5f58e908e8b92581757cb9e0407e469e939296a10c`. The archive identifies the source commit because Git metadata is absent from the benchmark environment.
+
+The frontend benchmark on 2026-11-28 used macOS 27.2.1, Apple M4, Chrome 158, the debug backend, and the built frontend. Its 56-turn fixture loaded 9 JavaScript files totaling 258,285 gzip bytes. Across its four scenarios, streaming update latency had p50 21–22 ms and p95 28–31 ms, and scroll frame intervals had p50 16.7 ms and p95 16.7–16.8 ms. These local results describe this machine and benchmark fixture.
 
 <details>
 <summary>Run the backend benchmark</summary>
