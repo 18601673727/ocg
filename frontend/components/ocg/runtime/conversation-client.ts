@@ -541,11 +541,9 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
       return existing.promise.then(load, load);
     }
     const state = { cancelled: false };
-    const isCurrent = () =>
-      !this.disposed &&
-      !state.cancelled &&
-      this.roots.get(root) === sessionId &&
-      this.earlier.get(sessionId) === cursor;
+    const isSessionCurrent = () =>
+      !this.disposed && !state.cancelled && this.roots.get(root) === sessionId;
+    const isCurrent = () => isSessionCurrent() && this.earlier.get(sessionId) === cursor;
     const task = (async () => {
       try {
         if (partial) {
@@ -636,10 +634,19 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         if (isCurrent()) throw error;
         return false;
       }
-    })().finally(() => {
-      if (this.loadingEarlier.get(sessionId)?.promise === task)
-        this.loadingEarlier.delete(sessionId);
-    });
+    })()
+      .finally(() => {
+        if (this.loadingEarlier.get(sessionId)?.promise === task)
+          this.loadingEarlier.delete(sessionId);
+      })
+      .then((advanced) => {
+        // A latest-page refresh can replace the cursor during this load. Retry
+        // after releasing it so callers waiting on the old load share the result.
+        if (!advanced && isSessionCurrent() && this.earlier.get(sessionId) !== cursor) {
+          return this.loadEarlierHistory(sessionId, kind === "turns" ? "turns" : scope);
+        }
+        return advanced;
+      });
     this.loadingEarlier.set(sessionId, { kind, promise: task, state });
     return task;
   }

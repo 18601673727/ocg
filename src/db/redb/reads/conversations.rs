@@ -340,6 +340,12 @@ pub(crate) fn conversation_summary(
         }
         None => (outcome, row.created_at),
     };
+    let job_state =
+        if outcome == Some(OutcomeKind::Cancelled) && tip_outcome == Some(OutcomeKind::Unknown) {
+            outcome_label(OutcomeKind::Unknown)
+        } else {
+            conversation_job_state(rx, &runtime, tip)?
+        };
     Ok(ConversationEntry {
         search_match: None,
         root_job: conversation,
@@ -358,7 +364,7 @@ pub(crate) fn conversation_summary(
         on_hold,
         tip_settlement_state: tip_outcome.map_or("unsettled", outcome_label).to_owned(),
         tip_created_at,
-        job_state: conversation_job_state(rx, &runtime, tip)?.to_owned(),
+        job_state: job_state.to_owned(),
         has_children: has_visible_child(rx, conversation)?,
     })
 }
@@ -396,10 +402,7 @@ pub(crate) fn read_conversation_children(
         let child = JobId::new(entry?.0.value().1);
         let row = read_conversation_row(&rx, child)?
             .ok_or_else(|| StorageError::corrupted("child conversation missing"))?;
-        let mut conversation = conversation_summary(&rx, &row, conversation_tip(&rx, &row)?)?;
-        if conversation.job_state == "cancelled" && conversation.tip_settlement_state == "unknown" {
-            conversation.job_state = outcome_label(OutcomeKind::Unknown).to_owned();
-        }
+        let conversation = conversation_summary(&rx, &row, conversation_tip(&rx, &row)?)?;
         children.push(ChildConversationEntry {
             conversation,
             origin: row.origin,
