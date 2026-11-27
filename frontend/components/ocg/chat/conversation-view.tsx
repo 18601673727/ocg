@@ -108,21 +108,20 @@ export function ConversationView(props: { sessionId: string; children: JSX.Eleme
     history();
     return client.hasEarlierHistory(props.sessionId);
   });
-  const [loadingEarlier, setLoadingEarlier] = createSignal(false);
+  const [earlierLoads, setEarlierLoads] = createSignal(0);
   async function loadEarlier(scope?: "turns") {
-    if (loadingEarlier()) return client.loadEarlierHistory(props.sessionId, scope);
-    setLoadingEarlier(true);
+    setEarlierLoads((count) => count + 1);
     try {
       return await client.loadEarlierHistory(props.sessionId, scope);
     } finally {
-      setLoadingEarlier(false);
+      setEarlierLoads((count) => count - 1);
     }
   }
   const value = {
     messages,
     byJob,
     hasEarlier,
-    loadingEarlier,
+    loadingEarlier: () => earlierLoads() > 0,
     loadEarlier,
     retry: (message: string) => client.retryMessage(props.sessionId, message),
     reportSubmissionNotice,

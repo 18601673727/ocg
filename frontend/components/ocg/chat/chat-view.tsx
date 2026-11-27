@@ -458,7 +458,7 @@ function PausedReportCard(props: {
           ? i18n.t("chat.card.paused")
           : i18n.t("chat.card.pausedAfter", { count: limit()! })}
       </p>
-      <p>{i18n.t("chat.card.resumeReports")}</p>
+      <p>{i18n.t(limit() === 0 ? "chat.card.enableReports" : "chat.card.resumeReports")}</p>
       <For each={props.card.waiting} keyed>
         {(id) => (
           <Button size="xs" variant="outline" onClick={() => props.onOpen(id)}>
@@ -494,9 +494,12 @@ function RoutedRecoveryCard(props: {
             {i18n.t("chat.card.recoveryTarget", {
               target: [
                 target().provider,
+                target().destination,
                 target().model,
                 target().effort ?? i18n.t("chat.profileDefault"),
-              ].join(" · "),
+              ]
+                .filter(Boolean)
+                .join(" · "),
             })}
           </p>
         )}

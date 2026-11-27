@@ -155,7 +155,7 @@ pub(crate) struct DevelopmentExecutionContext {
     pub adopted_summary: Option<VerifiedNativeSummary>,
     pub covered_inputs: Vec<DevelopmentRetainedInput>,
     pub history: Vec<DevelopmentContextTurn>,
-    pub prerequisite_results: Option<String>,
+    pub input_text: String,
 }
 
 impl DevelopmentExecutionContext {
@@ -198,6 +198,7 @@ pub(crate) struct DevelopmentRetainedInput {
 
 pub(crate) struct DevelopmentContextTurn {
     pub record: MutableJobRecord,
+    pub input_text: String,
     pub attachments: Vec<AttachmentRecord>,
     pub outputs: Vec<JobOutputRecord>,
     pub answer_text: Option<String>,

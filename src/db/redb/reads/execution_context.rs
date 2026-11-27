@@ -20,7 +20,7 @@ use crate::db::redb::schema::{
     ATTACHMENTS, CHILD_GROUPS, CHILDREN, DEPENDENCY_WAITERS, EXECUTORS, JOB_OUTPUTS, JOB_RUNTIME,
     JOBS, MESSAGES, META, POOL_ALLOCATIONS, POOLS, PROJECTS, TOOL_CALLS,
 };
-use crate::db::redb::{StorageError, allocations, jobs, state};
+use crate::db::redb::{StorageError, TxRead, allocations, jobs, state};
 use ::redb::{Database, ReadTransaction, ReadableTable};
 use std::collections::BTreeSet;
 
@@ -33,7 +33,7 @@ fn context_unavailable(detail: &str) -> StorageError {
 }
 
 fn read_awaiting_batch(
-    rx: &ReadTransaction,
+    rx: &impl TxRead,
     job: JobId,
     output: Option<&crate::db::entities::JobOutputRecord>,
     selected_bytes: &mut usize,
@@ -54,7 +54,7 @@ fn read_awaiting_batch(
         return Ok(Vec::new());
     }
 
-    let table = rx.open_table(TOOL_CALLS)?;
+    let table = rx.table(TOOL_CALLS)?;
     let id = job.get();
     let Some((last, _)) = table
         .range((id, 0, 0)..=(id, u32::MAX, u32::MAX))?
@@ -100,10 +100,10 @@ fn read_awaiting_batch(
 }
 
 fn context_attachments(
-    rx: &ReadTransaction,
+    rx: &impl TxRead,
     ids: &[AttachmentId],
 ) -> Result<Vec<AttachmentRecord>, StorageError> {
-    let table = rx.open_table(ATTACHMENTS)?;
+    let table = rx.table(ATTACHMENTS)?;
     ids.iter()
         .map(|id| {
             let bytes = table
@@ -814,8 +814,66 @@ fn development_candidate_in(
         Origin::Agent { call } => tool_call_name(rx, call)?.as_deref() == Some("job_plan"),
         Origin::User | Origin::System => false,
     };
-    let attachments = context_attachments(rx, record.job.input.attachments())?;
-    let compaction = global_compaction_settings(meta)?;
+    let sources = generative_context_sources(
+        rx,
+        GenerativeContextStart {
+            job: &record.job,
+            previous: record.job.previous,
+            adopted_summary: adopted_summary.as_ref(),
+        },
+        &configuration,
+        &conversation,
+        project.as_ref(),
+        requirements,
+    )?;
+    Ok(DevelopmentCandidate::Generative(
+        DevelopmentExecutionContext {
+            allocation,
+            job: record.job,
+            pool,
+            executor,
+            configuration,
+            conversation,
+            conversation_lifecycle,
+            plan_step,
+            project,
+            compaction: global_compaction_settings(meta)?,
+            attachments: sources.attachments,
+            adopted_summary,
+            covered_inputs: sources.covered_inputs,
+            history: sources.history,
+            input_text: sources.input_text,
+        },
+    ))
+}
+
+struct GenerativeContextSources {
+    attachments: Vec<AttachmentRecord>,
+    covered_inputs: Vec<DevelopmentRetainedInput>,
+    history: Vec<DevelopmentContextTurn>,
+    input_text: String,
+}
+
+struct GenerativeContextStart<'a> {
+    job: &'a MutableJob,
+    previous: Option<JobId>,
+    adopted_summary: Option<&'a VerifiedNativeSummary>,
+}
+
+fn generative_context_sources(
+    rx: &impl TxRead,
+    start: GenerativeContextStart<'_>,
+    configuration: &crate::db::entities::FrozenExecutionConfig,
+    conversation: &JobSpec,
+    project: Option<&crate::db::entities::ProjectRecord>,
+    requirements: &dyn crate::db::entities::DevelopmentContextRequirements,
+) -> Result<GenerativeContextSources, StorageError> {
+    let GenerativeContextStart {
+        job,
+        mut previous,
+        adopted_summary,
+    } = start;
+    let attachments = context_attachments(rx, job.input.attachments())?;
     let covered: BTreeSet<_> = adopted_summary
         .as_ref()
         .map_or_else(BTreeSet::new, |summary| {
@@ -827,9 +885,9 @@ fn development_candidate_in(
                 .collect()
         });
     let mut covered_inputs = Vec::with_capacity(covered.len());
-    let is_merge = record.job.input.text().starts_with("Merge ");
-    if let Some(source_digest) = record.job.summary_source {
-        let messages = rx.open_table(MESSAGES)?;
+    let is_merge = job.input.text().starts_with("Merge ");
+    if let Some(source_digest) = job.summary_source {
+        let messages = rx.table(MESSAGES)?;
         let manifest_bytes = messages
             .get(source_digest.as_bytes().as_slice())?
             .ok_or_else(|| StorageError::corrupted("summary manifest missing"))?;
@@ -837,8 +895,8 @@ fn development_candidate_in(
             serde_json::from_slice(manifest_bytes.value())
                 .map_err(|_| StorageError::corrupted("malformed summary manifest"))?;
         manifest.validate().map_err(StorageError::corrupted)?;
-        let jobs_table = rx.open_table(JOBS)?;
-        let outputs_table = rx.open_table(JOB_OUTPUTS)?;
+        let jobs_table = rx.table(JOBS)?;
+        let outputs_table = rx.table(JOB_OUTPUTS)?;
         if !is_merge {
             for boundary in &manifest.sources {
                 let job_bytes = jobs_table
@@ -848,7 +906,8 @@ fn development_candidate_in(
                     boundary.job.get(),
                     job_bytes.value(),
                 )?;
-                let mut turn_text = format!("User: {}\n", src_job.input.text());
+                let input_text = jobs::execution_input_text(&jobs_table, &src_job)?;
+                let mut turn_text = format!("User: {input_text}\n");
                 for entry in
                     outputs_table.range((boundary.job.get(), 0)..=(boundary.job.get(), u32::MAX))?
                 {
@@ -875,9 +934,9 @@ fn development_candidate_in(
             }
         }
         if is_merge {
-            let child_groups = rx.open_table(CHILD_GROUPS)?;
-            let children = rx.open_table(CHILDREN)?;
-            let waiters = rx.open_table(DEPENDENCY_WAITERS)?;
+            let child_groups = rx.table(CHILD_GROUPS)?;
+            let children = rx.table(CHILDREN)?;
+            let waiters = rx.table(DEPENDENCY_WAITERS)?;
             for cg in child_groups
                 .range((conversation.id.get(), 0)..=(conversation.id.get(), u128::MAX))?
             {
@@ -886,7 +945,7 @@ fn development_candidate_in(
                 for ch in children.range((cg_id, 0)..=(cg_id, u128::MAX))? {
                     let (ch_key, _) = ch?;
                     let (_, chunk_id) = ch_key.value();
-                    if waiters.get((chunk_id, record.job.id.get()))?.is_some() {
+                    if waiters.get((chunk_id, job.id.get()))?.is_some() {
                         let mut chunk_text = String::new();
                         for entry in outputs_table.range((chunk_id, 0)..=(chunk_id, u32::MAX))? {
                             let (key, val) = entry?;
@@ -913,29 +972,13 @@ fn development_candidate_in(
         }
     }
     let mut history = Vec::new();
-    let mut previous = record.job.previous;
-    let outputs = rx.open_table(JOB_OUTPUTS)?;
-    let after = &conversation_lifecycle.after;
-    let prerequisite_results = if record.job.summary_source.is_none()
-        && !conversation.is_chunk_group()
-        && !after.is_empty()
-    {
-        Some(
-            super::super::job_tree::prerequisite_results(rx, &conversation, after)?
-                .ok_or_else(|| context_unavailable("execution prerequisite is not satisfied"))?,
-        )
-    } else {
-        None
-    };
+    let input_text = jobs::execution_input_text(&rx.table(JOBS)?, job)?.into_owned();
     let mut output_bytes = 0usize;
-    let mut selected_bytes = record.job.input.text().len().saturating_add(
+    let mut selected_bytes = input_text.len().saturating_add(
         requirements
-            .prompt_bytes(&configuration, project.as_ref(), adopted_summary.as_ref())
+            .prompt_bytes(configuration, project, adopted_summary)
             .map_err(|_| StorageError::corrupted("invalid project context"))?,
     );
-    if let Some(results) = &prerequisite_results {
-        selected_bytes = selected_bytes.saturating_add(results.len() + 2);
-    }
     let mut image_count = attachments.len();
     while let Some(id) = previous {
         let is_covered = covered.contains(&id);
@@ -954,12 +997,12 @@ fn development_candidate_in(
                 "Decision predecessors cannot be projected as generative messages",
             ));
         }
-        let ended_unstarted = prior.job.parent_id == record.job.parent_id
+        let ended_unstarted = prior.job.parent_id == job.parent_id
             && prior.job.phase == MutableJobPhase::Queued
             && unstarted_settlement_in(
                 rx,
                 &prior,
-                rx.open_table(POOL_ALLOCATIONS)?
+                rx.table(POOL_ALLOCATIONS)?
                     .get(id.get())?
                     .map(|row| allocations::decode_pool_allocation(id.get(), row.value()))
                     .transpose()?
@@ -971,7 +1014,7 @@ fn development_candidate_in(
             .is_some_and(|o| o.kind == OutcomeKind::Unknown);
         if unknown
             && !rx
-                .open_table(POOL_ALLOCATIONS)?
+                .table(POOL_ALLOCATIONS)?
                 .get(id.get())?
                 .map(|row| allocations::decode_pool_allocation(id.get(), row.value()))
                 .transpose()?
@@ -982,7 +1025,7 @@ fn development_candidate_in(
             ));
         }
         if !ended_unstarted
-            && (prior.job.parent_id != record.job.parent_id
+            && (prior.job.parent_id != job.parent_id
                 || prior.job.phase != MutableJobPhase::Executing
                 || prior.outcome.is_none())
         {
@@ -990,7 +1033,12 @@ fn development_candidate_in(
                 "predecessor is not settled in this conversation",
             ));
         }
-        selected_bytes = selected_bytes.saturating_add(prior.job.input.text().len());
+        let prior_input_text = if ended_unstarted {
+            prior.job.input.text().to_owned()
+        } else {
+            jobs::execution_input_text(&rx.table(JOBS)?, &prior.job)?.into_owned()
+        };
+        selected_bytes = selected_bytes.saturating_add(prior_input_text.len());
         if selected_bytes > 8 * 1024 * 1024 {
             return Err(context_unavailable(
                 "selected execution context exceeds byte limit",
@@ -1007,43 +1055,47 @@ fn development_candidate_in(
             previous = prior.job.previous;
             covered_inputs.push(DevelopmentRetainedInput {
                 job: id,
-                text: prior.job.input.text().to_owned(),
+                text: prior_input_text,
                 attachments: prior_attachments,
             });
             continue;
         }
-        let mut prior_outputs = Vec::new();
-        let mut counted = BTreeSet::new();
-        for (expected_sequence, entry) in
-            (1u32..).zip(outputs.range((id.get(), 0)..=(id.get(), u32::MAX))?)
-        {
-            let (key, value) = entry?;
-            if key.value().1 != expected_sequence {
-                return Err(StorageError::corrupted(
-                    "predecessor output sequence has a gap",
-                ));
+        let prior_outputs = {
+            let outputs = rx.table(JOB_OUTPUTS)?;
+            let mut prior_outputs = Vec::new();
+            let mut counted = BTreeSet::new();
+            for (expected_sequence, entry) in
+                (1u32..).zip(outputs.range((id.get(), 0)..=(id.get(), u32::MAX))?)
+            {
+                let (key, value) = entry?;
+                if key.value().1 != expected_sequence {
+                    return Err(StorageError::corrupted(
+                        "predecessor output sequence has a gap",
+                    ));
+                }
+                let row = decode_output(key.value(), value.value())?;
+                let cost = super::super::observations::context_output_bytes(
+                    rx,
+                    &row,
+                    value.value().len(),
+                    &mut counted,
+                )?;
+                output_bytes = output_bytes.saturating_add(cost);
+                selected_bytes = selected_bytes.saturating_add(cost);
+                if selected_bytes > 8 * 1024 * 1024 {
+                    return Err(context_unavailable(
+                        "selected execution context exceeds byte limit",
+                    ));
+                }
+                if output_bytes > 8 * 1024 * 1024 {
+                    return Err(context_unavailable(
+                        "conversation output exceeds byte limit",
+                    ));
+                }
+                prior_outputs.push(row);
             }
-            let row = decode_output(key.value(), value.value())?;
-            let cost = super::super::observations::context_output_bytes(
-                rx,
-                &row,
-                value.value().len(),
-                &mut counted,
-            )?;
-            output_bytes = output_bytes.saturating_add(cost);
-            selected_bytes = selected_bytes.saturating_add(cost);
-            if selected_bytes > 8 * 1024 * 1024 {
-                return Err(context_unavailable(
-                    "selected execution context exceeds byte limit",
-                ));
-            }
-            if output_bytes > 8 * 1024 * 1024 {
-                return Err(context_unavailable(
-                    "conversation output exceeds byte limit",
-                ));
-            }
-            prior_outputs.push(row);
-        }
+            prior_outputs
+        };
         if !ended_unstarted
             && !unknown
             && prior_outputs
@@ -1096,6 +1148,7 @@ fn development_candidate_in(
         previous = prior.job.previous;
         history.push(DevelopmentContextTurn {
             record: prior,
+            input_text: prior_input_text,
             attachments: prior_attachments,
             outputs: prior_outputs,
             answer_text,
@@ -1103,11 +1156,11 @@ fn development_candidate_in(
             response_replay,
         });
     }
-    if record.job.summary_source.is_none() {
+    if job.summary_source.is_none() {
         covered_inputs.reverse();
     }
     history.reverse();
-    if record.job.summary_source.is_none() && covered_inputs.len() != covered.len() {
+    if job.summary_source.is_none() && covered_inputs.len() != covered.len() {
         return Err(StorageError::corrupted(
             "verified summary coverage is incomplete",
         ));
@@ -1124,28 +1177,60 @@ fn development_candidate_in(
     }
     if !requirements.admits_tokens(&configuration.llm, selected_bytes, image_count) {
         return Err(context_unavailable(
-            "selected execution context exceeds estimated model token budget",
+            crate::db::entities::UnstartedCause::CONTEXT_BUDGET_DETAIL,
         ));
     }
-    Ok(DevelopmentCandidate::Generative(
-        DevelopmentExecutionContext {
-            allocation,
-            job: record.job,
-            pool,
-            executor,
-            configuration,
-            conversation,
-            conversation_lifecycle,
-            plan_step,
-            project,
-            compaction,
-            attachments,
-            adopted_summary,
-            covered_inputs,
-            history,
-            prerequisite_results,
+    Ok(GenerativeContextSources {
+        attachments,
+        covered_inputs,
+        history,
+        input_text,
+    })
+}
+
+pub(in crate::db::redb) fn retry_context_fits(
+    tx: &impl TxRead,
+    failed: &MutableJob,
+    configuration: &crate::db::entities::FrozenExecutionConfig,
+) -> Result<bool, StorageError> {
+    // Use the same history projection and byte/token checks as a reserved Job.
+    // Image-bearing retries also require verified content reads during handoff.
+    if !failed.input.attachments().is_empty() {
+        return Ok(false);
+    }
+    let conversation = read_conversation_row(tx, failed.parent_id)?
+        .ok_or_else(|| StorageError::corrupted("retry conversation missing"))?;
+    let project = conversation
+        .project
+        .map(|id| {
+            let table = tx.table(PROJECTS)?;
+            let row = table
+                .get(id.get())?
+                .ok_or_else(|| StorageError::corrupted("conversation Project missing"))?;
+            decode_project(id.get(), row.value())
+        })
+        .transpose()?;
+    match generative_context_sources(
+        tx,
+        GenerativeContextStart {
+            job: failed,
+            previous: Some(failed.id),
+            adopted_summary: None,
         },
-    ))
+        configuration,
+        &conversation,
+        project.as_ref(),
+        &crate::ai::compact::DevelopmentContextBudget,
+    ) {
+        Ok(sources) => Ok(sources
+            .history
+            .iter()
+            .all(|turn| turn.attachments.is_empty())),
+        Err(error) if error.kind == super::StorageErrorKind::Other && error.os_error.is_none() => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(in crate::db::redb) fn projected_answer(

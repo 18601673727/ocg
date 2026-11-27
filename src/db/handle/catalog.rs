@@ -413,6 +413,15 @@ impl DatabaseHandle {
                 .unwrap_or_else(PoisonError::into_inner),
         )?;
         let permit = self.attachment_permit().await?;
+        // The update barrier checks for outstanding permits under this same lock.
+        // Check again while holding the permit so publication cannot cross a pause.
+        self.check_write_admission(
+            &self
+                .shared
+                .admission
+                .read()
+                .unwrap_or_else(PoisonError::into_inner),
+        )?;
         let (handoff_tx, handoff_rx) = flume::bounded(1);
         let (settle_tx, settle_rx) = flume::bounded(1);
         let submitted = Arc::new(AtomicBool::new(false));

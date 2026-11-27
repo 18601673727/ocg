@@ -88,6 +88,7 @@ pub(super) fn encode_mutable_job(job: &crate::db::entities::MutableJob) -> Vec<u
         e.u32(result.answer_end);
     }
     e.opt(job.child_notice.as_ref(), |e, call| e.call_ref(call));
+    e.ostr(job.prerequisite_context.as_deref());
     e.0
 }
 
@@ -376,7 +377,24 @@ pub(super) fn decode_mutable_job(
         });
     }
     let child_notice = d.opt(Dec::call_ref)?;
+    let prerequisite_context = d.ostr()?;
     d.end()?;
+    if let Some(context) = &prerequisite_context
+        && (previous.is_some()
+            || retry.is_some()
+            || phase == MutableJobPhase::Unsubmitted
+            || !matches!(submitted_by, Actor::Agent { .. })
+            || summary_source.is_some()
+            || !matches!(
+                input.content,
+                crate::db::entities::MutableJobContent::Generative { .. }
+            )
+            || !context.starts_with(super::job_tree::PREREQUISITE_HEADER)
+            || context.len() > MAX_INPUT_BYTES
+            || context.chars().any(invalid_input_character))
+    {
+        return Err(StorageError::corrupted("invalid Job prerequisite context"));
+    }
     if !child_results.is_empty() {
         let crate::db::entities::MutableJobContent::Generative { text, .. } = &input.content else {
             return Err(StorageError::corrupted(
@@ -524,6 +542,7 @@ pub(super) fn decode_mutable_job(
         frozen,
         child_results,
         child_notice,
+        prerequisite_context,
     })
 }
 
@@ -597,6 +616,36 @@ pub(super) fn validate_retry_source(
         return Err(StorageError::corrupted("invalid retry source"));
     }
     Ok(())
+}
+
+pub(super) fn execution_input_text<'a>(
+    table: &impl ::redb::ReadableTable<u128, &'static [u8]>,
+    job: &'a crate::db::entities::MutableJob,
+) -> Result<std::borrow::Cow<'a, str>, StorageError> {
+    let source = job
+        .retry
+        .as_ref()
+        .map(|retry| {
+            let row = table
+                .get(retry.original.get())?
+                .ok_or_else(|| StorageError::corrupted("retry source missing"))?;
+            let source = decode_mutable_job(retry.original.get(), row.value())?;
+            validate_retry_source(job, &source)?;
+            Ok::<_, StorageError>(source)
+        })
+        .transpose()?;
+    let context = source
+        .as_ref()
+        .unwrap_or(job)
+        .prerequisite_context
+        .as_deref();
+    let text = job.input.text();
+    // The assignment and report each have a 32 KiB cap. The assembled text
+    // counts in full against the execution context and model limits.
+    Ok(match context {
+        Some(context) => std::borrow::Cow::Owned(format!("{text}\n\n{context}")),
+        None => std::borrow::Cow::Borrowed(text),
+    })
 }
 
 fn encode_mutable_input_revision(
@@ -757,6 +806,12 @@ impl Batch {
             old.child_results != job.child_results || old.child_notice != job.child_notice
         }) {
             return self.corrupted("invalid change of Job child metadata".into());
+        }
+        if previous
+            .as_ref()
+            .is_some_and(|old| old.prerequisite_context != job.prerequisite_context)
+        {
+            return self.corrupted("invalid change of Job prerequisite context".into());
         }
         self.record_job_phase(job.id, previous.as_ref().map(|row| row.phase), job.phase)?;
         self.record_mutable_input_revision(
@@ -1111,6 +1166,7 @@ impl Batch {
             frozen: None,
             child_results,
             child_notice,
+            prerequisite_context: None,
         };
         self.store_mutable_job(&job)?;
         self.put_job_state(id, &JobState::new(id))?;
@@ -1753,6 +1809,7 @@ impl Batch {
             frozen: Some(storable),
             child_results: Vec::new(),
             child_notice: None,
+            prerequisite_context: None,
         };
         let req_tag = mutable_configuration_requirement(&FrozenConfiguration::Decision(frozen));
         self.enqueue_mutable_job(&job, req_tag, TurnMembership::Turn, false, true)?;

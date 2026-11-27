@@ -148,7 +148,8 @@ impl DatabaseHandle {
         &self,
         conversation: JobId,
     ) -> Result<Option<Vec<serde_json::Value>>, DatabaseError> {
-        self.read(move |database| redb::read_cards(database, conversation))
+        let key = self.shared.credential_key();
+        self.read(move |database| redb::read_cards(database, conversation, key.as_deref()))
             .await
     }
 
@@ -530,11 +531,14 @@ impl DatabaseHandle {
         turn: JobId,
         by: Actor,
     ) -> Result<Appended, DatabaseError> {
+        let key = self.shared.credential_key();
         self.write(
             4096,
             OperationKind::Retry,
-            (conversation, turn, by),
-            |batch, (c, t, by)| batch.retry(c, t, by),
+            (conversation, turn, by, key),
+            |batch, (conversation, turn, by, key)| {
+                batch.retry_with_target(conversation, turn, by, None, key.as_deref())
+            },
         )
         .await
     }
@@ -545,12 +549,19 @@ impl DatabaseHandle {
         turn: JobId,
         confirmation: String,
     ) -> Result<Appended, DatabaseError> {
+        let key = self.shared.credential_key();
         self.write(
             4096,
             OperationKind::Retry,
-            (conversation, turn, confirmation),
-            |batch, (conversation, turn, confirmation)| {
-                batch.retry_with_target(conversation, turn, Actor::User, Some(&confirmation))
+            (conversation, turn, confirmation, key),
+            |batch, (conversation, turn, confirmation, key)| {
+                batch.retry_with_target(
+                    conversation,
+                    turn,
+                    Actor::User,
+                    Some(&confirmation),
+                    key.as_deref(),
+                )
             },
         )
         .await

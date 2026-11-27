@@ -153,20 +153,20 @@ pub(crate) fn turn_first(
 }
 
 pub(crate) fn mutable_job_record_in(
-    rx: &ReadTransaction,
+    rx: &impl TxRead,
     id: JobId,
 ) -> Result<Option<MutableJobRecord>, StorageError> {
-    let jobs = rx.open_table(JOBS)?;
+    let jobs = rx.table(JOBS)?;
     let Some(bytes) = jobs.get(id.get())? else {
         return Ok(None);
     };
     let job = crate::db::redb::jobs::decode_mutable_job(id.get(), bytes.value())?;
     mutable_job_record(
         job,
-        &rx.open_table(JOB_RUNTIME)?,
-        &rx.open_table(JOB_EVENTS)?,
-        &rx.open_table(EXECUTION_COMMITS)?,
-        |parent| conversation_project(&rx.open_table(CONVERSATIONS)?, parent),
+        &rx.table(JOB_RUNTIME)?,
+        &rx.table(JOB_EVENTS)?,
+        &rx.table(EXECUTION_COMMITS)?,
+        |parent| conversation_project(&rx.table(CONVERSATIONS)?, parent),
     )
     .map(Some)
 }
@@ -1009,8 +1009,8 @@ fn mutable_configuration_in(
     }))
 }
 
-pub(super) fn unstarted_settlement_in(
-    rx: &ReadTransaction,
+pub(in crate::db::redb) fn unstarted_settlement_in(
+    rx: &impl TxRead,
     record: &crate::db::entities::MutableJobRecord,
     allocation: Option<&crate::db::entities::PoolAllocation>,
 ) -> Result<bool, StorageError> {
@@ -1052,7 +1052,7 @@ pub(super) fn unstarted_settlement_in(
     let id = record.job.id.get();
     for table in [REQUEST_EVENTS, TOOL_CALLS, APPROVALS] {
         if rx
-            .open_table(table)?
+            .table(table)?
             .range((id, 0, 0)..=(id, u32::MAX, u32::MAX))?
             .next()
             .transpose()?
@@ -1062,7 +1062,7 @@ pub(super) fn unstarted_settlement_in(
         }
     }
     if rx
-        .open_table(JOB_OBSERVATIONS)?
+        .table(JOB_OBSERVATIONS)?
         .range((id, 0, 0)..=(id, u8::MAX, u128::MAX))?
         .next()
         .transpose()?
@@ -1070,7 +1070,7 @@ pub(super) fn unstarted_settlement_in(
     {
         return Err(invalid());
     }
-    let outputs = rx.open_table(JOB_OUTPUTS)?;
+    let outputs = rx.table(JOB_OUTPUTS)?;
     let mut rows = outputs.range((id, 0)..=(id, u32::MAX))?;
     let output = rows
         .next()

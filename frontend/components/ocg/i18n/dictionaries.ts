@@ -258,6 +258,8 @@ export const en = {
   "chat.card.cards": "Needs your attention",
   "chat.card.paused": "Automatic replies paused",
   "chat.card.pausedAfter": "The agent paused after {count} automatic turns.",
+  "chat.card.enableReports":
+    "Raise the automatic turn limit in the conversation settings to receive these results.",
   "chat.card.resumeReports":
     "Send your next message to continue with the results from these children.",
   "chat.card.approve": "Approve",

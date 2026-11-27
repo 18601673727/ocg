@@ -422,6 +422,7 @@ pub(crate) struct ApprovalAssessmentView {
 pub(crate) struct RecoveryTargetView {
     provider: String,
     model: String,
+    destination: Option<String>,
     effort: Option<String>,
     confirmation: String,
 }

@@ -220,6 +220,16 @@ pub(super) async fn dispatch(
         ),
     )
     .await;
+    if preparation.reason() == Some(CancellationReason::Deadline) && !cancellation.is_cancelled() {
+        let cause = UnstartedCause::PreparationDeadlineExceeded;
+        return end_dispatch(
+            database,
+            allocation.token,
+            cause,
+            cause.summary().to_owned(),
+        )
+        .await;
+    }
     if let Some(reason) = preparation.reason() {
         cancellation.cancel_for(reason);
     }

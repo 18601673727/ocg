@@ -7,12 +7,14 @@ use crate::db::entities::{
     AllocationToken, ConfigBody, ConfigKind, DispatchSelection, ExecutionConfiguration,
     FrozenConfiguration, FrozenExecutionConfig, JobDependency, JobPlanRoute, JobPlanStep, JobSpec,
     JobToolCall, ModelCapability, MutableJob, MutableJobContent, ReasoningEffort, ToolAdmission,
-    ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload, Violation,
+    ToolCallRef, ToolDecision, ToolEffect, ToolEvidenceRecord, ToolOutcome, ToolPayload,
+    UnstartedCause, Violation,
 };
 use crate::db::redb::batch::{Batch, BatchError, Failure};
 use crate::db::redb::rows::{ConfigRow, decode_project};
-use crate::db::redb::schema::{CONFIGS, EXECUTORS, POOLS, PROJECTS, RECURRENCES};
-use crate::db::redb::{StorageError, TxRead, allocations, configs, job_tree};
+use crate::db::redb::scheduled_external::{ScheduledPolicies, ScheduledPolicyMatch};
+use crate::db::redb::schema::{CONFIGS, CREDENTIALS, EXECUTORS, POOLS, PROJECTS, RECURRENCES};
+use crate::db::redb::{CredentialKey, StorageError, TxRead, allocations, configs, job_tree, reads};
 use ::redb::ReadableTable;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -61,6 +63,7 @@ pub(super) struct RecoveryTarget {
     pub(super) confirmation: String,
     pub(super) provider: String,
     pub(super) model: String,
+    pub(super) destination: Option<String>,
     pub(super) effort: Option<String>,
 }
 
@@ -96,13 +99,79 @@ fn enabled_llm_transports(tx: &impl TxRead) -> Result<BTreeSet<LlmTransport>, St
     Ok(transports)
 }
 
+#[derive(Clone, Copy)]
+struct RecoverySelection<'a> {
+    failed: &'a FrozenExecutionConfig,
+    kind: RecoveryTargetKind,
+    failure: &'a job_tree::RoutedStepFailure,
+    credential_key: Option<&'a CredentialKey>,
+    scheduled: Option<(
+        &'a ScheduledPolicies,
+        crate::db::entities::ScheduledExternalPolicyId,
+    )>,
+}
+
+impl RecoverySelection<'_> {
+    fn admits(
+        self,
+        tx: &impl TxRead,
+        target: &FrozenExecutionConfig,
+    ) -> Result<bool, StorageError> {
+        let provider = &target.llm.provider;
+        let previous = &self.failed.llm.provider;
+        let same_target = provider.id == previous.id
+            && provider.transport == previous.transport
+            && provider.endpoint == previous.endpoint
+            && target.llm.model.id == self.failed.llm.model.id
+            && target.llm.config.model == self.failed.llm.config.model;
+        if same_target != (self.kind == RecoveryTargetKind::Original) {
+            return Ok(false);
+        }
+        let Some(cause) = self.failure.prestart else {
+            return Ok(true);
+        };
+        if self.scheduled.is_some_and(|(policies, required)| {
+            !matches!(policies.matching(target), ScheduledPolicyMatch::One { id, .. } if id == required)
+        }) || !retry_credentials_available(tx, provider, self.credential_key)? {
+            return Ok(false);
+        }
+        if cause == UnstartedCause::InputContextTooLarge {
+            return reads::execution_context::retry_context_fits(tx, &self.failure.job, target);
+        }
+        Ok(true)
+    }
+}
+
+fn retry_credentials_available(
+    tx: &impl TxRead,
+    provider: &crate::db::entities::ProviderSnapshot,
+    key: Option<&CredentialKey>,
+) -> Result<bool, StorageError> {
+    let table = tx.table(CREDENTIALS)?;
+    let references = provider
+        .credential_ref
+        .as_deref()
+        .into_iter()
+        .chain(provider.headers.secret_refs());
+    for reference in references {
+        let Some(key) = key else { return Ok(false) };
+        let Some(row) = table.get(reference)? else {
+            return Ok(false);
+        };
+        if key.decrypt(reference, row.value())?.is_none() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn choose_plan_target(
     tx: &impl TxRead,
     configs: &BTreeMap<ConfigId, ConfigRow>,
     transports: &BTreeSet<LlmTransport>,
     current: ExecutionConfiguration,
     route: &JobPlanRoute,
-    recovery: Option<(&FrozenExecutionConfig, RecoveryTargetKind)>,
+    recovery: Option<RecoverySelection<'_>>,
 ) -> Result<Option<ExecutionConfiguration>, BatchError> {
     let model_capabilities = route
         .model_capabilities
@@ -128,8 +197,8 @@ fn choose_plan_target(
         if !agent.capabilities.contains(&route.agent_capability)
             || agent.workspace_grant().is_some()
                 != (route.agent_capability == AgentCapability::Coding)
-            || recovery.is_some_and(|(failed, _)| {
-                failed.agent_ref.map(|reference| reference.id) != Some(row.id)
+            || recovery.is_some_and(|selection| {
+                selection.failed.agent_ref.map(|reference| reference.id) != Some(row.id)
             })
         {
             continue;
@@ -164,14 +233,9 @@ fn choose_plan_target(
             {
                 continue;
             }
-            let same_provider = recovery
-                .is_some_and(|(failed, _)| failed.llm.provider.id.get() == provider.id.get());
-            if let Some((failed, kind)) = recovery
-                && (same_provider && model.id == failed.llm.model.id)
-                    != (kind == RecoveryTargetKind::Original)
-            {
-                continue;
-            }
+            let same_provider = recovery.is_some_and(|selection| {
+                selection.failed.llm.provider.id.get() == provider.id.get()
+            });
             let candidate = ExecutionConfiguration {
                 agent_profile: Some(row.id.into()),
                 llm_profile: model.id.into(),
@@ -193,6 +257,11 @@ fn choose_plan_target(
                 Ok(FrozenConfiguration::Generative(config))
                     if config.native_execution_refusal().is_none() =>
                 {
+                    if let Some(selection) = recovery
+                        && !selection.admits(tx, &config)?
+                    {
+                        continue;
+                    }
                     best = Some((rank, candidate));
                 }
                 Ok(_) | Err(BatchError(Failure::Rejected(_))) => continue,
@@ -218,6 +287,7 @@ fn plan_configs(tx: &impl TxRead) -> Result<BTreeMap<ConfigId, ConfigRow>, Stora
 pub(super) fn recovery_targets(
     tx: &impl TxRead,
     failure: &job_tree::RoutedStepFailure,
+    credential_key: Option<&CredentialKey>,
 ) -> Result<RecoveryTargets, BatchError> {
     use crate::db::entities::MutableFrozenConfiguration;
     let MutableJobContent::Generative {
@@ -232,6 +302,14 @@ pub(super) fn recovery_targets(
     };
     let configs = plan_configs(tx)?;
     let transports = enabled_llm_transports(tx)?;
+    let required_policy = if failure.prestart.is_some() {
+        super::scheduled_external::binding_in(tx, failure.job.id)?.map(|binding| binding.policy)
+    } else {
+        None
+    };
+    let policies = required_policy
+        .map(|id| ScheduledPolicies::read(tx).map(|policies| (policies, id)))
+        .transpose()?;
     let choose = |kind| {
         choose_plan_target(
             tx,
@@ -239,7 +317,13 @@ pub(super) fn recovery_targets(
             &transports,
             current,
             &failure.route,
-            Some((failed, kind)),
+            Some(RecoverySelection {
+                failed,
+                kind,
+                failure,
+                credential_key,
+                scheduled: policies.as_ref().map(|(policies, id)| (policies, *id)),
+            }),
         )
     };
     let original = choose(RecoveryTargetKind::Original)?;
@@ -264,11 +348,26 @@ pub(super) fn recovery_targets(
                 .as_bytes(),
             )
             .to_string();
+            let destination = target
+                .llm
+                .provider
+                .endpoint
+                .as_deref()
+                .and_then(crate::ai::providers::provider_uri)
+                .and_then(|uri| {
+                    Some(format!(
+                        "{}://{}{}",
+                        uri.scheme_str()?,
+                        uri.authority()?,
+                        uri.path()
+                    ))
+                });
             Ok(RecoveryTarget {
                 configuration,
                 confirmation,
                 provider: target.llm.provider.name,
                 model: target.llm.config.model,
+                destination,
                 effort,
             })
         })

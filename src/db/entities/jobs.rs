@@ -179,6 +179,8 @@ pub struct MutableJob {
     pub frozen: Option<MutableFrozenConfiguration>,
     pub child_results: Vec<ChildTurnResult>,
     pub child_notice: Option<super::ToolCallRef>,
+    // Captured at reservation on the original assignment. Retries refer to it by JobRetry.
+    pub prerequisite_context: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

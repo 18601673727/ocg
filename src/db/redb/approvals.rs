@@ -892,6 +892,7 @@ fn approval_assessment(
 pub(crate) fn read_cards(
     database: &Database,
     root: JobId,
+    credential_key: Option<&super::CredentialKey>,
 ) -> Result<Option<Vec<serde_json::Value>>, StorageError> {
     use serde_json::json;
     let rx = read(database)?;
@@ -924,11 +925,13 @@ pub(crate) fn read_cards(
                 use super::job_tree::RoutedStepRecovery;
                 let (failure, outcome_unknown, targets) = match recovery {
                     RoutedStepRecovery::Failed(failure) => {
-                        let targets = match super::job_tools::recovery_targets(&rx, &failure) {
-                            Ok(targets) => Some(targets),
-                            Err(BatchError(Failure::Rejected(_))) => None,
-                            Err(BatchError(Failure::Storage(error))) => return Err(error),
-                        };
+                        let targets =
+                            match super::job_tools::recovery_targets(&rx, &failure, credential_key)
+                            {
+                                Ok(targets) => Some(targets),
+                                Err(BatchError(Failure::Rejected(_))) => None,
+                                Err(BatchError(Failure::Storage(error))) => return Err(error),
+                            };
                         let detail = failure.result.display_text().or(failure.result.code);
                         (detail.unwrap_or_default(), false, targets)
                     }
@@ -949,6 +952,7 @@ pub(crate) fn read_cards(
                     "alternate": targets.and_then(|targets| targets.alternate).map(|target| json!({
                         "provider": target.provider,
                         "model": target.model,
+                        "destination": target.destination,
                         "effort": target.effort,
                         "confirmation": target.confirmation,
                     })),

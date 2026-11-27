@@ -1,7 +1,7 @@
-use super::{StorageError, StorageErrorKind, TxRead, execution, jobs};
+use super::{StorageError, StorageErrorKind, TxRead, approvals, execution, jobs};
 use crate::db::entities::{
-    ApprovalRecord, ContentDigest, ExecutionOperation, ExecutionPoolId, ExecutorId, JobSpec,
-    JobState, LlmTransport, OutputKind, Recurrence,
+    Actor, ApprovalRecord, ChildNoticeKind, ContentDigest, ExecutionOperation, ExecutionPoolId,
+    ExecutorId, JobSpec, JobState, LlmTransport, OutputKind, Recurrence, ToolCallRef, ToolDecision,
 };
 use crate::db::entities::{JobId, OutcomeKind, Timestamp};
 use crate::db::redb::batch::{Batch, Commit};
@@ -12,10 +12,10 @@ use crate::db::redb::schema::{
     CHILDREN, CONFIGS, CONTENT_RECLAIM, CONVERSATIONS, CREDENTIALS, DATABASE_FILE_NAME,
     DATABASE_FORMAT_KEY, DEPENDENCY_WAITERS, EXECUTION_COMMITS, EXECUTORS, FORMAT_VERSION,
     JOB_EVENTS, JOB_INPUTS, JOB_OUTPUTS, JOB_RUNTIME, JOBS, LIVE_CHILDREN, MAX_PAGE, META,
-    POOL_ALLOCATIONS, POOL_EXECUTORS, POOLS, PROJECTS, RECURRENCES, REQUEST_EVENTS,
-    REQUEST_TIMELINE, RETRY_JOBS, SCHEDULED_EXTERNAL_BINDING, SCHEDULED_EXTERNAL_POLICY,
-    SCHEMA_FINGERPRINT, SCHEMA_FINGERPRINT_KEY, SEQUENCES, SUBMISSIONS, TOOL_CALLS, TURNS,
-    check_record_headers, check_required_tables, create_tables,
+    OPEN_APPROVALS, PENDING_CHILD_NOTICES, POOL_ALLOCATIONS, POOL_EXECUTORS, POOLS, PROJECTS,
+    RECURRENCES, REQUEST_EVENTS, REQUEST_TIMELINE, RETRY_JOBS, SCHEDULED_EXTERNAL_BINDING,
+    SCHEDULED_EXTERNAL_POLICY, SCHEMA_FINGERPRINT, SCHEMA_FINGERPRINT_KEY, SEQUENCES, SUBMISSIONS,
+    TOOL_CALLS, TURNS, check_record_headers, check_required_tables, create_tables,
 };
 use crate::db::redb::state::JobRuntime;
 use crate::db::redb::{allocations, codec, indexes, job_tree, reads, reservations, rows, state};
@@ -449,6 +449,7 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
     let retries = tx.open_table(RETRY_JOBS)?;
     let tool_calls = tx.open_table(TOOL_CALLS)?;
     let mut agent_retries = std::collections::BTreeMap::<JobId, usize>::new();
+    let mut delivered_notices = std::collections::BTreeSet::new();
     for entry in conversations.iter()? {
         let (key, value) = entry?;
         let spec = JobSpec::decode_at(key.value(), value.value())?;
@@ -531,6 +532,17 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
             })?;
             let evidence = rows::decode_tool_evidence(call, row.value())?;
             job_tree::pending_child_notice_kind(&evidence)?;
+            let child = child_notice_source(tx, job.parent_id, call)?;
+            if job.submitted_by
+                != (Actor::Agent {
+                    conversation: child,
+                })
+                || job.submitted_at.is_none()
+                || evidence.child_notice_drop.is_some()
+                || !delivered_notices.insert(call)
+            {
+                return Err(StorageError::corrupted("invalid child notice delivery"));
+            }
         }
         if let Some(retry) = &job.retry {
             let original = jobs
@@ -581,6 +593,15 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
             .get(job.parent_id.get())?
             .ok_or_else(|| StorageError::corrupted("mutable Job conversation is missing"))?;
         let spec = JobSpec::decode_at(job.parent_id.get(), parent.value())?;
+        if job.prerequisite_context.is_some()
+            && (!job_tree::is_prerequisite_assignment(&spec, &job)
+                || state::require(tx, spec.id)?.lifecycle.after.is_empty()
+                || allocations.get(job.id.get())?.is_none())
+        {
+            return Err(StorageError::corrupted(
+                "Job prerequisite context has no assignment reservation",
+            ));
+        }
         if spec.is_standalone_decision_group()
             && (job.previous.is_some()
                 || job.summary_source.is_some()
@@ -601,6 +622,7 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
             return Err(StorageError::corrupted("turn index differs from its Job"));
         }
     }
+    check_pending_child_notices(tx, &delivered_notices)?;
     for entry in turns.iter()? {
         let (key, _) = entry?;
         let (parent, id) = key.value();
@@ -637,6 +659,83 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
         {
             return Err(StorageError::corrupted(
                 "job_state row has no matching job record",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn child_notice_source(
+    tx: &ReadTransaction,
+    parent: JobId,
+    call: ToolCallRef,
+) -> Result<JobId, StorageError> {
+    let turn = jobs::mutable_job_in(tx, call.job)?
+        .ok_or_else(|| StorageError::corrupted("child notice references a missing turn"))?;
+    let child = reads::jobs::read_conversation_row(tx, turn.parent_id)?
+        .ok_or_else(|| StorageError::corrupted("child notice references a missing conversation"))?;
+    if child.parent_id != Some(parent) {
+        return Err(StorageError::corrupted("child notice has the wrong parent"));
+    }
+    Ok(child.id)
+}
+
+fn check_pending_child_notices(
+    tx: &ReadTransaction,
+    delivered: &std::collections::BTreeSet<ToolCallRef>,
+) -> Result<(), StorageError> {
+    let pending = tx.open_table(PENDING_CHILD_NOTICES)?;
+    let calls = tx.open_table(TOOL_CALLS)?;
+    let approvals = tx.open_table(APPROVALS)?;
+    let open_approvals = tx.open_table(OPEN_APPROVALS)?;
+    for entry in pending.iter()? {
+        let (parent, job, request, index) = entry?.0.value();
+        let parent = JobId::new(parent);
+        let call = rows::tool_call_ref((job, request, index))?;
+        let spec = reads::jobs::read_conversation_row(tx, parent)?
+            .ok_or_else(|| StorageError::corrupted("pending child notice parent is missing"))?;
+        if jobs::require_open_turn_parent(&spec, &state::require(tx, parent)?).is_err() {
+            return Err(StorageError::corrupted(
+                "pending child notice parent is closed",
+            ));
+        }
+        let key = rows::tool_call_key(call);
+        let row = calls
+            .get(key)?
+            .ok_or_else(|| StorageError::corrupted("pending child notice tool call is missing"))?;
+        let evidence = rows::decode_tool_evidence(call, row.value())?;
+        if evidence.child_notice_drop.is_some() || delivered.contains(&call) {
+            return Err(StorageError::corrupted(
+                "pending child notice was dropped or delivered",
+            ));
+        }
+        let text = job_tree::stored_notice_text(&evidence)?;
+        if !(1..=2000).contains(&text.trim().chars().count()) {
+            return Err(StorageError::corrupted(
+                "pending child notice has invalid text",
+            ));
+        }
+        let child = child_notice_source(tx, parent, call)?;
+        let settled = state::require(tx, call.job)?.state.outcome.is_some();
+        let valid = match job_tree::pending_child_notice_kind(&evidence)? {
+            ChildNoticeKind::Progress => {
+                !settled
+                    && matches!(evidence.decision.fact, ToolDecision::Admitted(_))
+                    && job_tree::deferred_child_progress(&evidence)
+            }
+            ChildNoticeKind::Help => {
+                settled
+                    && matches!(evidence.decision.fact, ToolDecision::AwaitingAnswer(_))
+                    && approvals.get(key)?.is_none()
+                    && open_approvals
+                        .get(approvals::open_key(child, call))?
+                        .is_some_and(|row| row.value() == 0)
+                    && job_tree::turn_awaits_tool_decision(tx, call.job)?
+            }
+        };
+        if !valid {
+            return Err(StorageError::corrupted(
+                "pending child notice disagrees with its turn",
             ));
         }
     }

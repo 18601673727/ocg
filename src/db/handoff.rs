@@ -379,6 +379,12 @@ pub(crate) fn classify_unstarted(error: DatabaseError) -> DevelopmentHandoffErro
             Some(entities::UnstartedCause::ExecutorUnavailable)
         }
         DatabaseError::Read(storage)
+            if storage.kind == StorageErrorKind::Other
+                && storage.detail == entities::UnstartedCause::CONTEXT_BUDGET_DETAIL =>
+        {
+            Some(entities::UnstartedCause::InputContextTooLarge)
+        }
+        DatabaseError::Read(storage)
             if storage.kind == StorageErrorKind::Other && storage.os_error.is_none() =>
         {
             Some(entities::UnstartedCause::InputUnavailable)

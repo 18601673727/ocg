@@ -1243,13 +1243,13 @@ pub(crate) fn read_provider_request(
 }
 
 pub(super) fn read_responses_replay(
-    rx: &::redb::ReadTransaction,
+    rx: &impl TxRead,
     job: JobId,
     include_last_answer: bool,
     budget: &mut usize,
 ) -> Result<Vec<Value>, StorageError> {
-    let events = rx.open_table(REQUEST_EVENTS)?;
-    let messages = rx.open_table(MESSAGES)?;
+    let events = rx.table(REQUEST_EVENTS)?;
+    let messages = rx.table(MESSAGES)?;
     let mut first: Option<Vec<ContentDigest>> = None;
     let mut tail = Vec::new();
     let mut answer = None;

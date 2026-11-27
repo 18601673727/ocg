@@ -229,6 +229,7 @@ export const zh: Dictionary = {
   "chat.card.cards": "需要您处理",
   "chat.card.paused": "已暂停自动回复",
   "chat.card.pausedAfter": "智能体在 {count} 轮自动回复后暂停。",
+  "chat.card.enableReports": "在对话设置中提高自动回复轮数上限，即可接收这些结果。",
   "chat.card.resumeReports": "发送下一条消息，即可继续处理以下子对话的结果。",
   "chat.card.approve": "批准",
   "chat.card.reject": "拒绝",

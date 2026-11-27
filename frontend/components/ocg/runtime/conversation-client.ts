@@ -42,7 +42,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   private readonly stopAccepted = new Set<string>();
   private readonly loading = new Map<string, Promise<string>>();
   private readonly earlier = new Map<string, string | null>();
-  private readonly loadingEarlier = new Map<string, Promise<boolean>>();
+  private readonly loadingEarlier = new Map<
+    string,
+    { kind: "outputs" | "turns"; promise: Promise<boolean>; state: { cancelled: boolean } }
+  >();
   private conversationListLoaded = false;
   private unsubscribeConversations: (() => void) | null = null;
 
@@ -211,7 +214,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
   private evictSession(sessionId: string, root: string) {
     this.selections.delete(sessionId);
     this.earlier.delete(sessionId);
-    this.loadingEarlier.delete(sessionId);
+    this.cancelEarlierHistory(sessionId);
     this.tips.delete(sessionId);
     this.roots.delete(root);
     this.unlisted.delete(sessionId);
@@ -249,7 +252,7 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     this.tips.delete(stray.id);
     this.unlisted.delete(stray.id);
     this.earlier.delete(stray.id);
-    this.loadingEarlier.delete(stray.id);
+    this.cancelEarlierHistory(stray.id);
     for (const turn of this.turns.values()) {
       if (turn.sessionId === stray.id) turn.sessionId = sessionId;
     }
@@ -507,11 +510,15 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
     );
   }
 
+  private cancelEarlierHistory(sessionId: string) {
+    const load = this.loadingEarlier.get(sessionId);
+    if (load) load.state.cancelled = true;
+    this.loadingEarlier.delete(sessionId);
+  }
+
   loadEarlierHistory(sessionId: string, scope?: "turns"): Promise<boolean> {
-    const existing = this.loadingEarlier.get(sessionId);
-    if (existing) return existing;
-    const cursor = this.earlier.get(sessionId);
     if (this.disposed) return Promise.resolve(false);
+    const cursor = this.earlier.get(sessionId);
     const partial =
       scope === "turns"
         ? undefined
@@ -521,10 +528,22 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
               (a, b) =>
                 b.job.created_at_us - a.job.created_at_us || b.job.id.localeCompare(a.job.id),
             )[0];
+    const kind = partial ? "outputs" : "turns";
+    const existing = this.loadingEarlier.get(sessionId);
+    if (existing?.kind === kind) return existing.promise;
     if (!cursor && !partial) return Promise.resolve(false);
     const root = this.sessionRoot(sessionId);
+    if (existing) {
+      const load = () =>
+        !this.disposed && !existing.state.cancelled && this.roots.get(root) === sessionId
+          ? this.loadEarlierHistory(sessionId, scope)
+          : false;
+      return existing.promise.then(load, load);
+    }
+    const state = { cancelled: false };
     const isCurrent = () =>
       !this.disposed &&
+      !state.cancelled &&
       this.roots.get(root) === sessionId &&
       this.earlier.get(sessionId) === cursor;
     const task = (async () => {
@@ -618,9 +637,10 @@ export class ConversationRuntimeClient extends RuntimeClientBase {
         return false;
       }
     })().finally(() => {
-      if (this.loadingEarlier.get(sessionId) === task) this.loadingEarlier.delete(sessionId);
+      if (this.loadingEarlier.get(sessionId)?.promise === task)
+        this.loadingEarlier.delete(sessionId);
     });
-    this.loadingEarlier.set(sessionId, task);
+    this.loadingEarlier.set(sessionId, { kind, promise: task, state });
     return task;
   }
 

@@ -1,4 +1,4 @@
-use super::StorageError;
+use super::{StorageError, TxRead};
 use crate::db::entities::{
     CursorPage, FrozenConfiguration, FrozenExecutionConfig, JobId, ScheduledExternalPolicyConfig,
     ScheduledExternalPolicyId, ScheduledExternalTarget, Violation,
@@ -30,6 +30,35 @@ struct ScheduledPolicy {
 }
 
 impl ScheduledPolicies {
+    pub(super) fn read(tx: &impl TxRead) -> Result<Self, StorageError> {
+        let table = tx.table(SCHEDULED_EXTERNAL_POLICY)?;
+        let mut policies = Vec::new();
+        for entry in table.iter()? {
+            let (key, row) = entry?;
+            let record = decode_scheduled_external_policy(key.value(), row.value())?;
+            if let Ok(config) = ScheduledExternalPolicyConfig::from_live_record(&record) {
+                policies.push(ScheduledPolicy {
+                    config,
+                    id: record.id,
+                    revision: record.revision,
+                });
+            }
+        }
+        policies.sort_unstable_by(|left, right| {
+            left.config
+                .match_key()
+                .cmp(&right.config.match_key())
+                .then_with(|| {
+                    right
+                        .config
+                        .limits()
+                        .max_output_tokens
+                        .cmp(&left.config.limits().max_output_tokens)
+                })
+        });
+        Ok(Self(policies))
+    }
+
     pub(super) fn matching(&self, frozen: &FrozenExecutionConfig) -> ScheduledPolicyMatch {
         let Some(target) = ScheduledExternalTarget::new(frozen) else {
             return ScheduledPolicyMatch::None;
@@ -60,6 +89,16 @@ impl ScheduledPolicies {
     }
 }
 
+pub(super) fn binding_in(
+    tx: &impl TxRead,
+    job: JobId,
+) -> Result<Option<crate::db::entities::ScheduledExternalBinding>, StorageError> {
+    tx.table(SCHEDULED_EXTERNAL_BINDING)?
+        .get(job.get())?
+        .map(|row| decode_scheduled_external_binding(job.get(), row.value()))
+        .transpose()
+}
+
 impl Batch {
     fn scheduled_external_policy_by_id(
         &mut self,
@@ -78,13 +117,7 @@ impl Batch {
         &mut self,
         job: JobId,
     ) -> Result<Option<crate::db::entities::ScheduledExternalBinding>, BatchError> {
-        self.step(|tx| {
-            let table = tx.open_table(SCHEDULED_EXTERNAL_BINDING)?;
-            table
-                .get(job.get())?
-                .map(|row| decode_scheduled_external_binding(job.get(), row.value()))
-                .transpose()
-        })
+        self.step(|tx| binding_in(tx, job))
     }
 
     pub(crate) fn create_scheduled_external_policy(
@@ -229,34 +262,7 @@ impl Batch {
     }
 
     pub(super) fn scheduled_external_policies(&mut self) -> Result<ScheduledPolicies, BatchError> {
-        self.step(|tx| {
-            let table = tx.open_table(SCHEDULED_EXTERNAL_POLICY)?;
-            let mut policies = Vec::new();
-            for entry in table.iter()? {
-                let (key, row) = entry?;
-                let record = decode_scheduled_external_policy(key.value(), row.value())?;
-                if let Ok(config) = ScheduledExternalPolicyConfig::from_live_record(&record) {
-                    policies.push(ScheduledPolicy {
-                        config,
-                        id: record.id,
-                        revision: record.revision,
-                    });
-                }
-            }
-            policies.sort_unstable_by(|left, right| {
-                left.config
-                    .match_key()
-                    .cmp(&right.config.match_key())
-                    .then_with(|| {
-                        right
-                            .config
-                            .limits()
-                            .max_output_tokens
-                            .cmp(&left.config.limits().max_output_tokens)
-                    })
-            });
-            Ok(ScheduledPolicies(policies))
-        })
+        self.step(ScheduledPolicies::read)
     }
 
     pub(crate) fn scheduled_external_authorization(

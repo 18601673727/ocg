@@ -385,7 +385,7 @@ pub(crate) fn prepare_development_handoff(
                     replay.push(ChatMessage::assistant(Some(answer), Vec::new()));
                 }
                 prior.push((
-                    Some(turn.record.job.input.text().to_owned()),
+                    Some(turn.input_text.clone()),
                     images_for(&turn.attachments)?,
                     replay,
                 ));
@@ -395,15 +395,10 @@ pub(crate) fn prepare_development_handoff(
                 return Err(unavailable());
             }
             let limits = ContextLimits::for_profile(&frozen.llm);
-            let assignment = snapshot.job.input.text();
-            let assignment_with_results = snapshot
-                .prerequisite_results
-                .as_ref()
-                .map(|results| format!("{assignment}\n\n{results}"));
             let mut conversation = fit_with_notices(
                 frozen,
                 prior,
-                Some(assignment_with_results.as_deref().unwrap_or(assignment)),
+                Some(&snapshot.input_text),
                 &current_images,
                 snapshot.project.as_ref(),
                 offer.and_then(|offer| offer.grant),

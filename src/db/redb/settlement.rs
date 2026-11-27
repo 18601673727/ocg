@@ -326,6 +326,7 @@ impl Batch {
                     frozen: Some(storable),
                     child_results: Vec::new(),
                     child_notice: None,
+                    prerequisite_context: None,
                 };
                 let req_tag = mutable_configuration_requirement(&wrapped);
                 batch.enqueue_mutable_job(&pred_job, req_tag, TurnMembership::NonTurn, false, true)
@@ -681,6 +682,7 @@ impl Batch {
             frozen: Some(storable),
             child_results: Vec::new(),
             child_notice: None,
+            prerequisite_context: None,
         };
         let req_tag = mutable_configuration_requirement(&wrapped);
         self.enqueue_mutable_job(&dec_job, req_tag, TurnMembership::Turn, false, true)?;
@@ -999,6 +1001,15 @@ impl Batch {
         token: crate::db::entities::AllocationToken,
         cause: crate::db::entities::UnstartedCause,
     ) -> Result<AppendedOutput, BatchError> {
+        use crate::db::entities::UnstartedCause;
+        let cause = if cause == UnstartedCause::PreparationDeadlineExceeded
+            && self
+                .step(|tx| Ok(super::scheduled_external::binding_in(tx, token.job)?.is_some()))?
+        {
+            UnstartedCause::DeadlineExceeded
+        } else {
+            cause
+        };
         let (job, output) = self.end_untouched_reservation(
             token,
             cause.outcome(),

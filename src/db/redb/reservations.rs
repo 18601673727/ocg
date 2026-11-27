@@ -304,6 +304,31 @@ impl Batch {
                 }
                 FrozenConfiguration::Decision(_) => None,
             };
+            if let Some(previous) = job.previous.filter(|_| job.retry.is_some())
+                && let Some(required) =
+                    self.step(|tx| super::scheduled_external::binding_in(tx, previous))?
+                && scheduled_external.map(|(id, _)| id) != Some(required.policy)
+            {
+                let previously_recoverable = self.step(|tx| {
+                    let outputs = tx.open_table(JOB_OUTPUTS)?;
+                    let Some((key, value)) = outputs
+                        .range((previous.get(), 0)..=(previous.get(), u32::MAX))?
+                        .next_back()
+                        .transpose()?
+                    else {
+                        return Ok(false);
+                    };
+                    let result = decode_output(key.value(), value.value())?;
+                    Ok(result
+                        .code
+                        .as_deref()
+                        .and_then(crate::db::entities::UnstartedCause::routed_recovery)
+                        .is_some())
+                })?;
+                if previously_recoverable {
+                    continue;
+                }
+            }
             let (operation, protocol) = match &frozen {
                 FrozenConfiguration::Generative(frozen) => (
                     ExecutionOperation::LlmRequest,
@@ -322,12 +347,34 @@ impl Batch {
             {
                 continue;
             }
+            let mut persist_job = job.context_selection != stored_selection;
+            if !summary_work
+                && job.previous.is_none()
+                && job.retry.is_none()
+                && job.prerequisite_context.is_none()
+                && matches!(&frozen, FrozenConfiguration::Generative(_))
+            {
+                let spec = self.require_mutable_conversation(job.parent_id)?;
+                let lifecycle = self.job_lifecycle(job.parent_id)?;
+                if !lifecycle.after.is_empty()
+                    && super::job_tree::is_prerequisite_assignment(&spec, &job)
+                {
+                    let Some(context) = self.step(|tx| {
+                        super::job_tree::prerequisite_results(tx, &spec, &lifecycle.after)
+                    })?
+                    else {
+                        continue;
+                    };
+                    job.prerequisite_context = Some(context);
+                    persist_job = true;
+                }
+            }
             return self
                 .reserve_pool_allocation(
                     &pool,
                     &executor,
                     &job,
-                    job.context_selection != stored_selection,
+                    persist_job,
                     *key,
                     request,
                     operation,
@@ -682,6 +729,13 @@ impl Batch {
                 ) {
                     return Err(stale());
                 }
+                let current_text = self.step(|tx| {
+                    super::jobs::execution_input_text(&tx.open_table(JOBS)?, job)
+                        .map(std::borrow::Cow::into_owned)
+                })?;
+                if current_text != context.input_text {
+                    return Err(stale());
+                }
                 let mut previous = job.previous;
                 for turn in context.history.iter().rev() {
                     let bounded = self.step(|tx| {
@@ -759,7 +813,11 @@ impl Batch {
                             return Err(stale());
                         }
                         let row = self.read_mutable_job(input.job)?.ok_or_else(stale)?;
-                        if row.job.input.text() != input.text
+                        let text = self.step(|tx| {
+                            super::jobs::execution_input_text(&tx.open_table(JOBS)?, &row.job)
+                                .map(std::borrow::Cow::into_owned)
+                        })?;
+                        if text != input.text
                             || row.job.input.attachments()
                                 != input
                                     .attachments

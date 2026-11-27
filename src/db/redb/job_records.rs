@@ -264,7 +264,8 @@ impl Batch {
             let mut context_tokens = 0usize;
             for boundary in &boundaries {
                 let job = summary_history_job(&tables.jobs, boundary.job, conversation)?;
-                let mut turn_text = format!("User: {}\n", job.input.text());
+                let input_text = jobs::execution_input_text(&tables.jobs, &job)?;
+                let mut turn_text = format!("User: {input_text}\n");
                 for entry in tables
                     .outputs
                     .range((boundary.job.get(), 0)..=(boundary.job.get(), u32::MAX))?
@@ -517,6 +518,7 @@ impl Batch {
                             frozen: Some(MutableFrozenConfiguration::Generative(frozen.clone())),
                             child_results: Vec::new(),
                             child_notice: None,
+                            prerequisite_context: None,
                         };
                         batch.insert_native_summary_job(&chunk_job, &frozen, 0, true)?;
                         batch.insert(
@@ -566,6 +568,7 @@ impl Batch {
                 frozen: Some(MutableFrozenConfiguration::Generative(frozen.clone())),
                 child_results: Vec::new(),
                 child_notice: None,
+                prerequisite_context: None,
             };
             batch.insert_native_summary_job(
                 &producer_job,

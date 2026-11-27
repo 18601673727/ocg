@@ -4,8 +4,7 @@ use crate::db::entities::{
     AWAITING_TOOL_DECISION, Actor, ChildNoticeDrop, ChildNoticeKind, ChildTurnResult,
     ContentDigest, JobId, JobOutputId, JobOutputRecord, JobSpec, MutableJob, MutableJobContent,
     MutableJobPhase, NativeSummaryResultLink, Origin, OutcomeKind, OutputKind, Recurrence,
-    RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision, ToolEvidenceRecord,
-    ToolOutcome,
+    RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision,
 };
 use crate::db::redb::codec::{
     Code, Dec, Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME,
@@ -49,7 +48,7 @@ impl Versions {
     fn changes_body(self, tags: &[u8]) -> bool {
         match tags {
             [TAG_OUTPUT] => self.crosses(2),
-            [TAG_JOB] => self.crosses(3) || self.crosses(7),
+            [TAG_JOB] => self.crosses(8),
             [TAG_JOB_RUNTIME] => self.crosses(3) || self.crosses(5),
             _ => false,
         }
@@ -74,6 +73,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         (Some(4), Some(b"ocg-native-format-4")) => 4,
         (Some(5), Some(b"ocg-native-format-5")) => 5,
         (Some(6), Some(b"ocg-native-format-6")) => 6,
+        (Some(7), Some(b"ocg-native-format-7")) => 7,
         (Some(FORMAT_VERSION), Some(SCHEMA_FINGERPRINT)) => {
             return Err(ReservedRefusal::new(
                 "already_migrated",
@@ -83,7 +83,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         _ => {
             return Err(ReservedRefusal::new(
                 "unsupported_source",
-                "migration requires Format 1 through 6 with its matching schema fingerprint",
+                "migration requires Format 1 through 7 with its matching schema fingerprint",
             ));
         }
     };
@@ -250,7 +250,7 @@ impl LegacyNotices {
             let call = rows::tool_call_ref(key.value())?;
             let tool = rows::decode_tool_evidence(call, value.value())?;
             let progress = match tool.name.as_str() {
-                "job_report_progress" if legacy_progress_deferred(&tool) => true,
+                "job_report_progress" if job_tree::deferred_child_progress(&tool) => true,
                 "job_ask_parent"
                     if matches!(tool.decision.fact, ToolDecision::AwaitingAnswer(_)) =>
                 {
@@ -352,18 +352,6 @@ impl LegacyNotices {
             Ok(rows::encode_tool_evidence(&record))
         })
     }
-}
-
-fn legacy_progress_deferred(tool: &ToolEvidenceRecord) -> bool {
-    let Some(ToolOutcome::Completed { result }) =
-        tool.outcome.as_ref().map(|outcome| &outcome.fact)
-    else {
-        return false;
-    };
-    serde_json::from_str::<Json>(result.as_str())
-        .ok()
-        .and_then(|result| result.get("deferred")?.as_bool())
-        == Some(true)
 }
 
 fn legacy_child_is_awaiting(
@@ -797,6 +785,10 @@ fn migrate_job_base(
     if versions.crosses(7) {
         // Append empty child_results (u32 0) and child_notice (None).
         row.extend_from_slice(&[0, 0, 0, 0, 0]);
+    }
+    if versions.crosses(8) {
+        // Pre-8 assignments have no admission snapshot. Preserve their request evidence.
+        row.push(0);
     }
     let Some(evidence) = evidence else {
         return Ok(MigratedJobBase { row, author: None });
@@ -1632,15 +1624,20 @@ fn migrate_chain(
     } else {
         None
     };
-    let child_turns = LegacyChildTurns::read(&tx)?;
-    child_turns.apply(&tx)?;
+    let child_turns = if versions.crosses(7) {
+        let turns = LegacyChildTurns::read(&tx)?;
+        turns.apply(&tx)?;
+        turns
+    } else {
+        LegacyChildTurns::default()
+    };
     tx.commit().map_err(StorageError::from)?;
 
     super::verify_reserved_residual(database)?;
     let result = database.begin_read().map_err(StorageError::from)?;
     verify_record_headers(versions, &source, &result, notices.as_ref())?;
     verify_payloads(&result, directory)?;
-    if LegacyChildTurns::read(&result)? != child_turns {
+    if versions.crosses(7) && LegacyChildTurns::read(&result)? != child_turns {
         return Err(ReservedRefusal::new(
             "audit_failed",
             "migration child turn metadata changed on re-evaluation",

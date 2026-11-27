@@ -79,11 +79,13 @@ pub struct PoolAllocation {
 pub enum UnstartedCause {
     FrozenSecretUnavailable,
     InputUnavailable,
+    InputContextTooLarge,
     StartRefused,
     ExecutorUnavailable,
     Cancelled,
     HostShutdown,
     DeadlineExceeded,
+    PreparationDeadlineExceeded,
     OfflineReconciled,
 }
 
@@ -93,10 +95,12 @@ impl UnstartedCause {
             Self::Cancelled => OutcomeKind::Cancelled,
             Self::FrozenSecretUnavailable
             | Self::InputUnavailable
+            | Self::InputContextTooLarge
             | Self::StartRefused
             | Self::ExecutorUnavailable
             | Self::HostShutdown
             | Self::DeadlineExceeded
+            | Self::PreparationDeadlineExceeded
             | Self::OfflineReconciled => OutcomeKind::Failed,
         }
     }
@@ -105,13 +109,29 @@ impl UnstartedCause {
         match self {
             Self::FrozenSecretUnavailable => "frozen_secret_unavailable",
             Self::InputUnavailable => "input_unavailable",
+            Self::InputContextTooLarge => "input_context_too_large_before_start",
             Self::StartRefused => "start_refused",
             Self::ExecutorUnavailable => "executor_unavailable_before_start",
             Self::Cancelled => "cancelled_before_start",
             Self::HostShutdown => "host_shutdown_before_start",
             Self::DeadlineExceeded => "deadline_exceeded_before_start",
+            Self::PreparationDeadlineExceeded => "preparation_deadline_exceeded_before_start",
             Self::OfflineReconciled => "reconciled_unstarted_reservation",
         }
+    }
+
+    pub(crate) const CONTEXT_BUDGET_DETAIL: &str =
+        "selected execution context exceeds estimated model token budget";
+
+    pub(crate) fn routed_recovery(code: &str) -> Option<Self> {
+        [
+            Self::OfflineReconciled,
+            Self::FrozenSecretUnavailable,
+            Self::InputContextTooLarge,
+            Self::PreparationDeadlineExceeded,
+        ]
+        .into_iter()
+        .find(|cause| cause.code() == code)
     }
 
     pub fn summary(self) -> &'static str {
@@ -121,6 +141,9 @@ impl UnstartedCause {
             }
             Self::InputUnavailable => {
                 "This Job's input could not be prepared safely, so it did not start. Nothing was sent to the Provider."
+            }
+            Self::InputContextTooLarge => {
+                "The selected context exceeds the Model's input budget. Nothing was sent to the Provider."
             }
             Self::StartRefused => {
                 "This Job could not be started safely. Nothing was sent to the Provider."
@@ -136,6 +159,9 @@ impl UnstartedCause {
             }
             Self::DeadlineExceeded => {
                 "The dispatch deadline expired before this Job started. Nothing was sent to the Provider."
+            }
+            Self::PreparationDeadlineExceeded => {
+                "Preparation timed out before this Job started. Nothing was sent to the Provider."
             }
             Self::OfflineReconciled => {
                 "OCG stopped after reserving capacity for this Job and before it started; an offline reconciliation ended it. Nothing was sent to the Provider."
