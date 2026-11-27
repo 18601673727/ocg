@@ -25,7 +25,15 @@ export function ConversationArtifacts(props: { sessionId: string }) {
       for (const call of message.toolCalls ?? []) {
         if (!message.jobId || !isArtifactCall(call)) continue;
         const id = `${message.jobId}:${call.request}:${call.index}`;
-        found.set(id, { id, title: artifactTitle(call), job: message.jobId, call });
+        found.set(id, {
+          id,
+          title:
+            call.name === "workspace_run_command"
+              ? i18n.t("chat.artifacts.commandDiff", { command: artifactTitle(call) })
+              : artifactTitle(call),
+          job: message.jobId,
+          call,
+        });
       }
       for (const image of [
         ...(message.images ?? []).map((image) => ({ name: image.name, url: image.url })),
@@ -89,7 +97,11 @@ export function ConversationArtifacts(props: { sessionId: string }) {
                       <DialogTitle class="break-all normal-case tracking-normal">
                         {selected()?.title || i18n.t("chat.artifacts.image")}
                       </DialogTitle>
-                      <DialogDescription>{i18n.t("chat.artifacts.note")}</DialogDescription>
+                      <DialogDescription>
+                        {selected() && "call" in selected()!
+                          ? i18n.t("chat.artifacts.commandDiffNote")
+                          : i18n.t("chat.artifacts.note")}
+                      </DialogDescription>
                     </DialogHeader>
                     {selected() && (
                       <div class="ocg-subtle-scrollbar min-h-0 min-w-0 overflow-y-auto">

@@ -282,7 +282,7 @@ function ExecutorRow(props: {
                 })}
               </Pill>
             ) : (
-              <Pill tone="violet" class="text-xs normal-case">
+              <Pill tone="primary" class="text-xs normal-case">
                 {i18n.t("settings.pools.executorPoolElsewhere", {
                   pool: props.executor.pool,
                 })}

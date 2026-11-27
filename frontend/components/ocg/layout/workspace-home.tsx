@@ -60,11 +60,11 @@ export function WorkspaceHome(props: {
               {recent().map((session) => {
                 const updated = Date.parse(session.updatedAt);
                 return (
-                  <li>
+                  <li class="first:rounded-t-xl last:rounded-b-xl">
                     <button
                       type="button"
                       onClick={() => props.onSelect(session.id)}
-                      class="group flex w-full items-center gap-3 rounded-xl px-4 py-3.5 text-left hover:bg-accent/60 focus-visible:outline-2 focus-visible:outline-ring"
+                      class="group flex w-full items-center gap-3 rounded-[inherit] px-4 py-3.5 text-left hover:bg-accent/60 focus-visible:outline-2 focus-visible:outline-ring"
                     >
                       <MessageSquare
                         class="size-4 shrink-0 text-muted-foreground"

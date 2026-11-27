@@ -108,7 +108,7 @@ function SettingRow(props: {
       <div class="min-w-0">
         <div class="flex flex-wrap items-center gap-2">
           <h3 class="text-sm font-medium">{props.label}</h3>
-          <Pill tone={props.origin === "browser" ? "violet" : "sky"} class="text-xs normal-case">
+          <Pill tone="primary" class="text-xs normal-case">
             {props.origin === "browser"
               ? i18n.t("settings.origin.browser")
               : i18n.t("settings.origin.runtime")}
@@ -732,7 +732,7 @@ export function SettingsSurface(props: {
                               <Pill tone="slate" class="text-xs normal-case">
                                 {profile.id}
                               </Pill>
-                              <Pill tone="sky" class="text-xs normal-case">
+                              <Pill tone="primary" class="text-xs normal-case">
                                 {profile.model}
                               </Pill>
                               {kind === "llm" && (
@@ -747,10 +747,7 @@ export function SettingsSurface(props: {
                                   )}
                                 </Pill>
                               )}
-                              <Pill
-                                tone={kind === "llm" ? "violet" : "amber"}
-                                class="text-xs normal-case"
-                              >
+                              <Pill tone="primary" class="text-xs normal-case">
                                 {i18n.t(
                                   kind === "llm"
                                     ? "settings.llm.generativeModel"
@@ -786,7 +783,7 @@ export function SettingsSurface(props: {
                             </p>
                             <div class="flex flex-wrap items-center gap-1.5 pt-0.5">
                               {profile.declared_capabilities.map((cap) => (
-                                <Pill tone="violet" class="text-[11px] normal-case">
+                                <Pill tone="primary" class="text-[11px] normal-case">
                                   {cap}
                                 </Pill>
                               ))}
@@ -1475,7 +1472,7 @@ export function SettingsSurface(props: {
                                 {agent.id}
                               </Pill>
                               {agent.capabilities.map((capability) => (
-                                <Pill tone="sky" class="text-xs">
+                                <Pill tone="primary" class="text-xs">
                                   {i18n.t(`settings.agent.capability.${capability}`)}
                                 </Pill>
                               ))}

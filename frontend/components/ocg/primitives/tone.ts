@@ -1,6 +1,7 @@
-export type Tone = "emerald" | "sky" | "amber" | "red" | "violet" | "slate";
+export type Tone = "primary" | "emerald" | "sky" | "amber" | "red" | "violet" | "slate";
 
 const BORDER_TONE: Record<Tone, string> = {
+  primary: "border-primary/30",
   emerald: "border-emerald-500/30",
   sky: "border-sky-500/30",
   amber: "border-amber-500/30",
@@ -10,6 +11,7 @@ const BORDER_TONE: Record<Tone, string> = {
 };
 
 const FILL_TONE: Record<Tone, string> = {
+  primary: "bg-primary/10",
   emerald: "bg-emerald-500/10",
   sky: "bg-sky-500/10",
   amber: "bg-amber-500/10",
@@ -26,6 +28,7 @@ const SURFACE_TONE: Record<Tone, string> = Object.fromEntries(
 ) as Record<Tone, string>;
 
 export const TEXT_TONE: Record<Tone, string> = {
+  primary: "text-primary",
   emerald: "text-emerald-700 dark:text-emerald-400",
   sky: "text-sky-700 dark:text-sky-400",
   amber: "text-amber-700 dark:text-amber-400",
@@ -35,6 +38,7 @@ export const TEXT_TONE: Record<Tone, string> = {
 };
 
 export const DOT_TONE: Record<Tone, string> = {
+  primary: "bg-primary",
   emerald: "bg-emerald-500",
   sky: "bg-sky-500",
   amber: "bg-amber-500",

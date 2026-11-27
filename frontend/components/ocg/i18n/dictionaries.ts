@@ -703,7 +703,10 @@ export const en = {
   "chat.cancel": "Cancel execution",
   "chat.queueHint": "Send now to queue a message for the next turn.",
   "chat.queuedMessage": "Waiting to start.",
-  "chat.artifacts.title": "Files and images ({count})",
+  "chat.artifacts.title": "Diffs and images ({count})",
+  "chat.artifacts.commandDiff": "Diff from {command}",
+  "chat.artifacts.commandDiffNote":
+    "This diff was captured from command output during the conversation. Files may have changed since then.",
   "chat.changes.title": "File changes",
   "chat.changes.unknownFiles": "Details for {count} changes are not yet available.",
   "chat.changes.files": "Edited {count} files",
