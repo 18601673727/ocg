@@ -771,6 +771,13 @@ fn development_candidate_in(
     if conversation_lifecycle.on_hold.is_some() || conversation_lifecycle.closing.is_some() {
         return Err(context_unavailable("conversation is not eligible"));
     }
+    if super::super::job_tree::prerequisite_assignment(rx, &conversation)?
+        .is_some_and(|assignment| assignment.prerequisite_context.is_none())
+    {
+        return Err(context_unavailable(
+            super::super::job_tree::PREREQUISITE_CONTEXT_LOST,
+        ));
+    }
     let project = record
         .project
         .map(|id| {
@@ -973,6 +980,9 @@ fn generative_context_sources(
     }
     let mut history = Vec::new();
     let input_text = jobs::execution_input_text(&rx.table(JOBS)?, job)?.into_owned();
+    // An unstarted assignment carries context for a direct continuation. A
+    // retry carries it with its own input, so skip it on the stopped original.
+    let mut replayed_assignment = job.retry.as_ref().map(|retry| retry.original);
     let mut output_bytes = 0usize;
     let mut selected_bytes = input_text.len().saturating_add(
         requirements
@@ -1033,11 +1043,15 @@ fn generative_context_sources(
                 "predecessor is not settled in this conversation",
             ));
         }
-        let prior_input_text = if ended_unstarted {
-            prior.job.input.text().to_owned()
-        } else {
-            jobs::execution_input_text(&rx.table(JOBS)?, &prior.job)?.into_owned()
-        };
+        let prior_input_text =
+            if ended_unstarted && (replayed_assignment == Some(id) || prior.job.retry.is_some()) {
+                prior.job.input.text().to_owned()
+            } else {
+                if let Some(retry) = &prior.job.retry {
+                    replayed_assignment = Some(retry.original);
+                }
+                jobs::execution_input_text(&rx.table(JOBS)?, &prior.job)?.into_owned()
+            };
         selected_bytes = selected_bytes.saturating_add(prior_input_text.len());
         if selected_bytes > 8 * 1024 * 1024 {
             return Err(context_unavailable(
@@ -1200,6 +1214,9 @@ pub(in crate::db::redb) fn retry_context_fits(
     }
     let conversation = read_conversation_row(tx, failed.parent_id)?
         .ok_or_else(|| StorageError::corrupted("retry conversation missing"))?;
+    if super::super::job_tree::prerequisite_context_lost(tx, &conversation)? {
+        return Ok(false);
+    }
     let project = conversation
         .project
         .map(|id| {

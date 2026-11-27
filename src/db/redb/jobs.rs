@@ -2203,6 +2203,15 @@ pub(super) fn require_generative_history(
     previous: Option<JobId>,
     current: Option<JobId>,
 ) -> Result<(), BatchError> {
+    if let Some(spec) = reads::jobs::read_conversation_row(tx, parent)?
+        && super::job_tree::prerequisite_context_lost(tx, &spec)?
+    {
+        return Err(Violation::InvalidValue(
+            "prerequisite_context",
+            super::job_tree::PREREQUISITE_CONTEXT_LOST,
+        )
+        .into());
+    }
     if has_decision_predecessors(tx, parent, previous, current)? {
         return Err(Violation::InvalidValue(
             "execution_context",

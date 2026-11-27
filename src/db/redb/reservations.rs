@@ -234,6 +234,23 @@ impl Batch {
             if !self.mutable_predecessor_ready(&job)? || self.mutable_job_blocked(&job)? {
                 continue;
             }
+            if matches!(
+                job.input.content,
+                crate::db::entities::MutableJobContent::Generative { .. }
+            ) {
+                match self.require_generative_predecessors(&job) {
+                    Ok(()) => {}
+                    Err(BatchError(Failure::Rejected(Violation::InvalidValue(
+                        "prerequisite_context",
+                        reason,
+                    )))) => {
+                        self.end_queued_native_job(&job, OutcomeCause::Text(reason.to_owned()))?;
+                        continue;
+                    }
+                    Err(BatchError(Failure::Rejected(_))) => continue,
+                    Err(error) => return Err(error),
+                }
+            }
             let stored_selection = job.context_selection;
             if previous.is_none()
                 && matches!(
@@ -253,16 +270,6 @@ impl Batch {
             }
             if !self.mutable_context_valid(&job, job.context_selection)? {
                 continue;
-            }
-            if matches!(
-                &job.input.content,
-                crate::db::entities::MutableJobContent::Generative { .. }
-            ) {
-                match self.require_generative_predecessors(&job) {
-                    Ok(()) => {}
-                    Err(BatchError(Failure::Rejected(_))) => continue,
-                    Err(error) => return Err(error),
-                }
             }
             let summary_work = self.is_summary_work(&job)?;
             if !summary_work
@@ -348,25 +355,26 @@ impl Batch {
                 continue;
             }
             let mut persist_job = job.context_selection != stored_selection;
-            if !summary_work
-                && job.previous.is_none()
-                && job.retry.is_none()
-                && job.prerequisite_context.is_none()
-                && matches!(&frozen, FrozenConfiguration::Generative(_))
-            {
+            if !summary_work && matches!(&frozen, FrozenConfiguration::Generative(_)) {
                 let spec = self.require_mutable_conversation(job.parent_id)?;
-                let lifecycle = self.job_lifecycle(job.parent_id)?;
-                if !lifecycle.after.is_empty()
-                    && super::job_tree::is_prerequisite_assignment(&spec, &job)
+                if let Some(mut assignment) =
+                    self.step(|tx| super::job_tree::prerequisite_assignment(tx, &spec))?
+                    && assignment.prerequisite_context.is_none()
                 {
+                    let lifecycle = self.job_lifecycle(job.parent_id)?;
                     let Some(context) = self.step(|tx| {
                         super::job_tree::prerequisite_results(tx, &spec, &lifecycle.after)
                     })?
                     else {
                         continue;
                     };
-                    job.prerequisite_context = Some(context);
-                    persist_job = true;
+                    if assignment.id == job.id {
+                        job.prerequisite_context = Some(context);
+                        persist_job = true;
+                    } else {
+                        assignment.prerequisite_context = Some(context);
+                        self.insert(JOBS, assignment.id.get(), &encode_mutable_job(&assignment))?;
+                    }
                 }
             }
             return self

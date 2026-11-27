@@ -111,6 +111,18 @@ impl Batch {
             });
         }
         let row = self.require_mutable_conversation(conversation)?;
+        if self.step(|tx| super::job_tree::prerequisite_context_lost(tx, &row))? {
+            return if automatic.is_some() {
+                Ok(crate::db::entities::CompactionRequest::Noop {
+                    reason: super::job_tree::PREREQUISITE_CONTEXT_LOST,
+                })
+            } else {
+                self.reject(Violation::InvalidValue(
+                    "prerequisite_context",
+                    super::job_tree::PREREQUISITE_CONTEXT_LOST,
+                ))
+            };
+        }
         if row.is_chunk_group() || row.is_standalone_decision_group() {
             refuse!(
                 "compaction_unavailable",

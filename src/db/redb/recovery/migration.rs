@@ -4,7 +4,7 @@ use crate::db::entities::{
     AWAITING_TOOL_DECISION, Actor, ChildNoticeDrop, ChildNoticeKind, ChildTurnResult,
     ContentDigest, JobId, JobOutputId, JobOutputRecord, JobSpec, MutableJob, MutableJobContent,
     MutableJobPhase, NativeSummaryResultLink, Origin, OutcomeKind, OutputKind, Recurrence,
-    RequestNumber, SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision,
+    RequestNumber, RequestPayload, SubmissionKey, SubmissionRecord, ToolCallRef, ToolDecision,
 };
 use crate::db::redb::codec::{
     Code, Dec, Enc, TAG_GLOBAL_COMPACTION, TAG_GLOBAL_HEADERS, TAG_JOB, TAG_JOB_RUNTIME,
@@ -48,7 +48,7 @@ impl Versions {
     fn changes_body(self, tags: &[u8]) -> bool {
         match tags {
             [TAG_OUTPUT] => self.crosses(2),
-            [TAG_JOB] => self.crosses(8),
+            [TAG_JOB] => self.crosses(9),
             [TAG_JOB_RUNTIME] => self.crosses(3) || self.crosses(5),
             _ => false,
         }
@@ -74,6 +74,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         (Some(5), Some(b"ocg-native-format-5")) => 5,
         (Some(6), Some(b"ocg-native-format-6")) => 6,
         (Some(7), Some(b"ocg-native-format-7")) => 7,
+        (Some(8), Some(b"ocg-native-format-8")) => 8,
         (Some(FORMAT_VERSION), Some(SCHEMA_FINGERPRINT)) => {
             return Err(ReservedRefusal::new(
                 "already_migrated",
@@ -83,7 +84,7 @@ fn source_layout(source: &ReadTransaction) -> Result<Versions, ReservedRefusal> 
         _ => {
             return Err(ReservedRefusal::new(
                 "unsupported_source",
-                "migration requires Format 1 through 7 with its matching schema fingerprint",
+                "migration requires Format 1 through 8 with its matching schema fingerprint",
             ));
         }
     };
@@ -844,6 +845,123 @@ fn migrate_turn_bases(
         jobs.insert(k.value(), migrated.row.as_slice())?;
     }
     Ok(())
+}
+
+#[derive(Default)]
+struct LegacyPrerequisites {
+    recovered: BTreeMap<JobId, String>,
+    blocked: BTreeSet<JobId>,
+}
+
+impl LegacyPrerequisites {
+    fn read(tx: &impl TxRead) -> Result<Self, StorageError> {
+        let mut legacy = Self::default();
+        for entry in tx.table(CONVERSATIONS)?.iter()? {
+            let (key, value) = entry?;
+            let spec = JobSpec::decode_at(key.value(), value.value())?;
+            let Some(assignment) = job_tree::prerequisite_assignment(tx, &spec)? else {
+                continue;
+            };
+            if assignment.prerequisite_context.is_some() {
+                continue;
+            }
+            let Some(first) = job_tree::prerequisite_admissions(tx, &assignment)?.first_started
+            else {
+                continue;
+            };
+            let attempt = jobs::mutable_job_in(tx, first)?
+                .ok_or_else(|| StorageError::corrupted("missing prerequisite execution"))?;
+            if attempt.parent_id != spec.id {
+                return Err(StorageError::corrupted(
+                    "prerequisite execution belongs to another conversation",
+                ));
+            }
+            if let Some(context) = initial_prerequisite_context(tx, &attempt)? {
+                legacy.recovered.insert(assignment.id, context);
+            } else if state::require(tx, spec.id)?.state.outcome.is_none() {
+                legacy.blocked.insert(spec.id);
+            }
+        }
+        Ok(legacy)
+    }
+
+    fn apply(&self, tx: &WriteTransaction) -> Result<(), StorageError> {
+        let mut table = tx.open_table(JOBS)?;
+        for (&id, context) in &self.recovered {
+            let mut job = {
+                let row = table
+                    .get(id.get())?
+                    .ok_or_else(|| StorageError::corrupted("missing prerequisite assignment"))?;
+                jobs::decode_mutable_job(id.get(), row.value())?
+            };
+            job.prerequisite_context = Some(context.clone());
+            table.insert(id.get(), jobs::encode_mutable_job(&job).as_slice())?;
+        }
+        Ok(())
+    }
+}
+
+fn initial_prerequisite_context(
+    tx: &impl TxRead,
+    attempt: &MutableJob,
+) -> Result<Option<String>, StorageError> {
+    // A textless turn can share an Anthropic user message with preceding text.
+    if attempt.input.text().is_empty() {
+        return Ok(None);
+    }
+    let events = tx.table(REQUEST_EVENTS)?;
+    let span = (attempt.id.get(), 1, 0)..=(attempt.id.get(), 1, u32::MAX);
+    for entry in events.range(span)? {
+        let (key, value) = entry?;
+        let (_, number, seq) = key.value();
+        let request = RequestNumber::new(number)
+            .ok_or_else(|| StorageError::corrupted("zero prerequisite request number"))?;
+        let RequestPayload::Sent {
+            messages,
+            dropped_turns: Some(0),
+            ..
+        } = rows::decode_request_event(attempt.id, request, seq, value.value())?.payload
+        else {
+            continue;
+        };
+        let Some(last) = messages.last() else {
+            return Ok(None);
+        };
+        let bodies = tx.table(MESSAGES)?;
+        let body = bodies
+            .get(last.as_bytes().as_slice())?
+            .ok_or_else(|| StorageError::corrupted("missing initial assignment message"))?;
+        let message: Json = serde_json::from_slice(body.value())
+            .map_err(|_| StorageError::corrupted("invalid initial assignment message"))?;
+        if message["role"].as_str() != Some("user") {
+            return Ok(None);
+        }
+        let content = &message["content"];
+        let text = content.as_str().or_else(|| {
+            // Image requests store text in a block. Anthropic can merge adjacent
+            // user messages, with the current input last in that message.
+            content
+                .as_array()?
+                .iter()
+                .rev()
+                .find(|part| matches!(part["type"].as_str(), Some("text" | "input_text")))?["text"]
+                .as_str()
+        });
+        let context = text.and_then(|text| {
+            text.strip_prefix(attempt.input.text())?
+                .strip_prefix("\n\n")
+        });
+        return Ok(context
+            .filter(|context| {
+                context
+                    .strip_prefix(job_tree::PREREQUISITE_HEADER)
+                    .is_some_and(|report| report.starts_with("\n\n"))
+                    && context.len() <= jobs::MAX_INPUT_BYTES
+                    && !context.chars().any(jobs::invalid_input_character)
+            })
+            .map(str::to_owned));
+    }
+    Ok(None)
 }
 
 struct ParsedReportHeader {
@@ -1631,6 +1749,8 @@ fn migrate_chain(
     } else {
         LegacyChildTurns::default()
     };
+    let prerequisites = LegacyPrerequisites::read(&tx)?;
+    prerequisites.apply(&tx)?;
     tx.commit().map_err(StorageError::from)?;
 
     super::verify_reserved_residual(database)?;
@@ -1665,6 +1785,11 @@ fn migrate_chain(
         } else if let Some(&call) = child_turns.notices.get(&key) {
             let mut job = jobs::decode_mutable_job(key, &row)?;
             job.child_notice = Some(call);
+            row = jobs::encode_mutable_job(&job);
+        }
+        if let Some(context) = prerequisites.recovered.get(&JobId::new(key)) {
+            let mut job = jobs::decode_mutable_job(key, &row)?;
+            job.prerequisite_context = Some(context.clone());
             row = jobs::encode_mutable_job(&job);
         }
         Ok(row)
@@ -1713,6 +1838,11 @@ fn migrate_chain(
             "heads_guessed_turns": child_turns.heads_guessed_turns.iter().map(ToString::to_string).collect::<Vec<_>>(),
         });
     }
+    plan["prerequisite_context"] = json!({
+        "recovered_assignments": prerequisites.recovered.keys().map(ToString::to_string).collect::<Vec<_>>(),
+        "blocked_conversations": prerequisites.blocked.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "blocked_reason": (!prerequisites.blocked.is_empty()).then_some(job_tree::PREREQUISITE_CONTEXT_LOST),
+    });
     let encoded = serde_json::to_vec(&plan)
         .map_err(|e| ReservedRefusal::new("invalid_plan", e.to_string()))?;
     Ok(json!({"plan": plan, "plan_digest": ContentDigest::of(&encoded).to_string()}))

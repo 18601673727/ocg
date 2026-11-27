@@ -596,7 +596,7 @@ fn check_native_invariants(tx: &ReadTransaction) -> Result<(), StorageError> {
         if job.prerequisite_context.is_some()
             && (!job_tree::is_prerequisite_assignment(&spec, &job)
                 || state::require(tx, spec.id)?.lifecycle.after.is_empty()
-                || allocations.get(job.id.get())?.is_none())
+                || !job_tree::prerequisite_admissions(tx, &job)?.reserved)
         {
             return Err(StorageError::corrupted(
                 "Job prerequisite context has no assignment reservation",
