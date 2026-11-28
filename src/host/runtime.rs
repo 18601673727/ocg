@@ -157,6 +157,8 @@ where
     let served = ntex::rt::System::build()
         .name("ocg")
         .signals(signals)
+        // Keep timer rounding below the provider output's 5 ms flush interval.
+        .timer_resolution(4)
         .build(ntex::rt::DefaultRuntime)
         .block_on(serve(
             data_directory.clone(),
