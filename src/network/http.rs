@@ -1,6 +1,9 @@
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::ffi::OsString;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -46,13 +49,72 @@ pub(crate) fn authorization(credential: &str) -> Result<HeaderValue, HttpError> 
     Ok(value)
 }
 
+#[derive(PartialEq, Eq)]
+struct ApprovedDestination {
+    host: String,
+    port: u16,
+    proxy: SocketAddr,
+}
+
+#[derive(Default)]
+struct ProviderClients {
+    http: Option<Client>,
+    https: Option<Client>,
+    approved: VecDeque<(ApprovedDestination, Client)>,
+}
+
+struct WorkerClients {
+    cache: Rc<RefCell<ProviderClients>>,
+    _lifetime: ntex::rt::JoinHandle<()>,
+}
+
+struct ClientCacheLifetime(Rc<RefCell<ProviderClients>>);
+
+impl Drop for ClientCacheLifetime {
+    fn drop(&mut self) {
+        drop(self.0.take());
+    }
+}
+
+fn worker_clients() -> Rc<RefCell<ProviderClients>> {
+    if let Some(clients) = ntex::rt::get_item::<Rc<WorkerClients>>() {
+        return clients.cache.clone();
+    }
+    let cache = Rc::<RefCell<ProviderClients>>::default();
+    // ntex pools need a live reactor to close idle connections. Runtime task
+    // cancellation drops this guard before the arbiter releases its values.
+    let guard = ClientCacheLifetime(cache.clone());
+    let lifetime = ntex::rt::spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    });
+    ntex::rt::set_item(Rc::new(WorkerClients {
+        cache: cache.clone(),
+        _lifetime: lifetime,
+    }));
+    cache
+}
+
 pub(crate) async fn standard_client(uri: &Uri) -> Result<Client, HttpError> {
-    let builder = if uri.scheme_str() == Some("http") {
+    let plain = uri.scheme_str() == Some("http");
+    let clients = worker_clients();
+    let mut clients = clients.borrow_mut();
+    let cache = if plain {
+        &mut clients.http
+    } else {
+        &mut clients.https
+    };
+    if let Some(client) = cache {
+        return Ok(client.clone());
+    }
+    let builder = if plain {
         Client::builder()
     } else {
         connector()?
     };
-    provider_client(builder, "provider").await
+    let client = provider_client(builder, "provider")?;
+    *cache = Some(client.clone());
+    Ok(client)
 }
 
 pub(crate) async fn approved_client(
@@ -60,10 +122,27 @@ pub(crate) async fn approved_client(
     port: u16,
     proxy: SocketAddr,
 ) -> Result<Client, HttpError> {
-    provider_client(approved_connector(host, port, proxy)?, "provider-approved").await
+    const LIMIT: usize = 16;
+    let key = ApprovedDestination {
+        host: bare_host(host),
+        port,
+        proxy,
+    };
+    let clients = worker_clients();
+    let mut clients = clients.borrow_mut();
+    let cache = &mut clients.approved;
+    if let Some((_, client)) = cache.iter().find(|(destination, _)| destination == &key) {
+        return Ok(client.clone());
+    }
+    let client = provider_client(approved_connector(host, port, proxy)?, "provider-approved")?;
+    if cache.len() == LIMIT {
+        cache.pop_front();
+    }
+    cache.push_back((key, client.clone()));
+    Ok(client)
 }
 
-async fn provider_client(builder: ClientBuilder, name: &'static str) -> Result<Client, HttpError> {
+fn provider_client(builder: ClientBuilder, name: &'static str) -> Result<Client, HttpError> {
     let config = ClientConfig::new()
         .set_header("User-Agent", concat!("ocg/", env!("CARGO_PKG_VERSION")))
         .map_err(|_| HttpError {
