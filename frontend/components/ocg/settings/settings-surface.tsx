@@ -902,7 +902,12 @@ export function SettingsSurface(props: {
                       </DialogHeader>
                       <form onSubmit={(e) => void handleSaveLlm(e)} class="flex flex-col gap-3">
                         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                          <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground sm:col-span-2">
+                          <label
+                            class={cn(
+                              "flex flex-col gap-1 text-xs font-medium text-muted-foreground",
+                              modelKind() === "decision_model" && "sm:col-span-2",
+                            )}
+                          >
                             {i18n.t("settings.llm.modelType")}
                             <Select
                               value={modelKind()}
@@ -927,6 +932,13 @@ export function SettingsSurface(props: {
                               </SelectItem>
                             </Select>
                           </label>
+                          {modelKind() === "llm" ? (
+                            <ProtocolSelect
+                              value={llmProtocol()}
+                              onChange={setLlmProtocol}
+                              disabled={llmSaving()}
+                            />
+                          ) : null}
                           <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground">
                             {i18n.t("settings.llm.name")}
                             <Input
@@ -945,13 +957,6 @@ export function SettingsSurface(props: {
                               spellcheck="false"
                             />
                           </label>
-                          {modelKind() === "llm" ? (
-                            <ProtocolSelect
-                              value={llmProtocol()}
-                              onChange={setLlmProtocol}
-                              disabled={llmSaving()}
-                            />
-                          ) : null}
                           <label class="flex flex-col gap-1 text-xs font-medium text-muted-foreground sm:col-span-2">
                             {i18n.t(
                               modelKind() === "llm" ? "settings.llm.endpoint" : "decision.endpoint",
