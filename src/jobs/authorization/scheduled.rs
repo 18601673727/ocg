@@ -45,7 +45,8 @@ impl ScheduledExternalGrant {
     }
 
     pub(crate) fn permits_destination(&self, destination: &DestinationPolicy) -> bool {
-        *destination == DestinationPolicy::scheduled_external(&self.policy)
+        matches!(destination, DestinationPolicy::ApprovedHttps { request_url, proxy }
+            if request_url == self.policy.endpoint() && *proxy == self.policy.proxy())
     }
 
     pub(crate) fn permits_endpoint(&self, endpoint: &str) -> bool {
@@ -103,14 +104,10 @@ impl ScheduledExternalGrant {
         }
         let parameters = &frozen.llm.config.parameters;
         check_thinking(model, parameters.reasoning_effort.as_deref())?;
-        let bounds: Vec<u32> = [parameters.max_tokens, parameters.max_completion_tokens]
-            .into_iter()
-            .flatten()
-            .collect();
-        if bounds.is_empty()
-            || bounds
-                .iter()
-                .any(|bound| *bound > self.policy.limits().max_output_tokens)
+        if parameters
+            .max_tokens
+            .max(parameters.max_completion_tokens)
+            .is_none_or(|bound| bound > self.policy.limits().max_output_tokens)
         {
             return Err(ScheduledExternalRefusal::new(
                 "output_bound_missing_or_too_large",
@@ -150,7 +147,7 @@ impl ScheduledExternalGrant {
             ));
         }
         let request = prepared.request();
-        let size = serde_json::to_vec(request).map_or(usize::MAX, |bytes| bytes.len());
+        let size = crate::db::serialized_len(request).unwrap_or(usize::MAX);
         if size > self.policy.limits().max_request_bytes {
             return Err(ScheduledExternalRefusal::new(
                 "request_too_large",

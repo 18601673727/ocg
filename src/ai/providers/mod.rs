@@ -4,6 +4,7 @@ use std::{future::Future, pin::Pin};
 use ntex::client::{ClientResponse, error::ClientError};
 
 use ntex::http::header::{ACCEPT, CONTENT_TYPE};
+use ntex::url::Url;
 use ntex::util::{Either, select};
 use serde_json::{Value, json};
 
@@ -35,7 +36,7 @@ pub use crate::support::cancellation::CancellationToken;
 pub(crate) use observe::announce;
 use observe::announce_at;
 pub(crate) use observe::unannounced_fact;
-pub(crate) fn model_endpoint(endpoint: &str) -> Result<String, ProviderExecutionError> {
+pub(crate) fn model_endpoint(endpoint: &str) -> Result<Url, ProviderExecutionError> {
     self::endpoint(endpoint, "models")
 }
 pub(crate) use models::{ModelListError, list_models};
@@ -49,7 +50,7 @@ pub use types::{
 pub(crate) use types::incomplete_tool_calls;
 pub(crate) use usage::UsageCapture;
 
-pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, ProviderExecutionError> {
+pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<Url, ProviderExecutionError> {
     let endpoint = endpoint.trim_end_matches('/');
     let base = endpoint
         .strip_suffix("/chat/completions")
@@ -59,14 +60,11 @@ pub(crate) fn endpoint(endpoint: &str, resource: &str) -> Result<String, Provide
         .or_else(|| endpoint.strip_suffix("/models"))
         .unwrap_or(endpoint);
     let url = format!("{base}/{resource}");
-    if provider_uri(&url).is_none() {
-        return Err(ProviderExecutionError::Build {
-            message:
-                "provider endpoint must use https (or http on localhost, 127.0.0.1 or ::1) without credentials, query or fragment"
-                    .to_owned(),
-        });
-    }
-    Ok(url)
+    provider_uri(&url).ok_or_else(|| ProviderExecutionError::Build {
+        message:
+            "provider endpoint must use https (or http on localhost, 127.0.0.1 or ::1) without credentials, query or fragment"
+                .to_owned(),
+    })
 }
 
 pub(crate) fn provider_uri(url: &str) -> Option<ntex::url::Url> {
@@ -132,7 +130,7 @@ pub(crate) fn provider_origins_match(
 }
 
 pub(super) async fn send(
-    endpoint: String,
+    endpoint: Url,
     (credential_ref, frozen_headers): (Option<&str>, &FrozenHeaders),
     resolver: &dyn CredentialResolver,
     config: &ProviderExecutionConfig,
@@ -162,14 +160,9 @@ pub(super) async fn send(
         config.timeout
     };
     let client = provider_client_for(&config.destination, &endpoint).await?;
-    let session = stream
-        .then(|| endpoint.parse::<ntex::url::Url>().ok())
-        .flatten()
-        .filter(|uri| {
-            uri.host()
-                .is_some_and(|host| host.eq_ignore_ascii_case("opencode.ai"))
-        })
-        .and(config.session_id)
+    let session = config
+        .session_id
+        .filter(|_| stream && endpoint.host() == Some("opencode.ai"))
         .map(|id| format!("ocg-{}", id.get()));
     let accept = if stream {
         "text/event-stream"

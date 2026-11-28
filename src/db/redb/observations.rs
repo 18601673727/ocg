@@ -553,7 +553,7 @@ pub(super) fn project_answer(
             .as_ref()
             .filter(|v| v.get("producer_job").is_some())
     {
-        let link = serde_json::from_value(value.clone())
+        let link = serde::Deserialize::deserialize(value)
             .map_err(|_| StorageError::corrupted("invalid summary result link"))?;
         let summary = linked_summary(tx, id, link)?.summary;
         output.summary = Some(crate::db::entities::output_filter::text(&summary).into_owned());
@@ -1047,12 +1047,13 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
         }
     }
 
-    let message: serde_json::Value = serde_json::from_slice(body)
+    let mut message: serde_json::Value = serde_json::from_slice(body)
         .map_err(|error| StorageError::corrupted(format!("invalid response JSON: {error}")))?;
-    let text = match message.get("content") {
-        None | Some(serde_json::Value::Null) => String::new(),
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(Value::Array(parts)) if message["role"] == "assistant" => anthropic_text(parts)
+    let requests_tools = requests_tools(&message);
+    let text = match message.get_mut("content").map(Value::take) {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text,
+        Some(Value::Array(parts)) if message["role"] == "assistant" => anthropic_text(&parts)
             .ok_or_else(|| StorageError::corrupted("invalid Anthropic text block"))?,
         Some(_) => return Err(StorageError::corrupted("response content is not text")),
     };
@@ -1090,7 +1091,7 @@ fn decode_message(digest: ContentDigest, body: &[u8]) -> Result<DecodedMessage, 
             .map(crate::db::entities::escaped_json_char_cost)
             .sum(),
         text: Arc::from(text),
-        requests_tools: requests_tools(&message),
+        requests_tools,
     };
 
     let mut cache = lock_message_cache();
@@ -1260,15 +1261,16 @@ pub(super) fn read_responses_replay(
         let request = RequestNumber::new(number)
             .ok_or_else(|| StorageError::corrupted("zero request number"))?;
         match decode_request_event(job, request, seq, bytes.value())?.payload {
-            RequestPayload::Sent { messages, .. } => {
+            RequestPayload::Sent { mut messages, .. } => {
                 answer = None;
                 if let Some(prefix) = &first {
-                    tail = messages
-                        .strip_prefix(prefix.as_slice())
-                        .ok_or_else(|| {
-                            StorageError::corrupted("Responses request changed its initial input")
-                        })?
-                        .to_vec();
+                    if !messages.starts_with(prefix) {
+                        return Err(StorageError::corrupted(
+                            "Responses request changed its initial input",
+                        ));
+                    }
+                    messages.drain(..prefix.len());
+                    tail = messages;
                 } else {
                     first = Some(messages);
                 }

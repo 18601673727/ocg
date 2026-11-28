@@ -1,4 +1,7 @@
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Serialize, Serializer};
 
 use super::openai_compatible::ChatConversation;
 use super::{OutputSinkError, Timestamp, Value, json};
@@ -46,9 +49,8 @@ impl RequestRecorder {
             return Err(record_error("recorded messages must only be appended"));
         }
         let mut digests = Vec::with_capacity(conversation.messages.len());
-        let mut keep_message = |value: &Value| -> Result<(), OutputSinkError> {
-            digests.push(self.keep(value, &mut bodies, &mut pending)?);
-            Ok(())
+        let mut keep_message = |message: MessageBody| {
+            digests.push(self.keep(message, &mut bodies, &mut pending));
         };
         if self.anthropic {
             record_anthropic_messages(messages, conversation, keep_message)?;
@@ -62,18 +64,17 @@ impl RequestRecorder {
         }
         let tools = body
             .get("tools")
-            .map(|value| self.keep(value, &mut bodies, &mut pending))
-            .transpose()?;
-        let parameters = {
-            let parameters = body
-                .as_object()
-                .ok_or_else(|| record_error("request is not an object"))?
-                .iter()
-                .filter(|(key, _)| !matches!(key.as_str(), "messages" | "input" | "tools"))
-                .map(|(key, value)| (key.clone(), value.clone()))
-                .collect();
-            self.keep(&Value::Object(parameters), &mut bodies, &mut pending)?
-        };
+            .map(message_body)
+            .transpose()?
+            .map(|message| self.keep(message, &mut bodies, &mut pending));
+        let parameters = body
+            .as_object()
+            .ok_or_else(|| record_error("request is not an object"))?;
+        let parameters = self.keep(
+            message_body(&RequestParameters(parameters))?,
+            &mut bodies,
+            &mut pending,
+        );
         let required_messages = digests
             .iter()
             .copied()
@@ -109,17 +110,15 @@ impl RequestRecorder {
 
     fn keep(
         &self,
-        value: &Value,
+        body: MessageBody,
         bodies: &mut Vec<MessageBody>,
         pending: &mut BTreeSet<ContentDigest>,
-    ) -> Result<ContentDigest, OutputSinkError> {
-        let body =
-            MessageBody::new_exact(value).map_err(|error| record_error(error.to_string()))?;
+    ) -> ContentDigest {
         let digest = body.digest();
         if !self.stored.contains(&digest) && pending.insert(digest) {
             bodies.push(body);
         }
-        Ok(digest)
+        digest
     }
 
     pub fn remember_response(&mut self, digest: ContentDigest) {
@@ -128,11 +127,27 @@ impl RequestRecorder {
     }
 }
 
+struct RequestParameters<'a>(&'a serde_json::Map<String, Value>);
+
+impl Serialize for RequestParameters<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(
+            self.0
+                .iter()
+                .filter(|(key, _)| !matches!(key.as_str(), "messages" | "input" | "tools")),
+        )
+    }
+}
+
+fn message_body(value: &impl Serialize) -> Result<MessageBody, OutputSinkError> {
+    MessageBody::new_exact(value).map_err(|error| record_error(error.to_string()))
+}
+
 fn record_chat_messages(
     messages: &[Value],
     conversation: &ChatConversation,
     responses: bool,
-    mut keep_message: impl FnMut(&Value) -> Result<(), OutputSinkError>,
+    mut keep_message: impl FnMut(MessageBody),
 ) -> Result<(), OutputSinkError> {
     let mut wire = messages;
     for (index, message) in conversation.messages.iter().enumerate() {
@@ -146,19 +161,17 @@ fn record_chat_messages(
             .split_at_checked(count)
             .ok_or_else(|| record_error("request input differs from its conversation"))?;
         wire = remaining;
-        let value = if let Some(group) = group {
+        let body = if let Some(group) = group {
             if group != items || !attachments.is_empty() {
                 return Err(record_error(
                     "request replay differs from its recorded output",
                 ));
             }
-            json!({"output": items})
+            message_body(&BTreeMap::from([("output", items)]))?
         } else {
-            let mut value = items[0].clone();
-            replace_images(&mut value, attachments)?;
-            value
+            message_body(replace_images(&items[0], attachments)?.as_ref())?
         };
-        keep_message(&value)?;
+        keep_message(body);
     }
     if !wire.is_empty() {
         return Err(record_error(
@@ -171,7 +184,7 @@ fn record_chat_messages(
 fn record_anthropic_messages(
     messages: &[Value],
     conversation: &ChatConversation,
-    mut keep_message: impl FnMut(&Value) -> Result<(), OutputSinkError>,
+    mut keep_message: impl FnMut(MessageBody),
 ) -> Result<(), OutputSinkError> {
     use super::openai_compatible::{ContentPartWire, MessageContentWire};
     let mut attachments = conversation.image_attachments.values().flatten();
@@ -187,13 +200,17 @@ fn record_anthropic_messages(
             ContentPartWire::ImageUrl { image_url } => Some(image_url.url.as_str()),
             ContentPartWire::Text { .. } => None,
         });
-    for message in messages {
-        let mut message = message.clone();
-        let parts = message["content"]
-            .as_array_mut()
+    for original in messages {
+        let mut message = Cow::Borrowed(original);
+        let parts = original["content"]
+            .as_array()
             .ok_or_else(|| record_error("Anthropic message has no content blocks"))?;
-        for part in parts.iter_mut().filter(|part| part["type"] == "image") {
-            let source = &mut part["source"];
+        for (index, part) in parts
+            .iter()
+            .enumerate()
+            .filter(|(_, part)| part["type"] == "image")
+        {
+            let source = &part["source"];
             let image = images
                 .next()
                 .and_then(|url| url.strip_prefix("data:"))
@@ -210,9 +227,10 @@ fn record_anthropic_messages(
             let attachment = attachments
                 .next()
                 .ok_or_else(|| record_error("request image has no stored Attachment"))?;
-            source["data"] = json!({"attachment": attachment.to_string()});
+            message.to_mut()["content"][index]["source"]["data"] =
+                json!({"attachment": attachment.to_string()});
         }
-        keep_message(&message)?;
+        keep_message(message_body(message.as_ref())?);
     }
     if attachments.next().is_some() || images.next().is_some() {
         return Err(record_error(
@@ -228,10 +246,14 @@ fn record_error(message: impl Into<String>) -> OutputSinkError {
     }
 }
 
-fn replace_images(value: &mut Value, attachments: &[AttachmentId]) -> Result<(), OutputSinkError> {
-    let Some(parts) = value.get_mut("content").and_then(Value::as_array_mut) else {
+fn replace_images<'a>(
+    original: &'a Value,
+    attachments: &[AttachmentId],
+) -> Result<Cow<'a, Value>, OutputSinkError> {
+    let mut value = Cow::Borrowed(original);
+    let Some(parts) = original.get("content").and_then(Value::as_array) else {
         return if attachments.is_empty() {
-            Ok(())
+            Ok(value)
         } else {
             Err(record_error(
                 "request message has Attachments but no content parts",
@@ -239,12 +261,10 @@ fn replace_images(value: &mut Value, attachments: &[AttachmentId]) -> Result<(),
         };
     };
     let mut attachments = attachments.iter();
-    for part in parts {
+    for (index, part) in parts.iter().enumerate() {
         let url = match part.get("type").and_then(Value::as_str) {
-            Some("image_url") => part
-                .get_mut("image_url")
-                .and_then(|image| image.get_mut("url")),
-            Some("input_image") => part.get_mut("image_url"),
+            Some("image_url") => part.get("image_url").and_then(|image| image.get("url")),
+            Some("input_image") => part.get("image_url"),
             _ => continue,
         };
         let Some(url) = url else {
@@ -259,6 +279,12 @@ fn replace_images(value: &mut Value, attachments: &[AttachmentId]) -> Result<(),
         let attachment = attachments
             .next()
             .ok_or_else(|| record_error("request image has no stored Attachment"))?;
+        let part = &mut value.to_mut()["content"][index];
+        let url = if part["type"] == "image_url" {
+            &mut part["image_url"]["url"]
+        } else {
+            &mut part["image_url"]
+        };
         *url = json!({"attachment": attachment.to_string()});
     }
     if attachments.next().is_some() {
@@ -266,5 +292,5 @@ fn replace_images(value: &mut Value, attachments: &[AttachmentId]) -> Result<(),
             "request does not carry all its stored Attachments",
         ));
     }
-    Ok(())
+    Ok(value)
 }

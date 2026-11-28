@@ -235,7 +235,7 @@ pub(crate) struct Terminal {
 impl Stream {
     pub(crate) fn event(
         &mut self,
-        event: Value,
+        mut event: Value,
         status_code: u16,
         request_id: Option<&str>,
         limit: usize,
@@ -261,7 +261,7 @@ impl Stream {
                         "Responses terminal event disagrees with its status",
                     ));
                 }
-                return Ok(Event::Terminal(response.clone()));
+                return Ok(Event::Terminal(event["response"].take()));
             }
             "error" => {
                 return Err(ProviderExecutionError::StreamFailure {

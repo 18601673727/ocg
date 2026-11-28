@@ -621,7 +621,6 @@ impl Batch {
         ready_now: bool,
     ) -> Result<(), BatchError> {
         let submitted = job.submitted_at.unwrap_or(job.created_at);
-        let frozen_config = crate::db::entities::FrozenConfiguration::Generative(frozen.clone());
         self.store_mutable_job(job)?;
         self.put_job_state(job.id, &JobState::new(job.id))?;
         self.step(|tx| {
@@ -631,7 +630,7 @@ impl Batch {
                         jobs::mutable_priority(job.input.priority),
                         submitted.as_unix_micros(),
                         job.id.get(),
-                        reservations::mutable_configuration_requirement(&frozen_config),
+                        reservations::execution_requirement(frozen),
                     ),
                     (),
                 )?;

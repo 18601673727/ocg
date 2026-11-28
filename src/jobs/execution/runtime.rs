@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -58,7 +60,7 @@ impl EndpointPolicy<'_> {
 
 pub(crate) async fn supervise_development_generative(
     database: &DatabaseHandle,
-    execution: DevelopmentExecution,
+    mut execution: DevelopmentExecution,
     config: &ProviderExecutionConfig,
     policy: EndpointPolicy<'_>,
     tools: Option<ToolExecution>,
@@ -71,9 +73,9 @@ pub(crate) async fn supervise_development_generative(
                 "handoff",
                 "generative handoff required",
             )))?;
-    let first_conversation = execution
+    let mut conversation = execution
         .conversation
-        .as_ref()
+        .take()
         .ok_or(DatabaseError::Rejected(Violation::InvalidValue(
             "handoff",
             "generative handoff required",
@@ -85,7 +87,7 @@ pub(crate) async fn supervise_development_generative(
             match frozen.llm.provider.endpoint.as_deref() {
                 None => Some("explicit endpoint required"),
                 Some(endpoint) if !policy.permits(endpoint, config) => Some(policy.refusal()),
-                Some(_) => offer_mismatch(first_conversation, tools.as_ref()),
+                Some(_) => offer_mismatch(&conversation, tools.as_ref()),
             }
         };
     if let Some(message) = local_rejection {
@@ -104,9 +106,8 @@ pub(crate) async fn supervise_development_generative(
     let max_requests = tools
         .as_ref()
         .map_or(1, |tools| tools.limits.max_provider_requests);
-    let mut conversation = first_conversation.clone();
     let mut estimate = None;
-    let mut body = prepared.clone();
+    let mut body = Cow::Borrowed(prepared);
     let mut request = RequestNumber::FIRST;
     let mut output_seq = 1u32;
     loop {
@@ -268,7 +269,7 @@ pub(crate) async fn supervise_development_generative(
             }
         }
         body = match crate::ai::generative_model::request_body(&frozen.llm, &conversation) {
-            Ok(body) => body,
+            Ok(body) => Cow::Owned(body),
             Err(error) => {
                 let stop = ToolLoopStop::ResponseUnserializable {
                     message: error.to_string(),
@@ -279,7 +280,7 @@ pub(crate) async fn supervise_development_generative(
         if matches!(policy, EndpointPolicy::ScheduledExternal(_)) {
             let recheck = match ScheduledExternalGrant::load(database, token).await {
                 Ok(Some(live_grant)) => {
-                    let body_bytes = crate::db::serialized_len(&body).unwrap_or(usize::MAX);
+                    let body_bytes = crate::db::serialized_len(body.as_ref()).unwrap_or(usize::MAX);
                     let ep_ok = frozen
                         .llm
                         .provider
@@ -483,25 +484,26 @@ fn awaiting_summary(result: &ProviderExecutionResult, awaiting: &[u32]) -> Strin
         let text = |key: &str| {
             arguments
                 .as_ref()
-                .and_then(|value| value.get(key)?.as_str().map(str::to_owned))
+                .and_then(|value| value.get(key)?.as_str())
                 .unwrap_or_default()
         };
         if call.name == REQUEST_COMMAND_TOOL_NAME {
             let argv = arguments
                 .as_ref()
-                .and_then(|value| value.get("argv")?.as_array().cloned())
+                .and_then(|value| value.get("argv")?.as_array().map(Vec::as_slice))
                 .unwrap_or_default()
                 .iter()
-                .filter_map(|argument| argument.as_str().map(str::to_owned))
+                .filter_map(serde_json::Value::as_str)
                 .collect::<Vec<_>>()
                 .join(" ");
-            summary.push_str(&format!(
+            let _ = write!(
+                summary,
                 "I ask your approval to add the command `{}` ({argv}) to this Project. {}",
                 text("name"),
                 text("reason"),
-            ));
+            );
         } else {
-            summary.push_str(&text("question"));
+            summary.push_str(text("question"));
         }
     }
     summary
@@ -528,16 +530,15 @@ async fn record_answered_request(
     transport: crate::db::entities::LlmTransport,
 ) -> Result<(), DatabaseError> {
     let response = if let Some(output) = &result.response_output {
-        let message = match transport {
+        match transport {
             crate::db::entities::LlmTransport::AnthropicMessages => {
-                providers::anthropic::assistant_content(&output.items)
+                MessageBody::new_exact(&providers::anthropic::assistant_content(&output.items))
             }
             crate::db::entities::LlmTransport::OpenAiChatCompletions
-            | crate::db::entities::LlmTransport::OpenAiResponses => {
-                serde_json::json!({"output":output.items})
-            }
-        };
-        MessageBody::new_exact(&message)
+            | crate::db::entities::LlmTransport::OpenAiResponses => MessageBody::new_exact(
+                &std::collections::BTreeMap::from([("output", &output.items)]),
+            ),
+        }
     } else {
         serde_json::to_value(assistant_message(result, transport))
             .and_then(|message| MessageBody::new_exact(&message))
@@ -721,7 +722,7 @@ pub(crate) async fn supervise_development_decision(
                 request: RequestNumber::FIRST,
                 observed_at: Timestamp::now(),
                 measurements: Measurements {
-                    usage: result.usage.clone(),
+                    usage: result.usage,
                     ..Measurements::default()
                 },
                 token: Some(TokenAnnotation::eligible(
@@ -1153,7 +1154,7 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
         observation: ProviderObservation,
     ) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
         Box::pin(async move {
-            let ProviderFact::Usage { usage, finality } = &observation.fact else {
+            let ProviderFact::Usage { usage, finality } = observation.fact else {
                 return;
             };
             if !usage.has_counts() {
@@ -1164,10 +1165,10 @@ impl ProviderOutputSink for DevelopmentLoopbackSink<'_> {
                 request: self.request,
                 observed_at: observation.observed_at,
                 measurements: Measurements {
-                    usage: usage.clone(),
+                    usage,
                     ..Measurements::default()
                 },
-                token: Some(TokenAnnotation::eligible(*finality)),
+                token: Some(TokenAnnotation::eligible(finality)),
             };
             if self
                 .database

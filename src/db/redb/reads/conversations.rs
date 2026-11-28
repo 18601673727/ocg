@@ -877,15 +877,24 @@ pub(crate) fn read_context_state(
         .map(|tip| mutable_job_details_in(&rx, tip, None, false))
         .transpose()?
         .flatten();
-    let active = tip_details
-        .as_ref()
-        .and_then(|details| match &details.record.job.frozen {
-            Some(crate::db::entities::MutableFrozenConfiguration::Generative(configuration)) => {
-                Some(configuration.clone())
-            }
-            Some(crate::db::entities::MutableFrozenConfiguration::Decision(_)) | None => None,
-        });
-    let model = active.as_ref().map(|frozen| frozen.llm.clone());
+    let (active, adopted_producer) = tip_details
+        .map(|details| {
+            let job = details.record.job;
+            let active = match job.frozen {
+                Some(crate::db::entities::MutableFrozenConfiguration::Generative(
+                    configuration,
+                )) => Some(configuration),
+                Some(crate::db::entities::MutableFrozenConfiguration::Decision(_)) | None => None,
+            };
+            let adopted_producer = match job.context_selection {
+                crate::db::entities::MutableContextSelection::AdoptedSummary {
+                    producer, ..
+                } => Some(producer),
+                crate::db::entities::MutableContextSelection::FullHistory => None,
+            };
+            (active, adopted_producer)
+        })
+        .unwrap_or_default();
     let (raw, growth, _) = tip
         .map(|tip| mutable_context_usage(&rx, conversation, tip))
         .transpose()?
@@ -940,12 +949,7 @@ pub(crate) fn read_context_state(
     };
     let limit = limit.clamp(1, 100);
     let mut work = Vec::new();
-    let adopted_producer = tip_details.and_then(|d| match d.record.job.context_selection {
-        crate::db::entities::MutableContextSelection::AdoptedSummary { producer, .. } => {
-            Some(producer)
-        }
-        crate::db::entities::MutableContextSelection::FullHistory => None,
-    });
+    let model = active.map(|frozen| frozen.llm);
     let jobs = rx.open_table(JOBS)?;
     let children = rx.open_table(CHILDREN)?;
     let mut entries = children

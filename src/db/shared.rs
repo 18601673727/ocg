@@ -9,7 +9,6 @@ use crate::db::redb::{Probe, StorageError, StorageErrorKind};
 use crate::db::scheduler_wake::{SchedulerWake, SchedulerWakeSubscription};
 use crate::host::data_directory::DataDirectory;
 use ::redb::Database;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, PoisonError, RwLock, RwLockWriteGuard};
 
@@ -72,7 +71,6 @@ pub(super) struct Shared {
     pub(super) scheduler_wake: SchedulerWake,
     pub(super) native_stops: crate::db::NativeStops,
     pub(super) scheduler_subscription: std::sync::Mutex<Option<SchedulerWakeSubscription>>,
-    pub(super) database_directory: PathBuf,
     pub(super) admission: RwLock<Admission>,
     pub(super) update_pauses: AtomicUsize,
     pub(super) database: RwLock<Option<Opened>>,
@@ -166,9 +164,10 @@ impl Shared {
         if let Some(key) = self.credential_key.get() {
             return Ok(key.clone());
         }
-        let key = match redb::load_credential_key(&self.database_directory)? {
+        let directory = self.data_directory.database_path();
+        let key = match redb::load_credential_key(directory)? {
             Some(key) => key,
-            None => redb::create_credential_key(&self.database_directory)?,
+            None => redb::create_credential_key(directory)?,
         };
         let _ = self.credential_key.set(key.clone());
         Ok(key)

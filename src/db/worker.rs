@@ -161,7 +161,6 @@ impl DatabaseWorker {
     ) -> Result<Self, DatabaseError> {
         config.validate().map_err(DatabaseError::Configuration)?;
         let attachment_directory = data_directory.attachments_path();
-        let directory = data_directory.database_path().to_path_buf();
         let data_directory = data_directory.clone();
         let paths = disk::protected_paths(&data_directory);
         let (sender, receiver) = flume::bounded(COMMAND_QUEUE_CAPACITY);
@@ -171,6 +170,7 @@ impl DatabaseWorker {
         let thread = std::thread::Builder::new()
             .name("ocg-database".to_string())
             .spawn(move || {
+                let directory = data_directory.database_path();
                 let shortfalls = space_shortfalls(&paths, config.disk_lock_threshold_bytes);
                 if !shortfalls.is_empty() {
                     ready_sender
@@ -178,7 +178,7 @@ impl DatabaseWorker {
                         .ok();
                     return Ok(());
                 }
-                let _database_lock = match crate::host::data_directory::lock_database(&directory) {
+                let _database_lock = match crate::host::data_directory::lock_database(directory) {
                     Ok(lock) => lock,
                     Err(error) => {
                         ready_sender.send(Err(DatabaseError::Startup(error))).ok();
@@ -187,11 +187,11 @@ impl DatabaseWorker {
                 };
                 // Opening redb changes the digest needed to finalize an offline publication.
                 #[cfg(unix)]
-                if let Err(error) = crate::cli::check_offline_publication(&directory) {
+                if let Err(error) = crate::cli::check_offline_publication(directory) {
                     ready_sender.send(Err(DatabaseError::Startup(error))).ok();
                     return Ok(());
                 }
-                let OpenedFile { database, epoch } = match redb::open(&directory) {
+                let OpenedFile { database, epoch } = match redb::open(directory) {
                     Ok(opened) => opened,
                     Err(error) => {
                         ready_sender.send(Err(DatabaseError::Open(error))).ok();
@@ -218,7 +218,7 @@ impl DatabaseWorker {
                         return Ok(());
                     }
                 };
-                let credential_key = match redb::load_credential_key(&directory) {
+                let credential_key = match redb::load_credential_key(directory) {
                     Ok(key) => key,
                     Err(error) => {
                         ready_sender.send(Err(DatabaseError::Open(error))).ok();
@@ -252,7 +252,7 @@ impl DatabaseWorker {
                     let _ = attachment_slots.0.try_send(());
                 }
                 let shared = Arc::new(Shared {
-                    data_directory: data_directory.clone(),
+                    data_directory,
                     catalog_changes: Default::default(),
                     generative_config_changes: Default::default(),
                     observation_changes: Default::default(),
@@ -260,7 +260,6 @@ impl DatabaseWorker {
                     scheduler_wake,
                     native_stops: Default::default(),
                     scheduler_subscription: std::sync::Mutex::new(Some(scheduler_subscription)),
-                    database_directory: directory.to_path_buf(),
                     admission: RwLock::new(Admission::Open),
                     update_pauses: AtomicUsize::new(0),
                     database: RwLock::new(Some(Opened { database, epoch })),
@@ -297,7 +296,6 @@ impl DatabaseWorker {
                     shared: shared.clone(),
                     receiver,
                     maintenance,
-                    directory,
                     paths,
                     config,
                     next_check: None,
@@ -430,7 +428,7 @@ impl DatabaseHandle {
         if self.shared.undecryptable_credentials_at_open > 0 {
             log::warn!(
                 "ocg.key is missing in {}; {} stored credential(s) cannot be decrypted",
-                self.shared.database_directory.display(),
+                self.shared.data_directory.database_path().display(),
                 self.shared.undecryptable_credentials_at_open
             );
         }
@@ -451,7 +449,6 @@ pub(super) struct WriteWorker {
     pub(super) shared: Arc<Shared>,
     pub(super) receiver: flume::Receiver<Message>,
     pub(super) maintenance: flume::Receiver<MaintenanceRequest>,
-    pub(super) directory: PathBuf,
     pub(super) paths: [(ProtectedArea, PathBuf); 3],
     pub(super) config: FilesystemConfig,
     pub(super) next_check: Option<Instant>,
@@ -587,7 +584,7 @@ impl WriteWorker {
     ) -> Result<(), SpaceRefusal> {
         match disk::check_space(
             ProtectedArea::Database,
-            &self.directory,
+            self.shared.data_directory.database_path(),
             expected_write_bytes,
             self.config.disk_lock_threshold_bytes,
         ) {
@@ -629,7 +626,7 @@ impl WriteWorker {
             && shared.protection.status().lock.is_none()
             && disk::check_space(
                 ProtectedArea::Database,
-                &self.directory,
+                shared.data_directory.database_path(),
                 group.iter().fold(0u64, |total, envelope| {
                     total.saturating_add(envelope.command.expected_write_bytes())
                 }),
@@ -791,7 +788,7 @@ impl WriteWorker {
                 remaining,
             }));
         }
-        let file = redb::database_file(&self.directory);
+        let file = redb::database_file(self.shared.data_directory.database_path());
         let file_bytes = file_length(&file)?;
         if file_bytes < COMPACTION_MIN_FILE_BYTES {
             return Ok(CompactionOutcome::Skipped(CompactionSkip::FileTooSmall {
@@ -1031,7 +1028,7 @@ impl WriteWorker {
 
     pub(super) fn reopen(&mut self) -> Result<u64, RecoveryError> {
         self.shared.release_database();
-        let OpenedFile { database, epoch } = redb::open(&self.directory)
+        let OpenedFile { database, epoch } = redb::open(self.shared.data_directory.database_path())
             .map_err(|error| RecoveryError::Reopen(ReopenFailure::Storage(error)))?;
         let native_resources = redb::read_native_resource_catalog(&database)
             .map_err(|error| RecoveryError::Reopen(ReopenFailure::Storage(error)))?;

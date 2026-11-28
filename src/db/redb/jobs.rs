@@ -35,6 +35,13 @@ pub(super) fn mutable_priority(priority: crate::db::entities::JobQueuePriority) 
 }
 
 pub(super) fn encode_mutable_job(job: &crate::db::entities::MutableJob) -> Vec<u8> {
+    encode_job_with_prerequisite_context(job, job.prerequisite_context.as_deref())
+}
+
+fn encode_job_with_prerequisite_context(
+    job: &crate::db::entities::MutableJob,
+    prerequisite_context: Option<&str>,
+) -> Vec<u8> {
     use crate::db::entities::{MutableContextSelection, MutableJobPhase};
     let mut e = Enc::new(TAG_JOB);
     e.u128(job.id.get());
@@ -88,7 +95,7 @@ pub(super) fn encode_mutable_job(job: &crate::db::entities::MutableJob) -> Vec<u
         e.u32(result.answer_end);
     }
     e.opt(job.child_notice.as_ref(), |e, call| e.call_ref(call));
-    e.ostr(job.prerequisite_context.as_deref());
+    e.ostr(prerequisite_context);
     e.0
 }
 
@@ -863,7 +870,7 @@ impl Batch {
         conversation: JobId,
     ) -> Result<PrerequisiteCapture, BatchError> {
         let spec = self.require_mutable_conversation(conversation)?;
-        let Some(mut assignment) =
+        let Some(assignment) =
             self.step(|tx| super::job_tree::prerequisite_assignment(tx, &spec))?
         else {
             return Ok(PrerequisiteCapture::NotRequired);
@@ -887,11 +894,10 @@ impl Batch {
         else {
             return Ok(PrerequisiteCapture::Pending);
         };
-        assignment.prerequisite_context = Some(context.clone());
         self.insert(
             JOBS,
             assignment.id.get(),
-            encode_mutable_job(&assignment).as_slice(),
+            encode_job_with_prerequisite_context(&assignment, Some(&context)).as_slice(),
         )?;
         Ok(PrerequisiteCapture::Captured {
             assignment: assignment.id,

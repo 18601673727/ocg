@@ -13,7 +13,7 @@ pub struct MessageBody {
 }
 
 impl MessageBody {
-    pub(crate) fn new_exact(value: &Value) -> Result<Self, serde_json::Error> {
+    pub(crate) fn new_exact(value: &impl serde::Serialize) -> Result<Self, serde_json::Error> {
         let bytes = serde_json::to_vec(value)?;
         Ok(Self {
             digest: ContentDigest::of(&bytes),

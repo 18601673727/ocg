@@ -329,11 +329,7 @@ impl ScheduledExternalRefusal {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ApprovedEndpoint {
-    host: String,
-    port: u16,
-    request_url: String,
-}
+struct ApprovedEndpoint(String);
 
 impl ApprovedEndpoint {
     fn parse(text: &str) -> Result<Self, ScheduledExternalRefusal> {
@@ -359,8 +355,7 @@ impl ApprovedEndpoint {
         if uri
             .authority()
             .is_none_or(|authority| authority.as_str().contains('@'))
-            || uri.query().is_some()
-            || text.contains('#')
+            || text.contains(['?', '#'])
         {
             return Err(invalid(
                 "the endpoint must carry no credentials, query or fragment",
@@ -371,11 +366,20 @@ impl ApprovedEndpoint {
                 "the host must be a public DNS name or a public address, not localhost, an intranet name or a private address",
             ));
         }
+        if host.ends_with('.') {
+            return Err(invalid("the endpoint host must not end in a dot"));
+        }
         let port = uri.port_u16().unwrap_or(443);
         if port == 0 {
             return Err(invalid("the port must not be 0"));
         }
-        let path = uri.path().as_str().trim_end_matches('/');
+        let (_, authority_and_path) = text
+            .split_once("://")
+            .ok_or_else(|| invalid("the endpoint must have an explicit authority"))?;
+        let path = authority_and_path
+            .find('/')
+            .map_or("", |start| &authority_and_path[start..])
+            .trim_end_matches('/');
         let path = path.strip_suffix("/chat/completions").unwrap_or(path);
         if [
             "/responses",
@@ -401,22 +405,12 @@ impl ApprovedEndpoint {
         {
             return Err(invalid("the endpoint path must be plain and normalized"));
         }
-        let host = crate::network::http::bare_host(host);
-        let host_text = if host.contains(':') {
-            format!("[{host}]")
-        } else {
-            host.clone()
-        };
-        let authority = if port == 443 {
-            host_text
-        } else {
-            format!("{host_text}:{port}")
-        };
-        Ok(Self {
-            request_url: format!("https://{authority}{path}/chat/completions"),
-            host,
-            port,
-        })
+        let request_url = crate::ai::providers::endpoint(text, "chat/completions")
+            .map_err(|_| invalid("the endpoint is not a valid Provider request URL"))?;
+        if request_url.as_str().len() > 2048 {
+            return Err(invalid("the Provider request URL exceeds 2048 characters"));
+        }
+        Ok(Self(request_url.to_string()))
     }
 
     fn permits(&self, frozen: &str) -> bool {
@@ -541,8 +535,6 @@ impl ScheduledExternalPolicyConfig {
             Duration::from_secs(u64::from(timeout_secs)),
         )?;
         valid_model_id(model)?;
-        // The canonical request URL must also satisfy the endpoint limits.
-        ApprovedEndpoint::parse(&endpoint.request_url)?;
         Ok(Self {
             endpoint,
             credential_ref: credential_ref.to_owned(),
@@ -610,11 +602,7 @@ impl ScheduledExternalPolicyConfig {
     }
 
     pub(crate) fn endpoint(&self) -> &str {
-        &self.endpoint.request_url
-    }
-
-    pub(crate) fn endpoint_origin(&self) -> (&str, u16) {
-        (&self.endpoint.host, self.endpoint.port)
+        &self.endpoint.0
     }
 
     pub(crate) fn permits_endpoint(&self, endpoint: &str) -> bool {
@@ -666,7 +654,7 @@ impl<'a> ScheduledExternalTarget<'a> {
     }
 
     pub(in crate::db) fn match_key(&self) -> (&str, &str, &str) {
-        (&self.endpoint.request_url, self.credential_ref, self.model)
+        (&self.endpoint.0, self.credential_ref, self.model)
     }
 
     pub(in crate::db) fn matches(&self, policy: &ScheduledExternalPolicyConfig) -> bool {

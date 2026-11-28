@@ -30,7 +30,7 @@ pub(crate) async fn list_models(
         let mut endpoint = if anthropic {
             format!("{base}?limit=1000")
         } else {
-            base.clone()
+            base.to_string()
         };
         let mut models = BTreeMap::new();
         let mut cursors = std::collections::BTreeSet::new();
@@ -56,14 +56,14 @@ pub(crate) async fn list_models(
                     return Err(ModelListError::NotListed);
                 }
                 let body = match response.body().limit(1024 * 1024).await {
-                    Ok(body) => body.to_vec(),
+                    Ok(body) => body,
                     Err(error)
                         if matches!(**error, ntex::http::error::PayloadError::Overflow)
                             && (200..300).contains(&status) =>
                     {
                         return Err(ModelListError::NotListed);
                     }
-                    Err(_) if !(200..300).contains(&status) => Vec::new(),
+                    Err(_) if !(200..300).contains(&status) => Default::default(),
                     Err(_) => return Err(ModelListError::Unreachable),
                 };
                 (status, body)

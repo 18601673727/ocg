@@ -87,8 +87,7 @@ pub enum DestinationPolicy {
     #[default]
     Standard,
     ApprovedHttps {
-        host: String,
-        port: u16,
+        request_url: String,
         proxy: LoopbackProxy,
     },
 }
@@ -97,10 +96,8 @@ impl DestinationPolicy {
     pub(crate) fn scheduled_external(
         policy: &crate::db::entities::ScheduledExternalPolicyConfig,
     ) -> Self {
-        let (host, port) = policy.endpoint_origin();
         Self::ApprovedHttps {
-            host: host.to_owned(),
-            port,
+            request_url: policy.endpoint().to_owned(),
             proxy: policy.proxy(),
         }
     }
