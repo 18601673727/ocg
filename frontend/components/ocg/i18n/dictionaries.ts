@@ -202,6 +202,21 @@ export const en = {
   "context.hourlyRequests": "Preparation requests per hour",
   "context.hourlyTokens": "Preparation tokens per hour",
   "context.manual": "Compact now",
+  "context.noSettledSource": "No completed conversation turn is available to compact yet.",
+  "context.sourceTools":
+    "This conversation contains tool activity that compaction does not yet support. Its original history is unchanged.",
+  "context.sourceAttachment":
+    "A source attachment is no longer available; the history was not compacted.",
+  "context.sourceLimit":
+    "The conversation exceeds the compaction verification size limit; its history was not compacted.",
+  "context.sourceExecution":
+    "A conversation turn cannot be verified as a supported, settled execution; its history was not compacted.",
+  "context.sourceExecutor":
+    "The executor no longer supports a source turn's operation; the history was not compacted.",
+  "context.recentProtected":
+    "Recent turns are protected by the compaction policy; there is nothing eligible to compact.",
+  "context.sourceUnavailable":
+    "The conversation history is not eligible for compaction; it remains unchanged.",
   "context.manualHint":
     "Manual compaction uses a generative model and works independently of prediction. Prepared context is adopted at a later safe turn boundary.",
   "context.usage": "Estimated {tokens} / {capacity} tokens · {mode} · {source}",

@@ -257,7 +257,7 @@ impl Batch {
                     Ok(pair) => pair,
                     Err(NativeSourceError::Unavailable(reason)) => {
                         log::debug!("compaction source {id} unavailable: {reason}");
-                        return Ok(None);
+                        return Ok(Err(reason));
                     }
                     Err(
                         error @ (NativeSourceError::Corrupt { .. } | NativeSourceError::Storage(_)),
@@ -269,7 +269,7 @@ impl Batch {
                 cursor = prev;
             }
             if boundaries.is_empty() {
-                return Ok(None);
+                return Ok(Err("no settled source"));
             }
             boundaries.reverse();
             let mut text = String::new();
@@ -309,13 +309,13 @@ impl Batch {
                     }
                 }
                 if text.len().saturating_add(turn_text.len()) > 7 * 256 * 1024 {
-                    return Ok(None);
+                    return Ok(Err("summary source text exceeds byte limit"));
                 }
                 context_tokens =
                     context_tokens.saturating_add(turn_text.len().saturating_add(3) / 4);
                 text.push_str(&turn_text);
             }
-            Ok(Some((
+            Ok(Ok((
                 NativeSummaryManifest {
                     conversation,
                     through_job: through,
@@ -325,10 +325,9 @@ impl Batch {
                 context_tokens,
             )))
         })?;
-        let Some((manifest, source_text, source_context_tokens)) = sealed else {
-            return Ok(crate::db::entities::CompactionRequest::Noop {
-                reason: "no eligible settled source",
-            });
+        let (manifest, source_text, source_context_tokens) = match sealed {
+            Ok(source) => source,
+            Err(reason) => return Ok(crate::db::entities::CompactionRequest::Noop { reason }),
         };
         let manifest_body =
             MessageBody::new_exact(&serde_json::to_value(&manifest).map_err(|_| {

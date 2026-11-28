@@ -12,7 +12,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { Select, SelectItem } from "@/components/ui/select";
 import { elementRef } from "@/lib/ui-state";
 import type { ContextStatus, ProfilesSnapshot } from "../contracts";
-import { useI18n } from "../i18n";
+import { type TranslateFn, useI18n } from "../i18n";
 import { DismissibleNotice } from "../primitives/dismissible-notice";
 import { useOcgRuntime } from "../runtime/runtime-context";
 import { describeError, selectableLlmProfiles } from "../settings/settings-parts";
@@ -23,6 +23,36 @@ function formatTokens(value: number): string {
   if (value < 1000) return String(value);
   if (value < 1_000_000) return `${(value / 1000).toFixed(1)}K`;
   return `${(value / 1_000_000).toFixed(1)}M`;
+}
+
+function compactionNotice(reason: string, t: TranslateFn): string {
+  switch (reason) {
+    case "no settled source":
+      return t("context.noSettledSource");
+    case "no eligible settled source":
+      return t("context.sourceUnavailable");
+    case "recent turns are protected":
+      return t("context.recentProtected");
+    case "summary source tool evidence is not supported":
+      return t("context.sourceTools");
+    case "summary source attachment unavailable":
+      return t("context.sourceAttachment");
+    case "summary verification record exceeds byte limit":
+    case "summary verification byte budget exceeded":
+    case "summary verification output budget exceeded":
+    case "summary source text exceeds byte limit":
+    case "summary source output overflow":
+      return t("context.sourceLimit");
+    case "Decision Jobs cannot be summary sources":
+    case "summary source Job has no settled execution":
+    case "summary source is not a settled conversation Job":
+    case "summary source output timing is inconsistent":
+      return t("context.sourceExecution");
+    case "summary Executor no longer supports the source operation":
+      return t("context.sourceExecutor");
+    default:
+      return reason;
+  }
 }
 
 export function ConversationContext(props: {
@@ -140,7 +170,7 @@ export function ConversationContext(props: {
           request.current.key,
         );
         request.current = null;
-        setNotice(result.reason ?? undefined);
+        setNotice(result.reason ? compactionNotice(result.reason, i18n.t) : undefined);
         setStatus(await api.readContextStatus(props.conversation));
       } finally {
         setRetrying(false);
